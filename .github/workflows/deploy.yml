@@ -21,19 +21,14 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v3
-        with:
-          version: 9
-
       - name: Setup Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'pnpm'
+          cache: 'npm'
 
       - name: Install Monorepo Dependencies
-        run: pnpm install
+        run: npm install
 
       - name: Inject COOP/COEP ServiceWorker for SharedArrayBuffer
         run: |
@@ -42,7 +37,7 @@ jobs:
       - name: Generate Nuxt 3 Static Site
         run: |
           cd app
-          pnpm generate
+          npm run generate
 
       - name: Setup Pages
         uses: actions/configure-pages@v5

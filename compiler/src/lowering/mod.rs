@@ -9,6 +9,7 @@ pub mod access_analysis;
 pub mod ast_to_pir;
 pub mod loop_extraction;
 pub mod reversible_lowering;
+pub mod simd;
 
 use crate::ast::Program;
 use crate::ir::validate::validate_pir;
@@ -16,6 +17,14 @@ use crate::ir::{
     AccessRelations, AffineDomain, AffineMap, PirModule, PirStatement, QuantityMap, ScheduleNode,
     ScheduleTree, StmtId,
 };
+
+/// SIMD lowering entry point
+pub fn lower_quantization_to_simd(
+    module: &PirModule,
+    target: simd::SimdTarget,
+) -> Result<PirModule, LoweringError> {
+    simd::lower_quantization_to_simd(module, target)
+}
 
 /// Lowering error types
 #[derive(Debug, Clone, thiserror::Error)]

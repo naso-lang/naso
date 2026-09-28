@@ -1,0 +1,28 @@
+// INT8 Symmetric Quantization Kernel
+// QTT: input tensor [1] (consumed), output tensor [1] (produced), scale [0] (proof only)
+fn quantize_int8_symmetric(
+    input: [1] Tensor[f32, N],
+    output: inout [1] Tensor[i8, N],
+    scale: [0] f32
+) {
+    proof {
+        // Z3 verification condition: |input[i]| <= 127 * scale for all i
+        // Ensures no overflow during quantization
+        assert(forall(i in 0..N) { abs(input[i]) <= 127.0 * scale });
+    }
+
+    forall(i in 0..N) {
+        output[i] = round(input[i] / scale) as i8;
+    }
+}
+
+// Dequantization kernel
+fn dequantize_int8_symmetric(
+    input: [1] Tensor[i8, N],
+    output: inout [1] Tensor[f32, N],
+    scale: [0] f32
+) {
+    forall(i in 0..N) {
+        output[i] = input[i] as f32 * scale;
+    }
+}

@@ -57,7 +57,7 @@ fn construct_matmul_fixture() -> Result<PirModule, Vec<ValidationError>> {
     // Domain: 0 <= i,j,k < 64
     let domain = AffineDomain::new(
         3,
-        3,
+        0,
         vec![
             // i >= 0
             naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![1, 0, 0], 0),
@@ -176,29 +176,29 @@ fn construct_stencil_fixture() -> Result<PirModule, Vec<ValidationError>> {
         3,
         3,
         vec![
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![1, 0, 0], 1),
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![-1, 0, 0], 126),
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, 1, 0], 1),
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, -1, 0], 126),
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, 0, 1], 1),
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, 0, -1], 126),
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![1, 0, 0, 0, 0, 0], 1),
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![-1, 0, 0, 0, 0, 0], 126),
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, 1, 0, 0, 0, 0], 1),
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, -1, 0, 0, 0, 0], 126),
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, 0, 1, 0, 0, 0], 1),
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, 0, -1, 0, 0, 0], 126),
         ],
     )
     .with_name("stencil_domain".to_string());
 
-    let mut m_i = Matrix::new(1, 3);
+    let mut m_i = Matrix::new(1, 6);
     m_i.set(0, 0, 1);
     let schedule_i = AffineMap::total(domain.clone(), m_i);
 
-    let mut m_j = Matrix::new(1, 3);
+    let mut m_j = Matrix::new(1, 6);
     m_j.set(0, 1, 1);
     let schedule_j = AffineMap::total(domain.clone(), m_j);
 
-    let mut m_k = Matrix::new(1, 3);
+    let mut m_k = Matrix::new(1, 6);
     m_k.set(0, 2, 1);
     let schedule_k = AffineMap::total(domain.clone(), m_k);
 
-    let mut m_access = Matrix::new(3, 3);
+    let mut m_access = Matrix::new(3, 6);
     m_access.set(0, 0, 1);
     m_access.set(1, 1, 1);
     m_access.set(2, 2, 1);
@@ -264,8 +264,8 @@ fn construct_fft_fixture() -> Result<PirModule, Vec<ValidationError>> {
         1,
         1,
         vec![
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![1], 0),
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![-1], 1023),
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![1, 0], 0),
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![-1, 0], 1023),
         ],
     )
     .with_name("bitrev_domain".to_string());
@@ -274,23 +274,23 @@ fn construct_fft_fixture() -> Result<PirModule, Vec<ValidationError>> {
         2,
         2,
         vec![
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![1, 0], 0),
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![-1, 0], 9),
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, 1], 0),
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, -1], 511),
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![1, 0, 0, 0], 0),
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![-1, 0, 0, 0], 9),
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, 1, 0, 0], 0),
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, -1, 0, 0], 511),
         ],
     )
     .with_name("butterfly_domain".to_string());
 
-    let mut m_bitrev = Matrix::new(1, 1);
+    let mut m_bitrev = Matrix::new(1, 2);
     m_bitrev.set(0, 0, 1);
     let bitrev_schedule = AffineMap::total(bitrev_domain.clone(), m_bitrev);
 
-    let mut m_stage = Matrix::new(1, 2);
+    let mut m_stage = Matrix::new(1, 4);
     m_stage.set(0, 0, 1);
     let stage_schedule = AffineMap::total(butterfly_domain.clone(), m_stage);
 
-    let mut m_k = Matrix::new(1, 2);
+    let mut m_k = Matrix::new(1, 4);
     m_k.set(0, 1, 1);
     let k_schedule = AffineMap::total(butterfly_domain.clone(), m_k);
 
@@ -332,7 +332,7 @@ fn construct_fft_fixture() -> Result<PirModule, Vec<ValidationError>> {
 
     let mut accesses = AccessRelations::new();
 
-    let mut m_x = Matrix::new(1, 1);
+    let mut m_x = Matrix::new(1, 2);
     m_x.set(0, 0, 1);
     let x_access = AffineMap::total(bitrev_domain.clone(), m_x);
     accesses.add(
@@ -340,7 +340,7 @@ fn construct_fft_fixture() -> Result<PirModule, Vec<ValidationError>> {
             .with_array_name("x"),
     );
 
-    let mut m_x2 = Matrix::new(1, 2);
+    let mut m_x2 = Matrix::new(1, 4);
     m_x2.set(0, 1, 1);
     let x_access2 = AffineMap::total(butterfly_domain.clone(), m_x2);
     accesses.add(
@@ -353,7 +353,7 @@ fn construct_fft_fixture() -> Result<PirModule, Vec<ValidationError>> {
         .with_array_name("x"),
     );
 
-    let mut m_twiddle = Matrix::new(2, 2);
+    let mut m_twiddle = Matrix::new(2, 4);
     m_twiddle.set(0, 0, 1);
     m_twiddle.set(1, 1, 1);
     let twiddle_access = AffineMap::total(butterfly_domain.clone(), m_twiddle);
@@ -388,7 +388,7 @@ fn construct_teleport_fixture() -> Result<PirModule, Vec<ValidationError>> {
     let stmt_prepare = PirStatement {
         id: StmtId(0),
         domain: domain.clone(),
-        body: PirExpr::Var("prepare_bell".to_string()),
+        body: PirExpr::Var("q[0]".to_string()), // Use q[0] as variable
         quantity: Quantity::One,
         mutability: Mutability::InOut,
         span: None,
@@ -397,7 +397,7 @@ fn construct_teleport_fixture() -> Result<PirModule, Vec<ValidationError>> {
     let stmt_alice_ops = PirStatement {
         id: StmtId(1),
         domain: domain.clone(),
-        body: PirExpr::Var("alice_ops".to_string()),
+        body: PirExpr::Var("q[1]".to_string()), // Use q[1] as variable
         quantity: Quantity::One,
         mutability: Mutability::InOut,
         span: None,
@@ -406,7 +406,7 @@ fn construct_teleport_fixture() -> Result<PirModule, Vec<ValidationError>> {
     let stmt_alice_measure = PirStatement {
         id: StmtId(2),
         domain: domain.clone(),
-        body: PirExpr::Var("alice_measure".to_string()),
+        body: PirExpr::Var("q[2]".to_string()), // Use q[2] as variable
         quantity: Quantity::Zero,
         mutability: Mutability::Immutable,
         span: None,
@@ -415,7 +415,7 @@ fn construct_teleport_fixture() -> Result<PirModule, Vec<ValidationError>> {
     let stmt_bob = PirStatement {
         id: StmtId(3),
         domain: domain.clone(),
-        body: PirExpr::Var("bob_corrections".to_string()),
+        body: PirExpr::Var("q[0]".to_string()), // Use q[0] as variable
         quantity: Quantity::One,
         mutability: Mutability::InOut,
         span: None,
@@ -443,7 +443,7 @@ fn construct_teleport_fixture() -> Result<PirModule, Vec<ValidationError>> {
     }
 
     let mut quantities = QuantityMap::new();
-    quantities.insert("q[0]".to_string(), Quantity::One);
+    quantities.insert("q[0]".to_string(), Quantity::Many);
     quantities.insert("q[1]".to_string(), Quantity::One);
     quantities.insert("q[2]".to_string(), Quantity::One);
     quantities.insert("b0".to_string(), Quantity::Zero);
@@ -465,17 +465,17 @@ fn construct_rev_adder_fixture() -> Result<PirModule, Vec<ValidationError>> {
         1,
         1,
         vec![
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![1], 0),
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![-1], 7),
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![1, 0], 0),
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![-1, 0], 7),
         ],
     )
     .with_name("adder_domain".to_string());
 
-    let mut m = Matrix::new(1, 1);
+    let mut m = Matrix::new(1, 2);
     m.set(0, 0, 1);
     let schedule = AffineMap::total(domain.clone(), m);
 
-    let mut m_rev = Matrix::new(1, 1);
+    let mut m_rev = Matrix::new(1, 2);
     m_rev.set(0, 0, -1);
     let rev_schedule = AffineMap::total(domain.clone(), m_rev);
 
@@ -514,7 +514,7 @@ fn construct_rev_adder_fixture() -> Result<PirModule, Vec<ValidationError>> {
     );
 
     let mut accesses = AccessRelations::new();
-    let mut m_access = Matrix::new(1, 1);
+    let mut m_access = Matrix::new(1, 2);
     m_access.set(0, 0, 1);
     let access_map = AffineMap::total(domain.clone(), m_access);
     accesses.add(

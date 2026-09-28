@@ -219,6 +219,10 @@ impl<'a> Parser<'a> {
                     Span::default(),
                 )
             }
+            Some(TK::IntKw) => {
+                self.bump();
+                Type::int(Span::default())
+            }
             Some(TK::TypeIdent(_)) | Some(TK::QRegister) => self.parse_named_type(),
             Some(TK::Ident(_)) if self.at_ident("int") => {
                 self.bump();

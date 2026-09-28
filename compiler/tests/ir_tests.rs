@@ -61,16 +61,16 @@ fn construct_matmul_fixture() -> Result<PirModule, Vec<ValidationError>> {
         vec![
             // i >= 0
             naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![1, 0, 0], 0),
-            // i <= 63
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![-1, 0, 0], 63),
+            // i <= 63 => -i >= -63
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![-1, 0, 0], -63),
             // j >= 0
             naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, 1, 0], 0),
-            // j <= 63
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, -1, 0], 63),
+            // j <= 63 => -j >= -63
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, -1, 0], -63),
             // k >= 0
             naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, 0, 1], 0),
-            // k <= 63
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, 0, -1], 63),
+            // k <= 63 => -k >= -63
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, 0, -1], -63),
         ],
     )
     .with_name("matmul_domain".to_string());
@@ -176,12 +176,18 @@ fn construct_stencil_fixture() -> Result<PirModule, Vec<ValidationError>> {
         3,
         3,
         vec![
+            // i >= 1
             naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![1, 0, 0, 0, 0, 0], 1),
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![-1, 0, 0, 0, 0, 0], 126),
+            // i <= 127 => -i >= -127
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![-1, 0, 0, 0, 0, 0], -127),
+            // j >= 1
             naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, 1, 0, 0, 0, 0], 1),
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, -1, 0, 0, 0, 0], 126),
+            // j <= 127 => -j >= -127
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, -1, 0, 0, 0, 0], -127),
+            // k >= 1
             naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, 0, 1, 0, 0, 0], 1),
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, 0, -1, 0, 0, 0], 126),
+            // k <= 127 => -k >= -127
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, 0, -1, 0, 0, 0], -127),
         ],
     )
     .with_name("stencil_domain".to_string());
@@ -264,8 +270,10 @@ fn construct_fft_fixture() -> Result<PirModule, Vec<ValidationError>> {
         1,
         1,
         vec![
+            // i >= 0
             naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![1, 0], 0),
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![-1, 0], 1023),
+            // i <= 1023 => -i >= -1023
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![-1, 0], -1023),
         ],
     )
     .with_name("bitrev_domain".to_string());
@@ -274,10 +282,14 @@ fn construct_fft_fixture() -> Result<PirModule, Vec<ValidationError>> {
         2,
         2,
         vec![
+            // s >= 0
             naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![1, 0, 0, 0], 0),
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![-1, 0, 0, 0], 9),
+            // s <= 9 => -s >= -9
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![-1, 0, 0, 0], -9),
+            // k >= 0
             naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, 1, 0, 0], 0),
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, -1, 0, 0], 511),
+            // k <= 511 => -k >= -511
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, -1, 0, 0], -511),
         ],
     )
     .with_name("butterfly_domain".to_string());
@@ -383,7 +395,15 @@ fn construct_fft_fixture() -> Result<PirModule, Vec<ValidationError>> {
 
 /// Construct teleport fixture
 fn construct_teleport_fixture() -> Result<PirModule, Vec<ValidationError>> {
-    let domain = AffineDomain::universe(0, 0).with_name("teleport_domain".to_string());
+    let domain = AffineDomain::new(
+        1,
+        1,
+        vec![
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![1, 0], 0),
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![-1, 0], -1),
+        ],
+    )
+    .with_name("teleport_domain".to_string());
 
     let stmt_prepare = PirStatement {
         id: StmtId(0),
@@ -423,17 +443,33 @@ fn construct_teleport_fixture() -> Result<PirModule, Vec<ValidationError>> {
 
     let schedule = ScheduleTree::new(
         ScheduleNode::sequence(vec![
-            ScheduleNode::domain(StmtId(0), domain.clone()),
-            ScheduleNode::domain(StmtId(1), domain.clone()),
-            ScheduleNode::domain(StmtId(2), domain.clone()),
-            ScheduleNode::domain(StmtId(3), domain.clone()),
+            ScheduleNode::band(
+                vec![AffineMap::total(domain.clone(), Matrix::new(0, 2))],
+                vec![false],
+                ScheduleNode::domain(StmtId(0), domain.clone()),
+            ),
+            ScheduleNode::band(
+                vec![AffineMap::total(domain.clone(), Matrix::new(0, 2))],
+                vec![false],
+                ScheduleNode::domain(StmtId(1), domain.clone()),
+            ),
+            ScheduleNode::band(
+                vec![AffineMap::total(domain.clone(), Matrix::new(0, 2))],
+                vec![false],
+                ScheduleNode::domain(StmtId(2), domain.clone()),
+            ),
+            ScheduleNode::band(
+                vec![AffineMap::total(domain.clone(), Matrix::new(0, 2))],
+                vec![false],
+                ScheduleNode::domain(StmtId(3), domain.clone()),
+            ),
         ]),
         vec![],
     );
 
     let mut accesses = AccessRelations::new();
     for q in 0..3 {
-        let m = Matrix::new(0, 0); // 0-dim access for qubit
+        let m = Matrix::new(0, 2); // 0-dim access for qubit, 2 cols = domain dims (1 iter + 1 param)
         let access = AffineMap::total(domain.clone(), m);
         let typ = AccessType::ReadWrite;
         accesses.add(
@@ -465,8 +501,10 @@ fn construct_rev_adder_fixture() -> Result<PirModule, Vec<ValidationError>> {
         1,
         1,
         vec![
+            // i >= 0
             naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![1, 0], 0),
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![-1, 0], 7),
+            // i <= 7 => -i >= -7
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![-1, 0], -7),
         ],
     )
     .with_name("adder_domain".to_string());

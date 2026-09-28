@@ -163,6 +163,8 @@ pub enum TokenKind {
     Nat,
     #[regex("[fF][lL][oO][aA][tT]", priority = 3)]
     FloatKw,
+    #[regex("[iI][nN][tT]", priority = 3)]
+    IntKw,
     #[regex("[tT][rR][uU][eE]", |lex| Some(lex.slice().eq_ignore_ascii_case("true")), priority = 3)]
     #[regex("[fF][aA][lL][sS][eE]", |lex| Some(lex.slice().eq_ignore_ascii_case("true")), priority = 3)]
     Bool(bool),
@@ -354,6 +356,7 @@ impl TokenKind {
             TokenKind::At => "'@'",
             TokenKind::Newline => "newline",
             TokenKind::Comment => "comment",
+            TokenKind::IntKw => "'int'",
             TokenKind::Error => "<lex error>",
         }
     }

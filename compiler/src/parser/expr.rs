@@ -826,8 +826,13 @@ mod tests {
             }
             other => panic!("expected tuple type, got {:?}", other),
         }
-        // Check body has two qalloc calls and a tuple return
-        assert_eq!(func.body.stmts.len(), 3);
+        // Check body has two qalloc calls and a tuple tail expression
+        assert_eq!(func.body.stmts.len(), 2);
+        assert!(func.body.expr.is_some());
+        match &func.body.expr.as_ref().unwrap().kind {
+            ExprKind::Tuple(items) => assert_eq!(items.len(), 2),
+            other => panic!("expected tuple tail expression, got {:?}", other),
+        }
     }
 
     #[test]

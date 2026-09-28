@@ -833,7 +833,13 @@ fn infer_quantum_op(
             let target_ty = infer_expr(checker, target)?;
             // Target must be Qubit @ 1
             unify::unify_types(checker, &target_ty, &Type::qubit(span))?;
-            checker.env.move_var(&target_ty.to_ident(), span)?;
+            // Mark the qubit variable as moved - extract ident if it's a variable
+            if let ExprKind::Var(ident) = &target.kind {
+                checker.env.move_var(ident, span)?;
+            } else {
+                // Fallback for non-variable expressions (shouldn't happen for measure)
+                checker.env.move_var(&target_ty.to_ident(), span)?;
+            }
             Ok(Type::new(TypeKind::Bool, Quantity::One, span))
         }
         QuantumOp::ApplyGate(_gate, args) => {

@@ -1,0 +1,29 @@
+{
+  "name": "naso-chat",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "nuxt dev",
+    "build": "nuxt build",
+    "preview": "nuxt preview",
+    "lint": "eslint . --ext .ts,.vue",
+    "typecheck": "nuxt typecheck"
+  },
+  "dependencies": {
+    "nuxt": "^3.11.2",
+    "vue": "^3.4.27",
+    "@vueuse/core": "^10.10.0"
+  },
+  "devDependencies": {
+    "@vite-pwa/nuxt": "^0.10.0",
+    "@nuxtjs/tailwindcss": "^6.12.0",
+    "tailwindcss": "^3.4.3",
+    "postcss": "^8.4.38",
+    "autoprefixer": "^10.4.19",
+    "typescript": "^5.4.5",
+    "eslint": "^8.57.0",
+    "@typescript-eslint/eslint-plugin": "^7.8.0",
+    "@typescript-eslint/parser": "^7.8.0",
+    "eslint-plugin-vue": "^9.26.0"
+  }
+}

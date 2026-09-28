@@ -4,11 +4,13 @@
 //! - LLVM (via inkwell) for native code generation
 //! - QIR (Quantum Intermediate Representation) for quantum programs
 //! - Cranelift for fast JIT compilation
+//! - WGSL for WebGPU compute shaders
 
 pub mod abi;
 pub mod context;
 pub mod error;
 pub mod validate;
+pub mod wgsl;
 
 #[cfg(feature = "cranelift")]
 pub mod cranelift;
@@ -36,6 +38,9 @@ pub use inkwell::context::Context as LlvmContext;
 pub use inkwell::module::Module as LlvmModule;
 #[cfg(feature = "llvm")]
 pub use inkwell::targets::{InitializationConfig, Target, TargetMachine};
+
+// Re-export WGSL codegen
+pub use wgsl::{generate_wgsl, verify_wgsl_linearity, WgslTarget};
 
 /// Main entry point for code generation
 #[cfg(feature = "llvm")]

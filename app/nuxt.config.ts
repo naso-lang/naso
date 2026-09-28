@@ -62,7 +62,27 @@ export default defineNuxtConfig({
         { rel: 'preconnect', href: 'https://fonts.googleapis.com' },
         { rel: 'preconnect', href: 'https://fonts.gstatic.com', crossorigin: '' },
         { rel: 'stylesheet', href: 'https://fonts.googleapis.com/css2?family=Geist:wght@400;500&family=Geist+Mono:wght@400;500&display=swap' },
+        // COOP/COEP for SharedArrayBuffer
+        { rel: 'modulepreload', href: '/coi-serviceworker.js' },
       ],
+      script: [
+        { src: '/coi-serviceworker.js', type: 'module', crossorigin: 'anonymous' },
+      ],
+    },
+  },
+  
+  nitro: {
+    preset: 'static',
+    static: {
+      generate: true,
+    },
+    routeRules: {
+      '/**': {
+        headers: {
+          'Cross-Origin-Opener-Policy': 'same-origin',
+          'Cross-Origin-Embedder-Policy': 'require-corp',
+        },
+      },
     },
   },
   

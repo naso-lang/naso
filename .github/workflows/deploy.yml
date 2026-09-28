@@ -1,0 +1,57 @@
+name: Deploy NasoChat to GitHub Pages
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 9
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'pnpm'
+
+      - name: Install Monorepo Dependencies
+        run: pnpm install
+
+      - name: Inject COOP/COEP ServiceWorker for SharedArrayBuffer
+        run: |
+          curl -sL https://raw.githubusercontent.com/gzuidhof/coi-serviceworker/master/coi-serviceworker.js -o app/public/coi-serviceworker.js
+
+      - name: Generate Nuxt 3 Static Site
+        run: |
+          cd app
+          pnpm generate
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: app/.output/public
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

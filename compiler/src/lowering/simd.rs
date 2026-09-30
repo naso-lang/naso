@@ -4,10 +4,8 @@
 //! into packed SIMD/vector compute instructions while preserving memory
 //! uncomputation and linear type invariants.
 
-use crate::ir::{
-    AffineDomain, PirExpr, PirModule, PirStatement, StmtId,
-};
 use crate::ast::Quantity;
+use crate::ir::{AffineDomain, PirExpr, PirModule, PirStatement, StmtId};
 use crate::lowering::LoweringError;
 
 /// SIMD target architectures
@@ -44,7 +42,10 @@ impl SimdLoweringContext {
             SimdTarget::Neon => 4,
             SimdTarget::Scalar => 1,
         };
-        Self { target, vector_width }
+        Self {
+            target,
+            vector_width,
+        }
     }
 
     /// Lower a quantization forall loop to SIMD instructions
@@ -68,10 +69,13 @@ impl SimdLoweringContext {
     ) -> Result<(String, String, String), LoweringError> {
         match expr {
             PirExpr::Call { name, args } => {
-                if (quant_op == SimdQuantOp::QuantizeSymmetric && name.contains("quantize")) ||
-                   (quant_op == SimdQuantOp::DequantizeSymmetric && name.contains("dequantize")) {
+                if (quant_op == SimdQuantOp::QuantizeSymmetric && name.contains("quantize"))
+                    || (quant_op == SimdQuantOp::DequantizeSymmetric && name.contains("dequantize"))
+                {
                     if args.len() >= 3 {
-                        if let (PirExpr::Var(input), PirExpr::Var(output), PirExpr::Var(scale)) = (&args[0], &args[1], &args[2]) {
+                        if let (PirExpr::Var(input), PirExpr::Var(output), PirExpr::Var(scale)) =
+                            (&args[0], &args[1], &args[2])
+                        {
                             return Ok((input.clone(), output.clone(), scale.clone()));
                         }
                     }
@@ -99,12 +103,8 @@ impl SimdLoweringContext {
     }
 
     /// Create a vectorized domain for SIMD iteration
-    fn create_vectorized_domain(
-        &self,
-        loop_var: &str,
-    ) -> Result<AffineDomain, LoweringError> {
-        let domain = AffineDomain::universe(1, 0)
-            .with_name(format!("vec_{}", loop_var));
+    fn create_vectorized_domain(&self, loop_var: &str) -> Result<AffineDomain, LoweringError> {
+        let domain = AffineDomain::universe(1, 0).with_name(format!("vec_{}", loop_var));
         Ok(domain)
     }
 
@@ -118,9 +118,14 @@ impl SimdLoweringContext {
         quant_op: SimdQuantOp,
     ) -> Result<Vec<PirStatement>, LoweringError> {
         match self.target {
-            SimdTarget::Avx2 => self.generate_avx2_quantization(domain, input_var, output_var, scale_var, quant_op),
-            SimdTarget::Neon => self.generate_neon_quantization(domain, input_var, output_var, scale_var, quant_op),
-            SimdTarget::Scalar => self.generate_scalar_quantization(domain, input_var, output_var, scale_var, quant_op),
+            SimdTarget::Avx2 => {
+                self.generate_avx2_quantization(domain, input_var, output_var, scale_var, quant_op)
+            }
+            SimdTarget::Neon => {
+                self.generate_neon_quantization(domain, input_var, output_var, scale_var, quant_op)
+            }
+            SimdTarget::Scalar => self
+                .generate_scalar_quantization(domain, input_var, output_var, scale_var, quant_op),
         }
     }
 
@@ -137,7 +142,9 @@ impl SimdLoweringContext {
             SimdQuantOp::QuantizeSymmetric => "avx2_quantize_symmetric",
             SimdQuantOp::DequantizeSymmetric => "avx2_dequantize_symmetric",
         };
-        Ok(vec![self.make_stmt(domain, name, input_var, output_var, scale_var)])
+        Ok(vec![
+            self.make_stmt(domain, name, input_var, output_var, scale_var),
+        ])
     }
 
     /// Generate NEON quantization instructions
@@ -153,7 +160,9 @@ impl SimdLoweringContext {
             SimdQuantOp::QuantizeSymmetric => "neon_quantize_symmetric",
             SimdQuantOp::DequantizeSymmetric => "neon_dequantize_symmetric",
         };
-        Ok(vec![self.make_stmt(domain, name, input_var, output_var, scale_var)])
+        Ok(vec![
+            self.make_stmt(domain, name, input_var, output_var, scale_var),
+        ])
     }
 
     /// Generate scalar fallback with vectorization hints
@@ -169,7 +178,9 @@ impl SimdLoweringContext {
             SimdQuantOp::QuantizeSymmetric => "scalar_quantize_symmetric",
             SimdQuantOp::DequantizeSymmetric => "scalar_dequantize_symmetric",
         };
-        Ok(vec![self.make_stmt(domain, name, input_var, output_var, scale_var)])
+        Ok(vec![
+            self.make_stmt(domain, name, input_var, output_var, scale_var),
+        ])
     }
 
     fn make_stmt(
@@ -217,7 +228,8 @@ pub fn lower_quantization_to_simd(
             } else {
                 SimdQuantOp::QuantizeSymmetric
             };
-            let stmts = ctx.lower_quantization_loop("", &PirExpr::IntLit(0), &stmt.body, quant_op)?;
+            let stmts =
+                ctx.lower_quantization_loop("", &PirExpr::IntLit(0), &stmt.body, quant_op)?;
             new_stmts.extend(stmts);
         } else {
             new_stmts.push(stmt.clone());
@@ -264,11 +276,30 @@ fn count_in_expr(expr: &PirExpr, var: &str) -> usize {
         PirExpr::Let { value, body, .. } => count_in_expr(value, var) + count_in_expr(body, var),
         PirExpr::Unary { expr, .. } => count_in_expr(expr, var),
         PirExpr::Call { args, .. } => args.iter().map(|a| count_in_expr(a, var)).sum(),
-        PirExpr::Index { base, indices } => count_in_expr(base, var) + indices.iter().map(|i| count_in_expr(i, var)).sum::<usize>(),
+        PirExpr::Index { base, indices } => {
+            count_in_expr(base, var) + indices.iter().map(|i| count_in_expr(i, var)).sum::<usize>()
+        }
         PirExpr::Field { base, .. } => count_in_expr(base, var),
-        PirExpr::If { cond, then_branch, else_branch } => count_in_expr(cond, var) + count_in_expr(then_branch, var) + count_in_expr(else_branch, var),
-        PirExpr::Reversible { body, inverse } => count_in_expr(body, var) + count_in_expr(inverse, var),
-        PirExpr::QuantumOp { op: _, args, qubits } => args.iter().map(|a| count_in_expr(a, var)).sum::<usize>() + qubits.iter().map(|q| count_in_expr(q, var)).sum::<usize>(),
+        PirExpr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            count_in_expr(cond, var)
+                + count_in_expr(then_branch, var)
+                + count_in_expr(else_branch, var)
+        }
+        PirExpr::Reversible { body, inverse } => {
+            count_in_expr(body, var) + count_in_expr(inverse, var)
+        }
+        PirExpr::QuantumOp {
+            op: _,
+            args,
+            qubits,
+        } => {
+            args.iter().map(|a| count_in_expr(a, var)).sum::<usize>()
+                + qubits.iter().map(|q| count_in_expr(q, var)).sum::<usize>()
+        }
         _ => 0,
     }
 }
@@ -292,13 +323,13 @@ impl SimdLoweringContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::{Mutability, Quantity};
     use crate::ir::{
+        access_relation::{AccessRelation, AccessRelations, AccessType},
         affine_domain::AffineDomain,
         affine_map::{AffineMap, Matrix},
         schedule_tree::{ScheduleNode, ScheduleTree},
-        access_relation::{AccessRelation, AccessRelations, AccessType},
     };
-    use crate::ast::{Mutability, Quantity};
     use std::collections::HashMap;
 
     fn make_test_module() -> PirModule {

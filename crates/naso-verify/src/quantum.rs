@@ -193,15 +193,15 @@ impl QuantumTracker {
                     .find(|q| &q.name == target)
                     .map(|q| q.id.clone()),
             };
-            if let Some(id) = id {
-                if let Some(qubit) = self.qubits.get_mut(&id) {
-                    qubit.operations.push(QubitOp {
-                        gate,
-                        target_qubits: targets.to_vec(),
-                        control_qubits: controls.to_vec(),
-                        span,
-                    });
-                }
+            if let Some(id) = id
+                && let Some(qubit) = self.qubits.get_mut(&id)
+            {
+                qubit.operations.push(QubitOp {
+                    gate,
+                    target_qubits: targets.to_vec(),
+                    control_qubits: controls.to_vec(),
+                    span,
+                });
             }
         }
     }

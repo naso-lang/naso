@@ -177,17 +177,35 @@ fn construct_stencil_fixture() -> Result<PirModule, Vec<ValidationError>> {
         3,
         vec![
             // i >= 1
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![1, 0, 0, 0, 0, 0], 1),
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(
+                vec![1, 0, 0, 0, 0, 0],
+                1,
+            ),
             // i <= 127 => -i >= -127
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![-1, 0, 0, 0, 0, 0], -127),
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(
+                vec![-1, 0, 0, 0, 0, 0],
+                -127,
+            ),
             // j >= 1
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, 1, 0, 0, 0, 0], 1),
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(
+                vec![0, 1, 0, 0, 0, 0],
+                1,
+            ),
             // j <= 127 => -j >= -127
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, -1, 0, 0, 0, 0], -127),
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(
+                vec![0, -1, 0, 0, 0, 0],
+                -127,
+            ),
             // k >= 1
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, 0, 1, 0, 0, 0], 1),
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(
+                vec![0, 0, 1, 0, 0, 0],
+                1,
+            ),
             // k <= 127 => -k >= -127
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![0, 0, -1, 0, 0, 0], -127),
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(
+                vec![0, 0, -1, 0, 0, 0],
+                -127,
+            ),
         ],
     )
     .with_name("stencil_domain".to_string());

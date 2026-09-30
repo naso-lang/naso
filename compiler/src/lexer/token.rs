@@ -119,6 +119,11 @@ pub enum TokenKind {
     Import,
     #[regex("[cC][oO][nN][sS][tT]", priority = 3)]
     Const,
+    // `proof` introduces a proof block: obligations that the verifier must
+    // discharge. Parsed and typechecked by the compiler, then consumed by
+    // naso-verify. Not reachable by codegen.
+    #[regex("[pP][rR][oO][oO][fF]", priority = 3)]
+    Proof,
     // `as` introduces a numeric cast: `expr as i8`. Numeric types only --
     // the typechecker rejects casts to tensor, qubit or pointer-shaped types,
     // so this is not a general reinterpret-cast operator.
@@ -170,6 +175,11 @@ pub enum TokenKind {
     FloatKw,
     #[regex("[iI][nN][tT]", priority = 3)]
     IntKw,
+    // `bool` as a type. Only bool *literals* existed before; there was no
+    // way to name the type, so no prelude function could take or return one.
+    // Needed to declare `assert(cond: bool)`.
+    #[regex("[bB][oO][oO][lL]", priority = 3)]
+    BoolKw,
     #[regex("[tT][rR][uU][eE]", |lex| Some(lex.slice().eq_ignore_ascii_case("true")), priority = 3)]
     #[regex("[fF][aA][lL][sS][eE]", |lex| Some(lex.slice().eq_ignore_ascii_case("true")), priority = 3)]
     Bool(bool),
@@ -293,6 +303,7 @@ impl TokenKind {
             TokenKind::Mod => "'mod'",
             TokenKind::Import => "'import'",
             TokenKind::Const => "'const'",
+            TokenKind::Proof => "'proof'",
             TokenKind::As => "'as'",
             TokenKind::Mut => "'mut'",
             TokenKind::Int8 => "'i8'",
@@ -363,6 +374,7 @@ impl TokenKind {
             TokenKind::Newline => "newline",
             TokenKind::Comment => "comment",
             TokenKind::IntKw => "'int'",
+            TokenKind::BoolKw => "'bool'",
             TokenKind::Error => "<lex error>",
         }
     }

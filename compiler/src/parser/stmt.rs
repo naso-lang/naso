@@ -48,6 +48,13 @@ impl<'a> Parser<'a> {
                     let span = self.span_from(start);
                     stmts.push(Stmt::new(StmtKind::Reversible(rb), span, next_id()))
                 }
+                Some(TK::Proof) => {
+                    let start = self.pos;
+                    let pb = self.parse_proof_block();
+                    self.eat(TK::Semicolon);
+                    let span = self.span_from(start);
+                    stmts.push(Stmt::new(StmtKind::Proof(pb), span, next_id()))
+                }
                 _ => {
                     debug_log("parse_stmt_list: dispatching to parse_expr");
                     let expr = self.parse_expr();
@@ -300,5 +307,19 @@ impl<'a> Parser<'a> {
             uncomputes: Vec::new(),
             span,
         }
+    }
+
+    /// Parse a `proof { ... }` block.
+    ///
+    /// The body is an ordinary block, so obligations inside it are typechecked
+    /// by the normal path. `uncomputes` is not modelled: proof obligations are
+    /// not a statement kind of their own yet, so they arrive as `assert(..)`
+    /// expressions in the block body.
+    pub(crate) fn parse_proof_block(&mut self) -> ProofBlock {
+        let start = self.pos;
+        self.expect(TK::Proof);
+        let body = self.parse_block();
+        let span = self.span_from(start);
+        ProofBlock { body, span }
     }
 }

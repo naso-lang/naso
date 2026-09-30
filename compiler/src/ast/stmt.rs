@@ -37,6 +37,9 @@ pub enum StmtKind {
     Item(crate::ast::Item),
     /// Reversible block statement
     Reversible(crate::ast::expr::ReversibleBlock),
+    /// Proof block: obligations the verifier must discharge. The body is
+    /// typechecked like any other block, but nothing in it reaches codegen.
+    Proof(crate::ast::expr::ProofBlock),
     /// Return statement
     Return(Option<Expr>),
     /// Break statement
@@ -84,6 +87,7 @@ impl fmt::Display for StmtKind {
             StmtKind::Expr(e) => write!(f, "{:?};", e),
             StmtKind::Item(i) => write!(f, "{:?}", i),
             StmtKind::Reversible(_r) => write!(f, "reversible {{ ... }}"),
+            StmtKind::Proof(_p) => write!(f, "proof {{ ... }}"),
             StmtKind::Return(opt) => {
                 if let Some(e) = opt {
                     write!(f, "return {:?};", e)

@@ -243,6 +243,10 @@ pub mod walk {
                 }
                 Ok(VisitOutcome::Continue)
             }
+            StmtKind::Proof(p) => {
+                walk_block(visitor, &p.body)?;
+                Ok(VisitOutcome::Continue)
+            }
             StmtKind::Item(i) => visitor.visit_item(i),
             StmtKind::Return(opt) => opt
                 .as_ref()

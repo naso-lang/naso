@@ -69,6 +69,9 @@ pub enum TypeError {
         span: Span,
     },
 
+    #[error("`assert` may only be used inside a `proof {{ .. }}` block")]
+    AssertOutsideProof { span: Span },
+
     #[error("cannot cast `{from}` to `{to}`: casts are only defined between numeric types")]
     InvalidCast { from: Type, to: Type, span: Span },
 

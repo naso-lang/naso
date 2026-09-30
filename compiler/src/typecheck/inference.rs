@@ -12,7 +12,7 @@ use crate::typecheck::check::{check_block, check_stmt};
 use crate::typecheck::error::TypeError;
 use crate::typecheck::*;
 
-/// Infer the type of a numeric cast: `expr as T`.
+/// Infer a numeric cast: `expr as T`.
 ///
 /// Both the operand and the target must be numeric. `Tensor`, `Qubit`,
 /// `QRegister`, bool, unit, tuples and functions are rejected: `as` is a
@@ -110,6 +110,13 @@ fn infer_literal(lit: &Literal, span: Span) -> Result<Type, TypeError> {
 
 /// Infer variable type from environment
 fn infer_var(checker: &mut TypeChecker, ident: &Ident, span: Span) -> Result<Type, TypeError> {
+    // `assert` is handled in infer_call, not here. It is an intrinsic rather
+    // than a prelude function precisely so that no code path resolves it at
+    // runtime: declaring it in the prelude would let `assert(x)` outside a
+    // proof block typecheck and then lower to nothing, a silent no-op where a
+    // check was written.
+    debug_assert_ne!(ident.name, "assert", "assert must be handled by infer_call");
+
     if let Some(info) = checker.env.lookup_var(ident) {
         // Return type with the variable's declared quantity, not the inferred type's quantity
         let mut ty = info.ty.clone();
@@ -224,6 +231,34 @@ fn infer_call(
     args: &[Expr],
     span: Span,
 ) -> Result<Type, TypeError> {
+    // `assert` is an intrinsic, not a prelude function, so intercept the call
+    // before the callee is inferred as a function type. infer_var would
+    // otherwise return Bool (the obligation's type) and the Function arm
+    // below would reject it.
+    if let ExprKind::Var(ident) = &callee.kind
+        && ident.name == "assert"
+    {
+        if !checker.in_proof {
+            return Err(TypeError::AssertOutsideProof { span });
+        }
+        if args.len() != 1 {
+            return Err(TypeError::ArgumentCountMismatch {
+                expected: 1,
+                found: args.len(),
+                span,
+            });
+        }
+        // The obligation must be a proposition. A bool is not accepted where
+        // the expression is checked against a Float, so this is the error the
+        // user sees for `assert(x)` with a non-boolean argument.
+        let cond = Type::new(TypeKind::Bool, Quantity::Many, span);
+        checker.check_expr(&args[0], &cond)?;
+        // Unit, not bool: `assert(..);` appears in statement position, where
+        // the block expects a statement of type (). The obligation's
+        // proposition type is only used for checking the argument.
+        return Ok(Type::unit(span));
+    }
+
     let callee_ty = infer_expr(checker, callee)?;
 
     // Expect callee to be a function type

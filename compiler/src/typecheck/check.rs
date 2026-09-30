@@ -84,6 +84,7 @@ pub fn check_stmt(checker: &mut TypeChecker, stmt: &Stmt) -> Result<(), TypeErro
         StmtKind::Return(opt_expr) => check_return(checker, opt_expr.as_ref()),
         StmtKind::Item(item) => check_item(checker, item),
         StmtKind::Reversible(block) => check_reversible(checker, block),
+        StmtKind::Proof(block) => check_proof(checker, block),
         StmtKind::Break(opt_expr) => check_break(checker, opt_expr.as_ref()),
         StmtKind::Continue => Ok(()),
         StmtKind::Empty => Ok(()),
@@ -328,6 +329,32 @@ fn check_reversible(checker: &mut TypeChecker, block: &ReversibleBlock) -> Resul
 
     checker.env.exit_scope(guard)?;
     checker.in_reversible = prev_reversible;
+    Ok(())
+}
+
+/// Check a `proof { .. }` block.
+///
+/// The body is typechecked as an ordinary block, in its own scope so its
+/// bindings cannot leak into the enclosing runtime code. Purity is *not*
+/// required: an obligation is not executed, and restricting what may appear in
+/// an obligation would only make some obligations inexpressible.
+///
+/// `in_reversible` is deliberately left alone. A proof block is a statement
+/// about a function, not an operation inside a reversible region, so entering
+/// one does not change whether the surrounding code is reversible.
+///
+/// This establishes that the obligations are well-typed. It does not
+/// discharge them -- that is `naso-verify`'s job, which reads the block from
+/// the AST.
+fn check_proof(checker: &mut TypeChecker, block: &ProofBlock) -> Result<(), TypeError> {
+    let guard = checker.env.enter_scope();
+    let prev_proof = checker.in_proof;
+    checker.in_proof = true;
+    for stmt in &block.body.stmts {
+        check_stmt(checker, stmt)?;
+    }
+    checker.in_proof = prev_proof;
+    checker.env.exit_scope(guard)?;
     Ok(())
 }
 

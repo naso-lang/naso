@@ -152,6 +152,10 @@ impl ControlFlowGraph {
             }
             StmtKind::Item(_) => Ok(entry_id),
             StmtKind::Reversible(_) => Ok(entry_id),
+            // A proof block contains no runtime control flow. Erasing it is
+            // correct for CFG analysis: obligations are read from the AST by
+            // the prover, not as part of the execution path.
+            StmtKind::Proof(_) => Ok(entry_id),
             StmtKind::Break(_) => Ok(entry_id),
             StmtKind::Continue => Ok(entry_id),
             StmtKind::Empty => Ok(entry_id),

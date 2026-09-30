@@ -63,6 +63,12 @@ pub struct TypeChecker {
     pub errors: Vec<error::TypeError>,
     /// Whether we're inside a reversible block (affects purity checks)
     pub in_reversible: bool,
+    /// Whether we're inside a `proof { .. }` block.
+    ///
+    /// Gates `assert`, which exists only to state an obligation. Making it
+    /// proof-only is what stops `assert(x)` in ordinary code from typechecking
+    /// and then being a silent no-op in codegen.
+    pub in_proof: bool,
     /// Current function signature being checked (for return type)
     pub current_fn_ret: Option<Type>,
 }
@@ -77,6 +83,7 @@ impl TypeChecker {
             mode: Mode::Infer,
             errors: Vec::new(),
             in_reversible: false,
+            in_proof: false,
             current_fn_ret: None,
         }
     }
@@ -90,6 +97,7 @@ impl TypeChecker {
             mode: Mode::Infer,
             errors: Vec::new(),
             in_reversible: false,
+            in_proof: false,
             current_fn_ret: None,
         }
     }

@@ -155,6 +155,21 @@ pub struct ReversibleBlock {
     pub span: Span,
 }
 
+/// A proof block: `proof { .. }`.
+///
+/// Holds verification obligations. The body is a normal block, so `assert(..)`
+/// and quantified expressions in it are typechecked exactly as they would be
+/// at runtime. That is deliberate: an obligation that cannot be stated in the
+/// language's own type system would be unenforceable.
+///
+/// Nothing in a proof block reaches codegen. The block is erased, and the
+/// `naso-verify` crate reads the obligations instead.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProofBlock {
+    pub body: crate::ast::Block,
+    pub span: Span,
+}
+
 /// Step in the uncomputation DAG
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UncomputeStep {

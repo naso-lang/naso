@@ -163,6 +163,10 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Type::new(TypeKind::Float, Quantity::Many, Span::default())
             }
+            Some(TK::BoolKw) => {
+                self.bump();
+                Type::new(TypeKind::Bool, Quantity::Many, Span::default())
+            }
             Some(TK::Int8) => {
                 self.bump();
                 Type::new(TypeKind::Int, Quantity::Many, Span::default())

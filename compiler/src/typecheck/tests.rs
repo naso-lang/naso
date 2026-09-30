@@ -492,6 +492,101 @@ mod tests {
         assert!(check_source("fn q(input: [1] Tensor[i8, 8], output: inout [1] Tensor[f32, 8]) { forall i in 0..8 { output[i] = input[i]; } }").is_err());
         assert!(check_source("fn q(input: [1] Tensor[f32, 8], output: inout [1] Tensor[i8, 8]) { forall i in 0..8 { output[i] = input[i]; } }").is_err());
     }
+    /// `proof { .. }` parses and typechecks. The body is an ordinary block,
+    /// so obligations inside it go through the normal inference path.
+    #[test]
+    fn test_proof_block_parses_and_typechecks() {
+        assert!(
+            check_source("fn f(x: f32) -> f32 { proof { assert(x > 0.0); } return x; }").is_ok()
+        );
+        assert!(check_source("fn f(x: f32) -> f32 { proof { } return x; }").is_ok());
+    }
+
+    /// The soundness property this design exists for: `assert` outside a proof
+    /// block is rejected. If it were declared in the prelude it would
+    /// typecheck in ordinary code and then lower to nothing, a silent no-op
+    /// where a runtime check was written.
+    #[test]
+    fn test_assert_rejected_outside_proof_block() {
+        let result = check_source("fn f(x: f32) -> f32 { assert(x > 0.0); return x; }");
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, TypeError::AssertOutsideProof { .. })),
+            "expected AssertOutsideProof, got {:?}",
+            errors
+        );
+    }
+
+    /// An obligation must be a proposition, and assert takes exactly one.
+    #[test]
+    fn test_assert_argument_checks() {
+        assert!(check_source("fn f(x: f32) -> f32 { proof { assert(x); } return x; }").is_err());
+        assert!(check_source("fn f(x: f32) -> f32 { proof { assert(); } return x; }").is_err());
+        assert!(
+            check_source("fn f(x: f32) -> f32 { proof { assert(x > 0.0, 1.0); } return x; }")
+                .is_err()
+        );
+    }
+
+    /// `bool` is now nameable as a type. Only bool literals existed before,
+    /// so no prelude function could take or return one.
+    #[test]
+    fn test_bool_type_is_nameable() {
+        assert!(check_source("fn f(x: bool) -> bool { return x; }").is_ok());
+    }
+
+    /// A proof block's scope does not leak: bindings inside it are not
+    /// visible to the enclosing runtime code.
+    #[test]
+    fn test_proof_block_scope_is_isolated() {
+        assert!(
+            check_source("fn f(x: f32) -> f32 { proof { let y = x; assert(y > 0.0); } return y; }")
+                .is_err()
+        );
+    }
+
+    /// Documented gap: `assert(forall ..)` does not typecheck.
+    ///
+    /// The parser reuses ExprKind::Forall for both loop statements and
+    /// quantified propositions, and infer_forall returns unit, so a
+    /// quantified obligation is currently inexpressible. This test records the
+    /// limit; it should be replaced with a positive one when quantifiers can
+    /// be distinguished from loops.
+    #[test]
+    fn test_quantified_assert_not_yet_supported() {
+        assert!(
+            check_source(
+                "fn f() -> bool { proof { assert(forall i in 0..10 { i < 10 }); } return true; }"
+            )
+            .is_err()
+        );
+    }
+
+    /// The quantize kernel with a real proof block. Obligations are currently
+    /// scalar; the per-element precondition is not yet expressible.
+    #[test]
+    fn test_quantize_kernel_with_proof_block() {
+        let src = "
+            fn quantize(
+                input: [1] Tensor[f32, 1024],
+                output: inout [1] Tensor[i8, 1024],
+                scale: f32
+            ) {
+                proof {
+                    assert(scale > 0.0);
+                }
+
+                forall i in 0..1024 {
+                    let v = round(input[i] / scale);
+                    output[i] = clamp(v, -128.0, 127.0) as i8;
+                }
+            }
+        ";
+        assert!(check_source(src).is_ok());
+    }
 }
 
 /// Unit tests for quantity unification and lattice operations (TASK-205)

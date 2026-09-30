@@ -15,33 +15,43 @@
 //   N is a literal (1024) because the parser requires a literal in
 //   Tensor[T, N] position; a symbolic extent is not expressible yet.
 //
-// Still not implemented:
-//   1. No `proof` block. `proof` is not a keyword anywhere in the lexer, so
-//      `proof { .. }` fails with "expected '}', found '{'". The verification
-//      condition below is a comment and is NOT checked by the prover. Until it
-//      is, this kernel is typechecked but not verified.
-//   2. Symbolic extents (see N above).
+// A `proof { .. }` block now exists: it parses, is typechecked in its own
+// scope, and reaches the AST for the prover to read. `assert` is proof-only --
+// using it at runtime is a type error, so it can never be a silent no-op.
 //
-// The cast can overflow unless the precondition holds, which is exactly what
-// the missing proof block would establish. Typechecking is not verification:
-// this file compiles, and the i8 narrowing is still unproven.
+// Still not implemented:
+//   1. Quantified obligations. The parser reuses ExprKind::Forall for both
+//      loop statements and propositions, and infer_forall returns unit, so
+//      `assert(forall i in 0..1024 { ... })` does not typecheck. Only scalar
+//      obligations are expressible today.
+//   2. Obligation discharge. naso-verify does not read proof blocks yet, so
+//      the assertions below are typechecked but never checked for truth.
+//   3. Symbolic extents (see N above).
+//
+// The per-element precondition that makes the i8 cast sound is therefore
+// still NOT established. `assert(scale > 0.0)` is the only obligation present,
+// and it does not imply |input[i]| <= 127 * scale. This kernel is typechecked
+// but unverified.
 
 /// Quantize f32 -> i8 with a symmetric scale.
 ///
-/// The cast can overflow unless the precondition holds, which is what the
-/// proof below would establish:
+/// The cast can overflow unless the precondition holds, which is what a
+/// proof should establish:
 ///
-///   forall i in 0..1024 { abs(input[i]) <= 127.0 * scale }
+///   forall i in 0..1024 { abs(input[i] / scale) <= 127.0 }
 ///
-/// so the clamp is load-bearing, not defensive decoration.
+/// That obligation is not yet expressible (see the file header), so the block
+/// below only states that the scale is positive. The clamp is load-bearing
+/// rather than defensive: without the precondition, the clamp is what keeps
+/// the narrowing in range, and it is also what makes the operation lossy.
 fn quantize_int8_symmetric(
     input: [1] Tensor[f32, 1024],
     output: inout [1] Tensor[i8, 1024],
     scale: f32
 ) {
-    // proof {
-    //     assert(forall (i in 0..1024) { abs(input[i]) <= 127.0 * scale });
-    // }
+    proof {
+        assert(scale > 0.0);
+    }
 
     forall i in 0..1024 {
         let v = round(input[i] / scale);

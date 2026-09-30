@@ -119,6 +119,11 @@ pub enum TokenKind {
     Import,
     #[regex("[cC][oO][nN][sS][tT]", priority = 3)]
     Const,
+    // `as` introduces a numeric cast: `expr as i8`. Numeric types only --
+    // the typechecker rejects casts to tensor, qubit or pointer-shaped types,
+    // so this is not a general reinterpret-cast operator.
+    #[regex("[aA][sS]", priority = 3)]
+    As,
     #[regex("[iI]8", priority = 3)]
     Int8,
     #[regex("[iI]16", priority = 3)]
@@ -288,6 +293,7 @@ impl TokenKind {
             TokenKind::Mod => "'mod'",
             TokenKind::Import => "'import'",
             TokenKind::Const => "'const'",
+            TokenKind::As => "'as'",
             TokenKind::Mut => "'mut'",
             TokenKind::Int8 => "'i8'",
             TokenKind::Int16 => "'i16'",

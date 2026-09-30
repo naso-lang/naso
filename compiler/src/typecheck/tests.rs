@@ -429,13 +429,66 @@ mod tests {
         assert!(check_source(src).is_ok());
     }
 
-    /// Documented gap: there is no numeric cast operator, so i8 and f32
-    /// tensors cannot be converted. `as i8` is a parse error, not a type
-    /// error. kernels/quant_int8.naso documents this as the reason symmetric
-    /// quantization is blocked. If a cast is ever added, this test should
-    /// start failing so it can be replaced with a positive one.
+    /// `as T` is a numeric cast. It exists because symmetric INT8
+    /// quantization needs an f32 -> i8 narrowing, and without it the
+    /// flagship kernel in kernels/quant_int8.naso could not typecheck.
     #[test]
-    fn test_no_numeric_cast_between_element_types() {
+    fn test_numeric_cast_between_scalar_types() {
+        assert!(check_source("fn q(x: f32) -> i8 { return x as i8; }").is_ok());
+        assert!(check_source("fn q(x: i8) -> f32 { return x as f32; }").is_ok());
+        assert!(check_source("fn q(x: i8) -> u32 { return x as u32; }").is_ok());
+    }
+
+    /// A cast yields the target type, so an element-wise conversion is what
+    /// lets an f32 tensor feed an i8 tensor slot. This is the exact shape the
+    /// quantizer relies on.
+    #[test]
+    fn test_cast_allows_cross_element_tensor_conversion() {
+        let quantize = "
+            fn quantize(
+                input: [1] Tensor[f32, 1024],
+                output: inout [1] Tensor[i8, 1024],
+                scale: f32
+            ) {
+                forall i in 0..1024 {
+                    let v = round(input[i] / scale);
+                    output[i] = clamp(v, -128.0, 127.0) as i8;
+                }
+            }
+        ";
+        assert!(check_source(quantize).is_ok());
+
+        let dequantize = "
+            fn dequantize(
+                input: [1] Tensor[i8, 1024],
+                output: inout [1] Tensor[f32, 1024],
+                scale: f32
+            ) {
+                forall i in 0..1024 {
+                    let v = input[i] as f32;
+                    output[i] = v * scale;
+                }
+            }
+        ";
+        assert!(check_source(dequantize).is_ok());
+    }
+
+    /// `as` is a numeric conversion, not a reinterpret cast. Both a
+    /// non-numeric operand and a non-numeric target must be rejected.
+    #[test]
+    fn test_cast_rejects_non_numeric() {
+        assert!(check_source("fn q(x: bool) -> i8 { return x as i8; }").is_err());
+        assert!(
+            check_source("fn q(x: f32) -> Tensor[f32, 4] { return x as Tensor[f32, 4]; }").is_err()
+        );
+        assert!(check_source("fn q(x: f32) -> Qubit { return x as Qubit; }").is_err());
+    }
+
+    /// Regression guard, now inverted: this used to assert that a bare
+    /// cross-element assignment is rejected. That is still true -- a cast is
+    /// required, and omitting it must not silently succeed.
+    #[test]
+    fn test_cross_element_tensor_assignment_still_needs_cast() {
         assert!(check_source("fn q(input: [1] Tensor[i8, 8], output: inout [1] Tensor[f32, 8]) { forall i in 0..8 { output[i] = input[i]; } }").is_err());
         assert!(check_source("fn q(input: [1] Tensor[f32, 8], output: inout [1] Tensor[i8, 8]) { forall i in 0..8 { output[i] = input[i]; } }").is_err());
     }

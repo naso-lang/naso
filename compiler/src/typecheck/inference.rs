@@ -12,6 +12,41 @@ use crate::typecheck::check::{check_block, check_stmt};
 use crate::typecheck::error::TypeError;
 use crate::typecheck::*;
 
+/// Infer the type of a numeric cast: `expr as T`.
+///
+/// Both the operand and the target must be numeric. `Tensor`, `Qubit`,
+/// `QRegister`, bool, unit, tuples and functions are rejected: `as` is a
+/// numeric conversion, not a reinterpret or bit-cast operator.
+///
+/// The quantity of the result is taken from the target type, not the operand,
+/// because a conversion does not consume a linear value any differently than
+/// its operand would.
+fn infer_cast(
+    checker: &mut TypeChecker,
+    inner: &Expr,
+    target: &Type,
+    span: Span,
+) -> Result<Type, TypeError> {
+    let from = infer_expr(checker, inner)?;
+
+    let is_numeric = |k: &TypeKind| {
+        matches!(
+            k,
+            TypeKind::Int | TypeKind::UInt | TypeKind::Float | TypeKind::Nat
+        )
+    };
+
+    if !is_numeric(&from.kind) || !is_numeric(&target.kind) {
+        return Err(TypeError::InvalidCast {
+            from,
+            to: target.clone(),
+            span,
+        });
+    }
+
+    Ok(Type::new(target.kind.clone(), target.quantity, span))
+}
+
 /// Infer the type of an expression (synthesis mode)
 pub fn infer_expr(checker: &mut TypeChecker, expr: &Expr) -> Result<Type, TypeError> {
     match &expr.kind {
@@ -52,7 +87,7 @@ pub fn infer_expr(checker: &mut TypeChecker, expr: &Expr) -> Result<Type, TypeEr
         ExprKind::Assign(lhs, rhs) => infer_assign(checker, lhs, rhs, expr.span),
         ExprKind::Projection(base) => infer_projection(checker, base, expr.span),
         ExprKind::QuantumOp(qop) => infer_quantum_op(checker, qop, expr.span),
-        ExprKind::Ascribe(_, ty) => Ok(ty.clone()),
+        ExprKind::Ascribe(inner, ty) => infer_cast(checker, inner, ty, expr.span),
         ExprKind::Break(opt_expr) => infer_break(checker, opt_expr.as_deref(), expr.span),
         ExprKind::Continue => infer_continue(expr.span),
         ExprKind::Error => Ok(Type::new(TypeKind::Error, Quantity::Many, expr.span)),

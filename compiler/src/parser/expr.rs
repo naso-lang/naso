@@ -170,6 +170,14 @@ impl<'a> Parser<'a> {
                     span,
                     next_id(),
                 );
+            } else if self.at(TK::As) {
+                // Numeric cast: `expr as i8`. Reuses ExprKind::Ascribe, which
+                // already existed in the AST and was wired into visiting and
+                // inference but never parsed.
+                self.bump();
+                let ty = self.parse_type();
+                let span = expr.span;
+                expr = Expr::new(ExprKind::Ascribe(Box::new(expr), ty), span, next_id());
             } else {
                 break;
             }

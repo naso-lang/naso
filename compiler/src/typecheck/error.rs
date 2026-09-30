@@ -69,6 +69,9 @@ pub enum TypeError {
         span: Span,
     },
 
+    #[error("cannot cast `{from}` to `{to}`: casts are only defined between numeric types")]
+    InvalidCast { from: Type, to: Type, span: Span },
+
     #[error("field `{field}` not found in type `{ty}`")]
     FieldNotFound { field: Ident, ty: Type, span: Span },
 

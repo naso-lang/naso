@@ -201,6 +201,7 @@ fn extract_span_from_error(e: &TypeError) -> Option<Span> {
         QuantityMismatch { span, .. } => Some(*span),
         ArgumentCountMismatch { span, .. } => Some(*span),
         TypeArgumentCountMismatch { span, .. } => Some(*span),
+        InvalidCast { span, .. } => Some(*span),
         FieldNotFound { span, .. } => Some(*span),
         VariantNotFound { span, .. } => Some(*span),
         NotAStruct { span, .. } => Some(*span),

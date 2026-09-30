@@ -1,28 +1,84 @@
 // INT8 Symmetric Quantization Kernel
-// QTT: input tensor [1] (consumed), output tensor [1] (produced), scale [0] (proof only)
-fn quantize_int8_symmetric(
-    input: [1] Tensor[f32, N],
-    output: inout [1] Tensor[i8, N],
-    scale: [0] f32
-) {
-    proof {
-        // Z3 verification condition: |input[i]| <= 127 * scale for all i
-        // Ensures no overflow during quantization
-        assert(forall(i in 0..N) { abs(input[i]) <= 127.0 * scale });
-    }
+//
+// STATUS: blocked. Neither kernel typechecks today. The blocker is a single
+// missing language feature: numeric conversion between element types.
+//
+// Probing the typechecker gives a precise picture:
+//
+//   Tensor[f32] -> Tensor[f32]   OK
+//   Tensor[i8]  -> Tensor[i8]    OK
+//   Tensor[i8]  -> Tensor[f32]   "type mismatch: expected `Float`, found `Int`"
+//   Tensor[f32] -> Tensor[i8]    "type mismatch: expected `Int`, found `Float`"
+//
+// `as i8` is not an escape hatch: there is no `as` token in the lexer, so it
+// is a parse error ("expected '}', found as").
+//
+// So symmetric INT8 quantization cannot be written in naso today, because
+// quantizing is precisely an f32 -> i8 narrowing. The bodies below are the
+// form each kernel will take once conversions exist; they are kept legible so
+// the intent is not lost, but they do not compile yet and must not be
+// presented as working.
+//
+// Three further gaps, found while checking these bodies:
+//
+// 1. No `proof` block. `proof` is not a keyword anywhere in the lexer, so
+//    `proof { .. }` fails with "expected '}', found '{'". The verification
+//    condition below is a comment and is NOT checked by the prover.
+//
+// 2. Symbolic extents. `Tensor[T, N]` requires a literal; `N` as a
+//    parameter is a parse error. The loop domain is therefore fixed at
+//    compile time rather than derived from an argument.
+//
+// 3. scale was originally `[0]`, which is right in spirit (read-only across
+//    the loop) but wrong in practice: a `[0]` variable is erased, and the
+//    typechecker correctly rejects it in a runtime position with "erased
+//    variable `scale` used at runtime". Read-only-across-the-loop is not yet
+//    expressible; `mut` does not mean it either.
 
-    forall(i in 0..N) {
-        output[i] = round(input[i] / scale) as i8;
+/// Quantize f32 -> i8 with a symmetric scale. BLOCKED: needs a cast.
+///
+/// The cast can overflow unless the precondition holds, which is what the
+/// proof below would establish:
+///
+///   forall i in 0..1024 { abs(input[i]) <= 127.0 * scale }
+///
+/// so the clamp is load-bearing, not defensive decoration.
+fn quantize_int8_symmetric(
+    input: [1] Tensor[f32, 1024],
+    output: inout [1] Tensor[i8, 1024],
+    scale: f32
+) {
+    // proof {
+    //     assert(forall (i in 0..1024) { abs(input[i]) <= 127.0 * scale });
+    // }
+
+    forall i in 0..1024 {
+        let v = round(input[i] / scale);
+        output[i] = clamp(v, -128.0, 127.0) as i8;
     }
 }
 
-// Dequantization kernel
+/// Dequantize i8 -> f32. BLOCKED: needs the same cast, in reverse.
 fn dequantize_int8_symmetric(
-    input: [1] Tensor[i8, N],
-    output: inout [1] Tensor[f32, N],
-    scale: [0] f32
+    input: [1] Tensor[i8, 1024],
+    output: inout [1] Tensor[f32, 1024],
+    scale: f32
 ) {
-    forall(i in 0..N) {
-        output[i] = input[i] as f32 * scale;
+    forall i in 0..1024 {
+        let v = input[i] as f32;
+        output[i] = v * scale;
+    }
+}
+
+/// Round-trip scaffolding that does typecheck today: f32 -> f32, using the
+/// same prelude intrinsics a quantizer needs. Useful as a smoke test that
+/// forall loops, tensor indexing and the math builtins all lower.
+fn normalize_f32(
+    input: [1] Tensor[f32, 1024],
+    output: inout [1] Tensor[f32, 1024],
+    scale: f32
+) {
+    forall i in 0..1024 {
+        output[i] = round(input[i] / scale);
     }
 }

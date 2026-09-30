@@ -1,12 +1,15 @@
 use crate::codegen::error::{CodegenError, CodegenResult};
-use crate::ir::{
-    access_relation::{AccessRelation, AccessRelations, AccessType},
-    affine_domain::{AffineDomain, AffineConstraint},
-    affine_map::{AffineMap, Matrix},
-    pir_types::{BinaryOp, PirExpr, PirModule, PirStatement, QuantityMap},
-    schedule_tree::{ScheduleNode, ScheduleTree, StmtId},
-};
+// WGSL codegen is partially implemented. The full lowering will still need
+// AccessRelation/AccessRelations, AffineConstraint, AffineMap/Matrix,
+// BinaryOp, QuantityMap and ScheduleNode/ScheduleTree/StmtId from the IR.
+// They are imported as the corresponding passes land; importing them unused
+// here only silenced the lint and hid what is still missing.
 use crate::ast::Quantity;
+use crate::ir::{
+    access_relation::AccessType,
+    affine_domain::AffineDomain,
+    pir_types::{PirExpr, PirModule, PirStatement},
+};
 use std::collections::{HashMap, HashSet};
 
 /// WGSL code generation target
@@ -17,6 +20,8 @@ pub enum WgslTarget {
 
 /// WGSL codegen context
 pub struct WgslContext {
+    /// Retained for when a second target (e.g. native) diverges from WGSL.
+    #[allow(dead_code)]
     target: WgslTarget,
     module: PirModule,
     binding_counter: usize,
@@ -91,7 +96,9 @@ impl WgslContext {
 
     fn emit_bindings(&self, wgsl: &mut String) -> CodegenResult<()> {
         wgsl.push_str("// Buffer Bindings\n");
-        wgsl.push_str("// @group(0) @binding(n) var<storage, read_write> buffer_name: array<type>;\n\n");
+        wgsl.push_str(
+            "// @group(0) @binding(n) var<storage, read_write> buffer_name: array<type>;\n\n",
+        );
 
         let mut binding_index = 0;
 
@@ -99,11 +106,11 @@ impl WgslContext {
         for access in &self.module.accesses.relations {
             let array = access.array_name.as_deref().unwrap_or("mem");
             if let Some(binding_name) = self.buffer_names.get(array) {
-                let (storage_class, access_mode) = match access.access_type {
-                    AccessType::Read => ("read", "read"),
-                    AccessType::Write => ("read_write", "write"),
-                    AccessType::ReadWrite => ("read_write", "read_write"),
-                    AccessType::Reduction => ("read_write", "read_write"),
+                let storage_class = match access.access_type {
+                    AccessType::Read => "read",
+                    AccessType::Write => "read_write",
+                    AccessType::ReadWrite => "read_write",
+                    AccessType::Reduction => "read_write",
                 };
 
                 // Determine element type from array name / usage
@@ -119,25 +126,24 @@ impl WgslContext {
         }
 
         // Scale uniform buffer (read-only)
-        if self.buffer_names.contains_key("scale") {
-            if let Some(binding_name) = self.buffer_names.get("scale") {
-                wgsl.push_str(&format!(
-                    "@group(0) @binding({}) var<uniform> {}: f32;\n",
-                    binding_index, binding_name
-                ));
-                binding_index += 1;
-            }
+        if self.buffer_names.contains_key("scale")
+            && let Some(binding_name) = self.buffer_names.get("scale")
+        {
+            wgsl.push_str(&format!(
+                "@group(0) @binding({}) var<uniform> {}: f32;\n",
+                binding_index, binding_name
+            ));
+            binding_index += 1;
         }
 
         // N parameter uniform
-        if self.buffer_names.contains_key("N") {
-            if let Some(binding_name) = self.buffer_names.get("N") {
-                wgsl.push_str(&format!(
-                    "@group(0) @binding({}) var<uniform> {}: u32;\n",
-                    binding_index, binding_name
-                ));
-                binding_index += 1;
-            }
+        if self.buffer_names.contains_key("N")
+            && let Some(binding_name) = self.buffer_names.get("N")
+        {
+            wgsl.push_str(&format!(
+                "@group(0) @binding({}) var<uniform> {}: u32;\n",
+                binding_index, binding_name
+            ));
         }
 
         wgsl.push('\n');
@@ -146,21 +152,21 @@ impl WgslContext {
 
     fn emit_compute_entry(&self, wgsl: &mut String, stmt: &PirStatement) -> CodegenResult<()> {
         let func_name = self.infer_function_name(&stmt.body);
-        
-        wgsl.push_str(&format!(
-            "\n// Compute entry for statement {}\n",
-            stmt.id
-        ));
+
+        wgsl.push_str(&format!("\n// Compute entry for statement {}\n", stmt.id));
 
         // Determine workgroup count based on domain
         let domain_size = self.compute_domain_size(&stmt.domain);
-        
+
         wgsl.push_str(&format!(
             "@compute @workgroup_size({})\n",
             self.workgroup_size
         ));
-        wgsl.push_str(&format!("fn {}(@builtin(global_invocation_id) global_id: vec3<u32>) {{\n", func_name));
-        
+        wgsl.push_str(&format!(
+            "fn {}(@builtin(global_invocation_id) global_id: vec3<u32>) {{\n",
+            func_name
+        ));
+
         // Bounds check
         wgsl.push_str(&format!(
             "    if (global_id.x >= {}) {{ return; }}\n",
@@ -199,23 +205,23 @@ impl WgslContext {
     fn infer_element_type(&self, array: &str) -> ElementType {
         // Determine element type based on array usage
         for stmt in &self.module.statements {
-            if let PirExpr::Call { name, args } = &stmt.body {
-                if (name.contains("quantize") || name.contains("dequantize")) && args.len() >= 2 {
-                    if let (PirExpr::Var(input), PirExpr::Var(output)) = (&args[0], &args[1]) {
-                        if output == array {
-                            if name.contains("quantize") {
-                                return ElementType::I8; // quantize: f32 -> i8
-                            } else {
-                                return ElementType::F32; // dequantize: i8 -> f32
-                            }
-                        }
-                        if input == array {
-                            if name.contains("quantize") {
-                                return ElementType::F32; // quantize input
-                            } else {
-                                return ElementType::I8; // dequantize input
-                            }
-                        }
+            if let PirExpr::Call { name, args } = &stmt.body
+                && (name.contains("quantize") || name.contains("dequantize"))
+                && args.len() >= 2
+                && let (PirExpr::Var(input), PirExpr::Var(output)) = (&args[0], &args[1])
+            {
+                if output == array {
+                    if name.contains("quantize") {
+                        return ElementType::I8; // quantize: f32 -> i8
+                    } else {
+                        return ElementType::F32; // dequantize: i8 -> f32
+                    }
+                }
+                if input == array {
+                    if name.contains("quantize") {
+                        return ElementType::F32; // quantize input
+                    } else {
+                        return ElementType::I8; // dequantize input
                     }
                 }
             }
@@ -234,7 +240,7 @@ impl WgslContext {
 
     fn emit_expr(&self, wgsl: &mut String, expr: &PirExpr, indent: usize) -> CodegenResult<()> {
         let indent_str = "    ".repeat(indent);
-        
+
         match expr {
             PirExpr::Call { name, args } => {
                 if name.contains("quantize_int8_symmetric") {
@@ -262,37 +268,23 @@ impl WgslContext {
         indent: usize,
     ) -> CodegenResult<()> {
         let indent_str = "    ".repeat(indent);
-        if args.len() >= 3 {
-            if let (PirExpr::Var(input), PirExpr::Var(output), PirExpr::Var(scale)) = (&args[0], &args[1], &args[2]) {
-                let input_buffer = self.buffer_names.get(input).unwrap_or(&input);
-                let output_buffer = self.buffer_names.get(output).unwrap_or(&output);
-                let scale_buffer = self.buffer_names.get(scale).unwrap_or(&scale);
+        if args.len() >= 3
+            && let (PirExpr::Var(input), PirExpr::Var(output), PirExpr::Var(scale)) =
+                (&args[0], &args[1], &args[2])
+        {
+            let input_buffer = self.buffer_names.get(input).unwrap_or(input);
+            let output_buffer = self.buffer_names.get(output).unwrap_or(output);
+            let scale_buffer = self.buffer_names.get(scale).unwrap_or(scale);
 
-                wgsl.push_str(&format!(
-                    "{}let idx = global_id.x;\n",
-                    indent_str
-                ));
-                wgsl.push_str(&format!(
-                    "{}let val = {}[idx];\n",
-                    indent_str, input_buffer
-                ));
-                wgsl.push_str(&format!(
-                    "{}let scaled = val / {};\n",
-                    indent_str, scale_buffer
-                ));
-                wgsl.push_str(&format!(
-                    "{}let rounded = round(scaled);\n",
-                    indent_str
-                ));
-                wgsl.push_str(&format!(
-                    "{}let quantized = i32(rounded);\n",
-                    indent_str
-                ));
-                wgsl.push_str(&format!(
-                    "{}{} = quantized;\n",
-                    indent_str, output_buffer
-                ));
-            }
+            wgsl.push_str(&format!("{}let idx = global_id.x;\n", indent_str));
+            wgsl.push_str(&format!("{}let val = {}[idx];\n", indent_str, input_buffer));
+            wgsl.push_str(&format!(
+                "{}let scaled = val / {};\n",
+                indent_str, scale_buffer
+            ));
+            wgsl.push_str(&format!("{}let rounded = round(scaled);\n", indent_str));
+            wgsl.push_str(&format!("{}let quantized = i32(rounded);\n", indent_str));
+            wgsl.push_str(&format!("{}{} = quantized;\n", indent_str, output_buffer));
         }
         Ok(())
     }
@@ -304,29 +296,21 @@ impl WgslContext {
         indent: usize,
     ) -> CodegenResult<()> {
         let indent_str = "    ".repeat(indent);
-        if args.len() >= 3 {
-            if let (PirExpr::Var(input), PirExpr::Var(output), PirExpr::Var(scale)) = (&args[0], &args[1], &args[2]) {
-                let input_buffer = self.buffer_names.get(input).unwrap_or(&input);
-                let output_buffer = self.buffer_names.get(output).unwrap_or(&output);
-                let scale_buffer = self.buffer_names.get(scale).unwrap_or(&scale);
+        if args.len() >= 3
+            && let (PirExpr::Var(input), PirExpr::Var(output), PirExpr::Var(scale)) =
+                (&args[0], &args[1], &args[2])
+        {
+            let input_buffer = self.buffer_names.get(input).unwrap_or(input);
+            let output_buffer = self.buffer_names.get(output).unwrap_or(output);
+            let scale_buffer = self.buffer_names.get(scale).unwrap_or(scale);
 
-                wgsl.push_str(&format!(
-                    "{}let idx = global_id.x;\n",
-                    indent_str
-                ));
-                wgsl.push_str(&format!(
-                    "{}let val = {}[idx];\n",
-                    indent_str, input_buffer
-                ));
-                wgsl.push_str(&format!(
-                    "{}let dequantized = f32(val) * {};\n",
-                    indent_str, scale_buffer
-                ));
-                wgsl.push_str(&format!(
-                    "{}{} = dequantized;\n",
-                    indent_str, output_buffer
-                ));
-            }
+            wgsl.push_str(&format!("{}let idx = global_id.x;\n", indent_str));
+            wgsl.push_str(&format!("{}let val = {}[idx];\n", indent_str, input_buffer));
+            wgsl.push_str(&format!(
+                "{}let dequantized = f32(val) * {};\n",
+                indent_str, scale_buffer
+            ));
+            wgsl.push_str(&format!("{}{} = dequantized;\n", indent_str, output_buffer));
         }
         Ok(())
     }
@@ -337,6 +321,9 @@ impl WgslContext {
 enum ElementType {
     I8,
     F32,
+    /// Reserved for the unsigned INT8 path; not produced by
+    /// `infer_element_type` yet.
+    #[allow(dead_code)]
     U8,
 }
 
@@ -378,11 +365,30 @@ fn count_in_expr(expr: &PirExpr, var: &str) -> usize {
         PirExpr::Let { value, body, .. } => count_in_expr(value, var) + count_in_expr(body, var),
         PirExpr::Unary { expr, .. } => count_in_expr(expr, var),
         PirExpr::Call { args, .. } => args.iter().map(|a| count_in_expr(a, var)).sum(),
-        PirExpr::Index { base, indices } => count_in_expr(base, var) + indices.iter().map(|i| count_in_expr(i, var)).sum::<usize>(),
+        PirExpr::Index { base, indices } => {
+            count_in_expr(base, var) + indices.iter().map(|i| count_in_expr(i, var)).sum::<usize>()
+        }
         PirExpr::Field { base, .. } => count_in_expr(base, var),
-        PirExpr::If { cond, then_branch, else_branch } => count_in_expr(cond, var) + count_in_expr(then_branch, var) + count_in_expr(else_branch, var),
-        PirExpr::Reversible { body, inverse } => count_in_expr(body, var) + count_in_expr(inverse, var),
-        PirExpr::QuantumOp { op: _, args, qubits } => args.iter().map(|a| count_in_expr(a, var)).sum::<usize>() + qubits.iter().map(|q| count_in_expr(q, var)).sum::<usize>(),
+        PirExpr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            count_in_expr(cond, var)
+                + count_in_expr(then_branch, var)
+                + count_in_expr(else_branch, var)
+        }
+        PirExpr::Reversible { body, inverse } => {
+            count_in_expr(body, var) + count_in_expr(inverse, var)
+        }
+        PirExpr::QuantumOp {
+            op: _,
+            args,
+            qubits,
+        } => {
+            args.iter().map(|a| count_in_expr(a, var)).sum::<usize>()
+                + qubits.iter().map(|q| count_in_expr(q, var)).sum::<usize>()
+        }
         _ => 0,
     }
 }
@@ -390,13 +396,16 @@ fn count_in_expr(expr: &PirExpr, var: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::{Mutability, Quantity};
+    // These were previously resolving through `use super::*`, which only
+    // worked while the parent module happened to import them. Import them
+    // explicitly so this test does not depend on the parent's import list.
     use crate::ir::{
         access_relation::{AccessRelation, AccessRelations, AccessType},
-        affine_domain::AffineDomain,
+        affine_domain::{AffineConstraint, AffineDomain},
         affine_map::{AffineMap, Matrix},
-        schedule_tree::{ScheduleNode, ScheduleTree},
+        schedule_tree::{ScheduleNode, ScheduleTree, StmtId},
     };
-    use crate::ast::{Mutability, Quantity};
     use std::collections::HashMap;
 
     fn make_quant_module() -> PirModule {
@@ -407,7 +416,8 @@ mod tests {
                 AffineConstraint::inequality(vec![1, 0], 0),
                 AffineConstraint::inequality(vec![-1, 1], 1),
             ],
-        ).with_name("quant_domain".to_string());
+        )
+        .with_name("quant_domain".to_string());
 
         let mut m = Matrix::new(1, 2);
         m.set(0, 0, 1);
@@ -477,7 +487,8 @@ mod tests {
                 AffineConstraint::inequality(vec![1, 0], 0),
                 AffineConstraint::inequality(vec![-1, 1], 1),
             ],
-        ).with_name("dequant_domain".to_string());
+        )
+        .with_name("dequant_domain".to_string());
 
         let mut m = Matrix::new(1, 2);
         m.set(0, 0, 1);
@@ -571,7 +582,7 @@ mod tests {
     fn test_wgsl_syntax_basic() {
         let module = make_quant_module();
         let wgsl = generate_wgsl(&module, WgslTarget::WebGpu).unwrap();
-        
+
         // Basic WGSL syntax checks
         assert!(wgsl.contains("@group(0)"));
         assert!(wgsl.contains("@binding("));

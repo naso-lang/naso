@@ -40,7 +40,7 @@ pub use inkwell::module::Module as LlvmModule;
 pub use inkwell::targets::{InitializationConfig, Target, TargetMachine};
 
 // Re-export WGSL codegen
-pub use wgsl::{generate_wgsl, verify_wgsl_linearity, WgslTarget};
+pub use wgsl::{WgslTarget, generate_wgsl, verify_wgsl_linearity};
 
 /// Main entry point for code generation
 #[cfg(feature = "llvm")]

@@ -15,8 +15,27 @@ z3 = ["dep:z3", "dep:z3-sys"]
 naso-compiler = { path = "../../compiler" }
 
 # SMT Solver
-z3 = { version = "0.21", optional = true }
-z3-sys = { version = "0.13", optional = true }
+#
+# `gh-release` downloads the OFFICIAL PREBUILT z3-glibc archive instead of
+# compiling the C++ core from source. That matters for portability: Z3 >= 5.0
+# needs the C++20 <format> header (GCC 13+), and the `vendored` feature only
+# ever ships z3-src 501.x == Z3 5.0.1, so no z3-sys >= 0.12 `vendored` build
+# can succeed on GCC 12. Nothing is compiled here, so the C++ toolchain
+# version stops mattering.
+#
+# The Z3 release itself is pinned via Z3_SYS_Z3_VERSION in the workspace
+# .cargo/config.toml -- NOT left at the z3-sys default of 4.16.0, whose
+# prebuilt requires glibc 2.38 + libstdc++ 14 and so fails to link on older
+# distros. z3-sys runs bindgen against the headers of whichever release it
+# downloads, so the bindings and the solver stay in lockstep at any pin.
+#
+# Cost: one network fetch at build time. GitHub throttles unauthenticated
+# requests, so set READ_ONLY_GITHUB_TOKEN in CI if you see 403s.
+#
+# To move to Z3 5.x: bump these to 0.21/0.13 with features = ["vendored"],
+# drop the Z3_SYS_Z3_VERSION pin, and require GCC 13+ on all builders.
+z3 = { version = "0.19", optional = true, features = ["gh-release"] }
+z3-sys = { version = "0.10", optional = true, features = ["gh-release"] }
 
 # Serialization
 serde = { workspace = true, features = ["derive"] }

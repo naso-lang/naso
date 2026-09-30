@@ -4,13 +4,17 @@
 //! and Z3 verification integration.
 
 use naso_compiler::ast::{Mutability, Quantity};
+// The module docstring above mentions "Z3 verification integration", but no
+// test here exercises the schedule validator yet. `BinaryOp`, `QuantityMap`,
+// `ValidationError` and `validate_schedule_detailed` were imported for that
+// test; they are added back when it is written.
 use naso_compiler::ir::{
     access_relation::{AccessRelation, AccessRelations, AccessType},
     affine_domain::AffineDomain,
     affine_map::{AffineMap, Matrix},
-    pir_types::{BinaryOp, PirExpr, PirModule, PirStatement, QuantityMap, ValidationError},
+    pir_types::{PirExpr, PirModule, PirStatement},
     schedule_tree::{ScheduleNode, ScheduleTree, StmtId},
-    validate::{validate_pir, validate_schedule_detailed},
+    validate::validate_pir,
 };
 use naso_compiler::lowering::{lower_quantization_to_simd, simd::SimdTarget};
 use std::collections::HashMap;
@@ -72,9 +76,8 @@ fn construct_quant_module() -> PirModule {
         .with_array_name("input"),
     );
     accesses.add(
-        AccessRelation::new(StmtId(0), domain, access_map, AccessType::Write).with_array_name(
-            "output",
-        ),
+        AccessRelation::new(StmtId(0), domain, access_map, AccessType::Write)
+            .with_array_name("output"),
     );
 
     let mut quantities = HashMap::new();
@@ -149,9 +152,8 @@ fn construct_dequant_module() -> PirModule {
         .with_array_name("input"),
     );
     accesses.add(
-        AccessRelation::new(StmtId(0), domain, access_map, AccessType::Write).with_array_name(
-            "output",
-        ),
+        AccessRelation::new(StmtId(0), domain, access_map, AccessType::Write)
+            .with_array_name("output"),
     );
 
     let mut quantities = HashMap::new();
@@ -195,7 +197,11 @@ fn test_dequant_module_validates() {
 fn test_avx2_quant_lowering() {
     let module = construct_quant_module();
     let result = lower_quantization_to_simd(&module, SimdTarget::Avx2);
-    assert!(result.is_ok(), "AVX2 quantization lowering failed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "AVX2 quantization lowering failed: {:?}",
+        result
+    );
 
     let lowered = result.unwrap();
     assert!(!lowered.statements.is_empty());
@@ -205,7 +211,11 @@ fn test_avx2_quant_lowering() {
 fn test_avx2_dequant_lowering() {
     let module = construct_dequant_module();
     let result = lower_quantization_to_simd(&module, SimdTarget::Avx2);
-    assert!(result.is_ok(), "AVX2 dequantization lowering failed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "AVX2 dequantization lowering failed: {:?}",
+        result
+    );
 
     let lowered = result.unwrap();
     assert!(!lowered.statements.is_empty());
@@ -215,21 +225,33 @@ fn test_avx2_dequant_lowering() {
 fn test_neon_quant_lowering() {
     let module = construct_quant_module();
     let result = lower_quantization_to_simd(&module, SimdTarget::Neon);
-    assert!(result.is_ok(), "NEON quantization lowering failed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "NEON quantization lowering failed: {:?}",
+        result
+    );
 }
 
 #[test]
 fn test_neon_dequant_lowering() {
     let module = construct_dequant_module();
     let result = lower_quantization_to_simd(&module, SimdTarget::Neon);
-    assert!(result.is_ok(), "NEON dequantization lowering failed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "NEON dequantization lowering failed: {:?}",
+        result
+    );
 }
 
 #[test]
 fn test_scalar_quant_lowering() {
     let module = construct_quant_module();
     let result = lower_quantization_to_simd(&module, SimdTarget::Scalar);
-    assert!(result.is_ok(), "Scalar quantization lowering failed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Scalar quantization lowering failed: {:?}",
+        result
+    );
 }
 
 #[test]
@@ -262,7 +284,8 @@ fn test_zero_quantity_erased_after_lowering() {
                 assert!(
                     !expr_contains_var(&stmt.body, var),
                     "Zero-quantity variable '{}' appears in runtime statement {}",
-                    var, stmt.id
+                    var,
+                    stmt.id
                 );
             }
         }
@@ -310,17 +333,12 @@ fn count_var_occurrences_in_module(module: &PirModule, var: &str) -> usize {
 fn count_in_expr(expr: &PirExpr, var: &str) -> usize {
     match expr {
         PirExpr::Var(v) if v == var => 1,
-        PirExpr::Binary { left, right, .. } => {
-            count_in_expr(left, var) + count_in_expr(right, var)
-        }
-        PirExpr::Let { value, body, .. } => {
-            count_in_expr(value, var) + count_in_expr(body, var)
-        }
+        PirExpr::Binary { left, right, .. } => count_in_expr(left, var) + count_in_expr(right, var),
+        PirExpr::Let { value, body, .. } => count_in_expr(value, var) + count_in_expr(body, var),
         PirExpr::Unary { expr, .. } => count_in_expr(expr, var),
         PirExpr::Call { args, .. } => args.iter().map(|a| count_in_expr(a, var)).sum(),
         PirExpr::Index { base, indices } => {
-            count_in_expr(base, var)
-                + indices.iter().map(|i| count_in_expr(i, var)).sum::<usize>()
+            count_in_expr(base, var) + indices.iter().map(|i| count_in_expr(i, var)).sum::<usize>()
         }
         PirExpr::Field { base, .. } => count_in_expr(base, var),
         PirExpr::If {

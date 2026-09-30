@@ -3,3 +3,17 @@ linker = "gcc"
 
 [build]
 rustflags = []
+
+[env]
+# Z3 release used by z3-sys's `gh-release` feature.
+#
+# z3-sys 0.10 defaults to 4.16.0, but the official 4.16.0 Linux prebuilt is
+# linked against glibc 2.38 + libstdc++ 14 and fails to link on older distros
+# with `undefined symbol: __isoc23_strtol`. 4.8.15 targets glibc 2.31, so it
+# links on anything from Debian 11 and Ubuntu 20.04 onward, and it is the
+# release that z3 0.19's default `z3_4_8_15` feature targets.
+#
+# This lives in the repo rather than a developer-local cargo config so CI pins
+# the same release. z3-sys runs bindgen against the headers of whatever it
+# downloads, so the bindings and the solver cannot drift apart at this pin.
+Z3_SYS_Z3_VERSION = "4.8.15"

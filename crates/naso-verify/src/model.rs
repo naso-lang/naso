@@ -229,7 +229,7 @@ mod z3_models {
                             .ok_or_else(|| "Failed to convert bool".to_string())
                     })
                     .map(ModelValue::Bool),
-                z3::SortKind::Bv => {
+                z3::SortKind::BV => {
                     // Use z3_sys to get bitvector size since Sort doesn't have a public method for this
                     let ctx = z3::Context::thread_local();
                     let width =

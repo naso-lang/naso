@@ -134,11 +134,40 @@ fn prove_function_uncomputation(func: &Function) -> Result<Vec<VerifyDiagnostic>
             &mut ctx.quantum,
         )?);
     }
+
+    // Every statement kind has to be encoded, not just expression statements.
+    // `let q = qalloc(1);` is a StmtKind::Let, so skipping it meant the qubit
+    // was never allocated, no temporary qubits existed, and the prover
+    // returned an empty diagnostic vector -- a false negative on exactly the
+    // case the prover exists to catch.
     for stmt in &func.body.stmts {
-        if let naso_compiler::ast::StmtKind::Expr(expr) = &stmt.kind {
-            let _ = crate::quantum::encode_quantum_expr(expr, &mut ctx.quantum)?;
+        match &stmt.kind {
+            naso_compiler::ast::StmtKind::Expr(expr) => {
+                let _ = crate::quantum::encode_quantum_expr(expr, &mut ctx.quantum)?;
+            }
+            naso_compiler::ast::StmtKind::Let(binding) => {
+                // Record the binding name so `qalloc` registers the qubit under
+                // the name the gates will use. Only a plain identifier binding
+                // (`let q = ...`) can name a qubit; tuple and wildcard patterns
+                // are not tracked here.
+                ctx.quantum.pending_name = match &binding.pattern.kind {
+                    naso_compiler::ast::pattern::PatternKind::Ident(id) => Some(id.name.clone()),
+                    _ => None,
+                };
+                let _ = crate::quantum::encode_quantum_expr(&binding.value, &mut ctx.quantum)?;
+                ctx.quantum.pending_name = None;
+            }
+            _ => {}
         }
     }
+
+    // Qubits bound by the return value are handed to the caller, not
+    // discarded, so they are not temporaries that must be uncomputed.
+    let mut returned_names = Vec::new();
+    if let Some(body_expr) = &func.body.expr {
+        collect_var_names(body_expr.as_ref(), &mut returned_names);
+    }
+    ctx.quantum.mark_returned(&returned_names);
 
     let temp_qubits: Vec<String> = ctx.quantum.temp_qubit_ids().to_vec();
 
@@ -146,32 +175,34 @@ fn prove_function_uncomputation(func: &Function) -> Result<Vec<VerifyDiagnostic>
         return Ok(Vec::new());
     }
 
-    // Collect qubits before finalize() takes ownership of ctx
-    let qubits: Vec<_> = temp_qubits
-        .iter()
-        .filter_map(|id| ctx.quantum.get_qubit(id).cloned())
-        .collect();
-
-    let uncomputation_constraints = ctx.quantum.generate_uncomputation_constraints();
-    let gate_constraints = ctx.quantum.generate_gate_constraints();
-
-    for constraint in uncomputation_constraints {
-        ctx.script.assert(constraint);
-    }
-    for constraint in gate_constraints {
-        ctx.script.assert(constraint);
-    }
-
-    let script = ctx.finalize()?;
-    let smt_script = script.to_string();
-
     let config = SolverConfig::thorough();
-    let result = verify(&smt_script, config)?;
-
     let mut diagnostics = Vec::new();
-    for qubit in qubits {
-        let diag = extract_uncomputation_diagnostic(&result, &func.name.name, &qubit);
-        if let Some(d) = diag {
+
+    // One query per qubit. A single shared script would make every qubit look
+    // guilty as soon as any one of them failed.
+    for id in temp_qubits {
+        let Some(qubit) = ctx.quantum.get_qubit(&id).cloned() else {
+            continue;
+        };
+
+        let mut script_ctx = LoweringContext::new();
+        script_ctx.current_function = Some(func.name.name.clone());
+        script_ctx.quantum.current_function = Some(func.name.name.clone());
+
+        ctx.quantum.declare_qubit(&mut script_ctx.script, &qubit);
+        // Fact: the state variable reflects the qubit's operation list.
+        script_ctx
+            .script
+            .assert(ctx.quantum.gate_semantics_for(&qubit));
+        // Requirement: a temporary must end in |0>.
+        script_ctx
+            .script
+            .assert(ctx.quantum.uncomputation_requirement(&qubit));
+
+        let smt_script = script_ctx.finalize()?.to_string();
+        let result = verify(&smt_script, config.clone())?;
+
+        if let Some(d) = extract_uncomputation_diagnostic(&result, &func.name.name, &qubit) {
             diagnostics.push(d);
         }
     }
@@ -179,7 +210,50 @@ fn prove_function_uncomputation(func: &Function) -> Result<Vec<VerifyDiagnostic>
     Ok(diagnostics)
 }
 
+/// Collect every plain variable name appearing in an expression.
+///
+/// Used to spot qubits named in the function's tail expression, i.e. the ones
+/// it returns.
+#[cfg(feature = "z3")]
+fn collect_var_names(expr: &naso_compiler::ast::Expr, out: &mut Vec<String>) {
+    match &expr.kind {
+        naso_compiler::ast::ExprKind::Var(name) => out.push(name.name.clone()),
+        naso_compiler::ast::ExprKind::Call(_, args) => {
+            for arg in args {
+                collect_var_names(arg, out);
+            }
+        }
+        naso_compiler::ast::ExprKind::Binary(_, lhs, rhs) => {
+            collect_var_names(lhs, out);
+            collect_var_names(rhs, out);
+        }
+        naso_compiler::ast::ExprKind::Unary(_, operand) => collect_var_names(operand, out),
+        naso_compiler::ast::ExprKind::Tuple(items) => {
+            for item in items {
+                collect_var_names(item, out);
+            }
+        }
+        naso_compiler::ast::ExprKind::Block(block) => {
+            if let Some(e) = &block.expr {
+                collect_var_names(e.as_ref(), out);
+            }
+            for stmt in &block.stmts {
+                if let naso_compiler::ast::StmtKind::Expr(e) = &stmt.kind {
+                    collect_var_names(e, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Extract diagnostic from verification result.
+///
+/// The script asserts the requirement `state == |0>`, so it is SAT exactly
+/// when the qubit CAN be uncomputed. That makes SAT the success case. The
+/// previous mapping had this backwards: it reported a diagnostic on Sat and
+/// stayed silent on Unsat, so any qubit that genuinely could not be returned
+/// to |0> was never reported.
 #[cfg(feature = "z3")]
 fn extract_uncomputation_diagnostic(
     result: &crate::solver::VerifyResult,
@@ -187,26 +261,23 @@ fn extract_uncomputation_diagnostic(
     qubit: &crate::quantum::SymbolicQubit,
 ) -> Option<VerifyDiagnostic> {
     match result {
-        crate::solver::VerifyResult::Sat(model) => {
-            let final_state = model.get_int(&qubit.state_var).unwrap_or(2);
-            Some(VerifyDiagnostic {
-                code: "NASO-UNC-001".to_string(),
-                message: format!(
-                    "Quantum uncomputation failed in '{}': temporary qubit '{}' not returned to |0> (final state: {})",
-                    func_name,
-                    qubit.id,
-                    state_to_string(final_state)
-                ),
-                span: qubit.span,
-                severity: crate::model::DiagnosticSeverity::Error,
-                related: vec![],
-                fix: Some(crate::model::CodeFix {
-                    title: "Add explicit uncomputation before scope exit".to_string(),
-                    edits: vec![],
-                }),
-            })
-        }
-        crate::solver::VerifyResult::Unsat(_) => None,
+        // Requirement satisfiable: the qubit provably returns to |0>.
+        crate::solver::VerifyResult::Sat(_) => None,
+        // Requirement refuted: no reachable state has this qubit in |0>.
+        crate::solver::VerifyResult::Unsat(_) => Some(VerifyDiagnostic {
+            code: "NASO-UNC-001".to_string(),
+            message: format!(
+                "Quantum uncomputation failed in '{}': temporary qubit '{}' is not provably returned to |0> before scope exit",
+                func_name, qubit.name
+            ),
+            span: qubit.span,
+            severity: crate::model::DiagnosticSeverity::Error,
+            related: vec![],
+            fix: Some(crate::model::CodeFix {
+                title: "Add explicit uncomputation before scope exit".to_string(),
+                edits: vec![],
+            }),
+        }),
         crate::solver::VerifyResult::Unknown(reason) => Some(VerifyDiagnostic {
             code: "NASO-UNC-002".to_string(),
             message: format!(
@@ -229,24 +300,71 @@ fn extract_uncomputation_diagnostic(
     }
 }
 
-/// Convert state integer to string.
-fn state_to_string(state: i64) -> &'static str {
-    match state {
-        0 => "|0⟩",
-        1 => "|1⟩",
-        2 => "superposition",
-        _ => "unknown",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use naso_compiler::parser::parse_program;
 
     #[test]
-    fn test_state_to_string() {
-        assert_eq!(state_to_string(0), "|0⟩");
-        assert_eq!(state_to_string(1), "|1⟩");
-        assert_eq!(state_to_string(2), "superposition");
+    fn test_bell_pair_qubits_escape() {
+        // Returned qubits must not be treated as temporaries: returning a Bell
+        // pair in superposition is correct, not an uncomputation failure.
+        let src = r#"
+        fn bell_pair() -> [1] Qubit {
+            let q0 = qalloc(1);
+            let q1 = qalloc(1);
+            hadamard(q0);
+            cnot(q0, q1);
+            (q0, q1)
+        }
+        "#;
+        let program = parse_program(src).expect("parse failed");
+        let diags = prove_uncomputation(&program).expect("prover failed");
+        assert!(diags.is_empty(), "returned qubits must escape: {diags:?}");
+    }
+
+    #[test]
+    fn test_self_inverse_gates_uncompute() {
+        // H;H and X;X are the identity, so the qubit ends in |0>.
+        for (label, gate) in [("hadamard", "hadamard"), ("X", "X")] {
+            let src = format!("fn f() {{ let q = qalloc(1); {gate}(q); {gate}(q); }}");
+            let program = parse_program(&src).expect("parse failed");
+            let diags = prove_uncomputation(&program).expect("prover failed");
+            assert!(
+                diags.is_empty(),
+                "{label};{label} must uncompute: {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_phase_gate_preserves_zero() {
+        // Z is diagonal: it fixes |0> up to a global phase.
+        let program = parse_program("fn f() { let q = qalloc(1); Z(q); }").expect("parse failed");
+        let diags = prove_uncomputation(&program).expect("prover failed");
+        assert!(diags.is_empty(), "Z must preserve |0>: {diags:?}");
+    }
+
+    #[test]
+    fn test_uncomputation_is_per_qubit() {
+        // Only q1 is left entangled. The prover must not blame q0.
+        let src = r#"
+        fn f() {
+            let q0 = qalloc(1);
+            let q1 = qalloc(1);
+            hadamard(q0);
+            hadamard(q0);
+            hadamard(q1);
+        }
+        "#;
+        let program = parse_program(src).expect("parse failed");
+        let diags = prove_uncomputation(&program).expect("prover failed");
+        assert_eq!(diags.len(), 1, "expected exactly one diagnostic: {diags:?}");
+        assert_eq!(diags[0].code, "NASO-UNC-001");
+        assert!(
+            diags[0].message.contains("'q1'"),
+            "must name the offending qubit: {}",
+            diags[0].message
+        );
     }
 }

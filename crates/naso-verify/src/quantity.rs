@@ -147,6 +147,37 @@ impl QuantityTracker {
         }
     }
 
+    /// Look up the linear resource IDs allocated under a given source name.
+    ///
+    /// A name can map to more than one resource (e.g. two `[1]` params sharing
+    /// a name across different allocation sites is impossible, but `alloc`
+    /// may register several indices for one callee name), so this returns all
+    /// matches and the caller consumes each.
+    pub fn linear_ids_by_name(&self, name: &str) -> Vec<String> {
+        self.linear_resources
+            .iter()
+            .filter(|(_, rid)| rid.name == name)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// How many times a linear resource has been consumed.
+    ///
+    /// Zero means leaked; one is correct; two or more is a double free.
+    pub fn consumption_count(&self, resource_id: &str) -> usize {
+        self.consumption
+            .get(resource_id)
+            .map_or(0, |paths| paths.len())
+    }
+
+    /// Span of the Nth consumption of a linear resource, if recorded.
+    pub fn consumption_span(&self, resource_id: &str, nth: usize) -> Option<Span> {
+        self.consumption
+            .get(resource_id)
+            .and_then(|paths| paths.get(nth))
+            .map(|p| p.location)
+    }
+
     /// Get all linear resource IDs.
     pub fn linear_resource_ids(&self) -> Vec<&String> {
         self.linear_resources.keys().collect()
@@ -260,10 +291,17 @@ pub fn encode_quantity_expr(
                             }
                         }
                     }
-                    "linear_free" | "qfree" | "free" => {
+                    "linear_free" | "qfree" | "free" | "consume" | "discard" => {
+                        // A consuming builtin discharges every linear resource
+                        // bound to the name it is handed. Previously this loop
+                        // body was empty, so `linear_free(x)` recorded no
+                        // consumption at all and every [1] resource was later
+                        // reported as leaked.
                         for arg in args {
-                            if let ExprKind::Var(_name) = &arg.kind {
-                                // Mark as consumed (would need path tracking in real impl)
+                            if let ExprKind::Var(name) = &arg.kind {
+                                for id in tracker.linear_ids_by_name(&name.name) {
+                                    tracker.consume_linear(&id, 0, expr.span);
+                                }
                             }
                         }
                     }

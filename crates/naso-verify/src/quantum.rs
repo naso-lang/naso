@@ -71,6 +71,11 @@ impl GateKind {
 #[derive(Debug, Clone)]
 pub struct SymbolicQubit {
     pub id: String,
+    /// Source-level binding this qubit was allocated under (`let q = qalloc(1)`).
+    ///
+    /// Gates are written against source names, so without this the lookup in
+    /// `apply_gate` could never resolve and every gate silently did nothing.
+    pub name: String,
     pub span: Span,
     /// Whether this qubit is a temporary (must be uncomputed)
     pub is_temp: bool,
@@ -98,7 +103,10 @@ pub struct QuantumTracker {
     /// Unitary matrix variables for symbolic reasoning
     pub unitary_vars: IndexMap<String, Term>,
     /// Next qubit ID
-    next_qubit_id: u32,
+    pub next_qubit_id: u32,
+    /// Source binding name for the next `qalloc`, set by the prover while
+    /// encoding a `let` statement.
+    pub pending_name: Option<String>,
     /// Current function for scoping
     pub current_function: Option<String>,
 }
@@ -110,18 +118,25 @@ impl QuantumTracker {
             temp_qubits: Vec::new(),
             unitary_vars: IndexMap::new(),
             next_qubit_id: 0,
+            pending_name: None,
             current_function: None,
         }
     }
 
     /// Allocate a new qubit (qalloc).
+    ///
+    /// If the caller has set `pending_name` -- the prover does this when
+    /// encoding `let q = qalloc(1)` -- the qubit is recorded under that
+    /// source name so later gates can resolve it.
     pub fn allocate_qubit(&mut self, is_temp: bool, span: Span) -> String {
         let id = format!("q_{}", self.next_qubit_id);
         self.next_qubit_id += 1;
 
+        let name = self.pending_name.take().unwrap_or_else(|| id.clone());
         let state_var = format!("state_{}", id);
         let qubit = SymbolicQubit {
             id: id.clone(),
+            name,
             span,
             is_temp,
             state_var: state_var.clone(),
@@ -135,6 +150,30 @@ impl QuantumTracker {
         id
     }
 
+    /// Drop every temporary qubit whose name is bound by the function's return
+    /// value.
+    ///
+    /// A returned qubit is handed to the caller rather than discarded, so it is
+    /// not a temporary that must be uncomputed to |0> -- returning a Bell pair
+    /// in superposition is the whole point. Without this, every valid quantum
+    /// routine would be reported as leaking.
+    pub fn mark_returned(&mut self, names: &[String]) {
+        for name in names {
+            let returned: Vec<String> = self
+                .qubits
+                .values()
+                .filter(|q| &q.name == name)
+                .map(|q| q.id.clone())
+                .collect();
+            for id in returned {
+                self.temp_qubits.retain(|t| t != &id);
+                if let Some(q) = self.qubits.get_mut(&id) {
+                    q.is_temp = false;
+                }
+            }
+        }
+    }
+
     /// Apply a gate to qubits.
     pub fn apply_gate(
         &mut self,
@@ -144,13 +183,25 @@ impl QuantumTracker {
         span: Span,
     ) {
         for target in targets {
-            if let Some(qubit) = self.qubits.get_mut(target) {
-                qubit.operations.push(QubitOp {
-                    gate,
-                    target_qubits: targets.to_vec(),
-                    control_qubits: controls.to_vec(),
-                    span,
-                });
+            // Gates are written against source names (`hadamard(q0)`), so
+            // resolve by name first and fall back to the raw id.
+            let id = match self.qubits.get(target) {
+                Some(_) => Some(target.clone()),
+                None => self
+                    .qubits
+                    .values()
+                    .find(|q| &q.name == target)
+                    .map(|q| q.id.clone()),
+            };
+            if let Some(id) = id {
+                if let Some(qubit) = self.qubits.get_mut(&id) {
+                    qubit.operations.push(QubitOp {
+                        gate,
+                        target_qubits: targets.to_vec(),
+                        control_qubits: controls.to_vec(),
+                        span,
+                    });
+                }
             }
         }
     }
@@ -165,15 +216,78 @@ impl QuantumTracker {
         self.qubits.get(id)
     }
 
+    /// Fold a qubit's operation list into a single symbolic state term.
+    ///
+    /// State encoding: `0` = |0>, `1` = |1>, `2` = superposition OR "not
+    /// provably |0>". The third value is deliberately an over-approximation:
+    /// anything this prover cannot demonstrate to be |0> becomes `2`, so an
+    /// unmodelled gate makes the prover *less* permissive, never more. A
+    /// verifier must never report "safe" on a gate it does not understand.
+    fn folded_state(&self, qubit: &SymbolicQubit) -> Term {
+        let mut state = var(&qubit.state_var, Sort::Int);
+
+        for op in &qubit.operations {
+            state = match op.gate {
+                // Bit flip: |0> <-> |1>, superposition unchanged.
+                GateKind::X => ite(
+                    eq(state.clone(), int(0)),
+                    int(1),
+                    ite(eq(state.clone(), int(1)), int(0), int(2)),
+                ),
+                // Hadamard maps any basis state to a superposition, so it
+                // always leaves the qubit provably not-|0>.
+                GateKind::H => ite(
+                    or(vec![eq(state.clone(), int(0)), eq(state.clone(), int(1))]),
+                    int(2),
+                    int(0),
+                ),
+                // Diagonal / phase gates. These fix |0> up to a global phase,
+                // so they provably preserve an uncomputed qubit.
+                GateKind::Y | GateKind::Z | GateKind::S | GateKind::T | GateKind::RZ => state,
+                // A non-trivial rotation about X or Y takes |0> out of |0>.
+                GateKind::RX | GateKind::RY => int(2),
+                // Explicit reset returns the qubit to |0>.
+                GateKind::Reset => int(0),
+                // Measurement collapses to a basis state; it is not proof of
+                // |0>, so the "superposition" value is the sound choice.
+                GateKind::Measure => int(2),
+                // Controlled gates: the target is only unchanged when the
+                // control is provably |0>, which we do not model. Assume the
+                // entangled case.
+                GateKind::CX | GateKind::CY | GateKind::CZ => int(2),
+                // An arbitrary unitary can map |0> anywhere.
+                GateKind::Unitary => int(2),
+            };
+        }
+
+        state
+    }
+
+    /// The uncomputation requirement for a single qubit: it must end in |0>.
+    pub fn uncomputation_requirement(&self, qubit: &SymbolicQubit) -> Term {
+        eq(var(&qubit.state_var, Sort::Int), int(0))
+    }
+
+    /// The gate-semantics fact for a single qubit: the state variable must
+    /// equal the folded effect of the qubit's operation list.
+    pub fn gate_semantics_for(&self, qubit: &SymbolicQubit) -> Term {
+        let state_var = var(&qubit.state_var, Sort::Int);
+        eq(state_var, self.folded_state(qubit))
+    }
+
+    /// Generate SMT declarations for a single qubit.
+    pub fn declare_qubit(&self, script: &mut crate::smtlib::Script, qubit: &SymbolicQubit) {
+        script.declare_const(&qubit.state_var, Sort::Int);
+        script.assert(and(vec![
+            ge(var(&qubit.state_var, Sort::Int), int(0)),
+            le(var(&qubit.state_var, Sort::Int), int(2)),
+        ]));
+    }
+
     /// Generate SMT declarations for qubits.
     pub fn generate_declarations(&self, script: &mut crate::smtlib::Script) {
-        for (_id, qubit) in &self.qubits {
-            script.declare_const(&qubit.state_var, Sort::Int);
-
-            script.assert(and(vec![
-                ge(var(&qubit.state_var, Sort::Int), int(0)),
-                le(var(&qubit.state_var, Sort::Int), int(2)),
-            ]));
+        for qubit in self.qubits.values() {
+            self.declare_qubit(script, qubit);
         }
 
         for (name, _term) in &self.unitary_vars {
@@ -183,61 +297,19 @@ impl QuantumTracker {
 
     /// Generate uncomputation constraints for all temporary qubits.
     pub fn generate_uncomputation_constraints(&self) -> Vec<Term> {
-        let mut constraints = Vec::new();
-
-        for temp_id in &self.temp_qubits {
-            if let Some(qubit) = self.qubits.get(temp_id) {
-                constraints.push(eq(var(&qubit.state_var, Sort::Int), int(0)));
-            }
-        }
-
-        constraints
+        self.temp_qubits
+            .iter()
+            .filter_map(|id| self.qubits.get(id))
+            .map(|q| self.uncomputation_requirement(q))
+            .collect()
     }
 
-    /// Generate constraints for gate semantics (simplified).
+    /// Generate constraints for gate semantics.
     pub fn generate_gate_constraints(&self) -> Vec<Term> {
-        let mut constraints = Vec::new();
-
-        for qubit in self.qubits.values() {
-            let mut current_state = var(&qubit.state_var, Sort::Int);
-
-            for op in &qubit.operations {
-                match op.gate {
-                    GateKind::X => {
-                        current_state = ite(
-                            eq(current_state.clone(), int(0)),
-                            int(1),
-                            ite(eq(current_state.clone(), int(1)), int(0), int(2)),
-                        );
-                    }
-                    GateKind::H => {
-                        current_state = ite(
-                            or(vec![
-                                eq(current_state.clone(), int(0)),
-                                eq(current_state.clone(), int(1)),
-                            ]),
-                            int(2),
-                            int(0),
-                        );
-                    }
-                    GateKind::Y | GateKind::Z | GateKind::S | GateKind::T => {}
-                    GateKind::Measure => {
-                        constraints.push(or(vec![
-                            eq(current_state.clone(), int(0)),
-                            eq(current_state.clone(), int(1)),
-                        ]));
-                    }
-                    GateKind::Reset => {
-                        current_state = int(0);
-                    }
-                    GateKind::CX | GateKind::CY | GateKind::CZ => {}
-                    GateKind::RX | GateKind::RY | GateKind::RZ => {}
-                    GateKind::Unitary => {}
-                }
-            }
-        }
-
-        constraints
+        self.qubits
+            .values()
+            .map(|q| self.gate_semantics_for(q))
+            .collect()
     }
 }
 

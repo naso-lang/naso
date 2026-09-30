@@ -1,6 +1,11 @@
 import tailwindcss from '@nuxtjs/tailwindcss'
 import vitePwa from '@vite-pwa/nuxt'
 
+// Where the generated site will be served from. GitHub Pages mounts this repo
+// at /naso/, Netlify and local dev serve from the root. Trailing slash matters
+// for Nuxt's path joining, so it is normalised here rather than at each use.
+const baseURL = process.env.NUXT_APP_BASE_URL || '/'
+
 export default defineNuxtConfig({
   ssr: false,
   devtools: { enabled: true },
@@ -57,7 +62,7 @@ export default defineNuxtConfig({
     // paths from this, so it must match where the site is actually served or
     // every asset 404s. The deploy workflow sets NUXT_APP_BASE_URL; it
     // defaults to "/" so local dev and the Netlify build are unaffected.
-    baseURL: process.env.NUXT_APP_BASE_URL || '/',
+    baseURL,
     head: {
       title: 'NasoChat',
       meta: [
@@ -68,11 +73,14 @@ export default defineNuxtConfig({
         { rel: 'preconnect', href: 'https://fonts.googleapis.com' },
         { rel: 'preconnect', href: 'https://fonts.gstatic.com', crossorigin: '' },
         { rel: 'stylesheet', href: 'https://fonts.googleapis.com/css2?family=Geist:wght@400;500&family=Geist+Mono:wght@400;500&display=swap' },
-        // COOP/COEP for SharedArrayBuffer
-        { rel: 'modulepreload', href: '/coi-serviceworker.js' },
+        // COOP/COEP for SharedArrayBuffer.
+        // These must be built from baseURL. Nuxt emits app.head script/link
+        // URLs verbatim, so a bare "/coi-serviceworker.js" stays rooted at the
+        // domain and 404s under a subpath deploy like GitHub Pages (/naso/).
+        { rel: 'modulepreload', href: `${baseURL}coi-serviceworker.js` },
       ],
       script: [
-        { src: '/coi-serviceworker.js', type: 'module', crossorigin: 'anonymous' },
+        { src: `${baseURL}coi-serviceworker.js`, type: 'module', crossorigin: 'anonymous' },
       ],
     },
   },

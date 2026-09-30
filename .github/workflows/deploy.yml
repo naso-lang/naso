@@ -45,6 +45,12 @@ jobs:
       - name: Generate Nuxt 3 Static Site
         run: npm run generate
         working-directory: app
+        env:
+          # GitHub Pages serves this repo from a /naso/ subpath, so the
+          # generated asset and router paths have to be prefixed. Without
+          # this the site builds fine but every asset 404s in production.
+          # Netlify and local dev leave it unset and serve from the root.
+          NUXT_APP_BASE_URL: /naso/
 
       - name: Setup Pages
         uses: actions/configure-pages@v5

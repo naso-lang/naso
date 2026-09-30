@@ -4,7 +4,7 @@ import vitePwa from '@vite-pwa/nuxt'
 export default defineNuxtConfig({
   ssr: false,
   devtools: { enabled: true },
-  
+
   modules: [
     '@nuxtjs/tailwindcss',
     '@vite-pwa/nuxt',
@@ -52,6 +52,12 @@ export default defineNuxtConfig({
   },
   
   app: {
+    // GitHub Pages serves this repo at /naso/ (a subpath), while Netlify and
+    // local dev serve it at the domain root. Nuxt derives asset and router
+    // paths from this, so it must match where the site is actually served or
+    // every asset 404s. The deploy workflow sets NUXT_APP_BASE_URL; it
+    // defaults to "/" so local dev and the Netlify build are unaffected.
+    baseURL: process.env.NUXT_APP_BASE_URL || '/',
     head: {
       title: 'NasoChat',
       meta: [

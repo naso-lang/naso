@@ -372,6 +372,73 @@ mod tests {
                 .any(|e| matches!(e, TypeError::UseOfMovedValue { .. }))
         );
     }
+    /// Round, abs, floor and ceil were added to the prelude because symmetric
+    /// INT8 quantization cannot be written without them: round(x/scale) and
+    /// the abs() in the overflow precondition are both required.
+    #[test]
+    fn test_prelude_math_builtins_float() {
+        for src in [
+            "fn q(x: f32) -> f32 { return round(x); }",
+            "fn q(x: f32) -> f32 { return abs(x); }",
+            "fn q(x: f32) -> f32 { return floor(x); }",
+            "fn q(x: f32) -> f32 { return ceil(x); }",
+            "fn q(x: f32) -> f32 { return exp(x); }",
+            "fn q(x: f32) -> f32 { return sqrt(x); }",
+        ] {
+            assert!(
+                check_source(src).is_ok(),
+                "expected prelude builtin to typecheck: {}",
+                src
+            );
+        }
+    }
+
+    /// clamp is 3-arity, so it is declared separately from the unary table.
+    /// The arity is part of the contract: a 2-arg call must not typecheck.
+    #[test]
+    fn test_prelude_clamp_arity() {
+        assert!(check_source("fn q(x: f32) -> f32 { return clamp(x, -128.0, 127.0); }").is_ok());
+        assert!(check_source("fn q(x: f32) -> f32 { return clamp(x, 127.0); }").is_err());
+    }
+
+    /// The builtins are float-only. A regression guard on the declaration
+    /// itself: an int argument must be rejected, not coerced.
+    #[test]
+    fn test_prelude_math_builtins_reject_int() {
+        assert!(check_source("fn q(x: i8) -> f32 { return round(x); }").is_err());
+        assert!(check_source("fn q(x: i8) -> f32 { return abs(x); }").is_err());
+        assert!(check_source("fn q() -> f32 { return round(0); }").is_err());
+    }
+
+    /// End-to-end shape of a quantization-style loop over tensors, which is
+    /// what the WGSL backend needs to lower eventually.
+    #[test]
+    fn test_tensor_loop_with_math_builtins() {
+        let src = "
+            fn normalize_clamped(
+                input: [1] Tensor[f32, 1024],
+                output: inout [1] Tensor[f32, 1024],
+                scale: f32
+            ) {
+                forall i in 0..1024 {
+                    let v = round(input[i] / scale);
+                    output[i] = clamp(v, -128.0, 127.0);
+                }
+            }
+        ";
+        assert!(check_source(src).is_ok());
+    }
+
+    /// Documented gap: there is no numeric cast operator, so i8 and f32
+    /// tensors cannot be converted. `as i8` is a parse error, not a type
+    /// error. kernels/quant_int8.naso documents this as the reason symmetric
+    /// quantization is blocked. If a cast is ever added, this test should
+    /// start failing so it can be replaced with a positive one.
+    #[test]
+    fn test_no_numeric_cast_between_element_types() {
+        assert!(check_source("fn q(input: [1] Tensor[i8, 8], output: inout [1] Tensor[f32, 8]) { forall i in 0..8 { output[i] = input[i]; } }").is_err());
+        assert!(check_source("fn q(input: [1] Tensor[f32, 8], output: inout [1] Tensor[i8, 8]) { forall i in 0..8 { output[i] = input[i]; } }").is_err());
+    }
 }
 
 /// Unit tests for quantity unification and lattice operations (TASK-205)

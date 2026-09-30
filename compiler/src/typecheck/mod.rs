@@ -390,10 +390,22 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
     }
     .insert(env);
 
-    // Math functions
+    // Math functions.
+    //
+    // These are compiler intrinsics: the body is empty because codegen emits
+    // them directly. Any new entry here needs a matching arm in the WGSL
+    // backend's expression lowering, or it will compile and then fail to
+    // lower.
     let math_funcs = [
         ("exp", TypeKind::Float, TypeKind::Float),
         ("sqrt", TypeKind::Float, TypeKind::Float),
+        // Required by symmetric INT8 quantization: round(x/scale) and
+        // clamp(.., -128.0, 127.0) are what make the i8 cast sound. Without
+        // these a quantizer cannot be written in naso at all.
+        ("round", TypeKind::Float, TypeKind::Float),
+        ("abs", TypeKind::Float, TypeKind::Float),
+        ("floor", TypeKind::Float, TypeKind::Float),
+        ("ceil", TypeKind::Float, TypeKind::Float),
     ];
     for (name, arg_ty, ret_ty) in math_funcs {
         PreludeFn {
@@ -411,6 +423,41 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
         }
         .insert(env);
     }
+
+    // clamp(value, lo, hi). Not a uniform arity like the table above, so it
+    // is declared explicitly. QTT does not model the bound on lo/hi: they
+    // are float literals in every valid use, and threading a quantity here
+    // would let a caller pass a linear value into a numeric bound.
+    PreludeFn {
+        name: "clamp",
+        params: vec![
+            Param {
+                name: Ident::new("x", Span::default()),
+                ty: Type::new(TypeKind::Float, Quantity::Many, Span::default()),
+                quantity: Quantity::Many,
+                mutability: Mutability::Immutable,
+                span: Span::default(),
+            },
+            Param {
+                name: Ident::new("lo", Span::default()),
+                ty: Type::new(TypeKind::Float, Quantity::Many, Span::default()),
+                quantity: Quantity::Many,
+                mutability: Mutability::Immutable,
+                span: Span::default(),
+            },
+            Param {
+                name: Ident::new("hi", Span::default()),
+                ty: Type::new(TypeKind::Float, Quantity::Many, Span::default()),
+                quantity: Quantity::Many,
+                mutability: Mutability::Immutable,
+                span: Span::default(),
+            },
+        ],
+        ret_ty: Some(Type::new(TypeKind::Float, Quantity::Many, Span::default())),
+        quantity: Quantity::Many,
+        is_reversible: false,
+    }
+    .insert(env);
 }
 
 /// Result of type checking a program

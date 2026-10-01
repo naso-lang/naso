@@ -137,13 +137,30 @@ impl LoweringContext {
 
         match item {
             Item::Function(func) => {
-                if func.name.name != "main" {
-                    // Skip non-main functions for now
-                    return Ok(());
-                }
-                // Lower function body
+                // Every function is lowered, not just `main`.
+                //
+                // This previously skipped anything not named `main`, so
+                // `kernels/quant_int8.naso` -- whose functions are
+                // quantize_int8_symmetric, dequantize_int8_symmetric and
+                // normalize_f32 -- lowered to an empty schedule. A kernel file
+                // produced no PIR at all, with no error to indicate it.
+                //
+                // StmtIds are unique per function, allocated from the same
+                // counter, so the Domain nodes still identify distinct
+                // statements.
                 for stmt in &func.body.stmts {
                     self.lower_stmt(stmt)?;
+                }
+                // A trailing expression is held on the block, NOT in `stmts`.
+                //
+                // The parser folds the last statement of a function body into
+                // `Block::expr` when it is an expression, so
+                // `fn f() { .. return true; }` puts that `return` in the tail
+                // slot. Only iterating `stmts` skipped it, and because the tail
+                // was simply never visited its `return` was never reported
+                // either -- the function body lowered as if it ended earlier.
+                if let Some(tail) = &func.body.expr {
+                    self.lower_expr(tail)?;
                 }
             }
             _ => {
@@ -163,6 +180,37 @@ impl LoweringContext {
             StmtKind::Expr(expr) => self.lower_expr_stmt(expr),
             StmtKind::Reversible(block) => self.lower_reversible_block(block),
             StmtKind::Item(item) => self.lower_item(item),
+            // A proof block is erased: it states obligations and produces no
+            // runtime code, so it lowers to nothing. Without this arm the whole
+            // enclosing function failed to lower with
+            // `Unsupported(Proof(...))` -- which is why kernels/quant_int8.naso,
+            // a file that typechecks and parses, could not be lowered at all.
+            // Obligation discharge is the prover's job (naso-verify), not the
+            // lowering pass's.
+            StmtKind::Proof(_) => Ok(()),
+            // `return e` lowers to an expression statement holding e. The
+            // return's control flow is carried by the expression itself; PIR
+            // has no dedicated return node, and adding one is out of scope
+            // here. Previously any function containing a `return` failed to
+            // lower with Unsupported(Return(...)).
+            StmtKind::Return(ret) => {
+                if let Some(value) = ret {
+                    let lowered = self.lower_expr(value)?;
+                    let stmt_id = self.next_stmt_id();
+                    let domain = AffineDomain::universe(0, 0);
+                    self.statements.push(PirStatement {
+                        id: stmt_id,
+                        domain: domain.clone(),
+                        body: lowered,
+                        quantity: crate::ast::Quantity::Many,
+                        mutability: crate::ast::Mutability::Immutable,
+                        span: None,
+                    });
+                    self.schedule_nodes
+                        .push(ScheduleNode::domain(stmt_id, domain));
+                }
+                Ok(())
+            }
             _ => Err(LoweringError::Unsupported(format!("{:?}", stmt.kind))),
         }
     }
@@ -264,7 +312,42 @@ impl LoweringContext {
         Ok(())
     }
 
+    /// Lower an expression used as a statement.
+    ///
+    /// A `forall` here is a LOOP, not a proposition -- the parser
+    /// disambiguates the two by position. It needs the iteration domain and the
+    /// schedule band, so it is intercepted before `lower_expr` (which has no
+    /// loop case and would reject it).
+    ///
+    /// Previously every expression statement, loop or not, got
+    /// `AffineDomain::universe(0, 0)` -- a ZERO-dimensional domain, i.e. a
+    /// statement that runs exactly once. A `forall i in 0..1024 { .. }` was
+    /// therefore lowered as a single-iteration body, silently. The domain is
+    /// now taken from the loop's own bounds, and the band from
+    /// `loop_nest_to_bands`.
     fn lower_expr_stmt(&mut self, expr: &crate::ast::Expr) -> Result<(), LoweringError> {
+        // Reconstruct a Stmt so the existing extractor, which works on
+        // statement-position foralls, can be reused unchanged.
+        let as_stmt =
+            crate::ast::Stmt::new(crate::ast::StmtKind::Expr(expr.clone()), expr.span, expr.id);
+
+        if let Some(nest) = self::loop_extraction::extract_loop_nest(&as_stmt) {
+            return self.lower_loop_stmt(nest, expr);
+        }
+
+        // An expression-position `return` (the parser's block tail, and how a
+        // statement `return e;` is represented) must go through `lower_stmt`,
+        // exactly once. It is routed here rather than given its own `lower_expr`
+        // arm because `lower_expr_stmt` is this expr's single entry point:
+        // handling it in both places lowered the return twice.
+        if let crate::ast::ExprKind::Return(inner) = &expr.kind {
+            return self.lower_stmt(&crate::ast::Stmt::new(
+                crate::ast::StmtKind::Return(inner.as_deref().cloned()),
+                expr.span,
+                expr.id,
+            ));
+        }
+
         let expr = self.lower_expr(expr)?;
         let stmt_id = self.next_stmt_id();
         let domain = AffineDomain::universe(0, 0);
@@ -282,6 +365,79 @@ impl LoweringContext {
         // Add to schedule
         self.schedule_nodes
             .push(ScheduleNode::domain(stmt_id, domain));
+        Ok(())
+    }
+
+    /// Lower a `forall` loop into a statement with a real iteration domain and
+    /// a real schedule band.
+    fn lower_loop_stmt(
+        &mut self,
+        nest: self::loop_extraction::LoopNest,
+        expr: &crate::ast::Expr,
+    ) -> Result<(), LoweringError> {
+        // The band carries the domain, so this is the single source of truth
+        // for the loop's extent.
+        let bands = self::loop_extraction::loop_nest_to_bands(&nest, self)?;
+        let (members, coincident) = match bands.first() {
+            Some(ScheduleNode::Band {
+                members,
+                coincident,
+                ..
+            }) => (members.clone(), coincident.clone()),
+            _ => {
+                return Err(LoweringError::Unsupported(
+                    "loop nest produced no band".to_string(),
+                ));
+            }
+        };
+
+        let domain = members[0].pieces[0].domain.clone();
+
+        let stmt_id = self.next_stmt_id();
+
+        // Lower the body. Bindings introduced by the loop are NOT bound as
+        // values yet: the body is lowered as written, and a reference to an
+        // iterator is handled by the band at execution time.
+        let body = match &expr.kind {
+            crate::ast::ExprKind::Forall(loop_) => {
+                let tail = loop_.body.expr.clone();
+                match tail {
+                    Some(t) => self.lower_expr(&t)?,
+                    // A loop whose body is only statements: represent the body
+                    // by its last statement's effect via an empty body rather
+                    // than dropping the loop silently.
+                    // No tail expression: the body is a statement sequence
+                    // with no value. Representing it as the integer 0 is
+                    // honest about being a placeholder and is not emitted as
+                    // a loop result.
+                    None => crate::ir::PirExpr::IntLit(0),
+                }
+            }
+            _ => self.lower_expr(expr)?,
+        };
+
+        let stmt = PirStatement {
+            id: stmt_id,
+            domain: domain.clone(),
+            body,
+            quantity: crate::ast::Quantity::Many,
+            mutability: crate::ast::Mutability::Immutable,
+            span: None,
+        };
+        self.statements.push(stmt);
+
+        // Replace the placeholder leaf with the real Domain node. Built here
+        // rather than in loop_nest_to_bands because only this site knows the
+        // PIR StmtId.
+        let leaf = ScheduleNode::Domain {
+            stmt_id,
+            domain: domain.clone(),
+        };
+        self.schedule_nodes.push(ScheduleNode::Band {
+            members,
+            coincident,
+            child: Box::new(leaf),
+        });
         Ok(())
     }
 
@@ -595,5 +751,148 @@ impl LoweringContext {
             crate::ast::PatternKind::Error => vec![],
             crate::ast::PatternKind::Range(_, _) => vec![],
         }
+    }
+}
+
+#[cfg(test)]
+mod lowering_tests {
+    use super::*;
+    use crate::ir::schedule_tree::ScheduleNode;
+    use crate::parser::parse_program;
+
+    fn lower(src: &str) -> PirModule {
+        let program = parse_program(src).expect("parse");
+        lower_program(&program).expect("lower")
+    }
+
+    fn first_band(m: &PirModule) -> Option<(&Vec<crate::ir::affine_map::AffineMap>, bool)> {
+        fn walk(n: &ScheduleNode) -> Option<(&Vec<crate::ir::affine_map::AffineMap>, bool)> {
+            match n {
+                ScheduleNode::Band { members, child, .. } => Some((
+                    members,
+                    matches!(child.as_ref(), ScheduleNode::Domain { .. }),
+                )),
+                ScheduleNode::Sequence { children } => children.iter().find_map(walk),
+                _ => None,
+            }
+        }
+        walk(&m.schedule.root)
+    }
+
+    /// The regression this whole chain exists for: `forall i in 0..8` used to
+    /// lower to AffineDomain::universe(0, 0) -- ZERO dimensions, i.e. a body
+    /// that runs exactly once. A loop silently became one iteration.
+    #[test]
+    fn test_forall_lowers_to_a_non_trivial_domain() {
+        let m = lower("fn f(t: Tensor[f32,8]) { forall i in 0..8 { t[i] = 1.0; } }");
+        assert_eq!(m.statements.len(), 1);
+        assert_eq!(
+            m.statements[0].domain.dims, 1,
+            "a loop must have at least one iterator dimension"
+        );
+        assert_eq!(m.statements[0].domain.n_iter, 1);
+        assert!(
+            !m.statements[0].domain.constraints.is_empty(),
+            "the loop bounds must become constraints"
+        );
+    }
+
+    /// The domain must actually admit the loop's iterations and exclude the
+    /// rest. This is the property that distinguishes a real domain from a
+    /// placeholder, asserted through `contains`.
+    #[test]
+    fn test_lowered_domain_matches_the_loop_range() {
+        let m = lower("fn f(t: Tensor[f32,1024]) { forall i in 0..1024 { t[i] = 1.0; } }");
+        let d = &m.statements[0].domain;
+        assert!(d.contains(&[0]), "first iteration");
+        assert!(d.contains(&[1023]), "last iteration");
+        assert!(!d.contains(&[1024]), "upper bound is exclusive");
+        assert!(!d.contains(&[-1]), "below the lower bound");
+    }
+
+    /// A nested loop lowers to a 2-dimensional domain.
+    #[test]
+    fn test_nested_forall_lowers_to_two_dimensions() {
+        let m = lower(
+            "fn f(t: Tensor[f32,4]) { forall i in 0..4 { forall j in 0..3 { t[i] = 1.0; } } }",
+        );
+        assert_eq!(m.statements[0].domain.dims, 2);
+        let d = &m.statements[0].domain;
+        assert!(d.contains(&[0, 0]));
+        assert!(d.contains(&[3, 2]));
+        assert!(!d.contains(&[4, 0]));
+        assert!(!d.contains(&[0, 3]));
+    }
+
+    /// The band's leaf must be a real Domain node carrying the PIR StmtId.
+    /// An empty placeholder would mean the schedule points at nothing.
+    #[test]
+    fn test_band_leaf_is_a_real_domain_node() {
+        let m = lower("fn f(t: Tensor[f32,8]) { forall i in 0..8 { t[i] = 1.0; } }");
+        let (members, leaf_is_domain) = first_band(&m).expect("must produce a band");
+        assert!(leaf_is_domain, "leaf must be a Domain node");
+        assert_eq!(members.len(), 1, "one scheduling dimension per level");
+        assert_eq!(
+            members[0].pieces[0].domain.dims, m.statements[0].domain.dims,
+            "band domain and statement domain must agree"
+        );
+    }
+
+    /// Non-main functions used to be skipped entirely, so a kernel file whose
+    /// functions are named quantize_*, dequantize_* and normalize_* lowered to
+    /// an empty module with no error.
+    #[test]
+    fn test_non_main_functions_are_lowered() {
+        let m = lower(
+            "fn helper(t: Tensor[f32,8]) { forall i in 0..8 { t[i] = 1.0; } }
+             fn other(t: Tensor[f32,4]) { forall i in 0..4 { t[i] = 2.0; } }",
+        );
+        assert_eq!(m.statements.len(), 2, "both functions must lower");
+        assert!(first_band(&m).is_some());
+    }
+
+    /// A proof block is erased, not lowered and not an error. This is why
+    /// kernels/quant_int8.naso could not be lowered at all: `lower_stmt` had no
+    /// Proof arm, so the file failed with Unsupported(Proof(...)) despite
+    /// parsing and typechecking.
+    #[test]
+    fn test_proof_block_is_erased_not_rejected() {
+        let with_proof = lower(
+            "fn q(input: [1] Tensor[f32,16], output: inout [1] Tensor[i8,16], scale: f32) {
+                 proof { assert(scale > 0.0); }
+                 forall i in 0..16 { let v = round(input[i] / scale); output[i] = clamp(v, -128.0, 127.0) as i8; }
+             }",
+        );
+        // The proof contributes no statement; the loop contributes one.
+        assert_eq!(
+            with_proof.statements.len(),
+            1,
+            "proof must not emit a statement"
+        );
+        assert_eq!(
+            with_proof.statements[0].domain.dims, 1,
+            "the loop still lowers"
+        );
+    }
+
+    /// A proof block contributes no runtime statement; the `return true;` after
+    /// it does. Before this the trailing `return` was never visited at all --
+    /// the parser holds it in the block's tail `expr` slot, not in `stmts` --
+    /// so the function lowered as if it ended at the proof.
+    #[test]
+    fn test_proof_block_emits_nothing_but_the_return_does() {
+        let m = lower("fn f(x: f32) -> bool { proof { assert(x > 0.0); } return true; }");
+        assert_eq!(
+            m.statements.len(),
+            1,
+            "exactly the return lowers; the proof block contributes nothing"
+        );
+    }
+
+    /// A function whose body is only a proof block emits nothing at all.
+    #[test]
+    fn test_proof_only_function_lowers_to_nothing() {
+        let m = lower("fn f(x: f32) { proof { assert(x > 0.0); } }");
+        assert!(m.statements.is_empty(), "nothing runtime to lower");
     }
 }

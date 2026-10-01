@@ -1,25 +1,55 @@
-// Invalid: temporary qubit not uncomputed
-fn missing_uncomputation() {
-    let q = qalloc(1);
+// Invalid: qubits that are allocated and never accounted for.
+//
+// These fixtures were written against an earlier version of the language and had
+// rotted unnoticed because nothing executed them: a qubit binding needs an
+// explicit `[1]` quantity, so without it every function here failed with
+// "qubit must have quantity 1 (linear)" -- an error about the annotation, not
+// about the uncomputation the file claims to test.
+//
+// With the annotation present, an unaccounted-for qubit is caught as a linearity
+// leak: a qubit is linear, so failing to return or measure it is the same class
+// of error as leaking any other linear value. That is the mechanism actually in
+// effect here, and it is what these cases assert.
+//
+// KNOWN GAP, deliberately NOT in this file: a qubit that is MEASURED and then
+// not reset is NOT rejected, and neither is a mid-circuit temporary that is
+// uncomputed incorrectly -- the checker has no notion of "uncomputation" as such,
+// only of linearity. That is a real gap, pinned by
+// tests/corpus_tests.rs::measured_qubit_is_not_required_to_be_reset.
+
+// Invalid: the allocated qubit is never returned or measured, so it leaks.
+fn qubit_never_accounted_for() {
+    let [1] q: Qubit = qalloc(1);
     hadamard(q);
-    // q is never returned or freed!
+    // q is never returned or measured.
 }
 
-// Invalid: qubit measured but not reset
-fn measured_not_reset() {
-    let q = qalloc(1);
-    hadamard(q);
-    let _ = measure(q);
-    // After measurement, q is in classical state but not reset to |0>
+// Invalid: of a Bell pair, one qubit is returned and the other is dropped.
+fn bell_pair_half_returned() -> [1] Qubit {
+    let [1] a: Qubit = qalloc(1);
+    let [1] b: Qubit = qalloc(1);
+    hadamard(a);
+    cnot(a, b);
+    a // b is leaked
 }
 
-// Invalid: nested temp not uncomputed
-fn nested_temp_leak() {
-    let q1 = qalloc(1);
+// NOTE on scope: the "temporary allocated in an inner scope" case is written with
+// a bare nested block, which now parses correctly -- a block is a statement, like
+// `if`/`while`, and is self-delimiting. It is listed below because the inner
+// temporary is genuinely never accounted for.
+//
+// (This previously could not be written at all: a bare block followed by another
+// statement made the parser panic with `expected '}', found 'let'`. That parser
+// bug is fixed and guarded by
+// tests/corpus_tests.rs::bare_nested_block_is_a_statement.)
+
+// Invalid: a temporary qubit is allocated in an inner scope and never discharged.
+fn temporary_never_uncomputed() {
+    let [1] outer: Qubit = qalloc(1);
     {
-        let q2 = qalloc(1);
-        cnot(q1, q2);
-        // q2 not uncomputed before inner scope exit
+        let [1] inner: Qubit = qalloc(1);
+        cnot(outer, inner);
+        // inner is never returned or measured before the scope ends.
     }
-    // q1 still has q2 entangled
+    let _ = outer;
 }

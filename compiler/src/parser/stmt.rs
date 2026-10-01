@@ -71,9 +71,18 @@ impl<'a> Parser<'a> {
                         self.bump();
                         let span = expr.span;
                         stmts.push(Stmt::new(StmtKind::Expr(expr), span, next_id()))
-                    } else if is_control_flow_stmt(&expr.kind) {
-                        // `if`/`match`/`for`/`while` are closed by `}` and
-                        // need no trailing semicolon.
+                    } else if is_control_flow_stmt(&expr.kind) || is_block_expr(&expr.kind) {
+                        // `if`/`match`/`for`/`while` are closed by `}` and need no
+                        // trailing semicolon.
+                        //
+                        // A BLOCK is the same: `{ .. }` is self-delimiting, so a
+                        // block is a complete statement with or without a `;`.
+                        // Without this a block was classified as the block's TAIL
+                        // expression, `parse_stmt_list` broke out early, and the
+                        // statement AFTER the block was orphaned -- so the parser
+                        // panicked with `expected '}', found 'let'`. A block
+                        // followed by anything could not be parsed at all, and
+                        // even `{} let z = 2;` failed.
                         let span = expr.span;
                         stmts.push(Stmt::new(StmtKind::Expr(expr), span, next_id()))
                     } else {
@@ -331,4 +340,12 @@ impl<'a> Parser<'a> {
         let span = self.span_from(start);
         ProofBlock { body, span }
     }
+}
+
+/// Whether an expression is a self-delimiting BLOCK, `{ .. }`.
+///
+/// Like `if`/`while`, a block is closed by its own `}` and needs no trailing
+/// semicolon, so it is a statement rather than a block's tail expression.
+pub(crate) fn is_block_expr(kind: &crate::ast::ExprKind) -> bool {
+    matches!(kind, crate::ast::ExprKind::Block(_))
 }

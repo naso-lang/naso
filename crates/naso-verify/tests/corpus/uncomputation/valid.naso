@@ -1,44 +1,56 @@
-// Valid Bell pair - should verify successfully
-fn bell_pair() -> [1] (Qubit, Qubit) {
-    let q0 = qalloc(1);
-    let q1 = qalloc(1);
-    hadamard(q0);
-    cnot(q0, q1);
-    (q0, q1)
+// Valid quantum circuits: every allocated qubit is accounted for.
+//
+// These fixtures were written against an earlier version of the language and had
+// rotted unnoticed because nothing executed them. Two things had changed: a qubit
+// binding needs an explicit `[1]` quantity (`let [1] q: Qubit = qalloc(1);`),
+// and a circuit accounts for its qubits by RETURNING them or MEASURING them.
+//
+// They are now run by tests/corpus_tests.rs, so drift fails the build instead of
+// hiding.
+
+// Valid: a Bell pair, both qubits returned to the caller.
+fn bell_pair() -> ([1] Qubit, [1] Qubit) {
+    let [1] a: Qubit = qalloc(1);
+    let [1] b: Qubit = qalloc(1);
+    hadamard(a);
+    cnot(a, b);
+    (a, b)
 }
 
-// Valid QFT with proper uncomputation
-fn qft_4qubits() -> [1] (Qubit, Qubit, Qubit, Qubit) {
-    let q0 = qalloc(1);
-    let q1 = qalloc(1);
-    let q2 = qalloc(1);
-    let q3 = qalloc(1);
-    
-    hadamard(q0);
-    cnot(q0, q1);
-    cnot(q1, q2);
-    cnot(q2, q3);
-    
-    (q0, q1, q2, q3)
+// Valid: a four-qubit chain, every qubit returned.
+fn chain_4qubits() -> ([1] Qubit, [1] Qubit, [1] Qubit, [1] Qubit) {
+    let [1] a: Qubit = qalloc(1);
+    let [1] b: Qubit = qalloc(1);
+    let [1] c: Qubit = qalloc(1);
+    let [1] d: Qubit = qalloc(1);
+
+    hadamard(a);
+    cnot(a, b);
+    cnot(b, c);
+    cnot(c, d);
+
+    (a, b, c, d)
 }
 
-// Valid teleportation circuit
-fn teleportation() {
-    let msg = qalloc(1);
-    let alice = qalloc(1);
-    let bob = qalloc(1);
-    
-    // Prepare Bell pair
-    hadamard(alice);
-    cnot(alice, bob);
-    
-    // Bell measurement
-    cnot(msg, alice);
-    hadamard(msg);
-    let m1 = measure(msg);
-    let m2 = measure(alice);
-    
-    // Correction
-    if m1 { X(bob); }
-    if m2 { Z(bob); }
+// Valid: a qubit is accounted for by being measured, which yields a classical
+// result. `m` is then consumed, so nothing leaks.
+fn measure_accounts_for_qubit() {
+    let [1] q: Qubit = qalloc(1);
+    hadamard(q);
+    let m = measure(q);
+    let _ = m;
+}
+
+// Valid: a Bell pair is created and both qubits measured, so the function
+// allocates and discharges everything it allocated.
+fn bell_measured() -> bool {
+    let [1] a: Qubit = qalloc(1);
+    let [1] b: Qubit = qalloc(1);
+    hadamard(a);
+    cnot(a, b);
+    let ma = measure(a);
+    let mb = measure(b);
+    let _ = ma;
+    let _ = mb;
+    true
 }

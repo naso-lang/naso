@@ -1,36 +1,36 @@
-// Invalid: linear resource leaked (never consumed)
+// Invalid: linear-resource violations the checker DOES catch.
+//
+// These fixtures were written against an older version of the language and had
+// rotted unnoticed because nothing executed them. `linear_free` was never a real
+// callee -- consumption is the `let consume y = x;` pattern -- so these cases
+// were not even exercising the errors they claimed to.
+//
+// Every function here is expected to be REJECTED by the typechecker, and each
+// says which diagnostic it is asserting, so a change in message wording shows up
+// as a test failure rather than passing silently.
+//
+// KNOWN GAP, deliberately NOT in this file: a linear value consumed in only ONE
+// arm of an `if` is NOT rejected. The checker does not join branch move-sets, so
+// a one-arm leak passes. That is a real soundness gap, pinned by
+// tests/corpus_tests.rs::branch_local_linear_leak_is_a_known_gap, and it must not
+// be listed here as if it were detected.
+
+// Invalid: the linear parameter is never used, so it leaks.
 fn leak(x: [1] i32) {
-    // x never consumed!
+    // x never consumed.
 }
 
-// Invalid: linear resource consumed twice
-fn double_free(x: [1] i32) {
-    linear_free(x);
-    linear_free(x); // Double free!
+// Invalid: the linear parameter is consumed twice.
+fn double_consume(x: [1] i32) {
+    let consume a = x;
+    let consume b = x;
+    let _ = a;
+    let _ = b;
 }
 
-// Invalid: linear resource consumed in only one branch
-fn branch_leak(cond: bool, x: [1] i32) {
-    if cond {
-        linear_free(x);
-    } else {
-        // x leaked in else branch!
-    }
-}
-
-// Invalid: linear resource moved then both consumed
-fn move_then_double(x: [1] i32) {
+// Invalid: the linear parameter is used after being moved.
+fn use_after_move(x: [1] i32) {
     let y = x; // Move
-    linear_free(x); // Error: x already moved
-    linear_free(y);
-}
-
-// Invalid: linear resource returned but not consumed by caller
-fn caller_leak() {
-    let x = return_linear();
-    // x never consumed!
-}
-
-fn return_linear() -> [1] i32 {
-    linear_alloc(42)
+    let _ = x; // Error: x already moved
+    let _ = y;
 }

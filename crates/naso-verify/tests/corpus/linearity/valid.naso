@@ -1,31 +1,66 @@
-// Valid: linear resource consumed exactly once
-fn consume_once(x: [1] i32) -> i32 {
-    linear_free(x)
+// Valid: a linear resource is used exactly once.
+//
+// These fixtures were written against an earlier version of the language and had
+// rotted unnoticed, because nothing executed them: `f64` is no longer a type,
+// `linear_free` was never a real callee (consumption is a *pattern* modifier,
+// `let consume y = x`, not an expression operator), and a tuple return did not
+// typecheck. They are now run by tests/corpus_tests.rs, so drift fails the build
+// instead of hiding.
+
+// Valid: linear resource consumed exactly once, into a `consume` binding.
+fn consume_once(x: [1] i32) {
+    let consume y = x;
+    let _ = y;
 }
 
-// Valid: linear resource moved and consumed
-fn move_and_consume(x: [1] i32) -> i32 {
+// Valid: a linear resource moved into a plain binding and then used.
+//
+// NOTE: the intermediate `let y = x;` yields `[1]`, but re-binding it with
+// `let consume z = y;` after the fact FAILS with
+// `quantity mismatch: expected [1], found [*]` -- an intervening plain `let`
+// widens the binding to `[*]`, so a later `consume` cannot match it. That is a
+// real gap in the checker, so this fixture uses the direct form below and does
+// NOT claim the two-step version works. See
+// tests/corpus_tests.rs::plain_let_between_moves_is_a_known_gap.
+fn move_and_use(x: [1] i32) {
     let y = x; // Move
-    linear_free(y)
+    let _ = y;
 }
 
-// Valid: multiple linear resources consumed
-fn multi_linear(x: [1] i32, y: [1] f64) -> (i32, f64) {
-    let x_val = linear_free(x);
-    let y_val = linear_free(y);
-    (x_val, y_val)
+// Valid: several linear resources, each consumed exactly once.
+fn multi_linear(x: [1] i32, y: [1] f32) {
+    let consume a = x;
+    let consume b = y;
+    let _ = a;
+    let _ = b;
 }
 
-// Valid: linear resource returned from function
+// Valid: a linear resource is produced and returned, so it is consumed by being
+// handed to the caller rather than discarded.
 fn return_linear() -> [1] i32 {
-    linear_alloc(42)
+    let q = 42;
+    q
 }
 
-// Valid: conditional consumption on all paths
-fn conditional_consume(cond: bool, x: [1] i32) -> i32 {
+// Valid: a linear resource written in place through an `inout` binding.
+fn write_in_place(x: [1] i32) -> [1] i32 {
+    let inout y = x;
+    y
+}
+
+// Valid: a non-linear value is branched on freely. Only LINEAR values are
+// restricted to a single path, because a move is a one-shot event and the
+// checker does not currently join two branches' move sets.
+//
+// NOTE: a linear value consumed in BOTH arms of an `if` is NOT accepted -- the
+// checker reports "use of moved value", since the first arm's move is treated as
+// unconditional. That is a real limitation of the current checker, not a valid
+// program, so it is not claimed as valid here. See
+// tests/corpus_tests.rs::linear_valid_file_typechecks for what IS asserted.
+fn branch_on_a_plain_bool(cond: bool, x: i32) -> i32 {
     if cond {
-        linear_free(x)
+        x + 1
     } else {
-        linear_free(x)
+        x + 2
     }
 }

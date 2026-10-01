@@ -540,22 +540,39 @@ fn let_as_an_expression_does_not_parse() {
 // Each of these is a real soundness or capability gap. They are asserted HERE,
 // as tests that currently PASS, so the behaviour cannot change silently. When one
 // is fixed, the test fails and gets inverted -- which is the point of naming it.
-// ---------------------------------------------------------------------------
-
-/// GAP: a measured qubit is not required to be reset.
+// ---------------------------------------------------------------------------/// There is NO `reset` in the language, so a measured qubit can only be discharged
+/// by returning it.
 ///
-/// Measurement collapses a qubit to a classical value, which arguably still
-/// needs a reset to return the qubit to |0>. The checker has no notion of
-/// uncomputation as such, only of linearity, so it does not object.
+/// CAPABILITY GAP, pinned so it cannot change silently.
+///
+/// `reset` exists in three places but not the fourth, which makes it look available:
+///   * the verifier has `GateKind::Reset => int(0)` (the transition that CLEANS a
+///     qubit), and `folded_state` handles it;
+///   * the runtime exporters emit a reset instruction (`exporter/braket.rs`,
+///     `exporter/openqasm.rs`);
+///   * but the compiler's `ast::GateKind` has no `Reset` variant, the parser has no
+///     `reset` production, and the prelude has no `reset` builtin -- so
+///     `reset(q)` fails to parse or typecheck ("variable `reset` not available").
+///
+/// So a user who measures a temporary qubit has no way to return it to |0> within
+/// the language. They must return it to the caller instead. That is a real
+/// usability limitation, and it is also why the prover's `Reset` transition is
+/// currently unreachable: nothing can produce one.
+///
+/// This is a missing FEATURE, not a soundness hole. The prover is on the safe side
+/// of it -- an unresettable measured qubit is FLAGGED, not waved through. The
+/// soundness half was fixed separately (see
+/// `naso_verify::prover::uncomputation::tests::test_measurement_is_not_evidence_of_zero`).
 #[test]
-fn measured_qubit_is_not_required_to_be_reset() {
-    let src = "fn f() { let [1] q: Qubit = qalloc(1); let m = measure(q); let _ = m; }\n";
-    let errs = diagnostics(src);
+fn reset_is_not_a_language_construct() {
+    // It does not typecheck: `reset` is not in the prelude.
+    let errs = diagnostics("fn f() { let [1] q: Qubit = qalloc(1); reset(q); }\n");
     assert!(
-        errs.is_empty(),
-        "KNOWN GAP: expected this to be accepted today. If it is now rejected, \
-         a measured-but-unreset case belongs in uncomputation/invalid.naso. \
-         Got: {errs:?}"
+        !errs.is_empty(),
+        "`reset` is expected NOT to be available today. If it now typechecks, a \
+         Reset variant reached the compiler's GateKind, and the verifier's \
+         `GateKind::Reset` transition became live -- which should then be tested \
+         by proving that a measured qubit followed by reset is CLEAN."
     );
 }
 

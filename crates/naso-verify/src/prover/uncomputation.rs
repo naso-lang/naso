@@ -3,6 +3,24 @@
 //! This prover verifies that all temporary qubits allocated via `qalloc`
 //! are returned to the |0> state before scope exit. It encodes the
 //! quantum circuit as symbolic unitary matrices and proves U_temp |0> = |0>.
+//!
+//! Two rules keep it on the safe side of an unmodelled operation:
+//!
+//! * An operation the prover does not understand folds a qubit's state to `2`
+//!   ("not provably |0>"), so an unknown gate makes it LESS permissive, never
+//!   more. `folded_state` is deliberately an over-approximation.
+//! * Every state-changing operation must go through `apply_gate`. A hand-written
+//!   shortcut that forgets to advance a qubit leaves it looking clean -- that is
+//!   exactly the bug this module once had, where `Measure` looked its qubit up and
+//!   did nothing under a comment claiming it collapsed the state. A measured qubit
+//!   was therefore reported uncomputed. See
+//!   `tests::test_measurement_is_not_evidence_of_zero`.
+//!
+//! KNOWN GAP: `reset` is not a language construct. `GateKind::Reset => int(0)`
+//! exists here and the runtime exporters emit a reset instruction, but the
+//! compiler's `GateKind` has no `Reset` variant and the parser cannot produce one,
+//! so a measured temporary cannot be cleaned in-language -- it must be returned.
+//! The consequence is that `GateKind::Reset` is currently unreachable from source.
 
 #[cfg(feature = "z3")]
 use crate::config::SolverConfig;
@@ -343,6 +361,116 @@ mod tests {
         let program = parse_program("fn f() { let q = qalloc(1); Z(q); }").expect("parse failed");
         let diags = prove_uncomputation(&program).expect("prover failed");
         assert!(diags.is_empty(), "Z must preserve |0>: {diags:?}");
+    }
+
+    /// A MEASURED qubit is not evidence that the qubit is |0>.
+    ///
+    /// REGRESSION GUARD. `QuantumOp::Measure` looked its qubit up and then did
+    /// nothing -- the comment "Measurement collapses state to basis" sat over an
+    /// EMPTY BLOCK, with no statement under it. The symbolic state was only ever
+    /// advanced by `apply_gate`, which measurement never called, so a measured
+    /// qubit kept whatever state it already had.
+    ///
+    /// The consequence was that a qubit measured while still |0> was reported
+    /// CLEAN:
+    ///
+    ///     fn f() { let q = qalloc(1); let m = measure(q); let _ = m; }
+    ///     -> 0 diagnostics
+    ///
+    /// which is unsound: measurement collapses to |0> OR |1>, so it is never proof
+    /// of |0>. The transition already existed (`GateKind::Measure => int(2)` in
+    /// `folded_state`, with a comment explaining the choice); nothing called it.
+    ///
+    /// This matters beyond tidiness. A measured qubit left in |0> is exactly the
+    /// shape a "measure, assume clean" shortcut would produce, and the prover is
+    /// the component whose job is to refuse that.
+    #[test]
+    fn test_measurement_is_not_evidence_of_zero() {
+        let src = r#"
+        fn f() {
+            let q = qalloc(1);
+            let m = measure(q);
+            let _ = m;
+        }
+        "#;
+        let program = parse_program(src).expect("parse failed");
+        let diags = prove_uncomputation(&program).expect("prover failed");
+        assert!(
+            !diags.is_empty(),
+            "a measured qubit is in |0> or |1>, never provably |0>: {diags:?}"
+        );
+        assert_eq!(diags[0].code, "NASO-UNC-001");
+    }
+
+    /// Measuring AFTER a gate that takes the qubit out of |0> must also be flagged.
+    ///
+    /// The same defect, reached the other way: the state was never advanced, so
+    /// this circuit kept its post-H state by accident rather than by reasoning.
+    #[test]
+    fn test_measure_after_entangling_gate_is_flagged() {
+        let src = r#"
+        fn f() {
+            let q = qalloc(1);
+            hadamard(q);
+            let m = measure(q);
+            let _ = m;
+        }
+        "#;
+        let program = parse_program(src).expect("parse failed");
+        let diags = prove_uncomputation(&program).expect("prover failed");
+        assert!(
+            !diags.is_empty(),
+            "H then measure leaves the qubit collapsed, not |0>: {diags:?}"
+        );
+    }
+
+    /// The self-inverse uncompute must still be ACCEPTED.
+    ///
+    /// The guard above is only meaningful if the prover is not simply rejecting
+    /// every circuit containing a measurement. This is the case that must stay
+    /// clean: measuring a qubit that had already been returned to |0> by H;H is
+    /// still ending in |0> only if the measurement is ignored -- and it is NOT,
+    /// so this case is expected to be FLAGGED too. It is asserted separately to
+    /// pin which way the sound answer goes, rather than blending it into the
+    /// positive test above.
+    #[test]
+    fn test_measurement_after_uncomputation_is_still_flagged() {
+        let src = r#"
+        fn f() {
+            let q = qalloc(1);
+            hadamard(q);
+            hadamard(q);
+            let m = measure(q);
+            let _ = m;
+        }
+        "#;
+        let program = parse_program(src).expect("parse failed");
+        let diags = prove_uncomputation(&program).expect("prover failed");
+        assert!(
+            !diags.is_empty(),
+            "a measurement collapses to |0> OR |1>, so it is not proof of |0> even \
+             after the qubit was uncomputed: {diags:?}"
+        );
+    }
+
+    /// The prover must not be fixed by rejecting every circuit with a measurement.
+    ///
+    /// A returned Bell pair is still clean, and stays clean: returning a qubit is
+    /// not the same as discarding it, so measurement must not blanket-fail.
+    #[test]
+    fn test_returned_qubits_are_still_clean_with_a_measurement_present() {
+        let src = r#"
+        fn bell_pair() -> [1] Qubit {
+            let q0 = qalloc(1);
+            let q1 = qalloc(1);
+            hadamard(q0);
+            cnot(q0, q1);
+            (q0, q1)
+        }
+        "#;
+        let program = parse_program(src).expect("parse failed");
+        let diags = prove_uncomputation(&program).expect("prover failed");
+        assert!(diags.is_empty(), "returned qubits must escape: {diags:?}");
     }
 
     #[test]

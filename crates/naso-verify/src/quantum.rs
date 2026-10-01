@@ -373,11 +373,32 @@ pub fn encode_quantum_expr(
                     tracker.allocate_qubit(true, expr.span);
                 }
                 naso_compiler::ast::expr::QuantumOp::Measure(target) => {
-                    #[allow(clippy::collapsible_if)]
+                    // Measurement must go through `apply_gate` like every other
+                    // gate, so the qubit's symbolic state is folded to `2`
+                    // ("not provably |0>") by `GateKind::Measure`'s transition.
+                    //
+                    // It did NOT. The arm looked the qubit up and then did nothing
+                    // -- the comment "Measurement collapses state to basis" was an
+                    // EMPTY BLOCK, with no statement under it -- and the state was
+                    // only ever advanced by the `encode_quantum_expr(target, ...)`
+                    // that read the variable. So a measured qubit kept whatever
+                    // state it had, and a qubit measured while still |0> was
+                    // reported CLEAN:
+                    //
+                    //     fn f() { let q = qalloc(1); let m = measure(q); }
+                    //     -> 0 diagnostics (claimed uncomputed)
+                    //
+                    // which is unsound twice over. A measurement collapses to |0> or
+                    // |1>, so it is never itself proof of |0>, and `folded_state`
+                    // already encodes exactly that with `Measure => int(2)`. The
+                    // transition existed; nothing called it.
                     if let ExprKind::Var(qname) = &target.kind {
-                        if let Some(_qubit) = tracker.get_qubit(&qname.name) {
-                            // Measurement collapses state to basis
-                        }
+                        tracker.apply_gate(
+                            GateKind::Measure,
+                            std::slice::from_ref(&qname.name),
+                            &[],
+                            expr.span,
+                        );
                     }
                     constraints.extend(encode_quantum_expr(target, tracker)?);
                 }

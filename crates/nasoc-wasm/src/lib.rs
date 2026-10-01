@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
 use naso_compiler::ast::Span;
+use naso_compiler::codegen::wgsl_compute::{describe_compute_abi, generate_wgsl_compute};
 use naso_compiler::lexer::Lexer;
 use naso_compiler::lowering::{LoweringError, lower_program};
 use naso_compiler::parser::parse_program;
@@ -299,6 +300,255 @@ pub fn parse_naso(source: &str) -> ParseResult {
             ast_json: None,
             error: Some(e),
         },
+    }
+}
+
+/// A storage binding in a generated compute kernel's host ABI.
+///
+/// Not a `#[wasm_bindgen]` struct: it has `String` fields, and the generated
+/// getters would require `Copy`. It is reached from JS through
+/// `WgslResult::binding(index)`, which returns a JSON string instead -- one
+/// allocation, and no getter that can drift from the field list.
+pub struct WasmBinding {
+    /// Naso parameter name, sanitized for WGSL.
+    pub name: String,
+    /// Element type as WGSL, e.g. `f32`.
+    pub elem: String,
+    /// `read` or `read_write`.
+    pub access: String,
+    /// Binding index, in source order.
+    pub index: u32,
+    /// Bytes one storage buffer for this binding needs.
+    pub bytes: u32,
+}
+
+impl WasmBinding {
+    /// JSON form, for the JS side.
+    pub fn to_json(&self) -> String {
+        serde_json::json!({
+            "name": self.name,
+            "elem": self.elem,
+            "access": self.access,
+            "index": self.index,
+            "bytes": self.bytes,
+        })
+        .to_string()
+    }
+}
+
+/// Compile one function to a WGSL compute shader, and describe its host ABI.
+///
+/// This is the browser's path from Naso source to a GPU kernel. Until now the
+/// WASM bridge stopped at PIR, so a page could parse and typecheck Naso but had no
+/// way to obtain a shader -- which is why the shipped NasoChat client carried
+/// hand-written WGSL that could drift from the language without anything noticing.
+///
+/// The shader and the ABI come from ONE analysis (`wgsl_compute::analyze`), so the
+/// host cannot be told to allocate buffers that disagree with the shader it will
+/// run. It gets `binding(n)` element types, access modes, buffer sizes, entry-point
+/// scalar argument types, workgroup size, and the dispatch count -- everything
+/// `createBindGroup` / `dispatchWorkgroups` need, without parsing shader text.
+///
+/// Returns the same diagnostics as `compile_naso_wasm` for a program that does not
+/// typecheck, so the UI has one error path rather than two.
+#[wasm_bindgen]
+pub fn compile_naso_wgsl(source: &str, kernel: &str) -> WgslResult {
+    let mut program = match parse_program(source) {
+        Ok(p) => p,
+        Err(e) => {
+            return WgslResult::failed(vec![Diagnostic {
+                severity: "error".to_string(),
+                message: format!("Parse error: {e}"),
+                line: 1,
+                column: 1,
+                end_line: 1,
+                end_column: 10,
+                code: Some("PARSE_ERROR".to_string()),
+            }]);
+        }
+    };
+
+    let check_result = check_program(&mut program);
+    let mut diagnostics = typecheck_errors_to_diagnostics(&check_result.errors);
+    if !check_result.errors.is_empty() {
+        // Codegen runs on typechecked input only. Handing a shader to a host for a
+        // program that does not compile is how a front end starts lying.
+        return WgslResult::failed(diagnostics);
+    }
+
+    let program = check_result.program;
+    let abi = match describe_compute_abi(&program, kernel) {
+        Ok(a) => a,
+        Err(e) => {
+            diagnostics.push(Diagnostic {
+                severity: "error".to_string(),
+                message: e.to_string(),
+                line: 1,
+                column: 1,
+                end_line: 1,
+                end_column: 1,
+                code: Some("WGSL_CODGEN_ERROR".to_string()),
+            });
+            return WgslResult::failed(diagnostics);
+        }
+    };
+
+    let wgsl = match generate_wgsl_compute(&program, kernel) {
+        Ok(w) => w,
+        Err(e) => {
+            // Unreachable in practice: `describe_compute_abi` refuses exactly what
+            // `generate_wgsl_compute` refuses. Kept so that a future divergence
+            // surfaces as a diagnostic rather than as a host handed a layout for a
+            // shader that was never emitted.
+            diagnostics.push(Diagnostic {
+                severity: "error".to_string(),
+                message: e.to_string(),
+                line: 1,
+                column: 1,
+                end_line: 1,
+                end_column: 1,
+                code: Some("WGSL_CODGEN_ERROR".to_string()),
+            });
+            return WgslResult::failed(diagnostics);
+        }
+    };
+
+    WgslResult {
+        success: true,
+        entry_point: abi.entry_point.clone(),
+        workgroup_size: abi.workgroup_size,
+        dispatch_groups: abi.elements().div_ceil(abi.workgroup_size as usize) as u32,
+        bindings: abi
+            .bindings
+            .iter()
+            .map(|b| WasmBinding {
+                name: b.name.clone(),
+                elem: b.elem.clone(),
+                access: b.access.to_string(),
+                index: b.index,
+                bytes: abi.buffer_bytes(b.index).unwrap_or(0) as u32,
+            })
+            .map(|b| b.to_json())
+            .collect(),
+        scalars: abi
+            .scalars
+            .iter()
+            .map(|(n, t)| format!("{n}: {t}"))
+            .collect(),
+        wgsl: Some(wgsl),
+        diagnostics,
+    }
+}
+
+/// Result of [`compile_naso_wgsl`].
+///
+/// Private fields with explicit getters, matching `ParseResult`. wasm-bindgen's
+/// derived getters require `Copy`, which `String` is not, so the getters are
+/// written out rather than derived.
+#[wasm_bindgen]
+pub struct WgslResult {
+    success: bool,
+    wgsl: Option<String>,
+    entry_point: String,
+    workgroup_size: u32,
+    dispatch_groups: u32,
+    bindings: Vec<String>,
+    scalars: Vec<String>,
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl WgslResult {
+    /// A failed result: no shader, no ABI, and the reason why.
+    ///
+    /// A single constructor so no failure path can accidentally return a populated
+    /// ABI alongside a `success: false`. A host that trusts the ABI without
+    /// checking `success` would otherwise allocate buffers for a shader that was
+    /// never emitted.
+    fn failed(diagnostics: Vec<Diagnostic>) -> Self {
+        WgslResult {
+            success: false,
+            wgsl: None,
+            entry_point: String::new(),
+            workgroup_size: 0,
+            dispatch_groups: 0,
+            bindings: Vec::new(),
+            scalars: Vec::new(),
+            diagnostics,
+        }
+    }
+}
+
+#[wasm_bindgen]
+impl WgslResult {
+    /// Whether a shader was produced.
+    #[wasm_bindgen(getter)]
+    pub fn success(&self) -> bool {
+        self.success
+    }
+
+    /// The shader source, or `None` on failure.
+    #[wasm_bindgen(getter)]
+    pub fn wgsl(&self) -> Option<String> {
+        self.wgsl.clone()
+    }
+
+    /// Name of the `@compute` entry point to create the pipeline with.
+    #[wasm_bindgen(getter)]
+    pub fn entry_point(&self) -> String {
+        self.entry_point.clone()
+    }
+
+    /// x-dimension of `@workgroup_size`.
+    #[wasm_bindgen(getter)]
+    pub fn workgroup_size(&self) -> u32 {
+        self.workgroup_size
+    }
+
+    /// `dispatchWorkgroups` count for a full run: ceil(elements / workgroup_size).
+    #[wasm_bindgen(getter)]
+    pub fn dispatch_groups(&self) -> u32 {
+        self.dispatch_groups
+    }
+
+    /// Storage bindings in binding-index order, each a JSON object:
+    /// `{"name","elem","access","index","bytes"}`.
+    ///
+    /// JSON strings rather than exported struct instances: wasm-bindgen cannot put a
+    /// struct with `String` fields into a `Vec`, and a hand-maintained getter list
+    /// is exactly the kind of thing that drifts from the field list.
+    #[wasm_bindgen(getter)]
+    pub fn bindings(&self) -> Vec<String> {
+        self.bindings.clone()
+    }
+
+    /// Entry-point scalar arguments as `name: type`, in parameter order.
+    #[wasm_bindgen(getter)]
+    pub fn scalars(&self) -> Vec<String> {
+        self.scalars.clone()
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn diagnostics(&self) -> Vec<Diagnostic> {
+        self.diagnostics.clone()
+    }
+
+    /// The whole result as one JSON object.
+    ///
+    /// One call for the common case, and the shape is produced by `serde` from the
+    /// same fields the getters read -- so it cannot describe a different result.
+    #[wasm_bindgen(js_name = toJson)]
+    pub fn to_json(&self) -> String {
+        serde_json::json!({
+            "success": self.success,
+            "wgsl": self.wgsl,
+            "entryPoint": self.entry_point,
+            "workgroupSize": self.workgroup_size,
+            "dispatchGroups": self.dispatch_groups,
+            "bindings": self.bindings,
+            "scalars": self.scalars,
+            "diagnostics": self.diagnostics,
+        })
+        .to_string()
     }
 }
 

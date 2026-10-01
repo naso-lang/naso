@@ -123,6 +123,8 @@ fn run_wgsl_build_command(args: &[String]) {
     let mut output_path: Option<PathBuf> = None;
     // --kernel <name> selects the function to emit as a compute entry point.
     let mut kernel: Option<String> = None;
+    // --emit-abi prints the host layout of the generated shader to stderr.
+    let mut emit_abi = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -140,6 +142,7 @@ fn run_wgsl_build_command(args: &[String]) {
                     kernel = Some(args[i].clone());
                 }
             }
+            "--emit-abi" => emit_abi = true,
             arg if arg.starts_with('-') => {}
             path => {
                 if input_file.is_none() {
@@ -230,6 +233,44 @@ fn run_wgsl_build_command(args: &[String]) {
             }
         },
     };
+
+    // The host ABI is described by the SAME analysis that emitted the shader,
+    // so the two cannot disagree. A WebGPU client needs it to allocate buffers:
+    // it must not have to recover the layout by parsing shader text.
+    if emit_abi {
+        let Some(name) = kernel.as_deref() else {
+            eprintln!("--emit-abi needs --kernel <name>: a scalar function has no bindings");
+            std::process::exit(1);
+        };
+        match naso_compiler::codegen::wgsl_compute::describe_compute_abi(&program, name) {
+            Ok(abi) => {
+                eprintln!("@group(0) entry point `{}`", abi.entry_point);
+                for b in &abi.bindings {
+                    eprintln!(
+                        "  binding({}) {} : array<{}> {} ({} bytes)",
+                        b.index,
+                        b.name,
+                        b.elem,
+                        b.access,
+                        abi.buffer_bytes(b.index).unwrap_or(0)
+                    );
+                }
+                for (n, t) in &abi.scalars {
+                    eprintln!("  argument {n} : {t}");
+                }
+                eprintln!(
+                    "  workgroup_size {} x, dispatch {} workgroups for {} elements",
+                    abi.workgroup_size,
+                    abi.elements().div_ceil(abi.workgroup_size as usize),
+                    abi.elements()
+                );
+            }
+            Err(e) => {
+                eprintln!("WGSL ABI error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     match output_path {
         Some(path) => {

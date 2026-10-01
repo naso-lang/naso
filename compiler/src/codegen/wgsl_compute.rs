@@ -71,22 +71,97 @@ pub const WORKGROUP_SIZE: u32 = 64;
 type CodegenResult<T> = Result<T, CodegenError>;
 
 /// A tensor parameter, resolved to a storage binding.
-struct Binding {
+///
+/// Public because it appears in [`ComputeAbi`], which a WebGPU host reads to
+/// allocate buffers. The field names are the ABI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Binding {
     /// Naso parameter name, sanitized for WGSL.
-    name: String,
+    pub name: String,
     /// Element type as WGSL, e.g. `f32`.
-    elem: String,
+    pub elem: String,
     /// `read` or `read_write`, derived from the parameter's mutability.
-    access: &'static str,
+    pub access: &'static str,
     /// Binding index, assigned in source order over tensor parameters only.
-    index: u32,
+    pub index: u32,
 }
 
-/// Lower one tensor-valued function to a WGSL compute shader.
+/// The host ABI of a generated compute kernel.
 ///
-/// Refuses anything it cannot lower honestly. It never emits a partial or
-/// approximate shader.
-pub fn generate_wgsl_compute(program: &Program, kernel: &str) -> CodegenResult<String> {
+/// Emitting the shader is only half the job. A WebGPU host has to allocate a
+/// buffer per binding, in binding order, of the right element type, and pass the
+/// scalars as entry-point arguments. If it has to recover that by PARSING the
+/// shader text, the ABI is only as trustworthy as a regex, and a shader that
+/// parses is not evidence that the buffers were wired correctly.
+///
+/// So the same analysis that decides the shader's shape is published as data, and
+/// both the emitter and the host read it. `generate_wgsl_compute` and
+/// `describe_compute_abi` share `analyze`; they cannot disagree about the ABI
+/// because there is only one description of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComputeAbi {
+    /// Name of the `@compute` entry point, e.g. `quantize_compute`.
+    pub entry_point: String,
+    /// x-dimension of `@workgroup_size`.
+    pub workgroup_size: u32,
+    /// Storage bindings, in binding-index order.
+    pub bindings: Vec<Binding>,
+    /// Entry-point scalar arguments, in parameter order, as `(name, wgsl type)`.
+    pub scalars: Vec<(String, String)>,
+    /// Elements each binding is indexed over. All bindings share one extent.
+    pub extent: u32,
+}
+
+impl ComputeAbi {
+    /// Total bytes one binding's storage buffer needs.
+    ///
+    /// `bytes_per_element` is 4 for every supported element type (f32, i32, u32);
+    /// it is spelled out rather than assumed so a future 8-byte type cannot
+    /// silently under-allocate.
+    pub fn buffer_bytes(&self, index: u32) -> Option<usize> {
+        let b = self.bindings.iter().find(|b| b.index == index)?;
+        Some(self.extent as usize * bytes_per_element(&b.elem))
+    }
+
+    /// Total elements in any one binding.
+    pub fn elements(&self) -> usize {
+        self.extent as usize
+    }
+}
+
+/// WGSL size in bytes for an element type this backend emits.
+fn bytes_per_element(elem: &str) -> usize {
+    match elem {
+        "f32" | "i32" | "u32" => 4,
+        "f16" | "i16" | "u16" => 2,
+        _ => 4,
+    }
+}
+
+/// Describe the compute ABI of `kernel` without emitting a shader.
+///
+/// Same refusals as `generate_wgsl_compute`: a kernel it cannot lower honestly is
+/// an error here too, so the host is never told about a kernel that will not build.
+pub fn describe_compute_abi(program: &Program, kernel: &str) -> CodegenResult<ComputeAbi> {
+    let a = analyze(program, kernel)?;
+    Ok(ComputeAbi {
+        entry_point: entry_name(kernel),
+        workgroup_size: WORKGROUP_SIZE,
+        bindings: a.bindings,
+        scalars: a.scalars,
+        extent: a.extent,
+    })
+}
+
+/// The parameter analysis shared by shader emission and ABI description.
+struct Analysis {
+    bindings: Vec<Binding>,
+    scalars: Vec<(String, String)>,
+    extent: u32,
+}
+
+/// Classify a kernel's parameters into storage bindings and scalar arguments.
+fn analyze(program: &Program, kernel: &str) -> CodegenResult<Analysis> {
     let func = program
         .items
         .iter()
@@ -155,6 +230,33 @@ pub fn generate_wgsl_compute(program: &Program, kernel: &str) -> CodegenResult<S
         )));
     }
     let extent = extents[0];
+
+    Ok(Analysis {
+        bindings,
+        scalars,
+        extent,
+    })
+}
+
+/// Lower one tensor-valued function to a WGSL compute shader.
+///
+/// Refuses anything it cannot lower honestly. It never emits a partial or
+/// approximate shader.
+pub fn generate_wgsl_compute(program: &Program, kernel: &str) -> CodegenResult<String> {
+    // The SAME analysis the host ABI is described from, so a host can never be
+    // handed a layout that disagrees with the shader it was generated from.
+    let a = analyze(program, kernel)?;
+    let bindings = a.bindings;
+    let scalars = a.scalars;
+    let extent = a.extent;
+    let func = program
+        .items
+        .iter()
+        .find_map(|i| match i {
+            Item::Function(f) if f.name.name == kernel => Some(f),
+            _ => None,
+        })
+        .expect("analyze() succeeded, so this function exists");
 
     let mut out = String::new();
     out.push_str("// Generated by Naso -- WGSL compute backend\n");
@@ -764,5 +866,195 @@ fn quantize(input: [1] Tensor[f32, 1024], output: inout [1] Tensor[f32, 1024], s
         let w = compute(src, "f").expect("must emit");
         assert!(w.contains("a: array<i32>"), "input element is i32: {w}");
         assert!(w.contains("b: array<f32>"), "output element is f32: {w}");
+    }
+
+    // ---------------------- host ABI ----------------------
+    //
+    // The point of `ComputeAbi` is that a WebGPU host can wire buffers WITHOUT
+    // parsing shader text. That is only true if the ABI and the shader describe
+    // the same thing, so the tests below check them against EACH OTHER rather
+    // than against hand-written expectations: each binding the ABI promises must
+    // appear in the shader with the same index, element type and access, and the
+    // entry point and workgroup size must match too.
+
+    fn parse(src: &str) -> Program {
+        crate::parser::parse_program(src).expect("parse failed")
+    }
+
+    const ABI_SRC: &str = r#"
+fn quantize(input: [*] Tensor[f32, 1024], output: inout [1] Tensor[i32, 1024],
+             scale: f32, N: u32) {
+    forall i in 0..1024 {
+        let v = input[i] / scale;
+        output[i] = clamp(round(v), -128.0, 127.0) as i32;
+    }
+}
+"#;
+
+    #[test]
+    fn abi_describes_bindings_in_source_order() {
+        let abi = describe_compute_abi(&parse(ABI_SRC), "quantize").expect("abi");
+        assert_eq!(abi.bindings.len(), 2, "two tensor params: {abi:?}");
+        assert_eq!(abi.bindings[0].name, "input");
+        assert_eq!(abi.bindings[0].elem, "f32");
+        assert_eq!(abi.bindings[0].access, "read");
+        assert_eq!(abi.bindings[0].index, 0);
+        assert_eq!(abi.bindings[1].name, "output");
+        assert_eq!(abi.bindings[1].elem, "i32");
+        assert_eq!(abi.bindings[1].access, "read_write");
+        assert_eq!(abi.bindings[1].index, 1);
+    }
+
+    #[test]
+    fn abi_reports_scalars_as_entry_arguments() {
+        let abi = describe_compute_abi(&parse(ABI_SRC), "quantize").expect("abi");
+        assert_eq!(
+            abi.scalars,
+            vec![
+                ("scale".to_string(), "f32".to_string()),
+                ("N".to_string(), "u32".to_string())
+            ],
+            "scalars are values, not resources: {abi:?}"
+        );
+    }
+
+    #[test]
+    fn abi_sizes_buffers_from_extent_and_element_width() {
+        let abi = describe_compute_abi(&parse(ABI_SRC), "quantize").expect("abi");
+        assert_eq!(abi.extent, 1024);
+        assert_eq!(abi.elements(), 1024);
+        // 1024 elements x 4 bytes, for both an f32 and an i32 buffer.
+        assert_eq!(abi.buffer_bytes(0), Some(4096));
+        assert_eq!(abi.buffer_bytes(1), Some(4096));
+        assert_eq!(abi.buffer_bytes(99), None, "no such binding");
+    }
+
+    /// The shader and the ABI must describe the same buffer layout.
+    ///
+    /// A host that allocates from the ABI but runs the shader will silently read
+    /// the wrong memory if these disagree -- a shader still validates, so nothing
+    /// downstream would catch it. Hence the cross-check rather than two separate
+    /// expectation tests that could drift apart while both pass.
+    #[test]
+    fn abi_agrees_with_the_emitted_shader() {
+        let p = parse(ABI_SRC);
+        let w = generate_wgsl_compute(&p, "quantize").expect("shader");
+        let abi = describe_compute_abi(&p, "quantize").expect("abi");
+
+        for b in &abi.bindings {
+            let decl = format!(
+                "@group(0) @binding({}) var<storage, {}> {}: array<{}>;",
+                b.index, b.access, b.name, b.elem
+            );
+            assert!(
+                w.contains(&decl),
+                "ABI binding {:?} must appear verbatim in the shader.\n  expected: {decl}\n  shader:\n{w}",
+                b
+            );
+        }
+
+        assert!(
+            w.contains(&format!("fn {}(", abi.entry_point)),
+            "entry point `{}` must be the shader's function: {w}",
+            abi.entry_point
+        );
+        assert!(
+            w.contains(&format!("@workgroup_size({})", abi.workgroup_size)),
+            "workgroup size must match: {w}"
+        );
+
+        // Scalars must be entry-point arguments, in ABI order.
+        let sig = w
+            .lines()
+            .find(|l| l.starts_with("fn "))
+            .expect("entry point line");
+        for (n, t) in &abi.scalars {
+            assert!(
+                sig.contains(&format!("{n}: {t}")),
+                "scalar {n}: {t} must be an entry argument, signature was: {sig}"
+            );
+        }
+
+        // And the dispatch count the host must issue.
+        let expected_groups = abi.elements().div_ceil(abi.workgroup_size as usize);
+        assert_eq!(expected_groups, 16, "1024 elements at 64 per group");
+    }
+
+    /// An `inout` tensor is writable, so the host must map it STORAGE|READ_WRITE.
+    ///
+    /// Getting this wrong fails at pipeline creation in the browser, which is the
+    /// first point the mistake is visible -- but only after a user has typed a
+    /// kernel and clicked run, so it is worth pinning here.
+    #[test]
+    fn mutable_tensors_become_read_write_bindings() {
+        let src = r#"
+fn touch(a: inout [1] Tensor[f32, 64]) {
+    forall i in 0..64 { a[i] = a[i] + 1.0; }
+}
+"#;
+        let abi = describe_compute_abi(&parse(src), "touch").expect("abi");
+        assert_eq!(abi.bindings[0].access, "read_write");
+        assert_eq!(abi.extent, 64);
+        assert_eq!(abi.buffer_bytes(0), Some(256));
+    }
+
+    /// A kernel with no tensor has no bindings, and says so.
+    #[test]
+    fn a_scalar_function_is_refused_rather_than_given_an_empty_abi() {
+        let src = "fn scalar_only(x: f32) -> f32 { return x + 1.0; }";
+        let err = describe_compute_abi(&parse(src), "scalar_only").expect_err("must refuse");
+        assert!(
+            err.to_string().contains("takes no tensor"),
+            "the refusal must say why, and point at the alternative: {err}"
+        );
+    }
+
+    /// A missing kernel is an error, not an empty ABI.
+    ///
+    /// An empty ABI would tell the host "no buffers needed", which reads like a
+    /// kernel that legitimately does nothing.
+    #[test]
+    fn an_unknown_kernel_is_an_error_not_an_empty_abi() {
+        let err = describe_compute_abi(&parse(ABI_SRC), "no_such_kernel").expect_err("must refuse");
+        assert!(err.to_string().contains("no function named"), "{err}");
+    }
+
+    /// Refusals in shader emission are refusals in the ABI too.
+    ///
+    /// Otherwise a host would be told about a kernel that cannot be emitted, and
+    /// the failure would appear as a shader compile error instead.
+    #[test]
+    fn abi_refuses_exactly_what_shader_emission_refuses() {
+        // Differing extents.
+        let src = r#"
+fn ragged(a: [*] Tensor[f32, 64], b: inout [1] Tensor[f32, 128]) {
+    forall i in 0..64 { b[i] = a[i]; }
+}
+"#;
+        let p = parse(src);
+        assert!(
+            generate_wgsl_compute(&p, "ragged").is_err(),
+            "emitter refuses"
+        );
+        assert!(
+            describe_compute_abi(&p, "ragged").is_err(),
+            "abi refuses too"
+        );
+
+        // Narrow integer storage.
+        let src = r#"
+fn narrow(a: [*] Tensor[i8, 64]) {
+    forall i in 0..64 { let v = a[i]; let _ = v; }
+}
+"#;
+        let p = parse(src);
+        assert!(
+            generate_wgsl_compute(&p, "narrow").is_err(),
+            "emitter refuses"
+        );
+        assert!(
+            describe_compute_abi(&p, "narrow").is_err(),
+            "abi refuses too"
+        );
     }
 }

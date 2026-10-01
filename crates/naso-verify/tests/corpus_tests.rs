@@ -533,46 +533,137 @@ fn let_as_an_expression_does_not_parse() {
          needs its own test."
     );
 }
-
-// ---------------------------------------------------------------------------
-// Pinned known gaps.
-//
-// Each of these is a real soundness or capability gap. They are asserted HERE,
-// as tests that currently PASS, so the behaviour cannot change silently. When one
-// is fixed, the test fails and gets inverted -- which is the point of naming it.
-// ---------------------------------------------------------------------------/// There is NO `reset` in the language, so a measured qubit can only be discharged
-/// by returning it.
+/// `reset` returns a qubit to |0> in place, and is NOT consuming.
 ///
-/// CAPABILITY GAP, pinned so it cannot change silently.
+/// `reset` was missing from the front end entirely -- no lexer token, no parser
+/// production, no AST variant -- while the verifier modelled it
+/// (`GateKind::Reset => int(0)`) and the runtime exporters emitted a reset
+/// instruction. Present in N-1 of N places, it read as a language feature and was
+/// not one.
 ///
-/// `reset` exists in three places but not the fourth, which makes it look available:
-///   * the verifier has `GateKind::Reset => int(0)` (the transition that CLEANS a
-///     qubit), and `folded_state` handles it;
-///   * the runtime exporters emit a reset instruction (`exporter/braket.rs`,
-///     `exporter/openqasm.rs`);
-///   * but the compiler's `ast::GateKind` has no `Reset` variant, the parser has no
-///     `reset` production, and the prelude has no `reset` builtin -- so
-///     `reset(q)` fails to parse or typecheck ("variable `reset` not available").
+/// NOTE on what reset is and is not for: it cleans a qubit that a GATE left dirty.
+/// It is NOT how a MEASURED qubit is discharged, because `measure` CONSUMES its
+/// qubit binding -- the value is moved, so there is nothing left to reset, and
+/// `reset(q)` after it is a use-after-move. Pinned by
+/// `measure_consumes_its_qubit_so_reset_cannot_follow`.
 ///
-/// So a user who measures a temporary qubit has no way to return it to |0> within
-/// the language. They must return it to the caller instead. That is a real
-/// usability limitation, and it is also why the prover's `Reset` transition is
-/// currently unreachable: nothing can produce one.
-///
-/// This is a missing FEATURE, not a soundness hole. The prover is on the safe side
-/// of it -- an unresettable measured qubit is FLAGGED, not waved through. The
-/// soundness half was fixed separately (see
-/// `naso_verify::prover::uncomputation::tests::test_measurement_is_not_evidence_of_zero`).
+/// These assert the semantics rather than the spelling, because the two easy
+/// mistakes are making `reset` consuming (which would be a use-after-move on the
+/// next gate) and making it sticky (which would wrongly discharge a later gate).
 #[test]
-fn reset_is_not_a_language_construct() {
-    // It does not typecheck: `reset` is not in the prelude.
-    let errs = diagnostics("fn f() { let [1] q: Qubit = qalloc(1); reset(q); }\n");
+fn reset_returns_a_qubit_and_leaves_it_usable() {
+    // reset, then a gate: the qubit is still bound, so this must typecheck.
+    let errs =
+        diagnostics("fn f() { let [1] q: Qubit = qalloc(1); reset(q); hadamard(q); qfree(q); }\n");
+    assert!(
+        errs.is_empty(),
+        "`reset` must leave the qubit usable -- it is not consuming, got: {errs:?}"
+    );
+}
+
+/// `reset` takes exactly one qubit.
+///
+/// Gate arity was never checked (`ApplyGate(_gate, args)` ignored the gate), so
+/// `hadamard(a, b)` and `cnot(a, b, c)` were accepted. Each argument was still
+/// type-checked as a Qubit, so only the COUNT went unverified -- and a
+/// two-qubit `hadamard` lowers to a PIR op with two qubits and runs as something
+/// the author did not write.
+#[test]
+fn gates_check_their_argument_count() {
+    for (label, src) in [
+        (
+            "two-qubit hadamard",
+            "fn f(a: Qubit, b: Qubit) { hadamard(a, b); }",
+        ),
+        ("zero-arg hadamard", "fn f(a: Qubit) { hadamard(); }"),
+        ("one-arg cnot", "fn f(a: Qubit) { cnot(a); }"),
+        (
+            "three-arg cnot",
+            "fn f(a: Qubit, b: Qubit, c: Qubit) { cnot(a, b, c); }",
+        ),
+        (
+            "two-qubit reset",
+            "fn f(a: Qubit, b: Qubit) { reset(a, b); }",
+        ),
+    ] {
+        let errs = diagnostics(&format!("{src}\n"));
+        assert!(
+            !errs.is_empty(),
+            "{label}: a wrong-arity gate must be rejected, got no error"
+        );
+    }
+}
+
+/// `measure` consumes its qubit, so `reset` CANNOT follow it.
+///
+/// This is the one semantic that matters for using `reset` correctly, and it is
+/// easy to get backwards: `measure` MOVES the binding, so the qubit is spent
+/// rather than dirty. `reset(q)` after a measurement is a use-after-move.
+///
+/// An earlier version of this work asserted the opposite -- that
+/// `measure` then `reset` typechecks and proves clean. It "passed" only because
+/// the prover runs on parsed-but-not-typechecked input, so it reported a clean
+/// verdict on a program that does not compile. That is the failure mode of testing
+/// a verifier with input it cannot check.
+#[test]
+fn measure_consumes_its_qubit_so_reset_cannot_follow() {
+    let errs = diagnostics(
+        "fn f() { let [1] q: Qubit = qalloc(1); hadamard(q); \
+         let m = measure(q); let _ = m; reset(q); }\n",
+    );
     assert!(
         !errs.is_empty(),
-        "`reset` is expected NOT to be available today. If it now typechecks, a \
-         Reset variant reached the compiler's GateKind, and the verifier's \
-         `GateKind::Reset` transition became live -- which should then be tested \
-         by proving that a measured qubit followed by reset is CLEAN."
+        "`measure` consumes q, so `reset(q)` after it must be rejected"
+    );
+}
+
+/// The expressible form: reset after a GATE, which does not consume.
+#[test]
+fn reset_after_a_gate_typechecks() {
+    let errs =
+        diagnostics("fn f() { let [1] q: Qubit = qalloc(1); hadamard(q); reset(q); qfree(q); }\n");
+    assert!(
+        errs.is_empty(),
+        "reset after a gate leaves the qubit usable and cleanable, got: {errs:?}"
+    );
+}
+
+/// The correct arities still typecheck.
+#[test]
+fn correctly_arityed_gates_typecheck() {
+    for (label, src) in [
+        ("hadamard(a)", "fn f(a: Qubit) { hadamard(a); }"),
+        ("cnot(a, b)", "fn f(a: Qubit, b: Qubit) { cnot(a, b); }"),
+        ("reset(a)", "fn f(a: Qubit) { reset(a); }"),
+    ] {
+        let errs = diagnostics(&format!("{src}\n"));
+        assert!(errs.is_empty(), "{label} must typecheck, got: {errs:?}");
+    }
+}
+
+/// A qubit may be BORROWED by any number of gates.
+///
+/// Every qubit reference in a `PirExpr::QuantumOp` used to count as one linear
+/// USE, so a second gate failed PIR validation:
+///
+///     fn f() { let [1] q: Qubit = qalloc(1); hadamard(q); hadamard(q); }
+///     -> LinearVarUsedMultipleTimes("q", 2)
+///
+/// That is the opposite of a linearity violation. A qubit is linear, so it may be
+/// borrowed any number of times; only being CONSUMED spends it, which is what
+/// `Mutability::InOut` on the `hadamard` prelude signature already says. Applying
+/// gates in sequence is what a circuit IS, so this made every multi-gate quantum
+/// program uncompilable.
+#[test]
+fn a_qubit_may_be_borrowed_by_many_gates() {
+    // The qubit is released at the end: a `[1]` value must be spent, so the only
+    // error available here would be a spurious one from the bug being guarded.
+    let src = "fn f() { let [1] q: Qubit = qalloc(1); \
+                hadamard(q); hadamard(q); hadamard(q); qfree(q); }\n";
+    let errs = diagnostics(src);
+    assert!(
+        errs.is_empty(),
+        "repeated gates borrow one linear qubit, which is legal, got: {errs:?}"
     );
 }
 

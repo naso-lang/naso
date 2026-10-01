@@ -75,13 +75,36 @@ pub fn validate_pir(module: &PirModule) -> Result<(), Vec<ValidationError>> {
         }
     }
 
-    // 6. Linearity check: [1] vars should be used exactly once (simplified)
+    // 6. Linearity check: a [1] var must be CONSUMED at most once.
+    //
+    // This was "used exactly once", counting every reference -- including the
+    // BORROWS that gates make -- which rejected every real circuit:
+    //
+    //     fn f() { let [1] q: Qubit = qalloc(1); hadamard(q); hadamard(q); }
+    //     -> LinearVarUsedMultipleTimes("q", 2)
+    //
+    // Applying gates in sequence is what a circuit IS, so no multi-gate quantum
+    // program could be compiled. Now only a consuming operation counts, so the
+    // check is "consumed more than once".
+    //
+    // The `count == 0` case is deliberately NOT an error here. "A `[1]` value must
+    // be consumed" is a source-level property, and the TYPECHECKER enforces it --
+    // including the parts PIR structurally cannot see:
+    //
+    //   * a value never consumed at all      -> "unused linear variable"
+    //   * consumed on only one branch        -> "consumed on only [0] of 2 branches"
+    //   * returned to the caller             -> accepted, correctly
+    //
+    // Those are the branch-join leaks fixed in the typechecker. PIR has no notion
+    // of branches or returns, so a check here would be a strictly weaker duplicate
+    // that rejected correct programs: a qubit that is legitimately returned, or
+    // borrowed and left for the caller, looks identical to a leak at this level.
+    // Flagging it would trade a false positive for a false negative on the very
+    // property the language exists to guarantee.
     for (var, qty) in &module.quantities {
         if qty == &Quantity::One {
             let count = count_var_occurrences(module, var);
-            if count == 0 {
-                errors.push(ValidationError::LinearVarNotUsed(var.clone()));
-            } else if count > 1 {
+            if count > 1 {
                 errors.push(ValidationError::LinearVarUsedMultipleTimes(
                     var.clone(),
                     count,
@@ -175,6 +198,16 @@ fn expr_contains_var(expr: &PirExpr, var: &str) -> bool {
     }
 }
 
+/// Whether a quantum operation CONSUMES its qubit rather than borrowing it.
+///
+/// `PirExpr::QuantumOp::op` is the gate's display string, produced by
+/// `ast::GateKind`'s `Display`. `measure` collapses a qubit and spends the binding;
+/// every other operation -- including `reset`, which returns the qubit to |0> but
+/// leaves it bound -- is an in-place mutation.
+pub fn is_consuming_quantum_op(op: &str) -> bool {
+    matches!(op, "measure")
+}
+
 /// Count variable occurrences in module
 fn count_var_occurrences(module: &PirModule, var: &str) -> usize {
     module
@@ -207,13 +240,35 @@ fn count_in_expr(expr: &PirExpr, var: &str) -> usize {
         PirExpr::Reversible { body, inverse } => {
             count_in_expr(body, var) + count_in_expr(inverse, var)
         }
-        PirExpr::QuantumOp {
-            op: _,
-            args,
-            qubits,
-        } => {
+        PirExpr::QuantumOp { op, args, qubits } => {
+            // Only a CONSUMING operation spends the qubit. Gates borrow: a qubit is
+            // linear, so it may be BORROWED any number of times, and only being
+            // consumed ends its life. Counting every gate as a use made any real
+            // circuit fail to lower:
+            //
+            //     fn f() { let [1] q: Qubit = qalloc(1); hadamard(q); hadamard(q); }
+            //     -> LinearVarUsedMultipleTimes("q", 2)
+            //
+            // which is not a linearity violation but its opposite -- and it made
+            // EVERY multi-gate quantum program uncompilable, since applying gates in
+            // sequence is what a circuit IS. `Mutability::InOut` on the `hadamard`
+            // prelude signature already says these borrow.
+            //
+            // `measure` consumes: it collapses the qubit, and the typechecker enforces
+            // the use-after-move. `reset` does NOT -- it returns the qubit to |0> but
+            // leaves the binding bound and usable.
+            //
+            // NOTE: `PirModule::count_var_occurrences` in pir_types.rs is a second,
+            // duplicate implementation of this walk. It had the same defect. The
+            // live path is this one (`ir::validate::validate_module`), which is what
+            // `lower_program` calls.
+            let consuming = is_consuming_quantum_op(op);
             args.iter().map(|a| count_in_expr(a, var)).sum::<usize>()
-                + qubits.iter().map(|q| count_in_expr(q, var)).sum::<usize>()
+                + if consuming {
+                    qubits.iter().map(|q| count_in_expr(q, var)).sum::<usize>()
+                } else {
+                    0
+                }
         }
         _ => 0,
     }

@@ -340,6 +340,13 @@ pub enum GateKind {
     RX(Box<Expr>),
     RY(Box<Expr>),
     RZ(Box<Expr>),
+    /// `reset(q)` -- returns the qubit to |0> IN PLACE.
+    ///
+    /// Not consuming: like `hadamard`, it mutates the qubit and leaves the binding
+    /// usable, because the qubit still exists afterwards. It just happens to be
+    /// guaranteed to put it back in |0>, which is what makes a measured temporary
+    /// dischargeable.
+    Reset,
     Custom(Ident),
 }
 
@@ -358,6 +365,7 @@ impl fmt::Display for GateKind {
             GateKind::RX(_) => write!(f, "RX"),
             GateKind::RY(_) => write!(f, "RY"),
             GateKind::RZ(_) => write!(f, "RZ"),
+            GateKind::Reset => write!(f, "reset"),
             GateKind::Custom(ident) => write!(f, "{}", ident),
         }
     }

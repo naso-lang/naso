@@ -219,6 +219,7 @@ impl<'a> Parser<'a> {
             Some(TK::Entangle) => self.parse_entangle(),
             Some(TK::QAlloc) => self.parse_qalloc(),
             Some(TK::Hadamard) => self.parse_hadamard(),
+            Some(TK::Reset) => self.parse_reset(),
             Some(TK::CNot) => self.parse_cnot(),
             Some(TK::Int(_)) | Some(TK::Float(_)) | Some(TK::Bool(_)) | Some(TK::Str(_))
             | Some(TK::Char(_)) => self.parse_literal(),
@@ -621,6 +622,28 @@ impl<'a> Parser<'a> {
         )
     }
 
+    /// `reset(q)` -- returns the qubit to |0> in place.
+    ///
+    /// Parsed as a `GateKind::Reset` apply-gate rather than a dedicated
+    /// `QuantumOp` variant: reset IS a gate application, it just has an exact
+    /// state effect. Routing it through `ApplyGate` means the verifier's existing
+    /// `GateKind::Reset => int(0)` transition and the runtime exporters' reset
+    /// emission both apply with no special case at either end.
+    fn parse_reset(&mut self) -> Expr {
+        let start = self.pos;
+        self.expect(TK::Reset);
+        self.expect(TK::LParen);
+        let args = self.parse_args_until(TK::RParen);
+        self.expect(TK::RParen);
+        let span = self.span_from(start);
+        // reset takes 1 qubit argument
+        Expr::new(
+            ExprKind::QuantumOp(QuantumOp::ApplyGate(GateKind::Reset, args)),
+            span,
+            next_id(),
+        )
+    }
+
     fn parse_cnot(&mut self) -> Expr {
         let start = self.pos;
         self.expect(TK::CNot);
@@ -810,6 +833,66 @@ mod tests {
             other => panic!("expected function, got {other:?}"),
         };
         assert_eq!(func.body.stmts.len(), 2);
+    }
+
+    /// `reset(q)` parses as a `GateKind::Reset` apply-gate.
+    ///
+    /// `reset` had no lexer token, no parser production, and no AST variant, while
+    /// the verifier modelled it and the runtime exporters emitted it -- so it read
+    /// as a language feature and was not one. It is routed through `ApplyGate`
+    /// rather than a dedicated `QuantumOp` because reset IS a gate application; it
+    /// just has an exact state effect, which is what lets the verifier's existing
+    /// `GateKind::Reset => int(0)` transition apply with no special case.
+    #[test]
+    fn parses_reset() {
+        let prog = parse_program("fn f(q: Qubit) { reset(q); }").expect("parse failed");
+        let func = match &prog.items[0] {
+            Item::Function(f) => f,
+            other => panic!("expected function, got {other:?}"),
+        };
+        match &func.body.stmts[0].kind {
+            StmtKind::Expr(e) => match &e.kind {
+                ExprKind::QuantumOp(QuantumOp::ApplyGate(GateKind::Reset, args)) => {
+                    assert_eq!(args.len(), 1, "reset takes exactly one qubit");
+                }
+                other => panic!("expected ApplyGate(Reset), got {other:?}"),
+            },
+            other => panic!("expected expression stmt, got {other:?}"),
+        }
+    }
+
+    /// `reset` is case-insensitive, like the other quantum keywords.
+    #[test]
+    fn parses_reset_case_insensitively() {
+        for src in [
+            "fn f(q: Qubit) { reset(q); }",
+            "fn f(q: Qubit) { Reset(q); }",
+            "fn f(q: Qubit) { RESET(q); }",
+        ] {
+            parse_program(src).unwrap_or_else(|e| panic!("{src} should parse: {e}"));
+        }
+    }
+
+    /// `reset` takes exactly one argument.
+    ///
+    /// Two arguments is a user error, not a two-qubit reset, so it must not parse
+    /// as one silently.
+    #[test]
+    fn reset_with_two_arguments_is_rejected() {
+        let result = std::panic::catch_unwind(|| {
+            parse_program("fn f(a: Qubit, b: Qubit) { reset(a, b); }").is_ok()
+        });
+        // Either it fails to parse or it parses and then fails to typecheck; what
+        // must not happen is it parsing as a valid single-qubit reset.
+        if result.unwrap_or(false) {
+            let mut prog =
+                parse_program("fn f(a: Qubit, b: Qubit) { reset(a, b); }").expect("parse failed");
+            let errors = crate::typecheck::check_program(&mut prog).errors;
+            assert!(
+                !errors.is_empty(),
+                "reset(a, b) must not be accepted as a valid statement"
+            );
+        }
     }
 
     #[test]

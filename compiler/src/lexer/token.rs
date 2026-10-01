@@ -165,6 +165,20 @@ pub enum TokenKind {
     Entangle,
     #[regex("[hH][aA][dD][aA][mM][aA][rR][dD]", priority = 3)]
     Hadamard,
+    // `reset(q)` returns a qubit to |0> in place, borrowing rather than consuming
+    // it -- like `hadamard`, it mutates and leaves the binding usable.
+    //
+    // It cleans a qubit a GATE left dirty, which had no in-language spelling: the
+    // verifier modelled the transition (`GateKind::Reset => int(0)`) and the runtime
+    // exporters emitted a reset instruction, but the front end had no token, no
+    // parser production and no AST variant. Present in N-1 of N places, it read as
+    // a language feature and was not one.
+    //
+    // It is NOT how a MEASURED qubit is discharged: `measure` CONSUMES its qubit
+    // binding, so the value is spent rather than dirty and `reset(q)` afterwards is
+    // a use-after-move.
+    #[regex("[rR][eE][sS][eE][tT]", priority = 3)]
+    Reset,
     #[regex("[cC][nN][oO][tT]", priority = 3)]
     CNot,
     #[regex("[qQ][aA][lL][lL][oO][cC]", priority = 3)]
@@ -324,6 +338,7 @@ impl TokenKind {
             TokenKind::Gate => "'gate'",
             TokenKind::Entangle => "'entangle'",
             TokenKind::Hadamard => "'hadamard'",
+            TokenKind::Reset => "'reset'",
             TokenKind::CNot => "'cnot'",
             TokenKind::QAlloc => "'qalloc'",
             TokenKind::Nat => "'nat'",

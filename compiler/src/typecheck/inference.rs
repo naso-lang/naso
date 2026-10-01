@@ -1020,6 +1020,25 @@ fn infer_projection(checker: &mut TypeChecker, base: &Expr, span: Span) -> Resul
     ))
 }
 
+/// The number of qubits a gate takes, or `None` when it is variable.
+///
+/// `None` means the arity is decided elsewhere: `RX`/`RY`/`RZ` each take a qubit
+/// plus an angle, so their AST form differs, and `Custom` names a gate this
+/// compiler does not know -- refusing an unknown gate's arity would be guessing.
+fn gate_arity(gate: &crate::ast::GateKind) -> Option<usize> {
+    use crate::ast::GateKind as G;
+    Some(match gate {
+        // single-qubit gates
+        G::H | G::X | G::Y | G::Z | G::S | G::T | G::Reset => 1,
+        // controlled gates: (control, target)
+        G::CX | G::CY | G::CZ => 2,
+        // rotations take an angle, which is not a qubit; the qubit count is 1 and
+        // the angle is not part of `args`.
+        G::RX(_) | G::RY(_) | G::RZ(_) => 1,
+        G::Custom(_) => return None,
+    })
+}
+
 /// Infer quantum operation type
 fn infer_quantum_op(
     checker: &mut TypeChecker,
@@ -1056,7 +1075,30 @@ fn infer_quantum_op(
             // program was rejected with "unused linear variable `r`".
             Ok(Type::new(TypeKind::Bool, Quantity::Many, span))
         }
-        QuantumOp::ApplyGate(_gate, args) => {
+        QuantumOp::ApplyGate(gate, args) => {
+            // Arity is checked here because the gate was previously ignored
+            // (`ApplyGate(_gate, args)`), so ANY argument count was accepted:
+            //
+            //     hadamard(a, b)   -> OK
+            //     cnot(a, b, c)    -> OK
+            //     reset(a, b)      -> OK
+            //
+            // Each argument is checked against `Type::qubit` below, so the types
+            // were right; only the COUNT was unverified. A two-qubit `hadamard` is
+            // not a thing, and silently accepting one means a circuit that is not
+            // what the source says compiles -- which then lowers to a PIR op with
+            // two qubits and runs on hardware as something the author did not write.
+            let expected = gate_arity(gate);
+            if let Some(expected) = expected
+                && args.len() != expected
+            {
+                return Err(TypeError::ArgumentCountMismatch {
+                    expected,
+                    found: args.len(),
+                    span,
+                });
+            }
+
             // Quantum gates are in-place operations that borrow qubits temporarily
             // They don't consume the qubit and don't create persistent borrows
             for arg in args {

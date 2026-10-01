@@ -16,12 +16,10 @@
 //!   was therefore reported uncomputed. See
 //!   `tests::test_measurement_is_not_evidence_of_zero`.
 //!
-//! KNOWN GAP: `reset` is not a language construct. `GateKind::Reset => int(0)`
-//! exists here and the runtime exporters emit a reset instruction, but the
-//! compiler's `GateKind` has no `Reset` variant and the parser cannot produce one,
-//! so a measured temporary cannot be cleaned in-language -- it must be returned.
-//! The consequence is that `GateKind::Reset` is currently unreachable from source.
-
+//! `reset(q)` returns a qubit to |0> in place. It is NOT how a measured qubit is
+//! discharged: `measure` CONSUMES its qubit binding, so the value is spent rather
+//! than dirty, and `reset(q)` afterwards is a use-after-move. Reset cleans a qubit
+//! that a GATE left dirty.
 #[cfg(feature = "z3")]
 use crate::config::SolverConfig;
 #[cfg(feature = "z3")]
@@ -471,6 +469,122 @@ mod tests {
         let program = parse_program(src).expect("parse failed");
         let diags = prove_uncomputation(&program).expect("prover failed");
         assert!(diags.is_empty(), "returned qubits must escape: {diags:?}");
+    }
+
+    /// `reset` cleans a qubit that a GATE took out of |0>.
+    ///
+    /// `reset` is not how a MEASURED qubit is discharged, because `measure`
+    /// CONSUMES its qubit binding: the source-level value is moved, so there is
+    /// nothing left to reset.
+    ///
+    ///     fn f() { ... let m = measure(q); let _ = m; reset(q); }
+    ///     -> use of moved value `q`
+    ///
+    /// That is the typechecker's decision, not this prover's, and it is a coherent
+    /// one -- a measured qubit is spent, not dirty. An earlier version of this test
+    /// asserted that `measure` then `reset` proves clean, and it passed ONLY because
+    /// the prover runs on parsed-but-not-typechecked input: it reported "clean" for a
+    /// program that does not compile. A verifier handed a program it cannot check is
+    /// not evidence of anything.
+    ///
+    /// So the useful, honest assertion is the one that IS expressible: reset after a
+    /// GATE returns the qubit to |0> and the circuit proves clean.
+    #[test]
+    fn test_reset_cleans_after_a_gate() {
+        let src = r#"
+        fn f() {
+            let [1] q: Qubit = qalloc(1);
+            hadamard(q);
+            reset(q);
+        }
+        "#;
+        let diags =
+            prove_uncomputation(&parse_program(src).expect("parse")).expect("prover failed");
+        assert!(
+            diags.is_empty(),
+            "reset returns the qubit to |0>, so a gated-then-reset circuit must prove \
+             clean: {diags:?}"
+        );
+    }
+
+    /// The same circuit WITHOUT the reset is flagged.
+    ///
+    /// Asserting both halves is what makes the test non-vacuous: a prover that
+    /// reported "clean" for everything would fail this one.
+    #[test]
+    fn test_gate_without_reset_is_flagged() {
+        let src = r#"
+        fn f() {
+            let [1] q: Qubit = qalloc(1);
+            hadamard(q);
+        }
+        "#;
+        let diags =
+            prove_uncomputation(&parse_program(src).expect("parse")).expect("prover failed");
+        assert!(
+            !diags.is_empty(),
+            "a qubit left in superposition must be flagged: {diags:?}"
+        );
+    }
+
+    /// A reset is only good for what PRECEDES it.
+    ///
+    /// `reset; H` is dirty again -- a reset is not a permanent property of a qubit.
+    /// This is the anti-regression for a fix that might have made `reset` sticky.
+    #[test]
+    fn test_reset_is_not_sticky() {
+        let src = r#"
+        fn f() {
+            let [1] q: Qubit = qalloc(1);
+            hadamard(q);
+            reset(q);
+            hadamard(q);
+        }
+        "#;
+        let diags =
+            prove_uncomputation(&parse_program(src).expect("parse")).expect("prover failed");
+        assert!(
+            !diags.is_empty(),
+            "a gate after a reset takes the qubit out of |0> again: {diags:?}"
+        );
+    }
+
+    /// Repeated `reset; gate; reset` cycles each discharge.
+    #[test]
+    fn test_repeated_reset_cycles_prove_clean() {
+        let src = r#"
+        fn f() {
+            let [1] q: Qubit = qalloc(1);
+            hadamard(q);
+            reset(q);
+            hadamard(q);
+            reset(q);
+        }
+        "#;
+        let diags =
+            prove_uncomputation(&parse_program(src).expect("parse")).expect("prover failed");
+        assert!(diags.is_empty(), "each cycle ends clean: {diags:?}");
+    }
+
+    /// `measure` CONSUMES its qubit, so it cannot be followed by `reset`.
+    ///
+    /// This is the typechecker's rule, and it is why `reset` is not the way to
+    /// discharge a measured qubit. Asserting it here pins the reason, and stops a
+    /// future reader from "fixing" the prover to accept measure-then-reset -- which
+    /// would mean accepting a program that does not compile.
+    ///
+    /// The prover itself runs on parsed input and does not see type errors, so this
+    /// is asserted through the typechecker, which is where the rule lives.
+    #[test]
+    fn test_measure_then_reset_is_a_use_after_move() {
+        let src = "fn f() { let [1] q: Qubit = qalloc(1); hadamard(q); \
+                   let m = measure(q); let _ = m; reset(q); }";
+        let mut program = parse_program(src).expect("parse failed");
+        let result = naso_compiler::typecheck::check_program(&mut program);
+        assert!(
+            !result.errors.is_empty(),
+            "`measure` consumes q, so `reset(q)` after it must be a use-after-move"
+        );
     }
 
     #[test]

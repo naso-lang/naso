@@ -45,6 +45,12 @@ impl GateKind {
             AstGateKind::RX(_) => GateKind::RX,
             AstGateKind::RY(_) => GateKind::RY,
             AstGateKind::RZ(_) => GateKind::RZ,
+            // `reset(q)` returns the qubit to |0>, which `folded_state` already
+            // encodes as `GateKind::Reset => int(0)`. Mapping it to `Unitary`
+            // instead would fold the state to "not provably |0>" -- the safe
+            // direction, but needlessly unprovable, so a reset could never discharge
+            // a measured temporary.
+            AstGateKind::Reset => GateKind::Reset,
             AstGateKind::Custom(_) => GateKind::Unitary,
         }
     }

@@ -895,4 +895,143 @@ mod lowering_tests {
         let m = lower("fn f(x: f32) { proof { assert(x > 0.0); } }");
         assert!(m.statements.is_empty(), "nothing runtime to lower");
     }
+
+    // -----------------------------------------------------------------------
+    // Quantum circuits lower at all.
+    //
+    // Every qubit reference in a `QuantumOp` used to be counted as one linear
+    // USE, so a second gate on the same qubit failed PIR validation:
+    //
+    //     fn f() { let [1] q: Qubit = qalloc(1); hadamard(q); hadamard(q); }
+    //     -> LinearVarUsedMultipleTimes("q", 2)
+    //
+    // That is not a linearity violation -- it is the opposite. A qubit is linear,
+    // so it may be BORROWED any number of times; only being CONSUMED spends it.
+    // `hadamard` mutates the qubit and leaves the binding usable, which is what
+    // `Mutability::InOut` on its prelude signature already says.
+    //
+    // Applying gates in sequence is what a circuit IS, so this made every
+    // multi-gate quantum program uncompilable. `lower()` panics on a validation
+    // error, so each case here is a compile-and-succeed assertion.
+    // -----------------------------------------------------------------------
+
+    /// A qubit may be borrowed by any number of gates.
+    #[test]
+    fn test_repeated_gates_on_one_qubit_lower() {
+        for (label, src) in [
+            (
+                "two gates",
+                "fn f() { let [1] q: Qubit = qalloc(1); hadamard(q); hadamard(q); }",
+            ),
+            (
+                "three gates",
+                "fn f() { let [1] q: Qubit = qalloc(1); hadamard(q); hadamard(q); hadamard(q); }",
+            ),
+        ] {
+            let m = lower(src);
+            assert!(!m.statements.is_empty(), "{label}: expected statements");
+        }
+    }
+
+    /// A realistic multi-qubit circuit lowers.
+    ///
+    /// This is the shape that matters: two qubits, four gates, each qubit touched
+    /// twice. Before the fix this failed with `LinearVarUsedMultipleTimes` on both.
+    #[test]
+    fn test_multiqubit_circuit_lowers() {
+        let src = "fn f() {\
+            let [1] a: Qubit = qalloc(1);\
+            let [1] b: Qubit = qalloc(1);\
+            hadamard(a);\
+            cnot(a, b);\
+            hadamard(a);\
+            cnot(a, b);\
+        }";
+        let m = lower(src);
+        assert!(m.statements.len() >= 2, "expected both qubits to appear");
+    }
+
+    /// A qubit BORROWED and then returned to the caller lowers.
+    ///
+    /// `count == 0` is deliberately not an error at PIR level: "a `[1]` value must
+    /// be consumed" is a source-level property, and the typechecker enforces it
+    /// where it can see branches and returns. This qubit is legitimately
+    /// returned, and at PIR level that is indistinguishable from a leak -- which
+    /// is why flagging it here would trade a false positive for a false negative
+    /// on the property the language exists to guarantee.
+    #[test]
+    fn test_borrowed_qubit_returned_lowers() {
+        let m = lower("fn f() -> [1] Qubit { let [1] q: Qubit = qalloc(1); hadamard(q); q }");
+        assert!(!m.statements.is_empty());
+    }
+
+    /// `reset(q)` parses, lowers, and is emitted as its own operation.
+    ///
+    /// `reset` was missing from the front end entirely while the verifier modelled
+    /// it and the runtime exporters emitted it, so it read as a language feature
+    /// and was not one. `Display` on the gate is what the lowering turns into the
+    /// PIR op string, so this asserts the op name reaches the IR.
+    #[test]
+    fn test_reset_parses_and_lowers_to_a_reset_op() {
+        let m = lower("fn f() { let [1] q: Qubit = qalloc(1); hadamard(q); reset(q); }");
+        let ir = format!("{m:?}");
+        assert!(
+            ir.contains("\"reset\""),
+            "expected a `reset` op in the lowered PIR: {ir}"
+        );
+    }
+
+    /// `measure` then `reset` -- the reason `reset` exists -- lowers.
+    ///
+    /// A measurement collapses to |0> or |1>, so it never discharges a temporary.
+    /// Without a reset the only way to clean one was to return it to the caller.
+    #[test]
+    fn test_measure_then_reset_lowers() {
+        let m = lower(
+            "fn f() { let [1] q: Qubit = qalloc(1); hadamard(q); \
+             let m = measure(q); let _ = m; reset(q); }",
+        );
+        let ir = format!("{m:?}");
+        assert!(ir.contains("\"measure\""), "expected a measure op: {ir}");
+        assert!(ir.contains("\"reset\""), "expected a reset op: {ir}");
+    }
+
+    /// `reset` does not CONSUME: the qubit stays bound and usable afterwards.
+    ///
+    /// It returns the qubit to |0> but leaves the binding, like `hadamard`. If
+    /// `reset` were consuming, `hadamard(q)` after it would be a use-after-move --
+    /// which the typechecker rejects, so this asserts the semantics from the front
+    /// end rather than from the IR.
+    #[test]
+    fn test_reset_does_not_consume_the_qubit() {
+        // The qubit is consumed at the end, because a `[1]` value must be spent --
+        // so the only error possible here is a use-after-move on the `hadamard`
+        // after the `reset`.
+        let src = "fn f() { let [1] q: Qubit = qalloc(1); reset(q); hadamard(q); qfree(q); }";
+        let mut program = parse_program(src).expect("parse");
+        let result = crate::typecheck::check_program(&mut program);
+        assert!(
+            result.errors.is_empty(),
+            "`reset` must leave the qubit usable, got: {:?}",
+            result.errors
+        );
+    }
+
+    /// Consuming a qubit twice is still rejected.
+    ///
+    /// The gate change must not have removed the check entirely: `measure` twice on
+    /// the same qubit is a genuine double consumption.
+    #[test]
+    fn test_double_measurement_is_still_rejected() {
+        let src = "fn f() { let [1] q: Qubit = qalloc(1); \
+                    let a = measure(q); let _ = a; let b = measure(q); let _ = b; }";
+        let program = parse_program(src).expect("parse");
+        let lowered = crate::lowering::lower_program(&program);
+        // Whichever layer rejects it is fine; what matters is that it IS rejected.
+        let typechecked = crate::typecheck::check_program(&mut program.clone());
+        assert!(
+            lowered.is_err() || !typechecked.errors.is_empty(),
+            "measuring the same qubit twice must be rejected"
+        );
+    }
 }

@@ -199,10 +199,12 @@ impl PirModule {
         // This is a simplified check - full linearity requires dataflow analysis
         for (var, qty) in &self.quantities {
             if qty == &Quantity::One {
+                // Only a CONSUMING operation counts; gates borrow. See
+                // `ir::validate` step 6 for why `count == 0` is not an error here:
+                // "must be consumed" is a source-level property enforced by the
+                // typechecker, which can see branches and returns and PIR cannot.
                 let count = self.count_var_occurrences(var);
-                if count == 0 {
-                    errors.push(ValidationError::LinearVarNotUsed(var.clone()));
-                } else if count > 1 {
+                if count > 1 {
                     errors.push(ValidationError::LinearVarUsedMultipleTimes(
                         var.clone(),
                         count,
@@ -296,18 +298,45 @@ impl PirModule {
             PirExpr::Reversible { body, inverse } => {
                 self.count_in_expr(body, var) + self.count_in_expr(inverse, var)
             }
-            PirExpr::QuantumOp {
-                op: _,
-                args,
-                qubits,
-            } => {
+            PirExpr::QuantumOp { op, args, qubits } => {
+                // Which quantum operations CONSUME their qubit, as opposed to
+                // borrowing it?
+                //
+                // Every qubit reference used to be counted as one linear use, so a
+                // second gate on the same qubit failed PIR validation:
+                //
+                //     fn f() { let [1] q: Qubit = qalloc(1); hadamard(q); hadamard(q); }
+                //     -> IR validation failed: LinearVarUsedMultipleTimes("q", 2)
+                //
+                // That is not a linearity violation -- it is the opposite. A qubit is
+                // linear, so it may be BORROWED any number of times; only being
+                // CONSUMED spends it. `hadamard` and friends mutate the qubit and
+                // leave the binding usable, which is exactly what `Mutability::InOut`
+                // on the `hadamard` prelude signature already says. Counting a borrow
+                // as a use made every real circuit -- which applies several gates in
+                // sequence -- fail to lower, so no multi-gate quantum program could be
+                // compiled at all.
+                //
+                // Only `measure` consumes: it collapses the qubit and the binding is
+                // gone afterwards (the typechecker enforces the use-after-move). So a
+                // qubit may appear under any number of gates, and at most once as the
+                // target of a `measure`.
+                //
+                // A `measure` nested inside another op's arguments is not special
+                // here: the `args` walk below still counts it, so the at-most-once
+                // rule is enforced for every position.
+                let consuming = crate::ir::validate::is_consuming_quantum_op(op);
                 args.iter()
                     .map(|a| self.count_in_expr(a, var))
                     .sum::<usize>()
-                    + qubits
-                        .iter()
-                        .map(|q| self.count_in_expr(q, var))
-                        .sum::<usize>()
+                    + if consuming {
+                        qubits
+                            .iter()
+                            .map(|q| self.count_in_expr(q, var))
+                            .sum::<usize>()
+                    } else {
+                        0
+                    }
             }
             _ => 0,
         }

@@ -27,6 +27,18 @@ pub struct LlvmValueBuilder<'ctx> {
     /// type it points at. Loads and GEPs need that type explicitly, so we
     /// remember it for every pointer we mint here (allocas, GEPs, struct GEPs).
     ptr_pointee_types: HashMap<PointerValue<'ctx>, BasicTypeEnum<'ctx>>,
+    /// Named variable allocations (name -> pointer, pointee type).
+    ///
+    /// This lives here, next to the builder that emits the loads and stores, so that
+    /// every lowering path shares ONE scope: `LLVMModuleBuilder` (which walks PIR
+    /// statements) and `ScheduleLowering` (which walks a schedule tree and emits loop
+    /// bodies) both borrow the same value builder. When the map was private to
+    /// `LLVMModuleBuilder`, the schedule path had no bindings at all, so a band body
+    /// could not even read or write the variable it was supposed to accumulate into.
+    ///
+    /// The pointee type is stored alongside the pointer for the same opaque-pointer
+    /// reason as `ptr_pointee_types`: LLVM 17 cannot recover it from the pointer.
+    variables: HashMap<String, (PointerValue<'ctx>, BasicTypeEnum<'ctx>)>,
 }
 
 impl<'ctx> LlvmValueBuilder<'ctx> {
@@ -37,6 +49,7 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
             type_lowering,
             metadata: HashMap::new(),
             ptr_pointee_types: HashMap::new(),
+            variables: HashMap::new(),
         }
     }
 
@@ -48,6 +61,72 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
     /// Get the type lowering
     pub fn type_lowering(&self) -> &LlvmTypeLowering<'ctx> {
         &self.type_lowering
+    }
+
+    /// Record a named allocation: the pointer plus the type it points at.
+    ///
+    /// `ty` is the pointee type of the allocation; LLVM 17 opaque pointers do not
+    /// carry it, so it is recorded here for the later `build_load` and for the
+    /// assignment width check.
+    pub fn add_variable(&mut self, name: String, ptr: PointerValue<'ctx>, ty: BasicTypeEnum<'ctx>) {
+        self.variables.insert(name, (ptr, ty));
+    }
+
+    /// Register every global in `module` as a variable named after it.
+    ///
+    /// A statement walked by `LLVMModuleBuilder` can bind its own storage with a `let`,
+    /// so it always has a destination for an assignment. A schedule tree has no such
+    /// step: the only nameable storage a band body has is what already exists in the
+    /// module. Without this, `counter = counter + 1` in a band body was refused with
+    /// "no allocation is known for it" -- correctly, but for want of any way to say
+    /// where `counter` lives.
+    ///
+    /// Registering a global is not a guess about its type: `GlobalValue` reports the
+    /// type it was declared with. A name that is not a global stays unbound, so an
+    /// assignment to it is still refused rather than silently dropped.
+    pub fn register_module_globals(&mut self, module: &Module<'ctx>) -> CodegenResult<()> {
+        for global in module.get_globals() {
+            let name = match global.get_name().to_str() {
+                Ok(n) if !n.is_empty() => n.to_string(),
+                // LLVM renames an unnamed global to a numeric slot name; binding it
+                // under that name would be meaningless, so it is left unregistered.
+                _ => continue,
+            };
+            // `GlobalValue::get_value_type` is an `AnyTypeEnum`, which also covers void
+            // and function types. Those cannot be loaded or stored, and coercing one
+            // into a `BasicTypeEnum` would be inventing a type. inkwell's own
+            // `as_basic_type_enum` PANICS on exactly these, so `TryFrom` is used
+            // instead: a global whose type is not loadable is reported by name.
+            let value_ty = BasicTypeEnum::try_from(global.get_value_type()).map_err(|_| {
+                CodegenError::UnsupportedFeature(format!(
+                    "global `{name}` has a type that is not loadable or storable, so it \
+                     cannot be a variable this backend binds by name"
+                ))
+            })?;
+            self.variables
+                .insert(name, (global.as_pointer_value(), value_ty));
+        }
+        Ok(())
+    }
+
+    /// Look up a named allocation and its pointee type.
+    pub fn variable(&self, name: &str) -> Option<(PointerValue<'ctx>, BasicTypeEnum<'ctx>)> {
+        self.variables.get(name).copied()
+    }
+
+    /// The names currently in scope, for a diagnostic that says what IS available.
+    pub fn variable_names(&self) -> Vec<String> {
+        self.variables.keys().cloned().collect()
+    }
+
+    /// Bring a name out of scope (a non-statement-position `let` leaving its body).
+    pub fn remove_variable(&mut self, name: &str) {
+        self.variables.remove(name);
+    }
+
+    /// Drop every binding. Called when a function body finishes.
+    pub fn clear_variables(&mut self) {
+        self.variables.clear();
     }
 
     /// Build a function with the given signature and body builder

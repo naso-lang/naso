@@ -229,14 +229,48 @@ impl LoweringContext {
         // Lower initialization expression
         let expr = self.lower_expr(&let_stmt.value)?;
 
-        // Create statement
+        // Create statement.
+        //
+        // A destructuring pattern (`let (a, b) = ...`) has no single name to bind, and
+        // PIR has no destructuring node, so those keep the previous behaviour of
+        // lowering to the value alone. That is a real gap -- the value is computed and
+        // discarded -- and it is reported rather than left silent below.
+        //
+        // A single-name pattern must become a `PirExpr::Let`, not bare the value. It used
+        // to lower to `expr` directly, so the NAME was dropped and no allocation was ever
+        // created: every later `total = ...` then had no destination and was refused with
+        // "no allocation is known for it", which is what stopped any `forall` body from
+        // accumulating into an outer variable.
+        let body = match names.as_slice() {
+            [single] => crate::ir::PirExpr::Let {
+                name: single.clone(),
+                qty,
+                mutability,
+                // `LetBinding`/`LetStmt` carry no body, so a statement-position binding
+                // gets a placeholder tail. The backend keys off statement position, not
+                // off this shape, so a genuine trailing expression of `0` is not
+                // mistaken for it.
+                value: Box::new(expr),
+                body: Box::new(crate::ir::PirExpr::IntLit(0)),
+            },
+            [] => expr,
+            multiple => {
+                return Err(LoweringError::Unsupported(format!(
+                    "destructuring `let` binding {{{}}} has no PIR node: the value is \
+                     computed and no variable is created, so every use of the bound \
+                     names would be undefined. Bind one name per statement instead.",
+                    multiple.join(", ")
+                )));
+            }
+        };
+
         let stmt_id = self.next_stmt_id();
         let domain = AffineDomain::universe(0, 0); // Scalar let binding
 
         let stmt = PirStatement {
             id: stmt_id,
             domain: domain.clone(),
-            body: expr,
+            body,
             quantity: qty,
             mutability,
             span: None,

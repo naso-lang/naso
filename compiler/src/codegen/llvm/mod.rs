@@ -5,6 +5,8 @@
 #[cfg(feature = "llvm")]
 pub mod access_emission;
 #[cfg(feature = "llvm")]
+pub mod expr_lowering;
+#[cfg(feature = "llvm")]
 pub mod loop_emission;
 #[cfg(feature = "llvm")]
 pub mod module_builder;
@@ -21,6 +23,8 @@ pub mod value_builder;
 
 #[cfg(feature = "llvm")]
 pub use access_emission::AccessEmitter;
+#[cfg(feature = "llvm")]
+pub use expr_lowering::PirExprLowerer;
 #[cfg(feature = "llvm")]
 pub use loop_emission::LoopEmitter;
 #[cfg(feature = "llvm")]

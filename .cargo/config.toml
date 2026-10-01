@@ -4,6 +4,16 @@ linker = "gcc"
 [build]
 rustflags = []
 
+# Incremental compilation caches were consuming 3.5 GB of the 10 GB /var/tmp
+# filesystem and pushed it to 99%, at which point `cc`/`lld` failed to link with
+# an LLVM crash rather than a disk error. The cache buys little on a workspace
+# this size and is fully regenerable, so it is turned off.
+[profile.dev]
+incremental = false
+
+[profile.test]
+incremental = false
+
 [env]
 # Z3 release used by z3-sys's `gh-release` feature.
 #

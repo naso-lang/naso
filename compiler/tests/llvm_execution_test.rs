@@ -16,7 +16,7 @@
 //! # How it runs
 //!
 //! `llc` compiles the generated `.ll` to an x86-64 object, a tiny C `main` calls the
-//! generated `stmt_0` and prints the result global, and the test parses that output.
+//! generated entry function and prints the result global, and the test parses that output.
 //! `lli` was tried first and rejected: it reports only an 8-bit exit status, so an i64
 //! result cannot be read from it, and inkwell 0.10 no longer exposes a JIT constructor.
 //!
@@ -91,10 +91,10 @@ impl Drop for CaseDir {
 const HARNESS_C: &str = r#"
 #include <stdint.h>
 #include <stdio.h>
-extern void stmt_0(void);
+extern void naso_entry(void);
 extern int64_t result;
 int main(void) {
-    stmt_0();
+    naso_entry();
     printf("%lld\n", (long long)result);
     return 0;
 }
@@ -104,10 +104,10 @@ int main(void) {
 const HARNESS_C_I8: &str = r#"
 #include <stdint.h>
 #include <stdio.h>
-extern void stmt_0(void);
+extern void naso_entry(void);
 extern int8_t result;
 int main(void) {
-    stmt_0();
+    naso_entry();
     printf("%d\n", (int)result);
     return 0;
 }
@@ -117,10 +117,10 @@ int main(void) {
 const HARNESS_C_I32: &str = r#"
 #include <stdint.h>
 #include <stdio.h>
-extern void stmt_0(void);
+extern void naso_entry(void);
 extern int32_t result;
 int main(void) {
-    stmt_0();
+    naso_entry();
     printf("%d\n", (int)result);
     return 0;
 }
@@ -522,68 +522,85 @@ fn an_unsigned_widening_cast_uses_zero_extension() {
     );
 }
 
-/// The `let mut total = 0; total = total + i;` pattern a `forall` loop body needs is
-/// NOT yet lowerable, and this test pins WHY rather than leaving it to a comment.
+/// A statement-position `let` creates a real allocation, and a LATER statement can
+/// assign to it.
 ///
-/// Two separate structural problems, both now producing honest diagnostics instead of
-/// silently wrong code:
+/// This is the end-to-end proof that statement scoping works. It used to be impossible:
+/// `build_module` emitted one function per PIR statement, so `total`'s alloca lived in
+/// `stmt_0` and a write from `stmt_1` had no destination. The backend refused it with
+/// "no allocation is known for it", which is why no `forall` body could accumulate into
+/// an outer variable.
 ///
-/// 1. `build_module` emits ONE FUNCTION PER PIR STATEMENT (`define void @stmt_N()`).
-///    An alloca created for statement 0 lives in `stmt_0`, so statement 1 cannot refer
-///    to it. The Assign arm therefore reports "no allocation is known for it".
-/// 2. `ExprKind::Let` lowers to `PirExpr::Let { body: IntLit(0) }` -- the binding's body
-///    is a fabricated literal, because `LetBinding` carries no body. The binding is
-///    scoped to its own statement for the same reason.
-///
-/// This is a real gap, not a passing configuration: a `forall` whose body accumulates
-/// into an outer variable does not compile to LLVM yet. The test asserts the DIAGNOSTIC,
-/// so that if the gap is ever closed the test fails and has to be rewritten into a
-/// numeric execution check -- which is the check that would actually prove the loop runs.
+/// 42 is written from the second statement and read by a third, so this fails if either
+/// the allocation or the cross-statement reference is missing -- not merely if an
+/// allocation is created and never used.
 #[test]
-fn a_loop_body_that_writes_an_outer_binding_is_refused_not_silently_dropped() {
-    let ir = {
-        let cc = CodegenContext::new(CodegenTarget::Host, OptLevel::None).expect("context");
-        let mut builder = LLVMModuleBuilder::new(&cc).expect("builder");
-        // Statement 0: bind `total` (as `let mut total = 0` does).
-        let bind = PirStatement {
-            id: StmtId(0),
-            domain: AffineDomain::universe(0, 0),
-            body: PirExpr::Let {
-                name: "total".into(),
-                qty: Quantity::Many,
-                mutability: Mutability::Mut,
-                value: Box::new(PirExpr::IntLit(0)),
-                body: Box::new(PirExpr::IntLit(0)),
-            },
-            quantity: Quantity::Many,
-            mutability: Mutability::Immutable,
-            span: None,
-        };
-        // Statement 1: `total = total + 1`, as a loop body would.
-        let write = PirStatement {
-            id: StmtId(1),
-            domain: AffineDomain::universe(0, 0),
-            body: PirExpr::Assign {
-                target: Box::new(PirExpr::Var("total".into())),
-                value: Box::new(PirExpr::IntLit(1)),
-            },
-            quantity: Quantity::Many,
-            mutability: Mutability::Immutable,
-            span: None,
-        };
-        let module = PirModule {
-            statements: vec![bind, write],
-            ..Default::default()
-        };
-        let err = builder
-            .build_module(&module)
-            .expect_err("a cross-statement write has no destination allocation");
-        err.to_string()
-    };
+fn a_later_statement_can_assign_to_a_statement_position_binding() {
+    let cc = CodegenContext::new(CodegenTarget::Host, OptLevel::None).expect("context");
+    let mut builder = LLVMModuleBuilder::new(&cc).expect("builder");
+    let i64t = cc.llvm_context().i64_type();
+    let global = builder.module().add_global(i64t, None, RESULT_GLOBAL);
+    global.set_initializer(&i64t.const_zero());
+    builder.add_variable(
+        RESULT_GLOBAL.to_string(),
+        global.as_pointer_value(),
+        i64t.into(),
+    );
 
-    assert!(
-        ir.contains("no allocation is known"),
-        "the diagnostic must explain the missing destination, not silently drop the \
-         write: {ir}"
+    let stmt = |id: usize, body: PirExpr| PirStatement {
+        id: StmtId(id),
+        domain: AffineDomain::universe(0, 0),
+        body,
+        quantity: Quantity::Many,
+        mutability: Mutability::Immutable,
+        span: None,
+    };
+    let module = PirModule {
+        statements: vec![
+            // `let mut total = 0;`
+            stmt(
+                0,
+                PirExpr::Let {
+                    name: "total".into(),
+                    qty: Quantity::Many,
+                    mutability: Mutability::Mut,
+                    value: Box::new(PirExpr::IntLit(0)),
+                    body: Box::new(PirExpr::IntLit(0)),
+                },
+            ),
+            // `total = 42;`
+            stmt(
+                1,
+                PirExpr::Assign {
+                    target: Box::new(PirExpr::Var("total".into())),
+                    value: Box::new(PirExpr::IntLit(42)),
+                },
+            ),
+            // `result = total;` -- the read proves the write landed in the SAME slot.
+            stmt(
+                2,
+                PirExpr::Assign {
+                    target: Box::new(PirExpr::Var(RESULT_GLOBAL.to_string())),
+                    value: Box::new(PirExpr::Var("total".into())),
+                },
+            ),
+        ],
+        ..Default::default()
+    };
+    builder
+        .build_module(&module)
+        .expect("a cross-statement write must now lower");
+
+    let ir = builder.module_to_string();
+    let got = execute(&ir, naso_compiler::codegen::abi::IntWidth::I64);
+    assert_eq!(
+        got, 42,
+        "the value written by the second statement must be visible to the third, \
+         which is only possible if they share one function's scope. Got {got}.\n--- IR ---\n{ir}"
+    );
+    assert_eq!(
+        ir.matches("alloca i64").count(),
+        1,
+        "there must be exactly ONE allocation for `total`, not one per statement: {ir}"
     );
 }

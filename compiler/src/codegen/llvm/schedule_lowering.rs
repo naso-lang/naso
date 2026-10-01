@@ -14,6 +14,7 @@ use crate::codegen::context::CodegenContext;
 use crate::codegen::error::{CodegenError, CodegenResult};
 use crate::codegen::llvm::{
     access_emission::AccessEmitter,
+    expr_lowering::PirExprLowerer,
     loop_emission::{LoopBounds as SequentialLoopBounds, LoopEmitter},
     parallel::{LoopBounds as ParallelLoopBounds, ParallelEmitter},
     polyhedral_opts::PolyhedralOptimizer,
@@ -32,8 +33,16 @@ use inkwell::values::{AnyValue, BasicValueEnum, FunctionValue};
 use std::collections::HashMap;
 
 /// Main entry point for lowering a ScheduleTree to LLVM IR
+///
+/// `module` is passed in rather than recovered from `function`. inkwell 0.10 exposes
+/// no safe "which module does this function belong to" accessor, and the only way to
+/// reach the `Module` from a `FunctionValue` is `unsafe { Module::new(raw) }` --
+/// which installs a `Drop` that calls `LLVMDisposeModule`, disposing a module the
+/// caller still owns. The body lowering needs the module to resolve a callee and to
+/// declare a quantum intrinsic, so it is threaded through explicitly.
 pub fn lower_schedule_tree<'ctx>(
-    ctx: &CodegenContext,
+    ctx: &'ctx CodegenContext,
+    module: &'ctx inkwell::module::Module<'ctx>,
     function: FunctionValue<'ctx>,
     schedule: &ScheduleTree,
     pir_module: &PirModule,
@@ -47,6 +56,12 @@ pub fn lower_schedule_tree<'ctx>(
     let type_lowering = LlvmTypeLowering::new(llvm_context);
     let mut value_builder = LlvmValueBuilder::new(builder, type_lowering);
 
+    // A schedule tree has no `let` step of its own, so a band body's only nameable
+    // storage is what already exists in the module. Bind the module's globals by name
+    // before lowering, so `counter = counter + 1` has somewhere to write. A name that
+    // is not a global stays unbound and an assignment to it is still refused.
+    value_builder.register_module_globals(module)?;
+
     // Create entry block
     let entry = llvm_context.append_basic_block(function, "entry");
     value_builder.builder().position_at_end(entry);
@@ -54,6 +69,7 @@ pub fn lower_schedule_tree<'ctx>(
     // Create schedule lowering context
     let mut lowering = ScheduleLowering::new(
         &mut value_builder,
+        module,
         function,
         pir_module,
         quantities,
@@ -85,9 +101,35 @@ pub fn lower_schedule_tree<'ctx>(
     Ok(())
 }
 
+/// Every `Domain` statement id in a schedule subtree, in tree order.
+fn statements_under(node: &ScheduleNode) -> Vec<StmtId> {
+    let mut ids = Vec::new();
+    collect_statements(node, &mut ids);
+    ids
+}
+
+fn collect_statements(node: &ScheduleNode, out: &mut Vec<StmtId>) {
+    match node {
+        ScheduleNode::Domain { stmt_id, .. } => out.push(*stmt_id),
+        ScheduleNode::Band { child, .. }
+        | ScheduleNode::Filter { child, .. }
+        | ScheduleNode::Context { child, .. }
+        | ScheduleNode::Extension { child, .. } => collect_statements(child, out),
+        ScheduleNode::Sequence { children } => {
+            for child in children {
+                collect_statements(child, out);
+            }
+        }
+        ScheduleNode::Empty => {}
+    }
+}
+
 /// Schedule lowering context
 pub struct ScheduleLowering<'ctx, 'a> {
     value_builder: &'a mut LlvmValueBuilder<'ctx>,
+    /// The module under construction, needed by the body lowering to resolve a callee
+    /// and to declare a quantum intrinsic on first use.
+    module: &'a inkwell::module::Module<'ctx>,
     function: FunctionValue<'ctx>,
     pir_module: &'a PirModule,
     quantities: &'a QuantityMap,
@@ -112,6 +154,7 @@ pub struct ScheduleLowering<'ctx, 'a> {
 impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
     pub fn new(
         value_builder: &'a mut LlvmValueBuilder<'ctx>,
+        module: &'a inkwell::module::Module<'ctx>,
         function: FunctionValue<'ctx>,
         pir_module: &'a PirModule,
         quantities: &'a QuantityMap,
@@ -124,6 +167,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
 
         Ok(Self {
             value_builder,
+            module,
             function,
             pir_module,
             quantities,
@@ -173,7 +217,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
         child: &ScheduleNode,
     ) -> CodegenResult<()> {
         // Check if this band should be erased ([0] quantity)
-        if self.is_band_erased(members) {
+        if self.is_band_erased(child) {
             // [0]-quantity band: skip code generation entirely
             return self.lower_node(child);
         }
@@ -190,6 +234,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
         // that builder; the immutable pieces (function, PIR module, quantities,
         // access relations) are `Copy` handles into `self`, so no borrow of
         // `self` is captured by the closure.
+        let module = self.module;
         let function = self.function;
         let pir_module = self.pir_module;
         let quantities = self.quantities;
@@ -214,6 +259,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
                 |lowering| {
                     let mut inner = ScheduleLowering::new(
                         lowering.value_builder(),
+                        module,
                         function,
                         pir_module,
                         quantities,
@@ -240,6 +286,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
                 |lowering| {
                     let mut inner = ScheduleLowering::new(
                         lowering.value_builder(),
+                        module,
                         function,
                         pir_module,
                         quantities,
@@ -263,10 +310,35 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
     /// per-statement quantities (available as `PirStatement::quantity`) plus a
     /// way to enumerate the statements covered by `members`; neither exists on
     /// `AffineMap` today. Left as-is pending that IR support.
-    fn is_band_erased(&self, _members: &[AffineMap]) -> bool {
-        self.quantities
-            .values()
-            .any(|q| matches!(q, crate::ast::Quantity::Zero))
+    /// Whether THIS band should be erased because its statements are `[0]`.
+    ///
+    /// This used to ignore its argument and test `self.quantities` as a whole: if ANY
+    /// binding anywhere in the program had `[0]` quantity, EVERY band was erased and
+    /// every loop became straight-line code. That is a silent wrong answer -- the loop
+    /// simply ran once -- rather than a diagnostic, and it applied to bands that had
+    /// nothing to do with the `[0]` statement.
+    ///
+    /// Now scoped to the statements actually in this band: a band is erased only when
+    /// every statement it covers is `[0]`. A band containing a `[0]` statement alongside
+    /// a `[1]` one is NOT erased, because dropping it would discard the `[1]` work.
+    fn is_band_erased(&self, child: &ScheduleNode) -> bool {
+        // A band with no statements at all has nothing to run; treating it as erased
+        // avoids emitting a loop whose body is empty.
+        let stmt_ids = statements_under(child);
+        if stmt_ids.is_empty() {
+            return true;
+        }
+        // A statement's quantity is the authority. The quantity MAP is keyed by variable
+        // name, not statement, so it cannot answer this question: two statements can
+        // touch the same name with different quantities, and a `[0]` binding in one
+        // statement says nothing about another.
+        stmt_ids.iter().all(|id| {
+            self.pir_module
+                .statements
+                .iter()
+                .find(|s| s.id == *id)
+                .is_some_and(|s| matches!(s.quantity, crate::ast::Quantity::Zero))
+        })
     }
 
     /// Extract loop bounds from affine scheduling maps
@@ -439,10 +511,35 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
         Ok(())
     }
 
-    /// Emit the body of a statement
-    fn emit_statement_body(&mut self, _stmt: &PirStatement) -> CodegenResult<()> {
-        // For now, this is handled by the access emitter
-        // In a full implementation, we'd lower the PirExpr to LLVM instructions
+    /// Emit the body of a statement: lower its `PirExpr` into real instructions.
+    ///
+    /// This used to be a stub returning `Ok(())`, on the theory that "this is handled
+    /// by the access emitter". It is not, and not partly: the access emitter only
+    /// handles `AccessRelation`s, which a plain expression body has none of. So a
+    /// `forall` lowered to a correct loop -- preheader, header, phi induction variable,
+    /// latch, exit -- with an EMPTY body. The loop ran the right number of times and
+    /// computed nothing, which is a silent wrong answer rather than a diagnostic.
+    ///
+    /// The expression logic itself lives in `PirExprLowerer`, shared with
+    /// `LLVMModuleBuilder`, so there is exactly one implementation of `Cast`, `Assign`
+    /// and the rest. Two copies would drift, and the copy that drifted would be the
+    /// one no existing test exercised -- which is exactly how the stub survived.
+    ///
+    /// `in_statement_position` is true: a `let` in a statement body is a binding, and
+    /// it must outlive its own expression.
+    fn emit_statement_body(&mut self, stmt: &PirStatement) -> CodegenResult<()> {
+        let quantities = self.quantities;
+        let mut lowerer = PirExprLowerer {
+            value_builder: self.value_builder,
+            module: self.module,
+            current_function: self.function,
+            in_statement_position: true,
+        };
+        // The value is discarded because a statement body's result is not the point --
+        // its SIDE EFFECTS are. Every arm of `build_expr` that has a side effect emits
+        // it before returning, and an error still propagates, so a body that cannot be
+        // lowered fails the build rather than compiling to nothing.
+        let _ = lowerer.build_expr(&stmt.body, quantities)?;
         Ok(())
     }
 
@@ -518,11 +615,130 @@ mod tests {
 
         let lowering = ScheduleLowering::new(
             &mut value_builder,
+            &module,
             function,
             &pir_module,
             &pir_module.quantities,
             &pir_module.accesses,
         );
         assert!(lowering.is_ok());
+    }
+
+    /// Build a `ScheduleLowering` over a module with the given statement quantities.
+    fn lowering_with_quantities(quantities: Vec<Quantity>) -> ScheduleLowering<'static, 'static> {
+        // The context must outlive the lowering, which borrows it, so it is leaked
+        // deliberately and released when the test process exits.
+        let context: &'static CodegenContext = Box::leak(Box::new(
+            CodegenContext::new(CodegenTarget::Host, OptLevel::None).unwrap(),
+        ));
+        let llvm_context = context.llvm_context();
+        // The module is leaked for the same reason as the context above: `Module<'ctx>`
+        // is invariant over `'ctx`, so `ScheduleLowering`'s borrow of it must be the
+        // same region as the borrow of the context, which a stack-local pair cannot
+        // satisfy (drop order is the reverse of declaration order).
+        let module: &'static inkwell::module::Module<'static> =
+            Box::leak(Box::new(llvm_context.create_module("test")));
+        let void_type = llvm_context.void_type();
+        let function = module.add_function("f", void_type.fn_type(&[], false), None);
+
+        let statements: Vec<PirStatement> = quantities
+            .iter()
+            .enumerate()
+            .map(|(i, q)| PirStatement {
+                id: StmtId(i),
+                domain: AffineDomain::universe(0, 0),
+                body: crate::ir::pir_types::PirExpr::IntLit(i as i64),
+                quantity: *q,
+                mutability: Mutability::Immutable,
+                span: None,
+            })
+            .collect();
+        let schedule = ScheduleTree::new(ScheduleNode::Empty, vec![]);
+        let pir_module = Box::leak(Box::new(PirModule::new(
+            statements,
+            schedule,
+            AccessRelations::new(),
+            HashMap::new(),
+            vec![],
+        )));
+
+        let type_lowering =
+            crate::codegen::llvm::type_lowering::LlvmTypeLowering::new(llvm_context);
+        let builder = llvm_context.create_builder();
+        let value_builder: &'static mut crate::codegen::llvm::value_builder::LlvmValueBuilder<
+            'static,
+        > = Box::leak(Box::new(
+            crate::codegen::llvm::value_builder::LlvmValueBuilder::new(builder, type_lowering),
+        ));
+        let lowering = ScheduleLowering::new(
+            value_builder,
+            module,
+            function,
+            pir_module,
+            &pir_module.quantities,
+            &pir_module.accesses,
+        )
+        .expect("lowering construction");
+        lowering
+    }
+
+    /// A band whose statements are all `[0]` is erased: the loop is dropped entirely.
+    #[test]
+    fn a_band_of_only_zero_quantity_statements_is_erased() {
+        let lowering = lowering_with_quantities(vec![Quantity::Zero, Quantity::Zero]);
+        let child = ScheduleNode::Sequence {
+            children: vec![
+                ScheduleNode::domain(StmtId(0), AffineDomain::universe(0, 0)),
+                ScheduleNode::domain(StmtId(1), AffineDomain::universe(0, 0)),
+            ],
+        };
+        assert!(
+            lowering.is_band_erased(&child),
+            "an all-[0] band must be erased"
+        );
+    }
+
+    /// A band containing a `[1]` statement is NOT erased, even if some OTHER statement
+    /// in the program is `[0]`.
+    ///
+    /// This is the regression for the old whole-quantity-map test, which erased EVERY
+    /// band as soon as ANY binding anywhere had `[0]` quantity. The loop then ran once
+    /// instead of iterating -- a silent wrong answer with no diagnostic.
+    #[test]
+    fn a_band_containing_a_linear_statement_survives_another_zero_quantity_statement() {
+        // Statement 0 is [0], statement 1 is [1]. The band covers only statement 1.
+        let lowering = lowering_with_quantities(vec![Quantity::Zero, Quantity::One]);
+        let child = ScheduleNode::domain(StmtId(1), AffineDomain::universe(0, 0));
+        assert!(
+            !lowering.is_band_erased(&child),
+            "a [1] statement's band must NOT be erased because another statement is [0]"
+        );
+    }
+
+    /// A band covering BOTH a [0] and a [1] statement is not erased: dropping it would
+    /// discard the linear work.
+    #[test]
+    fn a_band_mixing_zero_and_linear_statements_is_not_erased() {
+        let lowering = lowering_with_quantities(vec![Quantity::Zero, Quantity::One]);
+        let child = ScheduleNode::Sequence {
+            children: vec![
+                ScheduleNode::domain(StmtId(0), AffineDomain::universe(0, 0)),
+                ScheduleNode::domain(StmtId(1), AffineDomain::universe(0, 0)),
+            ],
+        };
+        assert!(
+            !lowering.is_band_erased(&child),
+            "erasing this band would silently drop the [1] statement"
+        );
+    }
+
+    /// A band with no statements has nothing to run, so it is erased.
+    #[test]
+    fn a_band_with_no_statements_is_erased() {
+        let lowering = lowering_with_quantities(vec![Quantity::One]);
+        assert!(
+            lowering.is_band_erased(&ScheduleNode::Empty),
+            "a band with no statements must be erased rather than emit an empty loop"
+        );
     }
 }

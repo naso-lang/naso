@@ -326,8 +326,16 @@ impl AffineDomain {
                     // x_i >= constant
                     lower = Some(AffineExpr::constant(c.constant / coeff));
                 } else if coeff < 0 && c.ctype == ConstraintType::Inequality {
-                    // -x_i >= constant  =>  x_i <= -constant
-                    upper = Some(AffineExpr::constant(-c.constant / coeff));
+                    // `coeff * x_i >= C` with `coeff < 0` means `x_i <= C / coeff`.
+                    //
+                    // The division by a negative coefficient is what flips the direction;
+                    // negating `C` as well inverted the bound a second time. For
+                    // `-i >= -3` (i.e. `i <= 3`) this returned `-3 / -1 = -3` -- an UPPER
+                    // bound of -3 -- so every generated loop had `iv < -3`, never
+                    // entered its body, and produced a silently wrong answer with no
+                    // diagnostic. The only test covering this compensated by writing the
+                    // constraint with a POSITIVE constant, which is why it passed.
+                    upper = Some(AffineExpr::constant(c.constant / coeff));
                 }
             }
         }
@@ -463,5 +471,69 @@ mod tests {
         };
         assert_eq!(e.evaluate(&[1, 2]), 2 * 1 + 3 * 2 + 5);
         assert_eq!(e.evaluate(&[0, 0]), 5);
+    }
+
+    /// `iterator_bounds` must recover the upper bound with the correct sign.
+    ///
+    /// `-i >= -3` means `i <= 3`. This returned `-3 / -1 = -3` because it negated the
+    /// constant as well as dividing by the negative coefficient, inverting the bound a
+    /// second time. Every generated loop then compared `iv < -3`, never ran its body,
+    /// and returned a silently wrong answer.
+    ///
+    /// The single test that exercised this path wrote the constraint with a POSITIVE
+    /// constant to work around the bug, so it passed against broken arithmetic.
+    #[test]
+    fn an_upper_bound_constraint_yields_the_correct_signed_bound() {
+        // 0 <= i, and i <= 3.
+        let domain = AffineDomain::new(
+            1,
+            0,
+            vec![
+                AffineConstraint::inequality(vec![1], 0),
+                AffineConstraint::inequality(vec![-1], -3),
+            ],
+        );
+        let (lower, upper) = domain
+            .iterator_bounds(0)
+            .expect("a bounded iteration space has bounds");
+        assert_eq!(lower.constant, 0, "the lower bound comes from `i >= 0`");
+        assert_eq!(
+            upper.constant, 3,
+            "`-i >= -3` means `i <= 3`, not `i <= -3`"
+        );
+    }
+
+    /// The same bound read with the coefficients scaled, which must not change the
+    /// result: `-2i >= -6` still means `i <= 3`.
+    ///
+    /// This pins the DIVISION, not just a negation. The buggy version returned
+    /// `-(-6) / -2 = -3`.
+    #[test]
+    fn an_upper_bound_is_invariant_under_scaling_the_constraint() {
+        let domain = AffineDomain::new(
+            1,
+            0,
+            vec![
+                AffineConstraint::inequality(vec![1], 0),
+                AffineConstraint::inequality(vec![-2], -6),
+            ],
+        );
+        let (_, upper) = domain.iterator_bounds(0).expect("bounds");
+        assert_eq!(upper.constant, 3, "`-2i >= -6` means `i <= 3`");
+    }
+
+    /// A lower bound with a negative constant is genuinely negative, not flipped.
+    #[test]
+    fn a_negative_lower_bound_keeps_its_sign() {
+        let domain = AffineDomain::new(
+            1,
+            0,
+            vec![
+                AffineConstraint::inequality(vec![1], -5),
+                AffineConstraint::inequality(vec![-1], -3),
+            ],
+        );
+        let (lower, _) = domain.iterator_bounds(0).expect("bounds");
+        assert_eq!(lower.constant, -5, "`i >= -5`");
     }
 }

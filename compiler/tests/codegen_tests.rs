@@ -923,10 +923,17 @@ mod llvm_codegen_tests {
             .emit_llvm(&pir)
             .expect("LLVM codegen failed");
 
-        // The LLVM module builder emits one `void` function per statement.
+        // All statements go into ONE function, so bindings are visible across them.
+        // This used to be a function per statement, which made any cross-statement
+        // write unlowerable.
         assert!(
-            llvm_ir.contains("define void @stmt_0()"),
-            "expected a stmt_0 function, got:\n{}",
+            llvm_ir.contains("define void @naso_entry()"),
+            "expected a single naso_entry function, got:\n{}",
+            llvm_ir
+        );
+        assert!(
+            llvm_ir.contains("stmt_0:"),
+            "expected a basic block per statement, got:\n{}",
             llvm_ir
         );
         // The fixture's parameters are parsed even though the LLVM module
@@ -947,8 +954,8 @@ mod llvm_codegen_tests {
             .emit_llvm(&pir)
             .expect("LLVM codegen failed");
         assert!(
-            llvm_ir.contains("define void @stmt_0()"),
-            "expected a stmt_0 function, got:\n{}",
+            llvm_ir.contains("define void @naso_entry()"),
+            "expected a single naso_entry function, got:\n{}",
             llvm_ir
         );
 
@@ -965,17 +972,20 @@ mod llvm_codegen_tests {
             .emit_llvm(&pir)
             .expect("LLVM codegen failed");
 
-        // One function per statement, in fixture order.
+        // One function, with one basic block per statement, in fixture order. The blocks
+        // are chained by unconditional branches, so statement order is the schedule's
+        // execution order.
         assert!(
-            llvm_ir.contains("@stmt_0()"),
-            "missing stmt_0:\n{}",
+            llvm_ir.contains("define void @naso_entry()"),
+            "missing naso_entry:\n{}",
             llvm_ir
         );
         assert!(
-            llvm_ir.contains("@stmt_1()"),
-            "missing stmt_1:\n{}",
+            llvm_ir.contains("stmt_0:"),
+            "missing the stmt_0 block:\n{}",
             llvm_ir
         );
+        assert!(llvm_ir.contains("stmt_1:"), "missing stmt_1:\n{}", llvm_ir);
 
         let report = check_ir(&llvm_ir, "fft_1024");
         println!("FFT validation: {}", report.summary());

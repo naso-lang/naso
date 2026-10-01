@@ -60,6 +60,7 @@ rayon = "1.10"
 blake3 = "1.5"
 
 [dev-dependencies]
+naga = { version = "25", features = ["wgsl-in"] }
 tempfile = "3.10"
 
 [[example]]

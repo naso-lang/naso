@@ -255,8 +255,15 @@ fn run_wgsl_build_command(args: &[String]) {
                         abi.buffer_bytes(b.index).unwrap_or(0)
                     );
                 }
-                for (n, t) in &abi.scalars {
-                    eprintln!("  argument {n} : {t}");
+                for (i, (n, t)) in abi.scalars.iter().enumerate() {
+                    eprintln!(
+                        "  binding({}) {} : {} uniform ({} bytes, WGSL name {}_u)",
+                        abi.scalar_binding(i).unwrap_or(0),
+                        n,
+                        t,
+                        abi.scalar_bytes(i).unwrap_or(0),
+                        n,
+                    );
                 }
                 eprintln!(
                     "  workgroup_size {} x, dispatch {} workgroups for {} elements",

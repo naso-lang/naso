@@ -26,6 +26,29 @@
 //! entry point. Dispatching over a tensor is not expressible without the loop
 //! lowering. That is stated at the call site rather than hidden.
 
+/// The WGSL scalar constructor for a Naso type, if `as T` is a numeric cast.
+///
+/// Returns `None` when `T` is not a scalar, in which case the ascription is a type
+/// annotation and carries no conversion.
+///
+/// Width lives in `Type::int_width`, not in the `TypeKind`, so it must be consulted
+/// the same way `scalar_wgsl` does it.
+pub fn cast_constructor(ty: &crate::ast::ty::Type) -> Option<String> {
+    use crate::ast::ty::TypeKind;
+    match &ty.kind {
+        // A narrower integer has no WGSL storage type. Emitting `i32(x)` would
+        // silently widen it, which is the wrong-answer bug this backend refuses
+        // elsewhere (`refuse_unsupported_int`), so it falls through to `None`.
+        TypeKind::Float => Some("f32".to_string()),
+        TypeKind::Int if ty.int_width.is_some_and(|w| w != 32) => None,
+        TypeKind::UInt if ty.int_width.is_some_and(|w| w != 32) => None,
+        TypeKind::Int => Some("i32".to_string()),
+        TypeKind::UInt => Some("u32".to_string()),
+        TypeKind::Bool => Some("bool".to_string()),
+        _ => None,
+    }
+}
+
 use crate::ast::{
     BinOp, Expr, ExprKind, Function, Item, Literal, Program, Stmt, StmtKind, TypeKind,
 };
@@ -690,7 +713,25 @@ fn emit_expr_inline(out: &mut String, expr: &Expr) {
             emit_expr_inline(out, idx);
             out.push(']');
         }
-        ExprKind::Ascribe(inner, _) => emit_expr_inline(out, inner),
+        // `as T` is a CAST, not an annotation. Emitting the inner expression alone
+        // silently drops the conversion, which is how `clamp(v) as i32` became
+        // `clamp(v)`: an f32 stored into an `array<i32>`. That shader still PARSES,
+        // so a parse-only check does not see it -- naga's validator does, and a
+        // driver would reject it at pipeline creation in the user's browser.
+        //
+        // WGSL spells numeric conversion as a constructor: `i32(3.7)`.
+        ExprKind::Ascribe(inner, ty) => match cast_constructor(ty) {
+            Some(wgsl) => {
+                out.push_str(&wgsl);
+                out.push('(');
+                emit_expr_inline(out, inner);
+                out.push(')');
+            }
+            // An ascription to a non-scalar type is not a numeric cast. Emitting the
+            // inner expression is correct for those -- `x as Tensor[f32, 4]` carries
+            // no conversion, only a type the compiler already agrees about.
+            None => emit_expr_inline(out, inner),
+        },
         ExprKind::Binary(op, lhs, rhs) => {
             // Parens everywhere: WGSL precedence rules and the AST shape do not
             // have to agree, and guessing here produces subtly wrong shaders.
@@ -1271,5 +1312,68 @@ mod tests {
             "stale header claim: {w}"
         );
         assert!(w.contains("Loops are emitted"), "header must say so: {w}");
+    }
+    /// A numeric cast must be EMITTED, not dropped -- tested at the emitter directly.
+    ///
+    /// Not through the pipeline: `lower_program` REFUSES `Ascribe` ("Unsupported
+    /// construct"), so a straight-line shader containing a cast cannot be built end to
+    /// end today. The emitter is still the place where the cast would be lost, and
+    /// `cast_constructor` is the shared logic the compute backend uses, so the unit
+    /// here pins it without depending on that refusal being lifted.
+    ///
+    /// That refusal is a real, separate gap and is recorded rather than hidden: with
+    /// it in place, a `as T` cast reaches WGSL only through the compute backend.
+    #[test]
+    fn cast_constructor_maps_the_supported_scalars() {
+        use crate::ast::Span;
+        use crate::ast::ty::{Type, TypeKind};
+        let mk = |k| Type::new(k, crate::ast::Quantity::Many, Span::default());
+
+        assert_eq!(
+            cast_constructor(&mk(TypeKind::Float)).as_deref(),
+            Some("f32")
+        );
+        assert_eq!(cast_constructor(&mk(TypeKind::Int)).as_deref(), Some("i32"));
+        assert_eq!(
+            cast_constructor(&mk(TypeKind::UInt)).as_deref(),
+            Some("u32")
+        );
+        assert_eq!(
+            cast_constructor(&mk(TypeKind::Bool)).as_deref(),
+            Some("bool")
+        );
+        // A tensor ascription carries no conversion, so the inner expression stands.
+        assert_eq!(cast_constructor(&mk(TypeKind::Tensor(vec![]))), None);
+
+        // Width lives in `int_width`, not in the TypeKind. Emitting `i32(x)` for an
+        // `i8` would silently widen it -- the same wrong-answer bug as binding an i8
+        // tensor as `array<i32>` -- so a narrow cast has no WGSL spelling here.
+        let mut narrow = mk(TypeKind::Int);
+        narrow.int_width = Some(8);
+        assert_eq!(
+            cast_constructor(&narrow),
+            None,
+            "widening i8 to i32 is the silent-wrong-answer bug"
+        );
+    }
+
+    /// `lower_program` refuses `Ascribe`, so a cast cannot reach the straight-line
+    /// backend end to end.
+    ///
+    /// Pinned so that lifting the refusal is a deliberate act: if this starts failing,
+    /// the straight-line emitter is reachable for casts and the emitter test above
+    /// should be rewritten to go through the pipeline.
+    #[test]
+    fn lowering_still_refuses_a_cast() {
+        let src = "fn clamp_i32(v: f32) -> i32 { return clamp(v, -128.0, 127.0) as i32; }";
+        let program = parse_program(src).expect("parse");
+        let result = crate::lowering::lower_program(&program);
+        assert!(
+            result.is_err(),
+            "lowering now accepts `as T`. The straight-line WGSL backend becomes \
+             reachable for casts: rewrite `cast_constructor_maps_the_supported_scalars` \
+             to assert on emitted WGSL rather than on the helper, and check the cast \
+             survives emission."
+        );
     }
 }

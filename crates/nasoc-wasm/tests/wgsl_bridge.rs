@@ -88,9 +88,15 @@ fn abi_reports_buffer_sizes() {
     assert_eq!(b1["access"], "read_write");
 }
 
-/// Scalars are reported as entry-point arguments, in order.
+/// Scalars are reported as UNIFORM BINDINGS, not entry-point arguments.
+///
+/// INVERTED from an earlier version of this file, which asserted the opposite -- that
+/// `compile_naso_wgsl` reported scalars as entry-point arguments. A WGSL compute
+/// entry point may take ONLY builtin values, so those shaders were legal text that
+/// every driver rejects at pipeline creation. `wgsl_reflect` parses them without
+/// complaint, which is why the error survived; naga's validator does not.
 #[test]
-fn abi_reports_scalar_arguments() {
+fn abi_reports_scalars_as_uniform_bindings() {
     let r = compile_naso_wgsl(SRC, "quantize");
     assert!(r.success());
     assert_eq!(r.scalars(), vec!["scale: f32", "N: u32"]);
@@ -100,12 +106,24 @@ fn abi_reports_scalar_arguments() {
         .lines()
         .find(|l| l.starts_with("fn "))
         .expect("entry point");
+
+    // Not in the signature: only builtins are legal there.
     for s in r.scalars() {
         assert!(
-            sig.contains(&s),
-            "scalar `{s}` missing from signature: {sig}"
+            !sig.contains(&s),
+            "a scalar must not be an entry-point argument, only builtins are legal: {sig}"
         );
     }
+
+    // In a uniform binding, numbered after the two tensors.
+    assert!(
+        w.contains("@group(0) @binding(2) var<uniform> scale_u: f32;"),
+        "scale must be a uniform binding at index 2: {w}"
+    );
+    assert!(
+        w.contains("@group(0) @binding(3) var<uniform> N_u: u32;"),
+        "N must be a uniform binding at index 3: {w}"
+    );
 }
 
 /// `toJson` describes the same result the getters return.

@@ -70,6 +70,29 @@ pub const WORKGROUP_SIZE: u32 = 64;
 
 type CodegenResult<T> = Result<T, CodegenError>;
 
+/// Naso parameter name -> the uniform that now carries it.
+///
+/// Scalar parameters are bound as `var<uniform> <name>_u`, because a WGSL compute
+/// entry point may take only builtin values. Reading such a parameter in the body
+/// must therefore emit the uniform's name, not the parameter's.
+///
+/// A module-level map rather than a parameter threaded through `emit_expr_inline`
+/// and `emit_stmt` (21 call sites): `emit_expr_inline` recurses over every
+/// expression, and `ExprKind::Var` is the single place a name becomes text, so one
+/// lookup here covers every path. Emission is single-threaded per compile, and the
+/// map is cleared at the start of each emission so one kernel cannot rename
+/// another's variables.
+static SCALAR_UNIFORMS: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// The WGSL name a Naso parameter is emitted under, if it is a scalar parameter.
+fn uniform_for(name: &str) -> Option<String> {
+    SCALAR_UNIFORMS.lock().ok().and_then(|m| {
+        m.iter()
+            .find(|(naso, _)| naso == name)
+            .map(|(_, wgsl)| wgsl.clone())
+    })
+}
+
 /// A tensor parameter, resolved to a storage binding.
 ///
 /// Public because it appears in [`ComputeAbi`], which a WebGPU host reads to
@@ -106,7 +129,11 @@ pub struct ComputeAbi {
     pub workgroup_size: u32,
     /// Storage bindings, in binding-index order.
     pub bindings: Vec<Binding>,
-    /// Entry-point scalar arguments, in parameter order, as `(name, wgsl type)`.
+    /// Scalar parameters, in parameter order, as `(name, wgsl type)`.
+    ///
+    /// These are UNIFORM BINDINGS, not entry-point arguments: a WGSL compute entry
+    /// point may take only builtin values. The WGSL binding name is `<name>_u`, and
+    /// the binding index is `bindings.len() + position in this list`.
     pub scalars: Vec<(String, String)>,
     /// Elements each binding is indexed over. All bindings share one extent.
     pub extent: u32,
@@ -126,6 +153,27 @@ impl ComputeAbi {
     /// Total elements in any one binding.
     pub fn elements(&self) -> usize {
         self.extent as usize
+    }
+
+    /// Binding index of the `i`th scalar uniform.
+    pub fn scalar_binding(&self, i: usize) -> Option<u32> {
+        self.scalars
+            .get(i)
+            .map(|_| self.bindings.len() as u32 + i as u32)
+    }
+
+    /// Bytes a scalar uniform buffer needs.
+    ///
+    /// WGSL requires a uniform binding to be at least 16 bytes and its size to be a
+    /// multiple of 16, so a single `f32` occupies a 16-byte slot whatever its type.
+    /// Reporting 4 here would have the host allocate a buffer the driver rejects.
+    pub fn scalar_bytes(&self, i: usize) -> Option<usize> {
+        self.scalars.get(i).map(|_| 16)
+    }
+
+    /// The WGSL name of the `i`th scalar uniform.
+    pub fn scalar_wgsl_name(&self, i: usize) -> Option<String> {
+        self.scalars.get(i).map(|(n, _)| format!("{}_u", n))
     }
 }
 
@@ -279,22 +327,39 @@ pub fn generate_wgsl_compute(program: &Program, kernel: &str) -> CodegenResult<S
     }
     out.push('\n');
 
-    // Scalar parameters become entry-point ARGUMENTS. A scalar is a value, so a
-    // uniform binding would be a needless resource and a `var<private>` module
-    // global would be writable module state rather than an input.
-    let scalar_params: String = scalars
-        .iter()
-        .map(|(n, t)| format!("{n}: {t}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    // Entry point.
-    // Scalars come first as entry-point arguments; the builtin is always last.
-    let mut params = scalar_params;
-    if !params.is_empty() {
-        params.push_str(", ");
+    // Scalar parameters become UNIFORM BINDINGS, not entry-point arguments.
+    //
+    // They were entry-point arguments. That is wrong: a WGSL compute entry point may
+    // take ONLY builtin values. A plain `scale: f32` parameter is legal TEXT --
+    // `wgsl_reflect` parses it without complaint -- and is rejected by validation,
+    // and by every driver at pipeline creation. So `kernels/scale_f32.naso` would
+    // never have run, on any GPU, in any browser.
+    //
+    // A uniform buffer is the correct spelling. Not `var<private>`: a scalar
+    // parameter is an input, and a private global is writable module state the host
+    // could never set.
+    //
+    // Uniforms are numbered AFTER the tensors, so every existing tensor-only kernel
+    // keeps the binding indices a host already allocates for.
+    if let Ok(mut m) = SCALAR_UNIFORMS.lock() {
+        m.clear();
+        for (name, _) in scalars.iter() {
+            m.push((name.clone(), format!("{}_u", sanitize(name))));
+        }
     }
-    params.push_str("@builtin(global_invocation_id) global_id: vec3<u32>");
+    for (i, (name, t)) in scalars.iter().enumerate() {
+        let index = bindings.len() as u32 + i as u32;
+        out.push_str(&format!(
+            "@group(0) @binding({index}) var<uniform> {}_u: {t};\n",
+            sanitize(name)
+        ));
+    }
+    if !scalars.is_empty() {
+        out.push('\n');
+    }
+
+    // Entry point: the builtin is the ONLY parameter a compute entry point may take.
+    let params = "@builtin(global_invocation_id) global_id: vec3<u32>";
     out.push_str(&format!(
         "@compute @workgroup_size({WORKGROUP_SIZE})\nfn {}({params}) {{\n",
         entry_name(kernel)
@@ -593,7 +658,10 @@ fn const_int(e: &Expr, line: u32) -> CodegenResult<i64> {
 fn emit_expr_inline(out: &mut String, expr: &Expr) {
     match &expr.kind {
         ExprKind::Literal(l) => out.push_str(&crate::codegen::wgsl_straight::emit_literal(l)),
-        ExprKind::Var(v) => out.push_str(&sanitize(&v.name)),
+        ExprKind::Var(v) => match uniform_for(&v.name) {
+            Some(wgsl) => out.push_str(&wgsl),
+            None => out.push_str(&sanitize(&v.name)),
+        },
         ExprKind::Assign(lhs, rhs) => {
             emit_expr_inline(out, lhs);
             out.push_str(" = ");
@@ -618,7 +686,19 @@ fn emit_expr_inline(out: &mut String, expr: &Expr) {
             }
             out.push(')');
         }
-        ExprKind::Ascribe(inner, _) => emit_expr_inline(out, inner),
+        // `as T` is a CAST. Dropping it here is what made `clamp(v) as i32` emit
+        // `clamp(v)`: an f32 written into an `array<i32>`. The shader still parses,
+        // so a parse-only check accepts it; naga's validator and every real driver
+        // reject it. See `cast_constructor`.
+        ExprKind::Ascribe(inner, ty) => match crate::codegen::wgsl_straight::cast_constructor(ty) {
+            Some(wgsl) => {
+                out.push_str(&wgsl);
+                out.push('(');
+                emit_expr_inline(out, inner);
+                out.push(')');
+            }
+            None => emit_expr_inline(out, inner),
+        },
         ExprKind::Binary(op, l, r) => {
             out.push('(');
             emit_expr_inline(out, l);
@@ -694,10 +774,37 @@ fn quantize(input: [1] Tensor[f32, 1024], output: inout [1] Tensor[f32, 1024], s
     /// A scalar parameter is an entry-point ARGUMENT, not a binding: it is a
     /// value, so a uniform would be a needless resource.
     #[test]
-    fn test_scalar_parameter_is_an_argument_not_a_binding() {
-        let w = compute(QUANT, "quantize").expect("must emit");
-        assert!(w.contains("scale: f32,"), "scale is a parameter: {w}");
-        assert!(!w.contains("@binding(2)"), "no binding for a scalar: {w}");
+    fn test_scalar_parameter_is_a_uniform_not_an_entry_argument() {
+        let src = r#"
+fn k(a: [*] Tensor[f32, 64], scale: f32) {
+    forall i in 0..64 { let v = a[i]; let _ = v * scale; }
+}
+"#;
+        let w = generate_wgsl_compute(&parse(src), "k").expect("shader");
+
+        // INVERTED. This test asserted the opposite: that a scalar is an
+        // entry-point argument, on the reasoning that "a scalar is a value, so a
+        // uniform binding would be a needless resource". That reasoning is wrong --
+        // a WGSL compute entry point may take ONLY builtin values, so
+        // `fn k(scale: f32, @builtin(global_invocation_id) ..)` is legal TEXT and
+        // rejected by every driver at pipeline creation.
+        //
+        // It survived because `wgsl_reflect` only PARSES. naga's validator, and a
+        // real GPU, both reject it. See wgsl_validation.rs.
+        let sig = w
+            .lines()
+            .find(|l| l.starts_with("fn "))
+            .expect("entry point");
+        assert!(
+            !sig.contains("scale: f32"),
+            "a scalar must not be an entry-point argument: {sig}"
+        );
+        assert!(
+            w.contains("@group(0) @binding(1) var<uniform> scale_u: f32;"),
+            "the scalar must be a uniform binding after the tensor: {w}"
+        );
+        // The body's read must name the uniform, not the parameter.
+        assert!(w.contains("scale_u"), "the body must read the uniform: {w}");
     }
 
     /// The guard bounds the invocation to the tensor's extent, which is why the
@@ -963,15 +1070,29 @@ fn quantize(input: [*] Tensor[f32, 1024], output: inout [1] Tensor[i32, 1024],
             "workgroup size must match: {w}"
         );
 
-        // Scalars must be entry-point arguments, in ABI order.
+        // The entry point must take ONLY the builtin.
         let sig = w
             .lines()
             .find(|l| l.starts_with("fn "))
             .expect("entry point line");
+        assert!(
+            sig.contains("@builtin(global_invocation_id)"),
+            "the builtin is required: {sig}"
+        );
         for (n, t) in &abi.scalars {
             assert!(
-                sig.contains(&format!("{n}: {t}")),
-                "scalar {n}: {t} must be an entry argument, signature was: {sig}"
+                !sig.contains(&format!("{n}: {t}")),
+                "a scalar must NOT be an entry-point argument -- only builtins are \
+                 legal there, and a driver rejects anything else. Signature was: {sig}"
+            );
+            // It must appear as a uniform binding instead, at the ABI's index.
+            let idx = abi
+                .scalar_binding(abi.scalars.iter().position(|(x, _)| x == n).unwrap())
+                .unwrap();
+            let decl = format!("@group(0) @binding({idx}) var<uniform> {n}_u: {t};");
+            assert!(
+                w.contains(&decl),
+                "expected binding declaration: {decl}\n{w}"
             );
         }
 

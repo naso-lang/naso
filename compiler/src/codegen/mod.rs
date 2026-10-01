@@ -9,6 +9,7 @@
 pub mod abi;
 pub mod context;
 pub mod error;
+pub mod schedule_consumer;
 pub mod validate;
 pub mod wgsl;
 pub mod wgsl_straight;

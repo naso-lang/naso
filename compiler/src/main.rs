@@ -170,6 +170,36 @@ fn run_wgsl_build_command(args: &[String]) {
         std::process::exit(1);
     }
 
+    // Lower the program and consume the schedule tree.
+    //
+    // This backend emits no loops, so the bands are used for the DIAGNOSTIC:
+    // a rejected `forall` now reports the iteration domain the lowering
+    // actually computed, rather than just naming the construct.
+    //
+    // The side effect that matters is reachability. `lower_program` previously
+    // ran only inside the `llvm`-gated build path, so in a default build the
+    // lowering pass -- including its non-trivial iteration domains -- was
+    // unreachable. Calling it here puts it on the `--target wgsl` path, which
+    // needs no LLVM feature. A build that reaches this line and reports a
+    // band with depth 1 and a real domain is proof the lowering works.
+    let pir = match naso_compiler::lowering::lower_program(&program) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Lowering error: {e}");
+            std::process::exit(1);
+        }
+    };
+    let bands = naso_compiler::codegen::schedule_consumer::module_bands(&pir);
+    if !bands.is_empty() {
+        eprintln!(
+            "note: schedule tree has {} band(s); this backend does not yet emit loops:",
+            bands.len()
+        );
+        for b in &bands {
+            eprintln!("  stmt {}: {}", b.stmt_id, b.describe());
+        }
+    }
+
     let wgsl = match generate_wgsl_straight_line(&program) {
         Ok(w) => w,
         Err(e) => {

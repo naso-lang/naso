@@ -19,6 +19,22 @@
 // scope, and reaches the AST for the prover to read. `assert` is proof-only --
 // using it at runtime is a type error, so it can never be a silent no-op.
 //
+// LOWERING AND CODEGEN (as of this commit):
+//   The lowering pass now gives each `forall` a real iteration domain and a
+//   real schedule band, and the WGSL backend emits loops as WGSL `for` loops.
+//   This file lowers: 3 statements, 3 bands, each 1-dimensional with the
+//   correct 0 <= i < 1024 domain.
+//
+//   It still does NOT produce a shader. `naso build --target wgsl` refuses it
+//   with an explicit reason: a tensor parameter has no WGSL equivalent in a
+//   function-parameter position, and `output[i] = ..` needs a buffer layout.
+//   Modelling that layout is the compute-pipeline work, and is not done.
+//
+//   So the ladder for this file is: parses -> typechecks -> lowers to PIR with
+//   correct iteration domains. It does NOT reach WGSL output, and its proof
+//   obligations are still NOT discharged (float reasoning is unsupported and
+//   reported as unproved, not as proved).
+//
 // Still not implemented:
 //   1. Obligation discharge for floats. naso-verify DOES read proof blocks and
 //      discharges the obligations it can encode, but the SMT layer has no

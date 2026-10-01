@@ -192,7 +192,8 @@ fn run_wgsl_build_command(args: &[String]) {
     let bands = naso_compiler::codegen::schedule_consumer::module_bands(&pir);
     if !bands.is_empty() {
         eprintln!(
-            "note: schedule tree has {} band(s); this backend does not yet emit loops:",
+            "note: schedule tree has {} band(s), emitted as WGSL `for` loops in \
+             source order:",
             bands.len()
         );
         for b in &bands {

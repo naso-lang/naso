@@ -1,9 +1,8 @@
 /// QIR Module Builder
-///
 /// Builds QIR-compatible LLVM IR modules with quantum intrinsics.
 use crate::codegen::context::CodegenContext;
 use crate::codegen::error::{CodegenError, CodegenResult};
-use crate::codegen::qir::primitives::{QIR_INTRINSICS, QirIntrinsic};
+use crate::codegen::qir::primitives::QIR_INTRINSICS;
 use crate::codegen::qir::profile::{QirProfile, QirProfileKind};
 use crate::ir::pir_types::{PirExpr, PirModule, PirStatement};
 use inkwell::AddressSpace;
@@ -11,36 +10,34 @@ use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder as LlvmBuilder;
 use inkwell::context::Context as LlvmContext;
 use inkwell::module::Module as LlvmModule;
-use inkwell::types::{BasicTypeEnum, FunctionType, IntType, PointerType, StructType, VoidType};
-use inkwell::values::{
-    BasicMetadataValueEnum, BasicValueEnum, FunctionValue, GlobalValue, PointerValue,
-};
+use inkwell::types::{BasicTypeEnum, IntType, PointerType};
+use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, FunctionValue, PointerValue};
 use std::collections::HashMap;
 
-/// QIR Module Builder for generating quantum IR
+// QIR Module Builder for generating quantum IR
 pub struct QIRModuleBuilder<'ctx> {
     context: &'ctx CodegenContext,
     module: LlvmModule<'ctx>,
     builder: LlvmBuilder<'ctx>,
     llvm_context: &'ctx LlvmContext,
     profile: QirProfile,
-    /// Qubit type (opaque pointer)
+    // Qubit type (opaque pointer)
     qubit_type: PointerType<'ctx>,
-    /// Result type (i1)
+    // Result type (i1)
     result_type: IntType<'ctx>,
-    /// Current function being built
+    // Current function being built
     current_function: Option<FunctionValue<'ctx>>,
-    /// Current basic block
+    // Current basic block
     current_block: Option<BasicBlock<'ctx>>,
-    /// Variable allocations: pointer plus the pointee type (required by
-    /// opaque-pointer `build_load` in inkwell 0.10)
+    // Variable allocations: pointer plus the pointee type (required by
+    // opaque-pointer `build_load` in inkwell 0.10)
     variables: HashMap<String, (PointerValue<'ctx>, BasicTypeEnum<'ctx>)>,
-    /// Declared intrinsics
+    // Declared intrinsics
     declared_intrinsics: HashMap<String, FunctionValue<'ctx>>,
 }
 
 impl<'ctx> QIRModuleBuilder<'ctx> {
-    /// Create a new QIR module builder
+    // Create a new QIR module builder
     pub fn new(context: &'ctx CodegenContext) -> CodegenResult<Self> {
         let llvm_context = context.llvm_context();
         let module = llvm_context.create_module("qir_module");
@@ -74,7 +71,7 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
         Ok(qir_builder)
     }
 
-    /// Create a new QIR module builder with specific profile
+    // Create a new QIR module builder with specific profile
     pub fn with_profile(context: &'ctx CodegenContext, profile: QirProfile) -> CodegenResult<Self> {
         let llvm_context = context.llvm_context();
         let module = llvm_context.create_module("qir_module");
@@ -103,32 +100,32 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
         Ok(qir_builder)
     }
 
-    /// Get the underlying LLVM module
+    // Get the underlying LLVM module
     pub fn module(&self) -> &LlvmModule<'ctx> {
         &self.module
     }
 
-    /// Get the LLVM context
+    // Get the LLVM context
     pub fn llvm_context(&self) -> &'ctx LlvmContext {
         self.llvm_context
     }
 
-    /// Get the qubit type
+    // Get the qubit type
     pub fn qubit_type(&self) -> PointerType<'ctx> {
         self.qubit_type
     }
 
-    /// Get the result type
+    // Get the result type
     pub fn result_type(&self) -> IntType<'ctx> {
         self.result_type
     }
 
-    /// Get the QIR profile
+    // Get the QIR profile
     pub fn profile(&self) -> &QirProfile {
         &self.profile
     }
 
-    /// Declare all QIR intrinsics
+    // Declare all QIR intrinsics
     fn declare_intrinsics(&mut self) -> CodegenResult<()> {
         for intrinsic in QIR_INTRINSICS {
             let fn_type = intrinsic.function_type(self);
@@ -139,7 +136,7 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
         Ok(())
     }
 
-    /// Add QIR module metadata
+    // Add QIR module metadata
     fn add_qir_metadata(&mut self) -> CodegenResult<()> {
         // Add QIR version metadata
         let version_md = self.llvm_context.metadata_string("1.0");
@@ -169,12 +166,12 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
         Ok(())
     }
 
-    /// Get an intrinsic by name
+    // Get an intrinsic by name
     pub fn get_intrinsic(&self, name: &str) -> Option<FunctionValue<'ctx>> {
         self.declared_intrinsics.get(name).copied()
     }
 
-    /// Call a QIR intrinsic
+    // Call a QIR intrinsic
     pub fn call_intrinsic(
         &mut self,
         name: &str,
@@ -198,7 +195,7 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
             .ok_or_else(|| CodegenError::QirError(format!("Intrinsic '{}' returned void", name)))
     }
 
-    /// Build the entire PIR module as QIR
+    // Build the entire PIR module as QIR
     pub fn build_module(&mut self, pir_module: &PirModule) -> CodegenResult<()> {
         // Build quantum operations from statements
         for stmt in &pir_module.statements {
@@ -213,7 +210,7 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
         Ok(())
     }
 
-    /// Build a PIR statement
+    // Build a PIR statement
     fn build_statement(&mut self, stmt: &PirStatement) -> CodegenResult<()> {
         // Create a function for this statement
         let func_name = format!("qir_stmt_{}", stmt.id.0);
@@ -241,7 +238,7 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
         Ok(())
     }
 
-    /// Build a PIR expression as QIR
+    // Build a PIR expression as QIR
     fn build_expr(&mut self, expr: &PirExpr) -> CodegenResult<BasicValueEnum<'ctx>> {
         match expr {
             PirExpr::IntLit(val) => {
@@ -315,6 +312,37 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
                 self.variables.remove(name);
                 Ok(result)
             }
+            // QIR models qubits and their measurement, not integer arithmetic.
+            // Refused rather than dropped: a dropped cast would emit QIR that computes
+            // something other than what the source says.
+            PirExpr::Cast { expr, width, .. } => Err(CodegenError::UnsupportedFeature(format!(
+                "a cast to i{} of {expr:?} is not expressible in QIR",
+                width.unwrap_or(32)
+            ))),
+            // QIR has no memory model, so there is nothing to store into.
+            // Reported rather than ignored: evaluating the value and dropping it would
+            // emit a QIR program that silently omits the program's effect.
+            PirExpr::Assign { target, .. } => Err(CodegenError::UnsupportedFeature(format!(
+                "assignment to {target:?} is not expressible in QIR, which models \
+                 qubits and no general memory"
+            ))),
+            // A statement sequence yields no value; every element is emitted in
+            // order and the value slot is filled with the i1 zero.
+            PirExpr::Stmts(parts) => {
+                let mut last: Option<BasicValueEnum<'ctx>> = None;
+                for part in parts {
+                    last = Some(self.build_expr(part)?);
+                }
+                match last {
+                    Some(v) => Ok(v),
+                    None => Ok(self
+                        .context
+                        .llvm_context()
+                        .i32_type()
+                        .const_int(0, false)
+                        .into()),
+                }
+            }
             PirExpr::If {
                 cond,
                 then_branch,
@@ -365,16 +393,16 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
                 phi.add_incoming(&[(&then_val, then_block_end), (&else_val, else_block_end)]);
                 Ok(phi.as_basic_value())
             }
-            PirExpr::Reversible { body, inverse } => {
+            PirExpr::Reversible { body, inverse: _ } => {
                 // For QIR, we just build the body
                 // The inverse would be handled by quantum compiler
                 self.build_expr(body)
             }
-            PirExpr::Index { base, indices } => {
+            PirExpr::Index { base, indices: _ } => {
                 let base_val = self.build_expr(base)?;
                 Ok(base_val)
             }
-            PirExpr::Field { base, field } => {
+            PirExpr::Field { base, field: _ } => {
                 let base_val = self.build_expr(base)?;
                 Ok(base_val)
             }
@@ -507,12 +535,12 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
         Ok(result.into())
     }
 
-    /// Convert module to QIR text format (.qir file)
+    // Convert module to QIR text format (.qir file)
     pub fn module_to_string(&self) -> String {
         self.module.print_to_string().to_string()
     }
 
-    /// Write module to .qir file
+    // Write module to .qir file
     pub fn write_qir_file(&self, path: &std::path::Path) -> CodegenResult<()> {
         self.module
             .print_to_file(path)
@@ -562,13 +590,44 @@ mod tests {
         assert!(ir.contains("qir.profile"));
     }
 
+    // `call_intrinsic` must be called from INSIDE a function.
+    // LLVM instructions can only be emitted into a basic block, and a module has no
+    // block to emit into. Calling this at module scope therefore fails with "Builder
+    // position is not set" -- which is correct, and is what the previous version of
+    // this test asserted against. The test now builds a real function first, which is
+    // how the one production caller uses it.
     #[test]
     fn test_qubit_allocation() {
         let context = CodegenContext::new(CodegenTarget::Host, OptLevel::None).unwrap();
         let mut builder = QIRModuleBuilder::new(&context).unwrap();
 
-        // Test calling qubit_alloc intrinsic
-        let result = builder.call_intrinsic("qir.qubit_alloc", &[], "q");
-        assert!(result.is_ok());
+        // A function body gives the builder a block to emit into. These are the same
+        // module's private fields, which a sibling test may reach.
+        let void_ty = context.llvm_context().void_type();
+        let fn_type = void_ty.fn_type(&[], false);
+        let func = builder.module.add_function("alloc_test", fn_type, None);
+        let entry = context.llvm_context().append_basic_block(func, "entry");
+        builder.builder.position_at_end(entry);
+
+        builder
+            .call_intrinsic("qir.qubit_alloc", &[], "q")
+            .expect("allocating a qubit inside a function must succeed");
+        // A void function still needs a terminator, or the module is invalid IR.
+        builder
+            .builder
+            .build_return(None)
+            .map_err(|e| CodegenError::InstructionError(e.to_string()))
+            .expect("terminator");
+
+        // The call must survive into the module text, and LLVM must accept it.
+        let ir = builder.module_to_string();
+        assert!(
+            ir.contains("qubit_alloc"),
+            "the intrinsic call must be emitted: {ir}"
+        );
+        builder
+            .module()
+            .verify()
+            .unwrap_or_else(|e| panic!("LLVM rejected the module: {e}\n{ir}"));
     }
 }

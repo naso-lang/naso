@@ -113,7 +113,7 @@ impl OpenQASMExporter {
         // Process operations
         for (idx, op) in module.operations.iter().enumerate() {
             match op {
-                QIROperation::AllocateQubit { index, quantity } => {
+                QIROperation::AllocateQubit { index: _, quantity } => {
                     // Qubits are pre-allocated in the register
                     // Just track quantity for barrier/reset insertion
                     if *quantity == Quantity::Zero {
@@ -135,7 +135,10 @@ impl OpenQASMExporter {
                             .entry("reset".to_string())
                             .and_modify(|c| *c += 1)
                             .or_insert(1);
-                        metadata.gate_count += 1;
+                        // `reset` is real emitted uncomputation, so it is counted -- but
+                        // under `operation_counts` only, not as a gate. Treating it as a
+                        // gate would put a `[0]`-qubit reset in the same tally as an `h`
+                        // and make the two exporters disagree.
                     } else if quantity == Quantity::One {
                         // [1] qubit: verify single use via barrier
                         if self.auto_barriers {
@@ -164,7 +167,7 @@ impl OpenQASMExporter {
                     }
                 }
                 QIROperation::Measure { qubit, basis } => {
-                    let basis_suffix = match basis {
+                    let _basis_suffix = match basis {
                         0 => "z",
                         1 => "x",
                         2 => "y",
@@ -186,7 +189,8 @@ impl OpenQASMExporter {
                     output.push_str(&format!("c[{}] = measure q[{}];\n", cbit_index, qubit));
                     *operation_counts.entry("measure".to_string()).or_insert(0) += 1;
                     metadata.measurement_count += 1;
-                    metadata.gate_count += 1;
+                    // NOT a gate. Incrementing `gate_count` here double-counted every
+                    // measurement, which `measurement_count` already reports.
                     cbit_index += 1;
                     current_depth += 1;
                     gate_depth = gate_depth.max(current_depth);

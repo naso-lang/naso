@@ -9,6 +9,7 @@ use super::access_relation::AccessRelations;
 use super::affine_domain::AffineDomain;
 use super::schedule_tree::{ScheduleTree, StmtId};
 use crate::ast::{Mutability, Quantity};
+use crate::ir::schedule_tree::ScheduleNode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -65,6 +66,54 @@ pub enum PirExpr {
         args: Vec<PirExpr>,
         qubits: Vec<PirExpr>,
     },
+    /// Store `value` into the lvalue `target`, evaluating to the stored value.
+    ///
+    /// Assignment was previously not representable, so `output[i] = ...` failed to
+    /// lower with `Unsupported(Assign(..))`. That is the correct failure -- it is a
+    /// diagnostic, not a wrong answer -- but it meant no loop kernel with a store
+    /// could reach a backend at all.
+    Assign {
+        target: Box<PirExpr>,
+        value: Box<PirExpr>,
+    },
+    /// A numeric conversion of `expr` to type `ty`.
+    ///
+    /// `e as T` was previously unrepresentable, so lowering refused with
+    /// `Unsupported(Ascribe(..))` -- or, when it sat inside a loop body, silently
+    /// discarded the whole body first (the body became `IntLit(0)`).
+    ///
+    /// The target type is carried rather than assumed: a backend that cannot perform
+    /// the conversion must say so instead of dropping it, because a dropped cast
+    /// stores the wrong type into the slot.
+    Cast {
+        expr: Box<PirExpr>,
+        /// Declared bit width of the cast target, when the target is an integer.
+        ///
+        /// Only the width is carried, not the whole `ast::Type`, because `PirExpr`
+        /// derives `Eq` and `Type` does not. The width is what a backend needs to
+        /// build the right LLVM integer type or WGSL constructor, and it is what was
+        /// being lost: `q[..] as i8` lowered with the `i8` simply absent.
+        width: Option<u8>,
+        /// Whether the TARGET is a signed integer.
+        ///
+        /// Carried explicitly because LLVM integer types are SIGNLESS -- `i32` is the
+        /// same type whether it holds a signed or an unsigned value, and the difference
+        /// is entirely in whether you emit `sext` or `zext`. Nothing downstream can
+        /// recover it, so guessing here is a wrong answer rather than a default: `zext`
+        /// of a negative value wraps, and `sext` of a large unsigned value goes negative.
+        signed: bool,
+    },
+    /// A sequence of statements evaluated for effect, yielding no value.
+    ///
+    /// This exists because a loop body is usually statements and no tail
+    /// expression. Before this variant, `forall i in 0..1024 { output[i] = ...; }`
+    /// lowered its body to `IntLit(0)` -- the ENTIRE body was discarded and the
+    /// kernel compiled to `define void @stmt_0() { ret void }`. `IntLit(0)` is a
+    /// value, so a value-less body had nowhere to live and the placeholder looked
+    /// plausible at the type level while throwing away the program's meaning.
+    ///
+    /// Order matters and is preserved: this is a sequence, not a set.
+    Stmts(Vec<PirExpr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,6 +176,23 @@ pub struct PirModule {
     pub parameters: Vec<String>,
     /// Function signatures for external calls
     pub extern_functions: Vec<ExternFunction>,
+}
+
+impl Default for PirModule {
+    fn default() -> Self {
+        // An EMPTY module, not an empty schedule tree around a dummy statement: the
+        // latter invents structure the IR never had. Tests and backends that need an
+        // empty module reach for `..Default::default()` constantly, and before this
+        // existed they each had to spell out six fields.
+        Self {
+            statements: Vec::new(),
+            schedule: ScheduleTree::new(ScheduleNode::Empty, Vec::new()),
+            accesses: AccessRelations::new(),
+            quantities: QuantityMap::new(),
+            parameters: Vec::new(),
+            extern_functions: Vec::new(),
+        }
+    }
 }
 
 /// External function declaration
@@ -236,6 +302,17 @@ impl PirModule {
                     || indices.iter().any(|i| self.expr_contains_var(i, var))
             }
             PirExpr::Field { base, .. } => self.expr_contains_var(base, var),
+            // A sequence's contents must be searched. Returning `false` here would
+            // make every statement inside a loop body invisible to linearity
+            // checking, so a linear value used only inside a loop would pass -- a
+            // soundness hole, not a cosmetic one.
+            PirExpr::Stmts(parts) => parts.iter().any(|p| self.expr_contains_var(p, var)),
+            // BOTH sides: a linear value appearing in the target is being bound to a
+            // location, and one in the value is being consumed. Both are uses.
+            PirExpr::Assign { target, value } => {
+                self.expr_contains_var(target, var) || self.expr_contains_var(value, var)
+            }
+            PirExpr::Cast { expr, .. } => self.expr_contains_var(expr, var),
             PirExpr::If {
                 cond,
                 then_branch,
@@ -416,6 +493,31 @@ fn pir_expr_to_string(expr: &PirExpr, _indent: usize) -> String {
         PirExpr::FloatLit(v) => format!("{}", v),
         PirExpr::BoolLit(v) => format!("{}", v),
         PirExpr::Var(v) => v.clone(),
+        PirExpr::Assign { target, value } => {
+            format!(
+                "{} = {}",
+                pir_expr_to_string(target, 0),
+                pir_expr_to_string(value, 0)
+            )
+        }
+        PirExpr::Cast {
+            expr,
+            width,
+            signed,
+        } => format!(
+            "{} as {}i{}",
+            pir_expr_to_string(expr, 0),
+            if *signed { "" } else { "u" },
+            width.unwrap_or(32)
+        ),
+        PirExpr::Stmts(parts) => {
+            let inner: Vec<String> = parts.iter().map(|p| pir_expr_to_string(p, 0)).collect();
+            if inner.is_empty() {
+                "{}".to_string()
+            } else {
+                format!("{{ {}; }}", inner.join("; "))
+            }
+        }
         PirExpr::Binary { op, left, right } => {
             format!(
                 "({} {} {})",

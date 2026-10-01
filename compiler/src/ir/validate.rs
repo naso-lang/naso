@@ -174,6 +174,15 @@ fn expr_contains_var(expr: &PirExpr, var: &str) -> bool {
             expr_contains_var(base, var) || indices.iter().any(|i| expr_contains_var(i, var))
         }
         PirExpr::Field { base, .. } => expr_contains_var(base, var),
+        // A sequence's contents MUST be searched. Returning `false` would hide
+        // every statement in a loop body from linearity validation, so a linear
+        // value consumed only inside a loop would never be seen.
+        PirExpr::Stmts(parts) => parts.iter().any(|p| expr_contains_var(p, var)),
+        // BOTH sides are uses: the target is bound to a location, the value is consumed.
+        PirExpr::Assign { target, value } => {
+            expr_contains_var(target, var) || expr_contains_var(value, var)
+        }
+        PirExpr::Cast { expr, .. } => expr_contains_var(expr, var),
         PirExpr::If {
             cond,
             then_branch,

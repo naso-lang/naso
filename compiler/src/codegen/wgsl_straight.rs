@@ -1357,23 +1357,38 @@ mod tests {
         );
     }
 
-    /// `lower_program` refuses `Ascribe`, so a cast cannot reach the straight-line
-    /// backend end to end.
+    /// A numeric cast now reaches the straight-line WGSL backend, and survives emission.
     ///
-    /// Pinned so that lifting the refusal is a deliberate act: if this starts failing,
-    /// the straight-line emitter is reachable for casts and the emitter test above
-    /// should be rewritten to go through the pipeline.
+    /// This test was a SENTINEL: while `lower_program` refused `Ascribe`, it asserted
+    /// that refusal still held, so that lifting it would be a deliberate act. Lowering
+    /// now lowers `e as T` to `PirExpr::Cast`, so the sentinel fired -- and did its job
+    /// by naming the rewrite. This is that rewrite.
+    ///
+    /// The bug it guards: `ExprKind::Ascribe` was emitted as its INNER EXPRESSION, so
+    /// `clamp(v) as i32` became `clamp(v)`. The shader still PARSED, so a parse-only
+    /// check accepted it, and a driver would reject it -- an f32 stored into an
+    /// `array<i32>`.
     #[test]
-    fn lowering_still_refuses_a_cast() {
+    fn a_numeric_cast_survives_emission_to_the_straight_line_backend() {
         let src = "fn clamp_i32(v: f32) -> i32 { return clamp(v, -128.0, 127.0) as i32; }";
         let program = parse_program(src).expect("parse");
-        let result = crate::lowering::lower_program(&program);
+
+        // The refusal is gone.
         assert!(
-            result.is_err(),
-            "lowering now accepts `as T`. The straight-line WGSL backend becomes \
-             reachable for casts: rewrite `cast_constructor_maps_the_supported_scalars` \
-             to assert on emitted WGSL rather than on the helper, and check the cast \
-             survives emission."
+            crate::lowering::lower_program(&program).is_ok(),
+            "a cast must lower; this test exists to assert that it reaches codegen"
+        );
+
+        let w = generate_wgsl_straight_line(&program).expect("shader");
+        // The emitter parenthesises every subexpression, so match on the
+        // constructor plus the call inside it rather than the whole expression.
+        assert!(
+            w.contains("i32(clamp("),
+            "the cast must appear as an i32(...) constructor, not vanish:\n{w}"
+        );
+        assert!(
+            !w.contains("return clamp("),
+            "returning the inner expression would mean the cast was dropped:\n{w}"
         );
     }
 }

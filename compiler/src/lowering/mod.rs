@@ -400,17 +400,35 @@ impl LoweringContext {
         // iterator is handled by the band at execution time.
         let body = match &expr.kind {
             crate::ast::ExprKind::Forall(loop_) => {
-                let tail = loop_.body.expr.clone();
-                match tail {
-                    Some(t) => self.lower_expr(&t)?,
-                    // A loop whose body is only statements: represent the body
-                    // by its last statement's effect via an empty body rather
-                    // than dropping the loop silently.
-                    // No tail expression: the body is a statement sequence
-                    // with no value. Representing it as the integer 0 is
-                    // honest about being a placeholder and is not emitted as
-                    // a loop result.
-                    None => crate::ir::PirExpr::IntLit(0),
+                // A loop body is usually a statement sequence with no tail value.
+                // It used to become `IntLit(0)` here, which discarded the body
+                // entirely: a 1024-iteration kernel compiled to an empty function.
+                // `PirExpr::Stmts` carries it instead.
+                // `lower_stmt` appends to `self.statements` rather than
+                // returning a value. Everything it appends for this body is
+                // this body's, so snapshot the length and take the tail. The
+                // outer statement's own schedule node is registered below.
+                let first_new = self.statements.len();
+                let first_sched = self.schedule_nodes.len();
+                for st in &loop_.body.stmts {
+                    self.lower_stmt(st)?;
+                }
+                let mut parts: Vec<crate::ir::PirExpr> = self.statements[first_new..]
+                    .iter()
+                    .map(|s| s.body.clone())
+                    .collect();
+                // Those inner statements must not also appear as top-level
+                // statements: they are the loop body's, and the band runs them.
+                self.statements.truncate(first_new);
+                self.schedule_nodes.truncate(first_sched);
+
+                if let Some(tail) = &loop_.body.expr {
+                    parts.push(self.lower_expr(tail)?);
+                }
+                match parts.len() {
+                    0 => crate::ir::PirExpr::Stmts(Vec::new()),
+                    1 => parts.pop().expect("len checked"),
+                    _ => crate::ir::PirExpr::Stmts(parts),
                 }
             }
             _ => self.lower_expr(expr)?,
@@ -461,6 +479,25 @@ impl LoweringContext {
 
         match &expr.kind {
             ExprKind::Literal(lit) => self.lower_literal(lit),
+            // `qir/primitives.rs` and `wgsl_compute.rs` apply it correctly.
+            ExprKind::Ascribe(inner, ty) => {
+                let lowered = self.lower_expr(inner)?;
+                Ok(crate::ir::PirExpr::Cast {
+                    expr: Box::new(lowered),
+                    // The DECLARED width travels with the cast. Lowering to the inner
+                    // expression alone loses the conversion, and a backend that cannot
+                    // see one was asked for will not perform it -- which is how an
+                    // `as i8` ended up storing an f64 into an i8 slot.
+                    width: ty.int_width,
+                    // `TypeKind::UInt`/`Nat` are the unsigned kinds; everything else
+                    // that is an integer here is signed.
+                    signed: !matches!(
+                        ty.kind,
+                        crate::ast::ty::TypeKind::UInt | crate::ast::ty::TypeKind::Nat
+                    ),
+                })
+            }
+
             ExprKind::Var(name) => Ok(PirExpr::Var(name.name.clone())),
             ExprKind::Binary(op, left, right) => {
                 let l = self.lower_expr(left)?;
@@ -543,6 +580,23 @@ impl LoweringContext {
                 })
             }
             ExprKind::QuantumOp(qop) => self.lower_quantum_op(qop),
+            // `e as T` is a numeric cast. Lower it to the inner expression and let
+            // the BACKEND apply the conversion: only a backend knows whether its
+            // target can represent T, and a narrowing cast that is silently dropped
+            // is exactly the `i8`-to-`i32` wrong-answer bug.
+            //
+            // Carrying the ascription rather than discarding it is what lets
+            ExprKind::Assign(target, value) => {
+                // The target is an lvalue; lower it structurally so a backend can
+                // decide whether it is addressable. A backend that cannot store
+                // must say so rather than evaluate the value and drop it.
+                let t = self.lower_expr(target)?;
+                let v = self.lower_expr(value)?;
+                Ok(crate::ir::PirExpr::Assign {
+                    target: Box::new(t),
+                    value: Box::new(v),
+                })
+            }
             _ => Err(LoweringError::Unsupported(format!("{:?}", expr.kind))),
         }
     }

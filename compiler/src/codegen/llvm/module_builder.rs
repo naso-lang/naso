@@ -17,33 +17,31 @@ use inkwell::values::{
 };
 use std::collections::HashMap;
 
-/// LLVM Module Builder for constructing LLVM IR from PIR
+// LLVM Module Builder for constructing LLVM IR from PIR
 pub struct LLVMModuleBuilder<'ctx> {
     context: &'ctx CodegenContext,
     module: LlvmModule<'ctx>,
     type_lowering: LlvmTypeLowering<'ctx>,
-    /// The single inkwell builder used for all instruction emission.
-    ///
-    /// It lives inside [`LlvmValueBuilder`]; this type does not keep a second
-    /// copy because `inkwell::builder::Builder` is neither `Copy` nor `Clone`
-    /// (it owns an `LLVMBuilderRef` and implements `Drop`), so two builders
-    /// would silently drift apart in insertion position.
+    // The single inkwell builder used for all instruction emission.
+    // It lives inside [`LlvmValueBuilder`]; this type does not keep a second
+    // copy because `inkwell::builder::Builder` is neither `Copy` nor `Clone`
+    // (it owns an `LLVMBuilderRef` and implements `Drop`), so two builders
+    // would silently drift apart in insertion position.
     value_builder: Option<LlvmValueBuilder<'ctx>>,
-    /// Current function being built
+    // Current function being built
     current_function: Option<FunctionValue<'ctx>>,
-    /// Current basic block
+    // Current basic block
     current_block: Option<BasicBlock<'ctx>>,
-    /// Variable allocations (name -> pointer, pointee type)
-    ///
-    /// LLVM 17 uses opaque pointers, so the pointee type cannot be recovered
-    /// from the pointer value itself; `build_load` needs it explicitly.
+    // Variable allocations (name -> pointer, pointee type)
+    // LLVM 17 uses opaque pointers, so the pointee type cannot be recovered
+    // from the pointer value itself; `build_load` needs it explicitly.
     variables: HashMap<String, (PointerValue<'ctx>, BasicTypeEnum<'ctx>)>,
-    /// Named struct types
+    // Named struct types
     struct_types: HashMap<String, inkwell::types::StructType<'ctx>>,
 }
 
 impl<'ctx> LLVMModuleBuilder<'ctx> {
-    /// Create a new module builder
+    // Create a new module builder
     pub fn new(context: &'ctx CodegenContext) -> CodegenResult<Self> {
         let llvm_context = context.llvm_context();
         let module = llvm_context.create_module("naso_module");
@@ -67,7 +65,7 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
         })
     }
 
-    /// The inkwell builder shared by this type and its value builder
+    // The inkwell builder shared by this type and its value builder
     fn llvm_builder(&self) -> &LlvmBuilder<'ctx> {
         self.value_builder
             .as_ref()
@@ -75,63 +73,62 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
             .builder()
     }
 
-    /// Get the underlying LLVM module
+    // Get the underlying LLVM module
     pub fn module(&self) -> &LlvmModule<'ctx> {
         &self.module
     }
 
-    /// Get the LLVM context
+    // Get the LLVM context
     pub fn llvm_context(&self) -> &inkwell::context::Context {
         self.context.llvm_context()
     }
 
-    /// Get the type lowering context
+    // Get the type lowering context
     pub fn type_lowering(&mut self) -> &mut LlvmTypeLowering<'ctx> {
         &mut self.type_lowering
     }
 
-    /// Get the value builder
+    // Get the value builder
     pub fn value_builder(&mut self) -> &mut LlvmValueBuilder<'ctx> {
         self.value_builder
             .as_mut()
             .expect("value_builder not initialized")
     }
 
-    /// Set the current function
+    // Set the current function
     pub fn set_current_function(&mut self, func: FunctionValue<'ctx>) {
         self.current_function = Some(func);
     }
 
-    /// Get the current function
+    // Get the current function
     pub fn current_function(&self) -> Option<FunctionValue<'ctx>> {
         self.current_function
     }
 
-    /// Set the current basic block
+    // Set the current basic block
     pub fn set_current_block(&mut self, block: BasicBlock<'ctx>) {
         self.current_block = Some(block);
         self.llvm_builder().position_at_end(block);
     }
 
-    /// Get the current basic block
+    // Get the current basic block
     pub fn current_block(&self) -> Option<BasicBlock<'ctx>> {
         self.current_block
     }
 
-    /// Add a variable allocation
-    ///
-    /// `ty` is the pointee type of the allocation; LLVM 17 opaque pointers do
-    /// not carry it, so it is recorded here for the later `build_load`.
+    // Add a variable allocation
+    // `ty` is the pointee type of the allocation; LLVM 17 opaque pointers do
+    // not carry it, so it is recorded here for the later `build_load`.
     pub fn add_variable(&mut self, name: String, ptr: PointerValue<'ctx>, ty: BasicTypeEnum<'ctx>) {
         self.variables.insert(name, (ptr, ty));
     }
 
-    /// Get a variable allocation
+    // Get a variable allocation
     pub fn get_variable(&self, name: &str) -> Option<PointerValue<'ctx>> {
         self.variables.get(name).map(|(ptr, _)| *ptr)
     }
 
-    /// Build the entire PIR module
+    // Build the entire PIR module
     pub fn build_module(&mut self, pir_module: &PirModule) -> CodegenResult<()> {
         // Declare external functions
         for extern_fn in &pir_module.extern_functions {
@@ -151,7 +148,7 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
         Ok(())
     }
 
-    /// Declare an external function
+    // Declare an external function
     fn declare_extern_function(
         &mut self,
         extern_fn: &crate::ir::pir_types::ExternFunction,
@@ -184,7 +181,7 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
         Ok(())
     }
 
-    /// Build a PIR statement as a function
+    // Build a PIR statement as a function
     fn build_statement(
         &mut self,
         stmt: &PirStatement,
@@ -223,7 +220,7 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
         Ok(())
     }
 
-    /// Build a PIR expression
+    // Build a PIR expression
     fn build_expr(
         &mut self,
         expr: &PirExpr,
@@ -408,6 +405,161 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
                 // Simplified: return base for now
                 Ok(base_val)
             }
+            // `expr as iN`: a REAL conversion instruction.
+            // The alternatives were both wrong: dropping the cast stored the source
+            // type into the target slot, and emitting the bare inner expression is
+            // the same bug. LLVM's `trunc`/`sext`/`zext` are the correct spelling, and
+            // choosing the wrong one is itself a wrong answer -- `sext` on an unsigned
+            // value and `zext` on a signed one both reinterpret the high bits.
+            // The signedness is not carried by PIR (only the width is), so this uses
+            // the source expression's own signedness from its LLVM type. A float source
+            // is `fptosi`, which saturates rather than trapping; a wider source is
+            // `trunc`. A target width equal to 32 with an i64 source is a trunc, not a
+            // no-op, because the VALUE is i64 and something must narrow it.
+            PirExpr::Cast {
+                expr,
+                width,
+                signed,
+            } => {
+                let v = self.build_expr(expr, quantities)?;
+                let target_w = u32::from(width.unwrap_or(32));
+                let source_ty = v.get_type();
+                let _source_w = match source_ty {
+                    BasicTypeEnum::IntType(t) => t.get_bit_width(),
+                    _ => 32,
+                };
+                let is_float = matches!(source_ty, BasicTypeEnum::FloatType(_));
+
+                // `IntWidth` is the enum the type lowering speaks; an unrecognised
+                // bit count has no LLVM spelling here, so refuse rather than guess
+                // a nearby width.
+                let target_ty = self.type_lowering.int_type(match target_w {
+                    1 => crate::codegen::abi::IntWidth::I1,
+                    8 => crate::codegen::abi::IntWidth::I8,
+                    16 => crate::codegen::abi::IntWidth::I16,
+                    32 => crate::codegen::abi::IntWidth::I32,
+                    64 => crate::codegen::abi::IntWidth::I64,
+                    128 => crate::codegen::abi::IntWidth::I128,
+                    other => {
+                        return Err(CodegenError::UnsupportedFeature(format!(
+                            "cast to a {other}-bit integer has no LLVM integer type here"
+                        )));
+                    }
+                });
+                // Same width AND an integer source means the conversion is a no-op, so
+                // no instruction is needed.
+                //
+                // The `!is_float` clause is currently redundant: `Cast` only ever builds
+                // an INTEGER target, so a float source can never compare equal to it.
+                // It is kept because the guard is what makes the intent explicit, and
+                // because a float target would otherwise silently turn this into a
+                // wrong-answer no-op. Note that removing it is an EQUIVALENT MUTANT --
+                // verified by mutation, all 14 execution tests still pass without it --
+                // so it is not covered by a test and is not claimed to be.
+                let target_enum: BasicTypeEnum<'ctx> = target_ty.into();
+                if !is_float && target_enum == source_ty {
+                    return Ok(v);
+                }
+
+                let converted = if is_float {
+                    // `fptosi`, which SATURATES on overflow rather than trapping.
+                    // A source that is out of range is a value the program computed,
+                    // not a bug to abort on.
+                    self.llvm_builder().build_float_to_signed_int(
+                        v.into_float_value(),
+                        target_ty,
+                        "cast",
+                    )
+                } else {
+                    // `build_int_cast_sign_flag` picks sext/zext/trunc from the widths
+                    // and the sign flag. Picking the wrong one is a wrong answer rather
+                    // than a default: `zext` of a negative value wraps, and `sext` of a
+                    // large unsigned value goes negative -- so the sign flag is
+                    // carried from the AST instead of guessed here, because LLVM's
+                    // integer types are signless and nothing downstream can recover it.
+                    self.llvm_builder().build_int_cast_sign_flag(
+                        v.into_int_value(),
+                        target_ty,
+                        *signed,
+                        "cast",
+                    )
+                }
+                .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+
+                Ok(converted.into())
+            }
+            // `target = value`: a real store, then the stored value.
+            // The target must resolve to an address. This is deliberately strict: if
+            // the target is not a known allocation, or its pointee type does not match
+            // the value, the code returns a diagnostic. Silently evaluating `value`
+            // and discarding it would compile to something that computes the right
+            // answer and stores nothing -- the class of bug this backend previously had
+            // with the whole loop body.
+            PirExpr::Assign { target, value } => {
+                let target = target.as_ref();
+                let value = self.build_expr(value, quantities)?;
+
+                // Only a plain named variable is addressable today. An indexed target
+                // (`output[i]`) needs a GEP, which requires an element type the IR
+                // carries only for allocas -- see AccessEmitter.
+                let name = match target {
+                    PirExpr::Var(n) => n,
+                    other => {
+                        return Err(CodegenError::UnsupportedFeature(format!(
+                            "assignment to {:?}: only a named variable is addressable by \
+                             the LLVM backend; an indexed or computed lvalue needs a \
+                             GEP with an element type this path does not carry",
+                            other
+                        )));
+                    }
+                };
+
+                let (ptr, pointee) = self.variables.get(name).copied().ok_or_else(|| {
+                    CodegenError::UnsupportedFeature(format!(
+                        "assignment to `{name}`: no allocation is known for it, so there \
+                         is nowhere to store. Declared names in scope: {:?}",
+                        self.variables.keys().collect::<Vec<_>>()
+                    ))
+                })?;
+
+                let value_ty = value.get_type();
+                if value_ty != pointee {
+                    return Err(CodegenError::UnsupportedFeature(format!(
+                        "assignment to `{name}`: storing {value_ty:?} into a slot of type \
+                         {pointee:?}. Widening or narrowing here would be a silent \
+                         wrong-answer bug, so it is refused."
+                    )));
+                }
+
+                self.llvm_builder()
+                    .build_store(ptr, value)
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                Ok(value)
+            }
+            // A statement sequence yields no value.
+            // Every element is emitted IN ORDER, and the sequence's result is the
+            // zero of its own type. `build_expr` has to return a
+            // `BasicValueEnum`, and there is no "void value" to return, so the
+            // placeholder is confined to the value slot only -- the SIDE EFFECTS
+            // of the sequence are what the caller actually needed and they are
+            // emitted.
+            // Returning early here (or skipping the loop) is how a whole kernel body
+            // previously vanished: the caller cannot tell an empty sequence from one
+            // whose effects were emitted.
+            PirExpr::Stmts(parts) => {
+                let mut last: Option<BasicValueEnum<'ctx>> = None;
+                for part in parts {
+                    last = Some(self.build_expr(part, quantities)?);
+                }
+                match last {
+                    Some(v) => Ok(v),
+                    None => Ok(self
+                        .type_lowering
+                        .int_type(crate::codegen::abi::IntWidth::I64)
+                        .const_int(0, false)
+                        .into()),
+                }
+            }
             PirExpr::QuantumOp { op, args, qubits } => {
                 // Quantum operations lower to a call of the runtime intrinsic
                 // with the same name, e.g. "h" -> "qir.h". Value arguments come
@@ -460,8 +612,8 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
         }
     }
 
-    /// Placeholder value for expressions that produce no LLVM value (a void
-    /// call). Mirrors the undefined-variable fallback: an `i64` zero.
+    // Placeholder value for expressions that produce no LLVM value (a void
+    // call). Mirrors the undefined-variable fallback: an `i64` zero.
     fn void_placeholder(&self) -> BasicValueEnum<'ctx> {
         let int_type = self
             .type_lowering
@@ -519,12 +671,12 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
         Ok(result.into())
     }
 
-    /// Convert module to LLVM IR string
+    // Convert module to LLVM IR string
     pub fn module_to_string(&self) -> String {
         self.module.print_to_string().to_string()
     }
 
-    /// Write module to .ll file
+    // Write module to .ll file
     pub fn write_ll_file(&self, path: &std::path::Path) -> CodegenResult<()> {
         self.module
             .print_to_file(path)

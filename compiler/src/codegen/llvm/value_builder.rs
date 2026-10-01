@@ -5,14 +5,13 @@
 // Typed builders for functions, globals, metadata, and common IR patterns.
 use crate::codegen::error::{CodegenError, CodegenResult};
 use crate::codegen::llvm::type_lowering::LlvmTypeLowering;
-use inkwell::AddressSpace;
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::module::Module;
 use inkwell::types::{BasicTypeEnum, FunctionType, StructType};
 use inkwell::values::{
     AnyValue, BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, GlobalValue,
-    InstructionValue, IntValue, MetadataValue, PointerValue,
+    InstructionOpcode, InstructionValue, IntValue, MetadataValue, PointerValue,
 };
 use std::collections::HashMap;
 
@@ -88,6 +87,62 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
 
         // Build function body
         body_builder(self, &params)?;
+
+        // A basic block MUST end in a terminator or the module is invalid IR, and LLVM's
+        // verifier rejects it. This was not emitted here, so every function built through
+        // this path produced `define void @f() { entry: }` -- unparseable by llc, and
+        // unrunnable. The two `value_builder` tests that had never passed were failing
+        // on exactly this.
+        //
+        // A body that emitted its own terminator is left alone; `ret` is not appended
+        // twice.
+        let needs_terminator = entry
+            .get_last_instruction()
+            .map(|last| {
+                !matches!(
+                    last.get_opcode(),
+                    InstructionOpcode::Return
+                        | InstructionOpcode::Br
+                        | InstructionOpcode::Switch
+                        | InstructionOpcode::Unreachable
+                        | InstructionOpcode::Resume
+                        | InstructionOpcode::Invoke
+                        | InstructionOpcode::CallBr
+                        | InstructionOpcode::CatchRet
+                        | InstructionOpcode::CatchSwitch
+                        | InstructionOpcode::CleanupRet
+                )
+            })
+            .unwrap_or(true);
+        if needs_terminator {
+            match ret_type {
+                // `ret void` is spelled `build_return(None)`: inkwell has no separate
+                // `build_ret_void`.
+                None => self
+                    .builder
+                    .build_return(None)
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?,
+                Some(rt) => {
+                    // Returning a fabricated zero is a wrong answer waiting to happen, so
+                    // it is only done for the scalar types where zero is genuinely the
+                    // right fallback for a body that forgot to return. Anything else is
+                    // refused rather than invented.
+                    let zero: BasicValueEnum<'ctx> = match rt {
+                        BasicTypeEnum::IntType(t) => t.const_zero().into(),
+                        BasicTypeEnum::FloatType(t) => t.const_zero().into(),
+                        _ => {
+                            return Err(CodegenError::UnsupportedFeature(format!(
+                                "cannot terminate `{name}`: its body emitted no return and \
+                                 its return type {rt:?} has no zero value"
+                            )));
+                        }
+                    };
+                    self.builder
+                        .build_return(Some(&zero))
+                        .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                }
+            };
+        }
 
         // Verify function. inkwell 0.10's `verify` reports through a bool and
         // prints diagnostics to stderr when `print` is true, so on failure we
@@ -652,6 +707,72 @@ mod tests {
 
         let fn_val = value_builder.build_void_function(&module, "test_fn", &[], &[], |_, _| Ok(()));
         assert!(fn_val.is_ok());
+    }
+
+    /// A function body that emits nothing must still get a terminator.
+    ///
+    /// Without one the module is `define void @f() { entry: }`, which is invalid IR:
+    /// `llc` rejects it and LLVM's verifier reports a missing terminator. This was the
+    /// failure behind `test_build_function` and `test_build_alloca`, neither of which
+    /// had ever passed. The module-level `verify` below is the real check -- a test that
+    /// only called `build_function` would still pass with an unterminated block.
+    #[test]
+    fn an_empty_body_still_produces_a_terminated_function() {
+        let context = CodegenContext::new(CodegenTarget::Host, OptLevel::None).unwrap();
+        let llvm_context = context.llvm_context();
+        let module = llvm_context.create_module("test");
+        let builder = llvm_context.create_builder();
+        let type_lowering =
+            crate::codegen::llvm::type_lowering::LlvmTypeLowering::new(llvm_context);
+        let mut value_builder = LlvmValueBuilder::new(builder, type_lowering);
+
+        value_builder
+            .build_void_function(&module, "empty", &[], &[], |_, _| Ok(()))
+            .expect("an empty void body must still build");
+
+        let ir = module.print_to_string().to_string();
+        module
+            .verify()
+            .unwrap_or_else(|e| panic!("LLVM rejected the module: {e}\n{ir}"));
+        assert!(
+            ir.contains("ret void"),
+            "an empty void function must end in `ret void`: {ir}"
+        );
+    }
+
+    /// A body that already emitted its own `ret` must not get a second one.
+    ///
+    /// Appending an unconditional terminator to an already-terminated block produces IR
+    /// with unreachable instructions after the return, which is at best noise and can be
+    /// rejected outright depending on the block layout.
+    #[test]
+    fn a_body_that_already_terminates_is_not_terminated_twice() {
+        let context = CodegenContext::new(CodegenTarget::Host, OptLevel::None).unwrap();
+        let llvm_context = context.llvm_context();
+        let module = llvm_context.create_module("test");
+        let builder = llvm_context.create_builder();
+        let type_lowering =
+            crate::codegen::llvm::type_lowering::LlvmTypeLowering::new(llvm_context);
+        let mut value_builder = LlvmValueBuilder::new(builder, type_lowering);
+
+        value_builder
+            .build_void_function(&module, "already", &[], &[], |vb, _| {
+                vb.builder()
+                    .build_return(None)
+                    .map_err(|e| crate::codegen::CodegenError::InstructionError(e.to_string()))?;
+                Ok(())
+            })
+            .expect("a self-terminated body must build");
+
+        let ir = module.print_to_string().to_string();
+        module
+            .verify()
+            .unwrap_or_else(|e| panic!("LLVM rejected the module: {e}\n{ir}"));
+        assert_eq!(
+            ir.matches("ret void").count(),
+            1,
+            "exactly one `ret void` is expected, not a duplicate: {ir}"
+        );
     }
 
     #[test]

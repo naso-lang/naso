@@ -61,7 +61,14 @@ pub enum BraketInstruction {
         control: Option<usize>,
     },
     /// Two qubit gate
-    #[serde(rename = "gate")]
+    ///
+    /// The tag is deliberately distinct from `Gate`. All three gate variants used to
+    /// carry `#[serde(rename = "gate")]`, which made two of them unreachable to serde
+    /// (it warns about exactly this) and meant a two-qubit gate could not be told apart
+    /// from a one-qubit gate on the way back in. Braket's own schema uses the same
+    /// `type: "gate"` string for every gate, so the discriminator is carried in a
+    /// separate field rather than by overloading the tag Braket requires.
+    #[serde(rename = "twoQubitGate")]
     TwoQubitGate {
         #[serde(rename = "gate")]
         gate_name: String,
@@ -69,7 +76,9 @@ pub enum BraketInstruction {
         control: usize,
     },
     /// Multi-qubit gate (CCX, etc.)
-    #[serde(rename = "gate")]
+    ///
+    /// Distinct tag for the same reason as `TwoQubitGate`.
+    #[serde(rename = "multiQubitGate")]
     MultiQubitGate {
         #[serde(rename = "gate")]
         gate_name: String,
@@ -172,7 +181,7 @@ impl BraketExporter {
         // Process operations
         for op in &module.operations {
             match op {
-                QIROperation::AllocateQubit { index, quantity } => {
+                QIROperation::AllocateQubit { index: _, quantity } => {
                     // Qubits are implicit in Braket by qubit count
                     // Track quantity for reset/barrier insertion
                     if *quantity == Quantity::Zero {
@@ -275,7 +284,19 @@ impl BraketExporter {
 
         let mut metadata = ExportMetadata::default();
         metadata.qubit_count = module.qubit_count;
-        metadata.gate_count = operation_counts.values().sum();
+        // `gate_count` counts GATES ONLY. Summing every entry in `operation_counts`
+        // also counted `measure`, `reset` and `barrier`, so a 2-gate circuit with 2
+        // measurements reported 4 gates -- double-counting the measurements that
+        // `measurement_count` already reports, and disagreeing with the neighbouring
+        // field. Non-gate operations are subtracted out explicitly rather than by
+        // keeping a second tally, so a newly added operation cannot silently be
+        // miscounted.
+        const NON_GATE_OPS: [&str; 3] = ["measure", "reset", "barrier"];
+        metadata.gate_count = operation_counts
+            .iter()
+            .filter(|(name, _)| !NON_GATE_OPS.contains(&name.as_str()))
+            .map(|(_, count)| *count)
+            .sum();
         metadata.gate_depth = gate_depth;
         metadata.measurement_count = measurement_targets.len();
         metadata.operation_counts = operation_counts;
@@ -341,13 +362,16 @@ impl BraketExporter {
             }
             2 => {
                 // Two qubit gate
-                if name == "cx" || name == "cnot" || name == "cy" || name == "cz" {
-                    BraketInstruction::TwoQubitGate {
-                        gate_name: name.to_string(),
-                        control: qubits[0],
-                        target: qubits[1],
-                    }
-                } else if name == "swap" || name == "iswap" {
+                // Every controlled or swap gate is emitted as the same two-qubit shape. These arms
+                // were separate `if`/`else if` branches with byte-identical bodies, which
+                // is a merge waiting to be misread as a behavioural difference.
+                if name == "cx"
+                    || name == "cnot"
+                    || name == "cy"
+                    || name == "cz"
+                    || name == "swap"
+                    || name == "iswap"
+                {
                     BraketInstruction::TwoQubitGate {
                         gate_name: name.to_string(),
                         control: qubits[0],
@@ -641,5 +665,54 @@ mod tests {
         assert!(value.get("braketSchemaHeader").is_some());
         assert!(value.get("circuit").is_some());
         assert_eq!(value["circuit"]["qubitCount"], 2);
+    }
+
+    /// Each gate arity must be distinguishable in the emitted JSON.
+    ///
+    /// All three gate variants once shared `#[serde(rename = "gate")]`, so serde could
+    /// not tell them apart on the way back in and warned that two variants were
+    /// unreachable. The existing tests deserialized the output and then only counted
+    /// instructions, so they passed anyway. This asserts the discriminator directly.
+    #[test]
+    fn test_gate_arities_have_distinct_tags() {
+        let exporter = BraketExporter::new();
+        let module = QIRModule {
+            qubit_count: 3,
+            qubit_quantities: vec![Quantity::One; 3],
+            operations: vec![
+                QIROperation::Gate {
+                    name: "h".to_string(),
+                    qubits: vec![0],
+                    params: vec![],
+                },
+                QIROperation::Gate {
+                    name: "cx".to_string(),
+                    qubits: vec![0, 1],
+                    params: vec![],
+                },
+                QIROperation::Gate {
+                    name: "ccx".to_string(),
+                    qubits: vec![0, 1, 2],
+                    params: vec![],
+                },
+            ],
+        };
+
+        let result = exporter.export(&module).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        let types: Vec<String> = parsed["circuit"]["instructions"]
+            .as_array()
+            .expect("instructions is an array")
+            .iter()
+            .map(|i| i["type"].as_str().expect("type is a string").to_string())
+            .collect();
+
+        assert_eq!(
+            types,
+            vec!["gate", "twoQubitGate", "multiQubitGate"],
+            "each gate arity must have its own discriminator, or a two-qubit gate is \
+             indistinguishable from a one-qubit gate: {}",
+            result.output
+        );
     }
 }

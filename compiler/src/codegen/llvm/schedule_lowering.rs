@@ -404,7 +404,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
     }
 
     /// Lower a domain node (statement instance)
-    fn lower_domain(&mut self, stmt_id: StmtId, domain: &AffineDomain) -> CodegenResult<()> {
+    fn lower_domain(&mut self, stmt_id: StmtId, _domain: &AffineDomain) -> CodegenResult<()> {
         // Find the statement
         let stmt = self
             .pir_module
@@ -480,7 +480,6 @@ mod tests {
     use crate::codegen::context::{CodegenContext, CodegenTarget, OptLevel};
     use crate::ir::{
         affine_domain::AffineDomain,
-        affine_map::{AffineMap, Matrix},
         pir_types::{PirModule, PirStatement},
         schedule_tree::{ScheduleNode, ScheduleTree, StmtId},
     };
@@ -511,7 +510,7 @@ mod tests {
 
         let pir_module = PirModule::new(vec![stmt], schedule, accesses, quantities, vec![]);
 
-        let mut type_lowering =
+        let type_lowering =
             crate::codegen::llvm::type_lowering::LlvmTypeLowering::new(llvm_context);
         let builder = llvm_context.create_builder();
         let mut value_builder =

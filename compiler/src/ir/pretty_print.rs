@@ -73,6 +73,31 @@ fn pir_expr_to_string(expr: &PirExpr, _indent: usize) -> String {
         PirExpr::FloatLit(v) => format!("{}", v),
         PirExpr::BoolLit(v) => format!("{}", v),
         PirExpr::Var(v) => v.clone(),
+        PirExpr::Assign { target, value } => {
+            format!(
+                "{} = {}",
+                pir_expr_to_string(target, 0),
+                pir_expr_to_string(value, 0)
+            )
+        }
+        PirExpr::Cast {
+            expr,
+            width,
+            signed,
+        } => format!(
+            "{} as {}i{}",
+            pir_expr_to_string(expr, 0),
+            if *signed { "" } else { "u" },
+            width.unwrap_or(32)
+        ),
+        PirExpr::Stmts(parts) => {
+            let inner: Vec<String> = parts.iter().map(|p| pir_expr_to_string(p, 0)).collect();
+            if inner.is_empty() {
+                "{}".to_string()
+            } else {
+                format!("{{ {}; }}", inner.join("; "))
+            }
+        }
         PirExpr::Binary { op, left, right } => {
             format!(
                 "({} {} {})",

@@ -3,19 +3,13 @@
 //! LLVM-specific lowering of quantity-aware types to inkwell types.
 
 #[cfg(feature = "llvm")]
-use crate::codegen::abi::abi_core::{
-    FloatWidth, IntWidth, LlvmAggregateType, LlvmPointerType, QuantityAwareType,
-};
+use crate::codegen::abi::abi_core::{LlvmAggregateType, LlvmPointerType, QuantityAwareType};
 #[cfg(feature = "llvm")]
 use crate::codegen::error::{CodegenError, CodegenResult};
 #[cfg(feature = "llvm")]
 use crate::codegen::llvm::type_lowering::LlvmTypeLowering;
 #[cfg(feature = "llvm")]
-use inkwell::context::Context as LlvmContext;
-#[cfg(feature = "llvm")]
-use inkwell::types::{
-    ArrayType, BasicType, BasicTypeEnum, FloatType, IntType, PointerType, StructType, VoidType,
-};
+use inkwell::types::{BasicType, BasicTypeEnum};
 
 #[cfg(feature = "llvm")]
 impl QuantityAwareType {

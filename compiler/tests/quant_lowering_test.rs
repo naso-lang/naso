@@ -361,6 +361,12 @@ fn count_in_expr(expr: &PirExpr, var: &str) -> usize {
             args.iter().map(|a| count_in_expr(a, var)).sum::<usize>()
                 + qubits.iter().map(|q| count_in_expr(q, var)).sum::<usize>()
         }
+        // A sequence holds statements; a use inside one is still a use. Returning 0
+        // here would make these counters under-report, so the test would pass on a
+        // program that actually uses the variable.
+        PirExpr::Stmts(parts) => parts.iter().map(|p| count_in_expr(p, var)).sum::<usize>(),
+        PirExpr::Assign { target, value } => count_in_expr(target, var) + count_in_expr(value, var),
+        PirExpr::Cast { expr, .. } => count_in_expr(expr, var),
         _ => 0,
     }
 }
@@ -400,6 +406,14 @@ fn expr_contains_var(expr: &PirExpr, var: &str) -> bool {
             args.iter().any(|a| expr_contains_var(a, var))
                 || qubits.iter().any(|q| expr_contains_var(q, var))
         }
+        // A use inside a statement sequence is still a use; the same goes for both
+        // sides of an assignment. Returning false for these would under-report
+        // usages and let a double-use slip through this test.
+        PirExpr::Stmts(parts) => parts.iter().any(|p| expr_contains_var(p, var)),
+        PirExpr::Assign { target, value } => {
+            expr_contains_var(target, var) || expr_contains_var(value, var)
+        }
+        PirExpr::Cast { expr, .. } => expr_contains_var(expr, var),
         PirExpr::IntLit(_) | PirExpr::FloatLit(_) | PirExpr::BoolLit(_) => false,
     }
 }

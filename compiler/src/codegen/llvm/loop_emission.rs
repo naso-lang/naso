@@ -12,7 +12,7 @@ use inkwell::context::Context;
 use inkwell::llvm_sys::core::{LLVMMetadataAsValue, LLVMValueAsMetadata};
 use inkwell::llvm_sys::debuginfo::{LLVMMetadataReplaceAllUsesWith, LLVMTemporaryMDNode};
 use inkwell::llvm_sys::prelude::LLVMMetadataRef;
-use inkwell::values::{AsValueRef, BasicValue, BasicValueEnum, FunctionValue, MetadataValue};
+use inkwell::values::{AsValueRef, BasicValue, BasicValueEnum, MetadataValue};
 
 /// Loop emitter for sequential and parallel bands
 pub struct LoopEmitter<'ctx> {

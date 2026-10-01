@@ -20,18 +20,22 @@
 // using it at runtime is a type error, so it can never be a silent no-op.
 //
 // Still not implemented:
-//   1. Quantified obligations. The parser reuses ExprKind::Forall for both
-//      loop statements and propositions, and infer_forall returns unit, so
-//      `assert(forall i in 0..1024 { ... })` does not typecheck. Only scalar
-//      obligations are expressible today.
-//   2. Obligation discharge. naso-verify does not read proof blocks yet, so
-//      the assertions below are typechecked but never checked for truth.
-//   3. Symbolic extents (see N above).
+//   1. Obligation discharge. naso-verify does not read proof blocks yet, so
+//      the assertions below are typechecked but never checked for truth. They
+//      are obligations, not results.
+//   2. Symbolic extents (see N above).
 //
-// The per-element precondition that makes the i8 cast sound is therefore
-// still NOT established. `assert(scale > 0.0)` is the only obligation present,
-// and it does not imply |input[i]| <= 127 * scale. This kernel is typechecked
-// but unverified.
+// `forall` is a proposition in expression position and a loop in statement
+// position. A proof block is erased, so reading `input` in an obligation does
+// not consume it -- which is what lets an obligation be stated about a `[1]`
+// linear value at all.
+//
+// The per-element precondition that makes the i8 cast sound is now *stated*,
+// above. It is still NOT *established*: nothing checks that it holds. So the
+// clamp remains load-bearing rather than decorative -- it is what keeps the
+// narrowing in range if the precondition is violated at runtime, and it is
+// also what makes the operation lossy. This kernel is typechecked but
+// unverified.
 
 /// Quantize f32 -> i8 with a symmetric scale.
 ///
@@ -40,10 +44,10 @@
 ///
 ///   forall i in 0..1024 { abs(input[i] / scale) <= 127.0 }
 ///
-/// That obligation is not yet expressible (see the file header), so the block
-/// below only states that the scale is positive. The clamp is load-bearing
-/// rather than defensive: without the precondition, the clamp is what keeps
-/// the narrowing in range, and it is also what makes the operation lossy.
+/// This obligation is stated but not discharged (see the file header). The
+/// clamp is therefore load-bearing rather than decorative: it is what keeps
+/// the narrowing in range if the precondition is violated, and it is also
+/// what makes the operation lossy.
 fn quantize_int8_symmetric(
     input: [1] Tensor[f32, 1024],
     output: inout [1] Tensor[i8, 1024],
@@ -51,6 +55,7 @@ fn quantize_int8_symmetric(
 ) {
     proof {
         assert(scale > 0.0);
+        assert(forall i in 0..1024 { abs(input[i] / scale) <= 127.0 });
     }
 
     forall i in 0..1024 {

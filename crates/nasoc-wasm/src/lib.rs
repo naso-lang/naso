@@ -203,6 +203,7 @@ fn extract_span_from_error(e: &TypeError) -> Option<Span> {
         TypeArgumentCountMismatch { span, .. } => Some(*span),
         InvalidCast { span, .. } => Some(*span),
         AssertOutsideProof { span } => Some(*span),
+        QuantifiedBodyNotBool { span } => Some(*span),
         FieldNotFound { span, .. } => Some(*span),
         VariantNotFound { span, .. } => Some(*span),
         NotAStruct { span, .. } => Some(*span),

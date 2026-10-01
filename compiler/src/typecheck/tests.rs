@@ -554,14 +554,83 @@ mod tests {
     /// quantified propositions, and infer_forall returns unit, so a
     /// quantified obligation is currently inexpressible. This test records the
     /// limit; it should be replaced with a positive one when quantifiers can
-    /// be distinguished from loops.
+    /// A quantified obligation is expressible. `forall` in expression position
+    /// is a proposition and has type bool, which is what `assert` requires.
     #[test]
-    fn test_quantified_assert_not_yet_supported() {
+    fn test_quantified_assert_is_supported() {
         assert!(
             check_source(
                 "fn f() -> bool { proof { assert(forall i in 0..10 { i < 10 }); } return true; }"
             )
+            .is_ok()
+        );
+        assert!(check_source("fn f() -> bool { proof { assert(forall i in 0..10, j in 0..20 { i < j }); } return true; }").is_ok());
+    }
+
+    /// A quantified body must be a proposition. A statement sequence states
+    /// nothing, and treating it as vacuously true would let an obligation that
+    /// asserts no condition pass -- the failure mode a verifier must not have.
+    #[test]
+    fn test_quantified_body_must_be_bool() {
+        assert!(
+            check_source(
+                "fn f() -> bool { proof { assert(forall i in 0..10 { }); } return true; }"
+            )
             .is_err()
+        );
+    }
+
+    /// Statement-position `forall` is still a loop, and the two forms did not
+    /// collide when the proposition variant was introduced.
+    #[test]
+    fn test_forall_statement_form_still_a_loop() {
+        assert!(
+            check_source("fn f() -> bool { forall i in 0..10 { let x = i; } return true; }")
+                .is_ok()
+        );
+    }
+
+    /// A proof block is erased, so reading a `[1]` linear value in an
+    /// obligation does not consume it. Without this, any obligation about a
+    /// linear parameter would make the surrounding runtime code look like a
+    /// double use, and quantified obligations would be inexpressible for
+    /// exactly the values worth stating properties about.
+    #[test]
+    fn test_proof_block_does_not_consume_linear_values() {
+        let src = "
+            fn quantize(
+                input: [1] Tensor[f32, 1024],
+                output: inout [1] Tensor[i8, 1024],
+                scale: f32
+            ) {
+                proof {
+                    assert(forall i in 0..1024 { abs(input[i] / scale) <= 127.0 });
+                }
+
+                forall i in 0..1024 {
+                    let v = round(input[i] / scale);
+                    output[i] = clamp(v, -128.0, 127.0) as i8;
+                }
+            }
+        ";
+        assert!(check_source(src).is_ok());
+    }
+
+    /// The erasure above is scoped to proof blocks only. A genuine runtime
+    /// double use must still be reported.
+    #[test]
+    fn test_runtime_double_use_still_reported() {
+        let result = check_source(
+            "fn f(x: [1] f32) -> f32 { proof { assert(x > 0.0); } let a = x; let b = x; return a; }",
+        );
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, TypeError::LinearVariableUsedTwice { .. })),
+            "expected LinearVariableUsedTwice, got {:?}",
+            errors
         );
     }
 

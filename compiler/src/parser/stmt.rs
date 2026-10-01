@@ -55,6 +55,15 @@ impl<'a> Parser<'a> {
                     let span = self.span_from(start);
                     stmts.push(Stmt::new(StmtKind::Proof(pb), span, next_id()))
                 }
+                // Statement-position `forall` is a loop. In expression
+                // position it is a proposition (parse_quantified), so the two
+                // forms are distinguished by where the keyword appears.
+                Some(TK::Forall) => {
+                    let expr = self.parse_forall();
+                    self.eat(TK::Semicolon);
+                    let span = expr.span;
+                    stmts.push(Stmt::new(StmtKind::Expr(expr), span, next_id()))
+                }
                 _ => {
                     debug_log("parse_stmt_list: dispatching to parse_expr");
                     let expr = self.parse_expr();

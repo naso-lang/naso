@@ -86,6 +86,18 @@ pub enum ExprKind {
     For(Box<ForLoop>),
     /// Forall loop (parallel polyhedral loop)
     Forall(Box<ForallLoop>),
+    /// Quantified proposition: `forall i in 0..N { <bool expr> }`.
+    ///
+    /// Distinct from `Forall` on purpose. The same `forall` syntax means a
+    /// loop in statement position and a proposition in expression position,
+    /// so the two cannot share a variant: a loop's body is a statement block
+    /// and its type is unit, while a proposition's body must be boolean.
+    /// Conflating them makes `assert(forall i in 0..N { .. })` inexpressible,
+    /// because the loop form is not a bool.
+    ///
+    /// Reuses `ForallLoop` for the bindings; the body block's tail expression
+    /// is the predicate.
+    Quantified(Box<ForallLoop>),
     /// While loop
     While(Box<Expr>, Box<Expr>),
     /// Return expression

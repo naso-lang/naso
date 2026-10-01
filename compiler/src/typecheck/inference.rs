@@ -82,6 +82,7 @@ pub fn infer_expr(checker: &mut TypeChecker, expr: &Expr) -> Result<Type, TypeEr
         ExprKind::Lambda(lambda) => infer_lambda(checker, lambda, expr.span),
         ExprKind::For(for_loop) => infer_for(checker, for_loop, expr.span),
         ExprKind::Forall(forall_loop) => infer_forall(checker, forall_loop, expr.span),
+        ExprKind::Quantified(quant) => infer_quantified(checker, quant, expr.span),
         ExprKind::While(cond, body) => infer_while(checker, cond, body, expr.span),
         ExprKind::Return(opt_expr) => infer_return(checker, opt_expr.as_deref(), expr.span),
         ExprKind::Assign(lhs, rhs) => infer_assign(checker, lhs, rhs, expr.span),
@@ -820,6 +821,53 @@ fn infer_forall(
     checker.env.exit_scope(guard)?;
 
     Ok(Type::unit(span))
+}
+
+/// Infer a quantified proposition: `forall i in a..b { predicate }`.
+///
+/// Always has type bool, unlike the loop form which is unit. The bound
+/// variables are bound in an inner scope so they cannot leak, and the body's
+/// tail expression is checked against bool. A body with no tail expression is
+/// an error rather than vacuously true: `forall i in 0..N { output[i] = 0; }`
+/// states no proposition, and silently treating it as `true` would let an
+/// obligation that asserts nothing pass.
+fn infer_quantified(
+    checker: &mut TypeChecker,
+    quant: &ForallLoop,
+    span: Span,
+) -> Result<Type, TypeError> {
+    let guard = checker.env.enter_scope();
+
+    for (var, lower, upper) in &quant.bindings {
+        let _lower_ty = infer_expr(checker, lower)?;
+        let _upper_ty = infer_expr(checker, upper)?;
+        checker.env.bind_var(
+            var.clone(),
+            Type::new(TypeKind::Int, Quantity::Many, span),
+            Quantity::Many,
+            Mutability::Immutable,
+        );
+    }
+
+    for stmt in &quant.body.stmts {
+        check_stmt(checker, stmt)?;
+    }
+
+    let bool_ty = Type::new(TypeKind::Bool, Quantity::Many, span);
+    match &quant.body.expr {
+        Some(predicate) => {
+            let pred_ty = infer_expr(checker, predicate)?;
+            unify::unify_types(checker, &pred_ty, &bool_ty)?;
+        }
+        None => {
+            return Err(TypeError::QuantifiedBodyNotBool {
+                span: quant.body.span,
+            });
+        }
+    }
+
+    checker.env.exit_scope(guard)?;
+    Ok(bool_ty)
 }
 
 /// Infer while loop type

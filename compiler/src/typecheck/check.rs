@@ -350,9 +350,14 @@ fn check_proof(checker: &mut TypeChecker, block: &ProofBlock) -> Result<(), Type
     let guard = checker.env.enter_scope();
     let prev_proof = checker.in_proof;
     checker.in_proof = true;
+    // A proof block is erased, so it observes values without consuming them.
+    // Without this, a quantified obligation about a `[1]` linear parameter
+    // would consume it and make the runtime loop report a double use.
+    let uses = checker.env.snapshot_uses();
     for stmt in &block.body.stmts {
         check_stmt(checker, stmt)?;
     }
+    checker.env.restore_uses(&uses);
     checker.in_proof = prev_proof;
     checker.env.exit_scope(guard)?;
     Ok(())

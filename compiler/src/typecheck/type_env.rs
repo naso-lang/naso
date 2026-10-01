@@ -9,7 +9,7 @@
 use crate::ast::*;
 use crate::typecheck::error::TypeError;
 use indexmap::IndexMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Information about a variable binding
 #[derive(Debug, Clone)]
@@ -28,6 +28,32 @@ pub struct VarInfo {
     pub moved: bool,
     /// Whether this variable is erased (quantity 0)
     pub erased: bool,
+}
+
+/// The use-state of a single variable, snapshotted across a proof block.
+///
+/// A proof block is erased: it reads values to state obligations but does not
+/// consume them. Restoring this state afterwards means an obligation can
+/// mention a `[1]` linear value without the enclosing runtime code seeing a
+/// spurious second use.
+#[derive(Debug, Clone)]
+pub struct VarUseState {
+    used_at: Vec<Span>,
+    moved: bool,
+}
+
+impl VarUseState {
+    fn from_info(info: &VarInfo) -> Self {
+        Self {
+            used_at: info.used_at.clone(),
+            moved: info.moved,
+        }
+    }
+
+    fn apply_to(&self, info: &mut VarInfo) {
+        info.used_at = self.used_at.clone();
+        info.moved = self.moved;
+    }
 }
 
 impl VarInfo {
@@ -187,6 +213,34 @@ impl TypeEnv {
     /// Lookup a variable mutably
     pub fn lookup_var_mut(&mut self, name: &Ident) -> Option<&mut VarInfo> {
         self.vars.get_mut(name)
+    }
+
+    /// Snapshot the use-state of every currently bound variable.
+    ///
+    /// Used to typecheck a `proof { .. }` block. A proof block is erased, so
+    /// reading a value in it observes the value without consuming it. Without
+    /// this, a quantified obligation mentioning a `[1]` linear parameter would
+    /// consume that parameter and make the surrounding runtime loop report a
+    /// double use -- which would make every obligation about a linear value
+    /// inexpressible.
+    pub fn snapshot_uses(&self) -> HashMap<Ident, VarUseState> {
+        self.vars
+            .iter()
+            .map(|(k, v)| (k.clone(), VarUseState::from_info(v)))
+            .collect()
+    }
+
+    /// Restore use-state captured by [`Self::snapshot_uses`].
+    ///
+    /// Only use-state is restored, not bindings: variables bound inside the
+    /// proof block leave with its scope, and restoring those would leak them
+    /// into the enclosing code.
+    pub fn restore_uses(&mut self, snapshot: &HashMap<Ident, VarUseState>) {
+        for (name, state) in snapshot {
+            if let Some(info) = self.vars.get_mut(name) {
+                state.apply_to(info);
+            }
+        }
     }
 
     /// Record a use of a variable

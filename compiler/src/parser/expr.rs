@@ -211,7 +211,7 @@ impl<'a> Parser<'a> {
             Some(TK::If) => self.parse_if(),
             Some(TK::Match) => self.parse_match(),
             Some(TK::For) => self.parse_for(),
-            Some(TK::Forall) => self.parse_forall(),
+            Some(TK::Forall) => self.parse_quantified(),
             Some(TK::While) => self.parse_while(),
             Some(TK::Return) => self.parse_return(),
             Some(TK::Reversible) => self.parse_reversible_expr(),
@@ -442,7 +442,7 @@ impl<'a> Parser<'a> {
         )
     }
 
-    fn parse_forall(&mut self) -> Expr {
+    pub(crate) fn parse_forall(&mut self) -> Expr {
         let start = self.pos;
         self.expect(TK::Forall);
 
@@ -471,6 +471,49 @@ impl<'a> Parser<'a> {
         let span = self.span_from(start);
         Expr::new(
             ExprKind::Forall(Box::new(ForallLoop {
+                bindings,
+                body,
+                span,
+            })),
+            span,
+            next_id(),
+        )
+    }
+
+    /// Parse a quantified proposition: `forall i in 0..N { <bool expr> }`.
+    ///
+    /// Same syntax as the loop form, but reached only from expression
+    /// position -- see ExprKind::Quantified. The body block must end in a
+    /// tail expression, because that tail is the predicate; a proposition
+    /// written as a statement sequence has no meaning.
+    fn parse_quantified(&mut self) -> Expr {
+        let start = self.pos;
+        self.expect(TK::Forall);
+
+        let mut bindings = Vec::new();
+        loop {
+            let var = self.parse_ident();
+            self.expect(TK::In);
+            let lower = self.parse_expr();
+            self.expect(TK::DotDot);
+            let upper = self.parse_expr();
+            bindings.push((var, lower, upper));
+
+            if !self.at(TK::Comma) {
+                break;
+            }
+            self.bump(); // consume comma
+        }
+
+        let body = self.parse_block_expr();
+        let body = match body.kind {
+            ExprKind::Block(b) => *b,
+            _ => unreachable!("quantified body is always a block"),
+        };
+
+        let span = self.span_from(start);
+        Expr::new(
+            ExprKind::Quantified(Box::new(ForallLoop {
                 bindings,
                 body,
                 span,

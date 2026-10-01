@@ -69,6 +69,9 @@ pub enum TypeError {
         span: Span,
     },
 
+    #[error("a quantified proposition must have a boolean body: `forall i in a..b {{ <expr> }}`")]
+    QuantifiedBodyNotBool { span: Span },
+
     #[error("`assert` may only be used inside a `proof {{ .. }}` block")]
     AssertOutsideProof { span: Span },
 

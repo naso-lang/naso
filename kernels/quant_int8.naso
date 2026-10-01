@@ -100,3 +100,16 @@ fn normalize_f32(
         output[i] = round(input[i] / scale);
     }
 }
+
+// BRANCHING AND LINEARITY
+// ------------------------
+// A `[1]` input must be consumed on EVERY path or NONE. This was previously
+// unenforced: a consume inside one `if` arm or one `match` arm was silently
+// accepted, so a quantum resource could leak on the paths that did not consume
+// it. The typechecker now joins each branch's consumption state and rejects a
+// value consumed on only some paths, so a circuit cannot conditionally discard a
+// qubit without saying so.
+//
+// This kernel has no branches, so it does not exercise that check; see
+// crates/naso-verify/tests/corpus_tests.rs (branch-join tests) and
+// crates/naso-verify/tests/corpus/linearity/invalid.naso (leak cases).

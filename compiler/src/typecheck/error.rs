@@ -40,6 +40,26 @@ pub enum TypeError {
     #[error("unused linear variable `{name}` (defined at {defined_at:?})")]
     UnusedLinearVariable { name: Ident, defined_at: Span },
 
+    #[error(
+        "linear variable `{name}` is consumed on only {consumed_on:?} of {total} branch(es) \
+         (branches {consumed_on:?} consume it, the others do not), so it leaks on the paths \
+         that do not consume it; a `[1]` value must be consumed on every path or none"
+    )]
+    LinearNotConsumedOnAllPaths {
+        name: Ident,
+        /// Zero-based indices of the branches that do consume it.
+        consumed_on: Vec<usize>,
+        /// How many mutually exclusive branches the join covered.
+        total: usize,
+        span: Span,
+    },
+
+    #[error(
+        "linear value consumed only under a match guard at {span:?}; a guarded arm may not \
+         be taken, so the consumption cannot be proven to happen on every path"
+    )]
+    LinearConsumedUnderGuard { span: Span },
+
     #[error("type mismatch: expected `{expected}`, found `{found}`")]
     TypeMismatch {
         expected: Type,

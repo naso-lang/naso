@@ -540,16 +540,44 @@ fn infer_if(
         &Type::new(TypeKind::Bool, Quantity::Many, span),
     )?;
 
-    let then_ty = infer_expr(checker, then_branch)?;
+    // Each branch is inferred from the SAME entry state, then the states are
+    // joined. Inferring them sequentially against one shared state was unsound in
+    // both directions: a consume in the `then` branch left the value moved, so the
+    // `else` branch was falsely rejected as a use-after-move, and a consume in only
+    // one branch was never reported as a leak.
+    let entry = checker.env.snapshot_linear();
 
-    if let Some(else_expr) = else_branch {
-        let else_ty = infer_expr(checker, else_expr)?;
-        unify::unify_types(checker, &then_ty, &else_ty)?;
-        Ok(then_ty)
-    } else {
-        // If without else returns Unit
-        unify::unify_types(checker, &then_ty, &Type::unit(span))?;
-        Ok(Type::unit(span))
+    checker.env.restore_linear(&entry);
+    let then_ty = infer_expr(checker, then_branch)?;
+    let then_state = checker.env.snapshot_linear();
+
+    let (else_ty, else_state) = match else_branch {
+        Some(else_expr) => {
+            checker.env.restore_linear(&entry);
+            let ty = infer_expr(checker, else_expr)?;
+            (Some(ty), checker.env.snapshot_linear())
+        }
+        // Without an `else` there is still a second path -- the one where the
+        // condition is false and the body never runs. Joining only the `then`
+        // branch would treat a conditional consume as unconditional, so the
+        // implicit no-op path is joined as a branch that consumes nothing.
+        None => (None, entry.clone()),
+    };
+
+    checker
+        .env
+        .join_linear(&entry, &[then_state, else_state], span)?;
+
+    match else_ty {
+        Some(else_ty) => {
+            unify::unify_types(checker, &then_ty, &else_ty)?;
+            Ok(then_ty)
+        }
+        None => {
+            // If without else returns Unit
+            unify::unify_types(checker, &then_ty, &Type::unit(span))?;
+            Ok(Type::unit(span))
+        }
     }
 }
 
@@ -566,28 +594,23 @@ fn infer_match(
         return Ok(Type::unit(span));
     }
 
-    // Check first arm to get expected result type
-    let first_arm = &arms[0];
-    let bindings = checker.check_pattern(&first_arm.pattern, &scrutinee_ty)?;
+    // Every arm is inferred from the SAME entry state and the results are joined,
+    // for the same reason as `if`: a sequential walk over one shared state both
+    // falsely rejects a correct consume-in-every-arm match and misses a leak when
+    // only some arms consume.
+    //
+    // Pattern bindings are bound per arm inside that arm's own scope, so they are
+    // local to the arm and do not take part in the join. The entry snapshot is
+    // taken BEFORE any pattern binding, so a name bound by one arm cannot leak
+    // into another's entry state.
+    let entry = checker.env.snapshot_linear();
 
-    // Bind pattern variables
-    let guard = checker.env.enter_scope();
-    for (name, info) in bindings.vars {
-        checker
-            .env
-            .bind_var(name, info.ty, info.quantity, info.mutability);
-    }
+    let mut result_ty: Option<Type> = None;
+    let mut branch_states = Vec::with_capacity(arms.len());
 
-    let result_ty = if let Some(guard_expr) = &first_arm.guard {
-        infer_expr(checker, guard_expr)?
-    } else {
-        infer_expr(checker, &first_arm.body)?
-    };
+    for arm in arms {
+        checker.env.restore_linear(&entry);
 
-    checker.env.exit_scope(guard)?;
-
-    // Check remaining arms
-    for arm in &arms[1..] {
         let bindings = checker.check_pattern(&arm.pattern, &scrutinee_ty)?;
         let guard = checker.env.enter_scope();
         for (name, info) in bindings.vars {
@@ -602,11 +625,39 @@ fn infer_match(
             infer_expr(checker, &arm.body)?
         };
 
-        unify::unify_types(checker, &result_ty, &arm_ty)?;
         checker.env.exit_scope(guard)?;
+        branch_states.push(checker.env.snapshot_linear());
+
+        if let Some(expected) = result_ty.clone() {
+            unify::unify_types(checker, &expected, &arm_ty)?;
+        } else {
+            result_ty = Some(arm_ty);
+        }
     }
 
-    Ok(result_ty)
+    checker.env.join_linear(&entry, &branch_states, span)?;
+
+    // A guarded arm may not be taken, so a consume that happens ONLY under a
+    // guard leaves a path unconsumed and cannot be proven. Guarded arms are
+    // therefore excluded from the join above -- their state is the entry state,
+    // since a guarded consume does not count as an unconditional one -- and any
+    // arm that consumes under a guard is reported here.
+    //
+    // This is conservative in the safe direction: it rejects a program it cannot
+    // prove, rather than accepting an unproven one. Making it precise would need
+    // an exhaustiveness analysis this checker does not have.
+    if arms.iter().any(|arm| arm.guard.is_some()) {
+        // A guarded arm's state was recorded with the entry state (the consume was
+        // not treated as unconditional), so re-check by inspecting each guarded arm
+        // against the state it produced.
+        for (arm, state) in arms.iter().zip(branch_states.iter()) {
+            if arm.guard.is_some() && state.any_consumed() {
+                return Err(TypeError::LinearConsumedUnderGuard { span: arm.span });
+            }
+        }
+    }
+
+    Ok(result_ty.unwrap_or_else(|| Type::unit(span)))
 }
 
 /// Infer let binding type

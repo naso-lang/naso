@@ -197,6 +197,10 @@ fn extract_span_from_error(e: &TypeError) -> Option<Span> {
         UseOfMovedValue { used_at, .. } => Some(*used_at),
         InOutAliasing { new_span, .. } => Some(*new_span),
         UnusedLinearVariable { defined_at, .. } => Some(*defined_at),
+        // A leak found at a branch join: report the branch's span, which is
+        // the point the user has to fix.
+        LinearNotConsumedOnAllPaths { span, .. } => Some(*span),
+        LinearConsumedUnderGuard { span } => Some(*span),
         TypeMismatch { span, .. } => Some(*span),
         QuantityMismatch { span, .. } => Some(*span),
         ArgumentCountMismatch { span, .. } => Some(*span),

@@ -9,13 +9,7 @@
 // says which diagnostic it is asserting, so a change in message wording shows up
 // as a test failure rather than passing silently.
 //
-// KNOWN GAP, deliberately NOT in this file: a linear value consumed in only ONE
-// arm of an `if` is NOT rejected. The checker does not join branch move-sets, so
-// a one-arm leak passes. That is a real soundness gap, pinned by
-// tests/corpus_tests.rs::branch_local_linear_leak_is_a_known_gap, and it must not
-// be listed here as if it were detected.
-
-// Invalid: the linear parameter is never used, so it leaks.
+// // Invalid: the linear parameter is never used, so it leaks.
 fn leak(x: [1] i32) {
     // x never consumed.
 }
@@ -33,4 +27,44 @@ fn use_after_move(x: [1] i32) {
     let y = x; // Move
     let _ = x; // Error: x already moved
     let _ = y;
+}
+
+// Invalid: a linear value consumed in only ONE arm of an `if` leaks on the other
+// path. The checker joins the branches' consumption states, so this is caught.
+fn leak_on_one_if_arm(cond: bool, x: [1] i32) {
+    if cond {
+        let consume a = x;
+        let _ = a;
+    }
+    // x is not consumed when cond is false.
+}
+
+// Invalid: consumed in one `match` arm only, leaked in the other.
+fn leak_on_one_match_arm(n: i32, x: [1] i32) {
+    match n {
+        0 => {
+            let consume a = x;
+            let _ = a;
+        }
+        _ => {
+            let _ = 1;
+        }
+    }
+    // x is not consumed for any n other than 0.
+}
+
+// Invalid: consumed in one arm of a three-arm match, leaked in the other two.
+fn leak_on_one_arm_of_three(n: i32, x: [1] i32) {
+    match n {
+        0 => {
+            let consume a = x;
+            let _ = a;
+        }
+        1 => {
+            let _ = 1;
+        }
+        _ => {
+            let _ = 2;
+        }
+    }
 }

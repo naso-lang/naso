@@ -54,6 +54,38 @@ impl VarUseState {
         info.used_at = self.used_at.clone();
         info.moved = self.moved;
     }
+
+    /// Whether a `[1]` value has already been spent at this program point.
+    ///
+    /// A linear value is spent by being moved (`let consume y = x;`) or by being
+    /// used, since `can_use` admits a `[1]` value only when it is neither moved
+    /// nor used.
+    pub fn is_consumed(&self) -> bool {
+        self.moved || !self.used_at.is_empty()
+    }
+
+    /// A state recording that a `[1]` value was consumed at `span`.
+    fn consumed_at(span: Span) -> Self {
+        Self {
+            used_at: vec![span],
+            moved: true,
+        }
+    }
+}
+
+/// The consumption state of every in-scope linear variable, plus the sets that
+/// shadow it.
+///
+/// A branch must be inferred from the state at the branch's ENTRY point, and the
+/// states of the branches then joined. Sharing one mutable state across branches
+/// is unsound in both directions: a consume in the first branch makes the second
+/// branch see a moved value (rejecting correct code), and a consume in only one
+/// branch is never noticed (accepting a leak).
+#[derive(Debug, Clone, Default)]
+pub struct LinearSnapshot {
+    uses: HashMap<Ident, VarUseState>,
+    moved_vars: HashSet<Ident>,
+    erasable_vars: HashSet<Ident>,
 }
 
 impl VarInfo {
@@ -185,6 +217,23 @@ pub struct ConstInfo {
     pub span: Span,
 }
 
+impl LinearSnapshot {
+    /// The names of the linear variables captured in this snapshot.
+    pub fn linear_names(&self) -> Vec<Ident> {
+        self.uses.keys().cloned().collect()
+    }
+
+    /// Whether the linear variable `name` is already spent in this snapshot.
+    pub fn is_consumed(&self, name: &Ident) -> bool {
+        self.uses.get(name).is_some_and(VarUseState::is_consumed)
+    }
+
+    /// Whether any captured linear variable is already spent in this snapshot.
+    pub fn any_consumed(&self) -> bool {
+        self.uses.values().any(VarUseState::is_consumed)
+    }
+}
+
 impl TypeEnv {
     /// Create a new empty type environment
     pub fn new() -> Self {
@@ -241,6 +290,107 @@ impl TypeEnv {
                 state.apply_to(info);
             }
         }
+    }
+
+    /// Capture the consumption state at a program point, for a later restore or
+    /// join. See [`LinearSnapshot`].
+    pub fn snapshot_linear(&self) -> LinearSnapshot {
+        LinearSnapshot {
+            uses: self
+                .vars
+                .iter()
+                .filter(|(_, info)| info.quantity == Quantity::One)
+                .map(|(k, v)| (k.clone(), VarUseState::from_info(v)))
+                .collect(),
+            moved_vars: self.moved_vars.clone(),
+            erasable_vars: self.erasable_vars.clone(),
+        }
+    }
+
+    /// Return the consumption state to a snapshot, dropping any linear binding
+    /// introduced since. Used to give each branch the same entry state.
+    ///
+    /// Only use-state is restored, not types or bindings that survive: a branch's
+    /// own scope exit removes what it introduced, and restoring those would leak
+    /// them outward. The `bindings` list exists so a name bound by a branch that
+    /// did not itself enter a scope cannot persist.
+    pub fn restore_linear(&mut self, snapshot: &LinearSnapshot) {
+        for (name, state) in &snapshot.uses {
+            if let Some(info) = self.vars.get_mut(name) {
+                state.apply_to(info);
+            }
+        }
+        // A linear variable that is not in the snapshot's bindings was bound after
+        // the snapshot; drop it so a later join cannot mistake it for pre-existing.
+        let introduced: Vec<Ident> = self
+            .vars
+            .iter()
+            .filter(|(name, info)| {
+                info.quantity == Quantity::One && !snapshot.uses.contains_key(*name)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in introduced {
+            self.vars.shift_remove(&name);
+        }
+        self.moved_vars = snapshot.moved_vars.clone();
+        self.erasable_vars = snapshot.erasable_vars.clone();
+    }
+
+    /// Join the states of several mutually exclusive branches.
+    ///
+    /// A `[1]` variable must be consumed on EVERY path or on NONE:
+    ///
+    /// * consumed in all branches -> consumed after the join, so a later use is
+    ///   correctly rejected;
+    /// * consumed in no branch -> unchanged, so a later consume is still allowed;
+    /// * consumed in SOME branches -> a leak on the paths that do not consume it,
+    ///   which is reported as [`TypeError::LinearNotConsumedOnAllPaths`].
+    ///
+    /// `branch_count` is the number of branches; a single branch (no `else`, one
+    /// `match` arm) is joined as a one-way join, which correctly rejects a
+    /// consume that might not happen.
+    pub fn join_linear(
+        &mut self,
+        entry: &LinearSnapshot,
+        branches: &[LinearSnapshot],
+        span: Span,
+    ) -> Result<(), TypeError> {
+        if branches.is_empty() {
+            return Ok(());
+        }
+        // Start from the entry state, then re-apply what the join established.
+        self.restore_linear(entry);
+
+        let names: Vec<Ident> = entry.uses.keys().cloned().collect();
+        for name in names {
+            let consumed_count = branches
+                .iter()
+                .filter(|b| b.uses.get(&name).is_some_and(VarUseState::is_consumed))
+                .count();
+
+            if consumed_count == branches.len() {
+                // Consumed on every path: the value is gone after the join.
+                let info = self.vars.get_mut(&name).expect("snapshot name in env");
+                VarUseState::consumed_at(span).apply_to(info);
+                self.moved_vars.insert(name);
+            } else if consumed_count > 0 {
+                let consumed_on: Vec<usize> = branches
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, b)| b.uses.get(&name).is_some_and(VarUseState::is_consumed))
+                    .map(|(i, _)| i)
+                    .collect();
+                return Err(TypeError::LinearNotConsumedOnAllPaths {
+                    name,
+                    consumed_on,
+                    total: branches.len(),
+                    span,
+                });
+            }
+            // Consumed on no path: leave the entry state, so a later consume works.
+        }
+        Ok(())
     }
 
     /// Record a use of a variable

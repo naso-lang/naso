@@ -161,29 +161,193 @@ fn invalid_corpus_files_are_rejected() {
 }
 
 // ---------------------------------------------------------------------------
+// Branch joins.
+//
+// A branch must be inferred from the state at the branch's ENTRY point, and the
+// per-branch states joined afterwards. Inferring branches sequentially against one
+// shared state was unsound in BOTH directions:
+//
+//   * a consume in the first branch left the value moved, so the second branch was
+//     falsely rejected as a use-after-move (a false positive -- correct programs
+//     did not compile);
+//   * a consume in only one branch was never reported (a false negative -- a leak
+//     compiled clean).
+//
+// Both directions are asserted here. The false positive is the one easy to
+// regress, because "reject more" looks like progress.
+// ---------------------------------------------------------------------------
+
+/// A leak on the `else` path is REJECTED.
+#[test]
+fn linear_consumed_in_one_if_arm_is_rejected() {
+    let errs =
+        diagnostics("fn f(c: bool, x: [1] i32) {\n    if c { let consume a = x; let _ = a; }\n}\n");
+    assert!(
+        !errs.is_empty(),
+        "a consume in only the `then` arm leaks on the `else` path and must be rejected"
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("branch") || e.contains("leaks")),
+        "expected a branch-join leak diagnostic, got: {errs:?}"
+    );
+}
+
+/// A consume in EVERY arm is ACCEPTED -- the false positive this fixes.
+///
+/// Before the fix this was rejected with "use of moved value", because the `then`
+/// branch's consume was still in effect when the `else` branch was checked. A
+/// checker that rejects correct code is not more sound; it is just unusable.
+#[test]
+fn linear_consumed_in_every_if_arm_is_accepted() {
+    let src = "fn f(c: bool, x: [1] i32) {\n    \
+               if c { let consume a = x; let _ = a; } else { let consume b = x; let _ = b; }\n}\n";
+    let errs = diagnostics(src);
+    assert!(
+        errs.is_empty(),
+        "consuming a `[1]` value in EVERY branch is correct and must typecheck, got: {errs:?}"
+    );
+}
+
+/// The same, for a `match`, and for a value consumed in every arm of three.
+#[test]
+fn linear_consumed_in_every_match_arm_is_accepted() {
+    for (label, src) in [
+        (
+            "two arms",
+            "fn f(n: i32, x: [1] i32) {\n    \
+             match n { 0 => { let consume a = x; let _ = a; } _ => { let consume b = x; let _ = b; } }\n}\n",
+        ),
+        (
+            "three arms",
+            "fn f(n: i32, x: [1] i32) {\n    \
+             match n { 0 => { let consume a = x; let _ = a; } \
+                       1 => { let consume b = x; let _ = b; } \
+                       _  => { let consume c = x; let _ = c; } }\n}\n",
+        ),
+    ] {
+        let errs = diagnostics(src);
+        assert!(
+            errs.is_empty(),
+            "consuming in every arm ({label}) must typecheck, got: {errs:?}"
+        );
+    }
+}
+
+/// A consume in only one `match` arm leaks on the others.
+#[test]
+fn linear_consumed_in_one_match_arm_is_rejected() {
+    let errs = diagnostics(
+        "fn f(n: i32, x: [1] i32) {\n    \
+         match n { 0 => { let consume a = x; let _ = a; } _ => { let _ = 1; } }\n}\n",
+    );
+    assert!(
+        !errs.is_empty(),
+        "a consume in only one match arm leaks on the other paths and must be rejected"
+    );
+}
+
+/// An `if` with no `else` has an implicit second path where the body never runs.
+///
+/// Joining only the `then` branch would treat a conditional consume as
+/// unconditional, which is the same false negative in a different shape.
+#[test]
+fn if_without_else_still_rejects_a_conditional_consume() {
+    let errs =
+        diagnostics("fn f(c: bool, x: [1] i32) { if c { let consume a = x; let _ = a; } }\n");
+    assert!(
+        !errs.is_empty(),
+        "an `if` without `else` may not run its body, so a consume inside it leaks"
+    );
+}
+
+/// After a join in which every branch consumed, a later use must still be rejected.
+///
+/// This is what makes the join meaningful rather than merely permissive: the value
+/// is spent after the join, not merely inside the branches.
+#[test]
+fn use_after_a_full_consuming_join_is_rejected() {
+    let errs = diagnostics(
+        "fn f(c: bool, x: [1] i32) {\n    \
+         if c { let consume a = x; let _ = a; } else { let consume b = x; let _ = b; }\n    \
+         let consume d = x;\n    let _ = d;\n}\n",
+    );
+    assert!(
+        !errs.is_empty(),
+        "x is consumed on every path, so consuming it again after the join must be rejected"
+    );
+}
+
+/// After a join in which NO branch consumed, a later consume must still be allowed.
+///
+/// The mirror of the previous test: a conservative join that consumed everything
+/// unconditionally would be sound but would reject this correct program.
+#[test]
+fn consume_after_a_non_consuming_join_is_accepted() {
+    let errs = diagnostics(
+        "fn f(c: bool, x: [1] i32) { if c { let _ = 1; } let consume a = x; let _ = a; }\n",
+    );
+    assert!(
+        errs.is_empty(),
+        "a join that consumed nothing must leave x available, got: {errs:?}"
+    );
+}
+
+/// A consume guarded by a `match` guard cannot be proven to happen.
+///
+/// A guarded arm may not be taken, so a consume under a guard leaves a path
+/// unconsumed. The checker rejects it rather than assuming the guard holds.
+#[test]
+fn consume_under_a_match_guard_is_rejected() {
+    let errs = diagnostics(
+        "fn f(n: i32, x: [1] i32) {\n    \
+         match n { 0 if true => { let consume a = x; let _ = a; } _ => { let _ = 1; } }\n}\n",
+    );
+    assert!(
+        !errs.is_empty(),
+        "a consume under a match guard may not happen, so it must be rejected"
+    );
+}
+
+/// Non-linear values are unaffected by branching.
+#[test]
+fn non_linear_values_are_unaffected_by_branches() {
+    for (label, src) in [
+        (
+            "if/else ints",
+            "fn f(c: bool, x: i32) -> i32 { if c { x } else { x + 1 } }\n",
+        ),
+        (
+            "match ints",
+            "fn f(n: i32) -> i32 { match n { 0 => 1 _ => 2 } }\n",
+        ),
+        (
+            "many-typed in both arms",
+            "fn f(c: bool) -> i32 { if c { 1 } else { 2 } }\n",
+        ),
+    ] {
+        let errs = diagnostics(src);
+        assert!(errs.is_empty(), "{label} must typecheck, got: {errs:?}");
+    }
+}
+
+/// Returning a linear value from both arms is fine, and consumes it on both paths.
+#[test]
+fn linear_returned_from_both_arms_is_accepted() {
+    let errs = diagnostics("fn f(c: bool, x: [1] i32) -> [1] i32 { if c { x } else { x } }\n");
+    assert!(
+        errs.is_empty(),
+        "returning x on both paths consumes it on both paths and must typecheck, got: {errs:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Pinned known gaps.
 //
 // Each of these is a real soundness or capability gap. They are asserted HERE,
 // as tests that currently PASS, so the behaviour cannot change silently. When one
 // is fixed, the test fails and gets inverted -- which is the point of naming it.
 // ---------------------------------------------------------------------------
-
-/// GAP: a linear value consumed in only ONE arm of an `if` is accepted.
-///
-/// The checker does not join the two branches' move sets, so the missing
-/// consumption in the other arm goes unnoticed. This is a soundness gap: a
-/// resource that should be proven consumed is not.
-#[test]
-fn branch_local_linear_leak_is_a_known_gap() {
-    let src = "fn f(c: bool, x: [1] i32) {\n    if c { let consume a = x; let _ = a; }\n}\n";
-    let errs = diagnostics(src);
-    assert!(
-        errs.is_empty(),
-        "KNOWN GAP: expected this to be accepted today. If it is now rejected, \
-         the gap is fixed -- move this case into linearity/invalid.naso, delete \
-         this test, and fix the fixture comment. Got: {errs:?}"
-    );
-}
 
 /// GAP: a plain `let` between a move and a later `consume` widens `[1]` to `[*]`.
 ///

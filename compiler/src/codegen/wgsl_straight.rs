@@ -30,6 +30,7 @@ use crate::ast::{
     BinOp, Expr, ExprKind, Function, Item, Literal, Program, Stmt, StmtKind, TypeKind,
 };
 use crate::codegen::error::{CodegenError, CodegenResult};
+use std::collections::{HashMap, HashSet};
 
 /// Lower a program to WGSL.
 ///
@@ -51,7 +52,18 @@ pub fn generate_wgsl_straight_line(program: &Program) -> CodegenResult<String> {
         })
         .collect();
 
-    let mut emitted = 0usize;
+    // Signatures, so a call can be arity- and return-checked.
+    let signatures: Vec<(&str, usize, bool)> = program
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Function(f) => Some((f.name.name.as_str(), f.params.len(), f.ret_ty.is_some())),
+            _ => None,
+        })
+        .collect();
+
+    // Reject the WHOLE program before emitting anything, so a failure never
+    // leaves a truncated shader on disk.
     for item in &program.items {
         let Item::Function(func) = item else {
             return Err(CodegenError::UnsupportedFeature(format!(
@@ -61,14 +73,18 @@ pub fn generate_wgsl_straight_line(program: &Program) -> CodegenResult<String> {
                 item_span_line(item)
             )));
         };
-        // Reject the whole program before emitting anything, so a failure
-        // never leaves a truncated shader on disk.
-        check_supported(func, &function_names)?;
-        emit_function(&mut out, func)?;
-        emitted += 1;
+        check_supported(func, &function_names, &signatures)?;
     }
 
-    if emitted == 0 {
+    // WGSL has no forward declarations: a function must be declared before it
+    // is called. Emitting in source order is therefore wrong whenever a caller
+    // precedes its callee, so emit in dependency order.
+    let order = emission_order(program)?;
+    for func in &order {
+        emit_function(&mut out, func)?;
+    }
+
+    if order.is_empty() {
         return Err(CodegenError::UnsupportedFeature(
             "no function definitions to lower to WGSL".to_string(),
         ));
@@ -76,27 +92,180 @@ pub fn generate_wgsl_straight_line(program: &Program) -> CodegenResult<String> {
     Ok(out)
 }
 
+/// Order functions so every callee is emitted before its callers.
+///
+/// DFS post-order over the call graph. A cycle means the program is recursive,
+/// which WGSL cannot express (no forward declarations, no mutual recursion);
+/// that is reported rather than emitted in an arbitrary order that would fail
+/// to compile with a confusing WGSL error.
+fn emission_order(program: &Program) -> CodegenResult<Vec<&Function>> {
+    let functions: Vec<&Function> = program
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Function(f) => Some(f),
+            _ => None,
+        })
+        .collect();
+
+    // Index by name for lookup.
+    let by_name: HashMap<&str, &Function> = functions
+        .iter()
+        .map(|f| (f.name.name.as_str(), *f))
+        .collect();
+
+    let mut order: Vec<&Function> = Vec::with_capacity(functions.len());
+    // "done" guards against re-emitting; "on_stack" detects cycles.
+    let mut done: HashSet<&str> = HashSet::new();
+    let mut on_stack: Vec<&str> = Vec::new();
+
+    // Explicit stack to avoid deep recursion on a long call chain.
+    for root in &functions {
+        if done.contains(root.name.name.as_str()) {
+            continue;
+        }
+        let mut work: Vec<(&str, bool)> = vec![(root.name.name.as_str(), false)];
+        while let Some((name, expanded)) = work.pop() {
+            if expanded {
+                on_stack.retain(|n| *n != name);
+                if done.insert(name)
+                    && let Some(f) = by_name.get(name)
+                {
+                    order.push(f);
+                }
+                continue;
+            }
+            if done.contains(name) {
+                continue;
+            }
+            if on_stack.contains(&name) {
+                return Err(CodegenError::UnsupportedFeature(format!(
+                    "recursive call to `{name}` is not supported: WGSL has no \
+                     forward declarations, so a callee must be emitted before \
+                     its caller. Mutual recursion has no valid WGSL form."
+                )));
+            }
+            on_stack.push(name);
+            work.push((name, true));
+            // Push callees first so they are visited (and emitted) first.
+            if let Some(f) = by_name.get(name) {
+                let mut callees = vec![];
+                collect_called_names(f, &by_name, &mut callees);
+                for c in callees.into_iter().rev() {
+                    if !done.contains(c) {
+                        work.push((c, false));
+                    }
+                }
+            }
+        }
+    }
+    Ok(order)
+}
+
+/// Gather names of functions called by `func`.
+///
+/// Written as a plain recursive function rather than a closure: a closure
+/// cannot call itself, and threading `&mut impl FnMut` through every arm fights
+/// the borrow checker for no benefit.
+fn collect_called_names<'a>(
+    func: &Function,
+    by_name: &HashMap<&'a str, &'a Function>,
+    out: &mut Vec<&'a str>,
+) {
+    for stmt in &func.body.stmts {
+        collect_called_names_stmt(stmt, by_name, out);
+    }
+    if let Some(e) = &func.body.expr {
+        collect_called_names_expr(e, by_name, out);
+    }
+}
+
+fn collect_called_names_stmt<'a>(
+    st: &Stmt,
+    by_name: &HashMap<&'a str, &'a Function>,
+    out: &mut Vec<&'a str>,
+) {
+    match &st.kind {
+        StmtKind::Let(s) => collect_called_names_expr(&s.value, by_name, out),
+        StmtKind::LetInOut(s) => collect_called_names_expr(&s.value, by_name, out),
+        StmtKind::LetConsume(s) => collect_called_names_expr(&s.value, by_name, out),
+        StmtKind::Expr(e) | StmtKind::Return(Some(e)) => collect_called_names_expr(e, by_name, out),
+        _ => {}
+    }
+}
+
+fn collect_called_names_expr<'a>(
+    e: &Expr,
+    by_name: &HashMap<&'a str, &'a Function>,
+    out: &mut Vec<&'a str>,
+) {
+    match &e.kind {
+        ExprKind::Call(callee, args) => {
+            if let ExprKind::Var(v) = &callee.kind
+                && let Some(target) = by_name.get(v.name.as_str())
+            {
+                out.push(target.name.name.as_str());
+            }
+            collect_called_names_expr(callee, by_name, out);
+            for a in args {
+                collect_called_names_expr(a, by_name, out);
+            }
+        }
+        ExprKind::Binary(_, l, r) => {
+            collect_called_names_expr(l, by_name, out);
+            collect_called_names_expr(r, by_name, out);
+        }
+        ExprKind::Unary(_, i) | ExprKind::Ascribe(i, _) | ExprKind::Index(i, _) => {
+            collect_called_names_expr(i, by_name, out)
+        }
+        ExprKind::Assign(l, r) => {
+            collect_called_names_expr(l, by_name, out);
+            collect_called_names_expr(r, by_name, out);
+        }
+        ExprKind::Return(Some(i)) | ExprKind::Break(Some(i)) => {
+            collect_called_names_expr(i, by_name, out)
+        }
+        ExprKind::Block(b) => {
+            for st in &b.stmts {
+                collect_called_names_stmt(st, by_name, out);
+            }
+            if let Some(e) = &b.expr {
+                collect_called_names_expr(e, by_name, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Reject any function containing a construct this backend cannot emit.
-fn check_supported(func: &Function, function_names: &[String]) -> CodegenResult<()> {
+fn check_supported(
+    func: &Function,
+    function_names: &[String],
+    signatures: &[(&str, usize, bool)],
+) -> CodegenResult<()> {
     let known_function_names: Vec<&str> = function_names.iter().map(|s| s.as_str()).collect();
     for stmt in &func.body.stmts {
-        check_stmt(stmt, &known_function_names)?;
+        check_stmt(stmt, &known_function_names, signatures)?;
     }
     if let Some(tail) = &func.body.expr {
-        check_expr(tail, &known_function_names)?;
+        check_expr(tail, &known_function_names, signatures)?;
     }
     Ok(())
 }
 
-fn check_stmt(stmt: &Stmt, known_function_names: &[&str]) -> CodegenResult<()> {
+fn check_stmt(
+    stmt: &Stmt,
+    known_function_names: &[&str],
+    signatures: &[(&str, usize, bool)],
+) -> CodegenResult<()> {
     match &stmt.kind {
-        StmtKind::Let(s) => check_expr(&s.value, known_function_names)?,
-        StmtKind::LetInOut(s) => check_expr(&s.value, known_function_names)?,
-        StmtKind::LetConsume(s) => check_expr(&s.value, known_function_names)?,
-        StmtKind::Expr(e) => check_expr(e, known_function_names)?,
+        StmtKind::Let(s) => check_expr(&s.value, known_function_names, signatures)?,
+        StmtKind::LetInOut(s) => check_expr(&s.value, known_function_names, signatures)?,
+        StmtKind::LetConsume(s) => check_expr(&s.value, known_function_names, signatures)?,
+        StmtKind::Expr(e) => check_expr(e, known_function_names, signatures)?,
         StmtKind::Return(e) => {
             if let Some(e) = e {
-                check_expr(e, known_function_names)?;
+                check_expr(e, known_function_names, signatures)?;
             }
         }
         // Proof blocks are erased: they produce no runtime code and so
@@ -113,59 +282,82 @@ fn check_stmt(stmt: &Stmt, known_function_names: &[&str]) -> CodegenResult<()> {
     Ok(())
 }
 
-fn check_expr(expr: &Expr, known_function_names: &[&str]) -> CodegenResult<()> {
+fn check_expr(
+    expr: &Expr,
+    known_function_names: &[&str],
+    signatures: &[(&str, usize, bool)],
+) -> CodegenResult<()> {
     match &expr.kind {
         ExprKind::Literal(_) | ExprKind::Var(_) | ExprKind::Index(..) => Ok(()),
         ExprKind::Block(b) => {
             for s in &b.stmts {
-                check_stmt(s, known_function_names)?;
+                check_stmt(s, known_function_names, signatures)?;
             }
             if let Some(e) = &b.expr {
-                check_expr(e, known_function_names)?;
+                check_expr(e, known_function_names, signatures)?;
             }
             Ok(())
         }
         ExprKind::Assign(lhs, rhs) => {
-            check_expr(lhs, known_function_names)?;
-            check_expr(rhs, known_function_names)
+            check_expr(lhs, known_function_names, signatures)?;
+            check_expr(rhs, known_function_names, signatures)
         }
-        ExprKind::Ascribe(inner, _) => check_expr(inner, known_function_names),
+        ExprKind::Ascribe(inner, _) => check_expr(inner, known_function_names, signatures),
         // `return` is an expression in this AST, and `naso parse` shows it
         // under ExprKind::Return rather than StmtKind::Return.
         ExprKind::Return(inner) => {
             if let Some(e) = inner {
-                check_expr(e, known_function_names)?;
+                check_expr(e, known_function_names, signatures)?;
             }
             Ok(())
         }
         ExprKind::Break(inner) => {
             if let Some(e) = inner {
-                check_expr(e, known_function_names)?;
+                check_expr(e, known_function_names, signatures)?;
             }
             Ok(())
         }
         ExprKind::Continue => Ok(()),
         ExprKind::Call(callee, args) => {
-            check_expr(callee, known_function_names)?;
+            check_expr(callee, known_function_names, signatures)?;
             for a in args {
-                check_expr(a, known_function_names)?;
+                check_expr(a, known_function_names, signatures)?;
             }
-            if builtin_from_name(&callee_name(callee)).is_some() {
+            let name = callee_name(callee);
+            if builtin_from_name(&name).is_some() {
                 return Ok(());
             }
-            // Distinguish a call to a Naso function from a call to nothing.
-            // Both are unsupported, but only the first is plausibly a user
-            // mistake worth naming.
-            let name = callee_name(callee);
-            if !name.is_empty() && known_function_names.contains(&name.as_str()) {
-                return Err(CodegenError::UnsupportedFeature(format!(
-                    "call to function `{name}` at line {} is not supported yet: \
-                     only calls to prelude builtins are lowered. Emitting the \
-                     callee as a WGSL function, and its body first, is \
-                     straightforward but is not implemented.",
-                    expr.span.line
-                )));
+
+            // A call to another function in this program. WGSL supports this;
+            // the emitter orders callees before callers so no forward
+            // declaration is needed. The signature is checked here so a
+            // mismatch is a diagnostic rather than invalid WGSL.
+            if let Some((_, arity, returns_value)) = signatures.iter().find(|(n, _, _)| *n == name)
+            {
+                if args.len() != *arity {
+                    return Err(CodegenError::InstructionError(format!(
+                        "call to `{name}` at line {} passes {} argument(s) but \
+                         it takes {arity}",
+                        expr.span.line,
+                        args.len()
+                    )));
+                }
+                // A unit-returning callee used for a value has no WGSL form:
+                // `f()` where f is `fn f()` yields nothing to assign.
+                if !returns_value
+                    && matches!(
+                        &expr.kind,
+                        ExprKind::Binary(..) | ExprKind::Index(..) | ExprKind::Call(..)
+                    )
+                {
+                    return Err(CodegenError::InstructionError(format!(
+                        "`{name}` at line {} returns no value but is used as one",
+                        expr.span.line
+                    )));
+                }
+                return Ok(());
             }
+
             Err(unsupported_expr(expr))
         }
         ExprKind::Binary(op, lhs, rhs) => {
@@ -175,8 +367,8 @@ fn check_expr(expr: &Expr, known_function_names: &[&str]) -> CodegenResult<()> {
                     expr.span.line
                 )));
             }
-            check_expr(lhs, known_function_names)?;
-            check_expr(rhs, known_function_names)
+            check_expr(lhs, known_function_names, signatures)?;
+            check_expr(rhs, known_function_names, signatures)
         }
         ExprKind::Unary(op, inner) => {
             if wgsl_unop(op).is_none() {
@@ -185,7 +377,7 @@ fn check_expr(expr: &Expr, known_function_names: &[&str]) -> CodegenResult<()> {
                     expr.span.line
                 )));
             }
-            check_expr(inner, known_function_names)
+            check_expr(inner, known_function_names, signatures)
         }
         _ => Err(unsupported_expr(expr)),
     }
@@ -674,16 +866,79 @@ mod tests {
 
     /// A call to another Naso function is refused, but by NAME. Emitting the
     /// callee is easy -- it is already emitted as a WGSL fn -- so the message
-    /// names it rather than reporting an unknown expression.
+    /// A call to another function in the program is emitted.
+    ///
+    /// WGSL has no forward declarations, so a callee must appear before its
+    /// caller even when the source lists the caller first.
     #[test]
-    fn test_call_to_user_function_is_reported_by_name() {
-        let err = lower(
-            "fn a(x: int) -> int { return x + 1; }\nfn b(x: int) -> int { return a(x) * 2; }",
+    fn test_cross_function_call_is_emitted_callee_first() {
+        let wgsl = lower(
+            "fn outer(x: float) -> float { return inner(x) * 2.0; }\nfn inner(x: float) -> float { return round(x); }",
         )
-        .expect_err("must reject a cross-function call");
+        .unwrap();
+        let inner_at = wgsl.find("fn inner").expect("inner emitted");
+        let outer_at = wgsl.find("fn outer").expect("outer emitted");
+        assert!(
+            inner_at < outer_at,
+            "callee must be declared first:\n{wgsl}"
+        );
+        assert!(wgsl.contains("(inner(x) * 2.0)"), "{wgsl}");
+    }
+
+    /// Every callee precedes its caller, across a scrambled 6-function chain.
+    #[test]
+    fn test_declaration_order_respects_all_dependencies() {
+        let wgsl = lower(
+            "fn f6(x: int) -> int { return f1(x); }\nfn f3(x: int) -> int { return f4(x); }\nfn f1(x: int) -> int { return f2(x); }\nfn f5(x: int) -> int { return f6(x); }\nfn f2(x: int) -> int { return x; }\nfn f4(x: int) -> int { return f5(x); }",
+        )
+        .unwrap();
+        let at = |n: &str| {
+            wgsl.find(&format!("fn {n}"))
+                .unwrap_or_else(|| panic!("{n} missing\n{wgsl}"))
+        };
+        for (caller, callee) in [
+            ("f6", "f1"),
+            ("f1", "f2"),
+            ("f3", "f4"),
+            ("f4", "f5"),
+            ("f5", "f6"),
+        ] {
+            assert!(
+                at(callee) < at(caller),
+                "{callee} must precede {caller}\n{wgsl}"
+            );
+        }
+    }
+
+    /// Recursion has no valid WGSL form. The typechecker accepts `fn f(x) {
+    /// f(x) }` today, so the backend must refuse rather than emit something
+    /// that fails to compile.
+    #[test]
+    fn test_self_recursion_is_rejected() {
+        let err =
+            lower("fn f(x: int) -> int { return f(x) + 1; }").expect_err("must reject recursion");
+        assert!(err.to_string().contains("recursive call to `f`"), "{err}");
+    }
+
+    #[test]
+    fn test_mutual_recursion_is_rejected() {
+        let err =
+            lower("fn a(x: int) -> int { return b(x); }\nfn b(x: int) -> int { return a(x); }")
+                .expect_err("must reject mutual recursion");
         let msg = err.to_string();
-        assert!(msg.contains("call to function `a`"), "{msg}");
-        assert!(msg.contains("not supported"), "{msg}");
+        assert!(msg.contains("recursive call"), "{msg}");
+        assert!(msg.contains("Mutual recursion"), "{msg}");
+    }
+
+    /// A wrong argument count is a diagnostic, not invalid WGSL. The
+    /// typechecker catches this first in practice, but the backend must not
+    /// rely on that: `lower` bypasses check_program.
+    #[test]
+    fn test_call_arity_is_checked() {
+        let err =
+            lower("fn a(x: int) -> int { return x + 1; }\nfn b(x: int) -> int { return a(); }")
+                .expect_err("must reject wrong arity");
+        assert!(err.to_string().contains("passes 0 argument"), "{err}");
     }
 
     #[test]

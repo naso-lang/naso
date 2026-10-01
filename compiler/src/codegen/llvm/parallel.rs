@@ -140,17 +140,32 @@ impl<'ctx> ParallelEmitter<'ctx> {
             .build_load(iv_alloca, "iv_val")?
             .into_int_value();
 
-        // Compare with upper bound
+        // Compare with upper bound.
+        //
+        // The comparison is INCLUSIVE (`<=`): `bounds.upper` is the largest value
+        // the domain admits, and the front end encodes the half-open source range
+        // `lo..hi` as `i <= hi - 1`. See the matching comment in
+        // `loop_emission::LoopEmitter::emit_single_loop`.
         let upper_val = bounds.upper.into_int_value();
         let cond =
-            value_builder.build_int_compare(IntPredicate::SLT, iv_val, upper_val, "loop_cond")?;
+            value_builder.build_int_compare(IntPredicate::SLE, iv_val, upper_val, "loop_cond")?;
 
         value_builder.build_conditional_branch(cond, body, exit)?;
 
         // Body
         value_builder.builder().position_at_end(body);
 
+        // Bind the induction variable's source spelling for the body, exactly as
+        // `loop_emission` does for a sequential band: a body reading `i` resolves
+        // through the value builder's scope, and an unbound `i` reads zero, which
+        // would make a correctly-iterated loop compute the wrong answer.
+        if let Some(name) = &bounds.iterator_name {
+            value_builder.add_variable(name.clone(), iv_alloca, int_type.into());
+        }
         body_builder(value_builder)?;
+        if let Some(name) = &bounds.iterator_name {
+            value_builder.remove_variable(name);
+        }
         value_builder.build_unconditional_branch(latch)?;
 
         // Latch: increment induction variable
@@ -303,7 +318,7 @@ impl<'ctx> ParallelEmitter<'ctx> {
             .into_int_value();
         let upper_val = bounds.upper.into_int_value();
         let cond =
-            value_builder.build_int_compare(IntPredicate::SLT, iv_val, upper_val, "loop_cond")?;
+            value_builder.build_int_compare(IntPredicate::SLE, iv_val, upper_val, "loop_cond")?;
         value_builder.build_conditional_branch(cond, body, exit)?;
 
         value_builder.builder().position_at_end(body);
@@ -370,6 +385,9 @@ impl<'ctx> ParallelEmitter<'ctx> {
 pub struct LoopBounds<'ctx> {
     pub iterator_dim: usize,
     pub lower: BasicValueEnum<'ctx>,
+    /// The source spelling of this loop's induction variable, when known.
+    /// See `loop_emission::LoopBounds::iterator_name`.
+    pub iterator_name: Option<String>,
     pub upper: BasicValueEnum<'ctx>,
     pub step: i64,
 }

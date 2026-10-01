@@ -931,9 +931,28 @@ mod llvm_codegen_tests {
             "expected a single naso_entry function, got:\n{}",
             llvm_ir
         );
+        // There is no longer one block per statement. `build_module` now lowers the
+        // SCHEDULE TREE, and the schedule tree owns the block structure: a `Sequence`
+        // of `Domain` nodes emits into the single `entry` block, while a `Band` emits a
+        // loop nest. This fixture's parsed schedule is a flat `Sequence`, so `entry`
+        // IS the whole body.
+        //
+        // The assertion is on the block that must exist and the store that must have
+        // been emitted -- not merely on `entry`, which an empty body would also have.
         assert!(
-            llvm_ir.contains("stmt_0:"),
-            "expected a basic block per statement, got:\n{}",
+            llvm_ir.contains("entry:"),
+            "the schedule lowering must emit an entry block, got:\n{}",
+            llvm_ir
+        );
+        assert!(
+            llvm_ir.contains("store i64") && llvm_ir.contains("alloca i64"),
+            "the statement body must have been emitted into the entry block, got:\n{}",
+            llvm_ir
+        );
+        assert!(
+            !llvm_ir.contains("stmt_0:"),
+            "statement-per-block emission is gone; the schedule tree owns the blocks, \
+             so a `stmt_N` block means the old walk is still in use:\n{}",
             llvm_ir
         );
         // The fixture's parameters are parsed even though the LLVM module
@@ -972,20 +991,30 @@ mod llvm_codegen_tests {
             .emit_llvm(&pir)
             .expect("LLVM codegen failed");
 
-        // One function, with one basic block per statement, in fixture order. The blocks
-        // are chained by unconditional branches, so statement order is the schedule's
-        // execution order.
+        // One function. Both statements land in the single `entry` block, because the
+        // parsed schedule for this fixture is a `Sequence` of two `Domain` nodes and a
+        // `Sequence` adds no control flow of its own.
         assert!(
             llvm_ir.contains("define void @naso_entry()"),
             "missing naso_entry:\n{}",
             llvm_ir
         );
         assert!(
-            llvm_ir.contains("stmt_0:"),
-            "missing the stmt_0 block:\n{}",
+            llvm_ir.contains("entry:"),
+            "missing the entry block the schedule lowering creates:\n{}",
             llvm_ir
         );
-        assert!(llvm_ir.contains("stmt_1:"), "missing stmt_1:\n{}", llvm_ir);
+        // TWO statements, so TWO `qubit_alloc` calls: the earlier assertion was on a
+        // block NAME, which proves nothing once the block naming changed. Counting the
+        // calls is what actually distinguishes "both statements were emitted" from
+        // "only the first one was".
+        let allocs = llvm_ir.matches("@qir.qubit_alloc()").count();
+        assert!(
+            allocs >= 2,
+            "both statements' bodies must be emitted; found {allocs} qubit_alloc \
+             calls in:\n{}",
+            llvm_ir
+        );
 
         let report = check_ir(&llvm_ir, "fft_1024");
         println!("FFT validation: {}", report.summary());
@@ -1343,6 +1372,15 @@ mod llvm_codegen_tests {
 
     /// Every gate named in a fixture body must appear as a call in the
     /// generated IR -- this is what ties the fixture text to the emitted code.
+    ///
+    /// A gate belonging to a `[0]`-quantity statement is EXCLUDED, and deliberately
+    /// asserted absent below. `build_module` now lowers the schedule tree, and
+    /// `ScheduleLowering::lower_domain` skips a `[0]` statement: a zero-quantity
+    /// statement is an ancilla-computation artefact that is erased, so emitting its
+    /// gates would be wrong. `rev_adder`'s `S_uncompute_carry` is `quantity = Zero`
+    /// and its body is `uncompute carry[i+1]`, which `lower_op` spells as an `x`
+    /// gate -- so `@qir.x(` used to appear only because the old walk-statements path
+    /// emitted the erased statement anyway.
     #[test]
     fn test_fixture_gates_appear_in_generated_ir() {
         let cases: [(&str, &[&str]); 2] = [
@@ -1350,7 +1388,7 @@ mod llvm_codegen_tests {
                 "teleport",
                 &["@qir.h(", "@qir.cx(", "@qir.mz(", "@qir.x(", "@qir.z("],
             ),
-            ("rev_adder", &["@qir.ccx(", "@qir.x("]),
+            ("rev_adder", &["@qir.ccx("]),
         ];
         for (fixture, gates) in cases {
             let ir = pipeline(OptLevel::Default)
@@ -1367,6 +1405,19 @@ mod llvm_codegen_tests {
             }
             check_ir(&ir, fixture);
         }
+
+        // The `[0]`-quantity statement's gate must NOT be emitted. `rev_adder`'s
+        // `S_uncompute_carry` has `quantity = Zero`, and its body lowers to a single
+        // `x` gate. The old statement-walking path emitted it anyway; the schedule
+        // path erases it, which is what a `[0]` statement means.
+        let ir = pipeline(OptLevel::Default)
+            .emit_llvm(&load_pir_fixture("rev_adder"))
+            .expect("LLVM codegen failed");
+        assert!(
+            !ir.contains("@qir.x("),
+            "a [0]-quantity statement must be erased, so its `x` gate must not be \
+             emitted; if it is, `lower_domain` stopped skipping erased statements:\n{ir}"
+        );
     }
 
     /// The call sites the builder emits really do target the functions it

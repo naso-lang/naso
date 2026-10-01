@@ -42,7 +42,7 @@ use std::collections::HashMap;
 /// declare a quantum intrinsic, so it is threaded through explicitly.
 pub fn lower_schedule_tree<'ctx>(
     ctx: &'ctx CodegenContext,
-    module: &'ctx inkwell::module::Module<'ctx>,
+    module: &inkwell::module::Module<'ctx>,
     function: FunctionValue<'ctx>,
     schedule: &ScheduleTree,
     pir_module: &PirModule,
@@ -56,6 +56,52 @@ pub fn lower_schedule_tree<'ctx>(
     let type_lowering = LlvmTypeLowering::new(llvm_context);
     let mut value_builder = LlvmValueBuilder::new(builder, type_lowering);
 
+    lower_schedule_tree_into(
+        ctx,
+        module,
+        function,
+        &mut value_builder,
+        schedule,
+        pir_module,
+        quantities,
+        access_relations,
+    )
+}
+
+/// Lower a schedule tree into `function` through a CALLER-SUPPLIED value builder.
+///
+/// This is the same lowering [`lower_schedule_tree`] performs, split so the
+/// caller keeps ownership of the single `LlvmValueBuilder`. The reason is scope:
+/// `LlvmValueBuilder` owns the `name -> allocation` map, and a `let` bound before
+/// a `forall` must still be writable inside the loop body. A caller that built its
+/// own `LlvmValueBuilder` (as `lower_schedule_tree` does) and passed in a
+/// different one would silently lose every binding made before the call, so
+/// there is exactly ONE builder and it is threaded through.
+///
+/// `function` must have NO basic blocks yet: this function appends the `entry`
+/// block, emits the schedule, appends exactly one return, and verifies. A caller
+/// that has already added blocks or its own terminator will produce a
+/// double-terminated or unreachable-IR module, so ownership of the body is
+/// deliberately not split.
+// The parameter list mirrors `lower_schedule_tree` plus the value builder, and every
+// one of them is load-bearing: `ctx` for the LLVM context, `module` for callee and
+// intrinsic resolution, `function` for the block being built, the value builder for
+// the single insertion point and variable scope, and the four PIR arguments because
+// `PirModule` is borrowed rather than decomposed. Bundling them into a struct would
+// only move the same fields one level down without removing any of them.
+#[allow(clippy::too_many_arguments)]
+pub fn lower_schedule_tree_into<'ctx>(
+    ctx: &'ctx CodegenContext,
+    module: &inkwell::module::Module<'ctx>,
+    function: FunctionValue<'ctx>,
+    value_builder: &mut LlvmValueBuilder<'ctx>,
+    schedule: &ScheduleTree,
+    pir_module: &PirModule,
+    quantities: &QuantityMap,
+    access_relations: &AccessRelations,
+) -> CodegenResult<()> {
+    let llvm_context = ctx.llvm_context();
+
     // A schedule tree has no `let` step of its own, so a band body's only nameable
     // storage is what already exists in the module. Bind the module's globals by name
     // before lowering, so `counter = counter + 1` has somewhere to write. A name that
@@ -68,7 +114,7 @@ pub fn lower_schedule_tree<'ctx>(
 
     // Create schedule lowering context
     let mut lowering = ScheduleLowering::new(
-        &mut value_builder,
+        value_builder,
         module,
         function,
         pir_module,
@@ -83,9 +129,13 @@ pub fn lower_schedule_tree<'ctx>(
     // `Option<&dyn BasicValue>`; a void function returns `None`, while a typed
     // function returns a zero value of its return type (`FunctionType` has no
     // `Void` variant -- `None` *is* void).
+    //
+    // This is the ONE return for the function. A band emits its own `ret`-free
+    // exit block and leaves the builder positioned there, so appending here
+    // terminates the exit rather than an already-terminated block.
     let return_type = function.get_type().get_return_type();
-    let return_value = return_type.map(|ty| value_builder.build_zero(ty));
-    value_builder.build_return(return_value)?;
+    let return_value = return_type.map(|ty| lowering.value_builder.build_zero(ty));
+    lowering.value_builder.build_return(return_value)?;
 
     // Verify function. inkwell 0.10's `verify` returns a `bool` rather than a
     // `Result`, printing diagnostics to stderr when `print` is true; on failure
@@ -102,7 +152,7 @@ pub fn lower_schedule_tree<'ctx>(
 }
 
 /// Every `Domain` statement id in a schedule subtree, in tree order.
-fn statements_under(node: &ScheduleNode) -> Vec<StmtId> {
+pub fn statements_under(node: &ScheduleNode) -> Vec<StmtId> {
     let mut ids = Vec::new();
     collect_statements(node, &mut ids);
     ids
@@ -225,6 +275,33 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
         // Extract loop bounds from scheduling maps
         let bounds = self.extract_bounds(members)?;
 
+        // A band whose domain pins no iterator to a constant range has NO bounds,
+        // and `emit_sequential_band` emits one loop PER bound -- so with no bounds it
+        // emits no loop and the callback that lowers the child is never invoked. The
+        // band body would then vanish from the module entirely: the statements are in
+        // the schedule tree, so the coverage check passes, and the program compiles to
+        // something that simply does less than it was told to.
+        //
+        // That is the same silent wrong answer as running a loop body once, so it is
+        // refused here instead. The common cause is a symbolic bound:
+        // `forall i in 0..n` records only `i >= 0`, and `iterator_bounds` needs both
+        // ends of the range. Lowering a symbolic bound needs the parameter to reach
+        // codegen as a value, which the IR does not yet carry.
+        if bounds.is_empty() && !self.is_band_erased(child) {
+            return Err(CodegenError::UnsupportedFeature(format!(
+                "cannot lower a band with no constant loop bounds: its domain {:?} \
+                 constrains no iterator to a range with both a lower and an upper \
+                 bound, so no trip count can be computed. A symbolic bound such as \
+                 `forall i in 0..n` is the usual cause -- it records only `i >= 0`. \
+                 The band's body is NOT emitted as straight-line code, because \
+                 running it once is a different program.",
+                members
+                    .first()
+                    .map(|m| m.pieces[0].domain.name.clone().unwrap_or_default())
+                    .unwrap_or_else(|| "<unnamed>".to_string())
+            )));
+        }
+
         // Check if this band is parallelizable
         let is_parallel = coincident.iter().any(|&c| c);
 
@@ -249,6 +326,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
                     lower: b.lower,
                     upper: b.upper,
                     step: b.step,
+                    iterator_name: b.iterator_name.clone(),
                 })
                 .collect();
             self.parallel_emitter.emit_parallel_band(
@@ -276,6 +354,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
                     lower: b.lower,
                     upper: b.upper,
                     step: b.step,
+                    iterator_name: b.iterator_name.clone(),
                 })
                 .collect();
             self.loop_emitter.emit_sequential_band(
@@ -342,19 +421,42 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
     }
 
     /// Extract loop bounds from affine scheduling maps
+    //
+    // This can return FEWER bounds than the band has dimensions, or none at all,
+    // when the band's domain does not pin an iterator to a constant range: a
+    // symbolic `forall i in 0..n` encodes only `i >= 0`, and
+    // `AffineDomain::iterator_bounds` requires BOTH a lower and an upper
+    // constraint to answer. `lower_band` treats an empty result as an error
+    // rather than emitting a body once, because emitting the body once is a
+    // silent wrong answer -- precisely the bug this schedule path exists to fix.
     fn extract_bounds(&mut self, members: &[AffineMap]) -> CodegenResult<Vec<LoopBounds<'ctx>>> {
         let mut bounds = Vec::new();
 
-        for member in members {
+        // A band's `members` are its SCHEDULING maps -- one per loop level. Each
+        // member's piece describes ONE iterator, so the iteration space has exactly
+        // `members.len()` dimensions.
+        //
+        // This used to iterate `0..domain.n_iter` for every member, taking the loop
+        // bounds from a member's domain rather than from the member itself. For a
+        // 2-dimensional band that produced 2 x 2 = 4 bounds instead of 2, so the
+        // emitter built a 4-deep nest: a 3x2 loop accumulated 36 rather than 6. The IR
+        // looked like an ordinary nest, so nothing about it was legible as wrong.
+        for (level, member) in members.iter().enumerate() {
             // Get the domain of the schedule map
             let domain = &member.pieces[0].domain;
 
-            // For each iterator dimension, extract bounds
-            for iter_dim in 0..domain.n_iter {
+            // The bound for THIS level, which is the member's own index. Iterating the
+            // full `n_iter` would repeat earlier levels once per member.
+            for iter_dim in [level] {
                 if let Some((lower, upper)) = domain.iterator_bounds(iter_dim) {
                     bounds.push(LoopBounds {
                         iterator_dim: iter_dim,
                         lower: self.lower_affine_expr(&lower)?,
+                        // The domain's own name is where the source spelling of the
+                        // iterator lives. It is read here and nowhere else, so the
+                        // binding decision is made once, next to the loop bound that
+                        // it describes.
+                        iterator_name: domain.nest_iterator().map(str::to_string),
                         upper: self.lower_affine_expr(&upper)?,
                         step: 1, // Default step of 1
                     });
@@ -566,6 +668,14 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
 struct LoopBounds<'ctx> {
     iterator_dim: usize,
     lower: BasicValueEnum<'ctx>,
+    /// The iterator this bound drives, when the band's domain names it.
+    ///
+    /// `AffineDomain::name` is `nest(i)` for a domain derived from `forall i in
+    /// ..`, which is the only channel carrying the source spelling of the
+    /// iterator. It is `None` for a hand-built domain, in which case the
+    /// induction variable is still emitted (the loop is real) but is not bound
+    /// to a name, and a body reading it stays a diagnostic rather than a guess.
+    iterator_name: Option<String>,
     upper: BasicValueEnum<'ctx>,
     step: i64,
 }

@@ -159,7 +159,7 @@ fn build_loop_ir() -> String {
         vec![
             // i >= 0
             naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![1], 0),
-            // `-i >= -4` means `i <= 4`, so the loop runs 5 times.
+            // `-i >= -3` means `i <= 3`, so the loop runs 4 times.
             //
             // This is the natural spelling. It previously had to be written as
             // `-i >= 4`, which is the OPPOSITE inequality, because
@@ -168,7 +168,16 @@ fn build_loop_ir() -> String {
             // sign -- a `0..3` loop then compared `iv < -3` and never ran its body. That
             // compensation hid the bug; the correct arithmetic is pinned in
             // `affine_domain`'s unit tests.
-            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![-1], -4),
+            //
+            // It also used to be written `-i >= -4`, i.e. `i <= 4`, to get 4 iterations.
+            // That compensated for the emitter comparing `iv < upper` against what is
+            // an INCLUSIVE bound: the front end encodes the half-open source range
+            // `0..4` as `i <= 4 - 1`, so the emitter must compare `iv <= upper`.
+            // With the exclusive compare, every loop this backend emitted from a real
+            // `.naso` source dropped its final iteration -- `0..4` summed 0+1+2 and
+            // reported 3. Both the encoding and the comparison are now the honest
+            // half-open ones, and this test asserts the trip count the source asks for.
+            naso_compiler::ir::affine_domain::AffineConstraint::inequality(vec![-1], -3),
         ],
     );
     let map = naso_compiler::ir::affine_map::AffineMap::new(vec![

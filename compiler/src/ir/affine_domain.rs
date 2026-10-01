@@ -122,6 +122,29 @@ impl AffineDomain {
         self
     }
 
+    /// The source-level iterator a `nest(...)` domain was built for, if any.
+    ///
+    /// `lowering::loop_extraction::domain_from_nest` names the domain it derives
+    /// from a `forall i in lo..hi` as `nest(i)`. That name is currently the ONLY
+    /// channel by which the iterator's spelling reaches the backend: neither
+    /// `AffineDomain` nor `AffineMap` nor `ScheduleNode::Band` carries an
+    /// iterator name as data. Without it the loop emitter can emit a correct loop
+    /// with a correct induction variable and still have no way to bind the name
+    /// the loop BODY refers to, so `i` read as an unbound name.
+    ///
+    /// This accessor is deliberately strict: it returns `None` for any name that
+    /// is not exactly `nest(<non-empty>)`, so a domain with no name, a `None`
+    /// name, or a debug name of some other shape is reported as "no iterator
+    /// name" rather than guessed at.
+    pub fn nest_iterator(&self) -> Option<&str> {
+        let inner = self
+            .name
+            .as_deref()?
+            .strip_prefix("nest(")?
+            .strip_suffix(')')?;
+        if inner.is_empty() { None } else { Some(inner) }
+    }
+
     /// Add a constraint to the domain
     pub fn add_constraint(&mut self, constraint: AffineConstraint) {
         assert_eq!(

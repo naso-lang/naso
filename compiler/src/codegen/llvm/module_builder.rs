@@ -2,18 +2,19 @@
 //
 // High-level wrapper around inkwell::module::Module for building LLVM IR.
 
-use crate::ast::{Quantity, Span, Type, TypeKind};
+use crate::ast::{Span, Type, TypeKind};
 use crate::codegen::context::CodegenContext;
 use crate::codegen::error::{CodegenError, CodegenResult};
-use crate::codegen::llvm::expr_lowering::PirExprLowerer;
+use crate::codegen::llvm::schedule_lowering::{lower_schedule_tree_into, statements_under};
 use crate::codegen::llvm::type_lowering::LlvmTypeLowering;
 use crate::codegen::llvm::value_builder::LlvmValueBuilder;
-use crate::ir::pir_types::{PirExpr, PirModule, PirStatement};
+use crate::ir::pir_types::PirModule;
+use crate::ir::schedule_tree::StmtId;
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder as LlvmBuilder;
 use inkwell::module::Module as LlvmModule;
 use inkwell::types::BasicTypeEnum;
-use inkwell::values::{BasicValueEnum, FunctionValue, PointerValue};
+use inkwell::values::{FunctionValue, PointerValue};
 /// The single entry function generated for a whole [`PirModule`].
 ///
 /// A `PirModule` is one program's statement list, so all of its statements go into one
@@ -38,12 +39,6 @@ pub struct LLVMModuleBuilder<'ctx> {
     current_function: Option<FunctionValue<'ctx>>,
     // Current basic block
     current_block: Option<BasicBlock<'ctx>>,
-    // True while building a PIR STATEMENT, as opposed to an expression. A
-    // statement-position `let` is a binding that outlives its own expression, so
-    // `build_expr` must not remove it from scope when it finishes. See the `Let`
-    // arm in `PirExprLowerer` for why this cannot be inferred from the
-    // expression's shape.
-    in_statement_position: bool,
     // Named struct types
     struct_types: HashMap<String, inkwell::types::StructType<'ctx>>,
 }
@@ -68,7 +63,6 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
             value_builder: Some(value_builder),
             current_function: None,
             current_block: None,
-            in_statement_position: false,
 
             struct_types: HashMap::new(),
         })
@@ -161,49 +155,71 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
         // list -- it has no function structure of its own -- so a single function is
         // both correct and what makes bindings visible across statements.
         //
-        // Each statement gets its own basic block so the emitted IR still shows where
-        // one statement ends and the next begins, and a malformed statement is easy to
-        // locate. Blocks fall through in order, which is the schedule's execution order.
+        // The SCHEDULE, not the statement list, decides execution order and loop
+        // structure. Walking `pir_module.statements` directly cannot express a loop at
+        // all: a `forall` appears as ONE statement whose domain is `nest(i)`, so
+        // walking statements ran its body exactly once -- arithmetically wrong, with
+        // no diagnostic, while the band that recorded the iteration bounds sat in the
+        // schedule tree unread. `lower_schedule_tree_into` emits a real loop nest
+        // (preheader / header with a phi / body / latch / exit) and honours the bands.
+        //
+        // It also owns the function BODY: the `entry` block, the single return, and
+        // the verification. Nothing is emitted here, so there is exactly one return
+        // and no block is terminated twice.
         if !pir_module.statements.is_empty() {
             let fn_type = self.type_lowering.fn_type(None, &[], false); // `None` is void
             let function = self.module.add_function(ENTRY_NAME, fn_type, None);
             self.set_current_function(function);
 
-            // One basic block per statement, so the IR still shows where one statement
-            // ends and the next begins. Blocks fall through in order, which is the
-            // schedule's execution order.
-            let mut blocks: Vec<BasicBlock<'ctx>> = pir_module
-                .statements
-                .iter()
-                .map(|stmt| {
-                    self.context
-                        .llvm_context()
-                        .append_basic_block(function, &format!("stmt_{}", stmt.id.0))
-                })
-                .collect();
-
-            let last = blocks.len() - 1;
-            for (index, stmt) in pir_module.statements.iter().enumerate() {
-                self.set_current_block(blocks[index]);
-                // A `let` in statement position binds for the rest of the function.
-                self.in_statement_position = true;
-                self.build_expr(&stmt.body, &pir_module.quantities)?;
-
-                if index == last {
-                    // The last statement ends the function.
-                    self.llvm_builder()
-                        .build_return(None)
-                        .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
-                } else {
-                    self.llvm_builder()
-                        .build_unconditional_branch(blocks[index + 1])
-                        .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
-                }
-            }
+            // The value builder is the ONE scope for the whole function. It is the
+            // builder `add_variable` writes into, so a name bound before this call is
+            // visible inside a band body; passing a different builder in would give
+            // the loop body an empty scope and silently drop every outer binding.
+            //
+            // `self.module` and `self.value_builder` are borrowed separately because
+            // the callee needs the module immutably and the value builder mutably,
+            // and both are fields of the same `&mut self`.
+            let module = &self.module;
+            let value_builder = self
+                .value_builder
+                .as_mut()
+                .expect("value_builder not initialized");
+            lower_schedule_tree_into(
+                self.context,
+                module,
+                function,
+                value_builder,
+                &pir_module.schedule,
+                pir_module,
+                &pir_module.quantities,
+                &pir_module.accesses,
+            )?;
+            self.value_builder().clear_variables();
 
             self.current_function = None;
             self.current_block = None;
             self.value_builder().clear_variables();
+        }
+
+        // Every statement must be REACHABLE from the schedule tree, or it will not be
+        // emitted. This is checked AFTER lowering, because the schedule tree is now
+        // the only thing that emits a statement: walking the statement list as well
+        // would emit it twice.
+        //
+        // Silently accepting a statement the schedule never mentions would compile it
+        // to nothing -- the same class of silent wrong answer as the loop-once body.
+        // A `[0]`-quantity statement IS in the tree and is deliberately skipped by
+        // `lower_domain`, which is erasure, not a coverage gap, so it is not reported.
+        let scheduled: Vec<StmtId> = statements_under(&pir_module.schedule.root);
+        for stmt in &pir_module.statements {
+            if !scheduled.contains(&stmt.id) {
+                return Err(CodegenError::UnsupportedFeature(format!(
+                    "PIR statement {} is in `statements` but no `Domain` node in the \
+                     schedule tree covers it, so the LLVM backend would emit nothing \
+                     for it. Add a schedule node naming it, or drop the statement.",
+                    stmt.id
+                )));
+            }
         }
 
         // Verify the module
@@ -247,83 +263,6 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
         Ok(())
     }
 
-    // Build a PIR statement as a function
-    fn build_statement(
-        &mut self,
-        stmt: &PirStatement,
-        quantities: &HashMap<String, Quantity>,
-    ) -> CodegenResult<()> {
-        let func_name = format!("stmt_{}", stmt.id.0);
-
-        // Determine function signature based on quantities used
-        let params: Vec<BasicTypeEnum<'ctx>> = Vec::new(); // Simplified for now
-        // Statement functions return void; `None` is the void return type.
-        let ret_type: Option<BasicTypeEnum<'ctx>> = None;
-        let fn_type = self.type_lowering.fn_type(ret_type, &params, false);
-
-        let function = self.module.add_function(&func_name, fn_type, None);
-        self.set_current_function(function);
-
-        // Create entry block
-        let entry = self
-            .context
-            .llvm_context()
-            .append_basic_block(function, "entry");
-        self.set_current_block(entry);
-
-        // Build the statement body
-        self.build_expr(&stmt.body, quantities)?;
-
-        // Return void
-        self.llvm_builder()
-            .build_return(None)
-            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
-
-        self.current_function = None;
-        self.current_block = None;
-        self.value_builder().clear_variables();
-
-        Ok(())
-    }
-
-    // Build a PIR expression
-    //
-    // The logic itself lives in `PirExprLowerer`, which `ScheduleLowering` also uses
-    // for schedule band bodies. Keeping it here as a private copy is what left a band
-    // body with nothing to emit: the loop structure was correct and the body was
-    // empty, so the loop iterated the right number of times and computed nothing.
-    //
-    // This method is the module-builder-shaped entry point: it supplies the current
-    // function and the statement-position flag from this type's own state.
-    fn build_expr(
-        &mut self,
-        expr: &PirExpr,
-        quantities: &HashMap<String, Quantity>,
-    ) -> CodegenResult<BasicValueEnum<'ctx>> {
-        let function = self.current_function().ok_or_else(|| {
-            CodegenError::FunctionBuildError(
-                "no function is being built: a PIR expression cannot be lowered outside \
-                 one"
-                .to_string(),
-            )
-        })?;
-        let in_statement_position = self.in_statement_position;
-        // Borrow the two fields separately: `value_builder` needs `&mut` (it owns the
-        // builder and the variable map) while `module` needs only `&`, and taking both
-        // out of `self` in one struct literal would borrow `self` mutably twice.
-        let module = &self.module;
-        let mut lowerer = PirExprLowerer {
-            value_builder: self
-                .value_builder
-                .as_mut()
-                .expect("value_builder not initialized"),
-            module,
-            current_function: function,
-            in_statement_position,
-        };
-        lowerer.build_expr(expr, quantities)
-    }
-
     // Convert module to LLVM IR string
     pub fn module_to_string(&self) -> String {
         self.module.print_to_string().to_string()
@@ -355,7 +294,7 @@ mod tests {
         let mut builder = LLVMModuleBuilder::new(&context).unwrap();
 
         // Create a minimal PIR module
-        use crate::ast::Mutability;
+        use crate::ast::{Mutability, Quantity};
         use crate::ir::access_relation::AccessRelations;
         use crate::ir::affine_domain::AffineDomain;
         use crate::ir::pir_types::{PirModule, PirStatement};

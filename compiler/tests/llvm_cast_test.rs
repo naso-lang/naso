@@ -31,7 +31,7 @@ use naso_compiler::codegen::context::{CodegenContext, CodegenTarget, OptLevel};
 use naso_compiler::codegen::llvm::LLVMModuleBuilder;
 use naso_compiler::ir::affine_domain::AffineDomain;
 use naso_compiler::ir::pir_types::{PirExpr, PirModule, PirStatement};
-use naso_compiler::ir::schedule_tree::StmtId;
+use naso_compiler::ir::schedule_tree::{ScheduleNode, ScheduleTree, StmtId};
 
 #[test]
 fn a_cast_to_an_unsupported_bit_width_is_refused() {
@@ -52,8 +52,17 @@ fn a_cast_to_an_unsupported_bit_width_is_refused() {
         mutability: Mutability::Immutable,
         span: None,
     };
+    // The schedule tree must name the statement: `build_module` lowers the SCHEDULE,
+    // not the statement list, so a statement no `Domain` node covers is reported as
+    // unreachable. Giving the statement a `Domain` node is what lets the intended
+    // error -- the unlowerable cast, or the unknown allocation -- be the one that
+    // surfaces instead of the coverage check.
     let module = PirModule {
         statements: vec![stmt],
+        schedule: ScheduleTree::new(
+            ScheduleNode::domain(StmtId(0), AffineDomain::universe(0, 0)),
+            vec![],
+        ),
         ..Default::default()
     };
     let err = builder
@@ -84,8 +93,17 @@ fn assignment_to_an_unknown_allocation_is_refused() {
         mutability: Mutability::Immutable,
         span: None,
     };
+    // The schedule tree must name the statement: `build_module` lowers the SCHEDULE,
+    // not the statement list, so a statement no `Domain` node covers is reported as
+    // unreachable. Giving the statement a `Domain` node is what lets the intended
+    // error -- the unlowerable cast, or the unknown allocation -- be the one that
+    // surfaces instead of the coverage check.
     let module = PirModule {
         statements: vec![stmt],
+        schedule: ScheduleTree::new(
+            ScheduleNode::domain(StmtId(0), AffineDomain::universe(0, 0)),
+            vec![],
+        ),
         ..Default::default()
     };
     let err = builder

@@ -36,15 +36,39 @@ impl<'ctx> LoopEmitter<'ctx> {
     where
         F: FnMut(&mut dyn ScheduleLoweringLike<'ctx>) -> CodegenResult<()>,
     {
-        // For now, emit a single loop as example
-        // Full implementation would handle multi-dimensional loop nests
-        for bound in bounds {
-            self.emit_single_loop(value_builder, bound, false, |vb| {
-                // Create a mock lowering context for the child
-                lower_child(&mut MockLowering { value_builder: vb })
-            })?;
-        }
-        Ok(())
+        // A band with N bounds is an N-DEEP nest, so the emission must RECURSE: each
+        // loop's body contains the next loop, not the next loop's body.
+        //
+        // This used to be a flat `for bound in bounds`, emitting SIBLING loops and
+        // running the child in each one. A 2-dimensional band therefore executed its
+        // body once per dimension instead of once per point: a `0..3` by `0..2` nest
+        // accumulated 10 instead of 6. The generated IR looked like two ordinary loops,
+        // so nothing about it signalled the error.
+        self.emit_nest(value_builder, bounds, &mut lower_child)
+    }
+
+    /// Emit the nest from `depth` onwards: one loop per bound, each nested in the
+    /// previous, with the child lowered in the innermost body.
+    fn emit_nest<F>(
+        &self,
+        value_builder: &mut LlvmValueBuilder<'ctx>,
+        bounds: &[LoopBounds<'ctx>],
+        lower_child: &mut F,
+    ) -> CodegenResult<()>
+    where
+        F: FnMut(&mut dyn ScheduleLoweringLike<'ctx>) -> CodegenResult<()>,
+    {
+        let Some((bound, rest)) = bounds.split_first() else {
+            // Innermost level: no more dimensions, so the band's child goes here.
+            return lower_child(&mut MockLowering { value_builder });
+        };
+
+        // `emit_single_loop` calls this closure with the builder positioned in THIS
+        // loop's body, so recursing from inside it nests the next dimension rather than
+        // following it.
+        self.emit_single_loop(value_builder, bound, false, |vb| {
+            self.emit_nest(vb, rest, lower_child)
+        })
     }
 
     /// Emit a parallel band (with llvm.loop.parallel_accesses metadata)
@@ -125,16 +149,39 @@ impl<'ctx> LoopEmitter<'ctx> {
             .build_load(iv_alloca, "iv_val")?
             .into_int_value();
 
-        // Compare with upper bound
+        // Compare with upper bound.
+        //
+        // The comparison is INCLUSIVE (`<=`). `AffineDomain::iterator_bounds`
+        // recovers the largest value the domain admits, and the front end encodes
+        // the half-open source range `lo..hi` as `i <= hi - 1`
+        // (`lowering::loop_extraction::domain_from_nest`). Comparing with `<`
+        // against that inclusive bound dropped the final iteration: `forall i in
+        // 0..4` emitted `icmp slt i64 %iv_val, 3`, ran three times, and summed
+        // 0+1+2 instead of 0+1+2+3 -- a loop that looked correct and computed a
+        // wrong answer with no diagnostic.
         let upper_val = bounds.upper.into_int_value();
         let cond =
-            value_builder.build_int_compare(IntPredicate::SLT, iv_val, upper_val, "loop_cond")?;
+            value_builder.build_int_compare(IntPredicate::SLE, iv_val, upper_val, "loop_cond")?;
 
         value_builder.build_conditional_branch(cond, body, exit)?;
 
         // Body
         value_builder.builder().position_at_end(body);
+        // Bind the induction variable's SOURCE SPELLING to the same alloca the phi
+        // drives, so a body that reads `i` sees the current iteration. The phi alone
+        // is not reachable by name: `PirExpr::Var` resolves through the value
+        // builder's scope map, and before this binding `i` had no entry there, so
+        // `total = total + i` read an unbound name and computed zero every
+        // iteration -- a loop that iterated correctly and produced a wrong answer.
+        //
+        // The binding is removed after the body so it does not leak past the loop.
+        if let Some(name) = &bounds.iterator_name {
+            value_builder.add_variable(name.clone(), iv_alloca, int_type.into());
+        }
         body_builder(value_builder)?;
+        if let Some(name) = &bounds.iterator_name {
+            value_builder.remove_variable(name);
+        }
         value_builder.build_unconditional_branch(latch)?;
 
         // Latch: increment induction variable
@@ -256,6 +303,13 @@ impl<'ctx> LoopEmitter<'ctx> {
 pub struct LoopBounds<'ctx> {
     pub iterator_dim: usize,
     pub lower: BasicValueEnum<'ctx>,
+    /// The source spelling of this loop's induction variable, when known.
+    ///
+    /// Bound into the value builder's scope for the duration of the loop body, so
+    /// `forall i in 0..n { ... i ... }` can read `i`. `None` means the domain does
+    /// not name the iterator, and the body then has no binding for it -- reported
+    /// rather than guessed.
+    pub iterator_name: Option<String>,
     pub upper: BasicValueEnum<'ctx>,
     pub step: i64,
 }

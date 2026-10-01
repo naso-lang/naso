@@ -44,7 +44,30 @@ use naso_compiler::codegen::context::{CodegenContext, CodegenTarget, OptLevel};
 use naso_compiler::codegen::llvm::LLVMModuleBuilder;
 use naso_compiler::ir::affine_domain::AffineDomain;
 use naso_compiler::ir::pir_types::{PirExpr, PirModule, PirStatement};
-use naso_compiler::ir::schedule_tree::StmtId;
+use naso_compiler::ir::schedule_tree::{ScheduleNode, ScheduleTree, StmtId};
+
+/// Wrap statements in a schedule tree whose root is a `Sequence` naming each of them.
+///
+/// `build_module` lowers the SCHEDULE TREE, not the statement list, so a statement no
+/// `Domain` node covers is reported as unreachable. Tests that build a `PirModule` by
+/// hand must therefore say which statements are scheduled; `..Default::default()`
+/// leaves the tree `Empty`, which now (correctly) means "emit nothing".
+fn scheduled(statements: Vec<PirStatement>) -> PirModule {
+    let schedule = ScheduleTree::new(
+        ScheduleNode::Sequence {
+            children: statements
+                .iter()
+                .map(|s| ScheduleNode::domain(s.id, s.domain.clone()))
+                .collect(),
+        },
+        vec![],
+    );
+    PirModule {
+        statements,
+        schedule,
+        ..Default::default()
+    }
+}
 
 /// The global the generated statement stores its result into.
 const RESULT_GLOBAL: &str = "result";
@@ -172,10 +195,7 @@ fn build_storing_ir_at(value: PirExpr, width: naso_compiler::codegen::abi::IntWi
         mutability: Mutability::Immutable,
         span: None,
     };
-    let module = PirModule {
-        statements: vec![stmt],
-        ..Default::default()
-    };
+    let module = scheduled(vec![stmt]);
     builder
         .build_module(&module)
         .unwrap_or_else(|e| panic!("lowering to IR failed: {e}"));
@@ -555,38 +575,35 @@ fn a_later_statement_can_assign_to_a_statement_position_binding() {
         mutability: Mutability::Immutable,
         span: None,
     };
-    let module = PirModule {
-        statements: vec![
-            // `let mut total = 0;`
-            stmt(
-                0,
-                PirExpr::Let {
-                    name: "total".into(),
-                    qty: Quantity::Many,
-                    mutability: Mutability::Mut,
-                    value: Box::new(PirExpr::IntLit(0)),
-                    body: Box::new(PirExpr::IntLit(0)),
-                },
-            ),
-            // `total = 42;`
-            stmt(
-                1,
-                PirExpr::Assign {
-                    target: Box::new(PirExpr::Var("total".into())),
-                    value: Box::new(PirExpr::IntLit(42)),
-                },
-            ),
-            // `result = total;` -- the read proves the write landed in the SAME slot.
-            stmt(
-                2,
-                PirExpr::Assign {
-                    target: Box::new(PirExpr::Var(RESULT_GLOBAL.to_string())),
-                    value: Box::new(PirExpr::Var("total".into())),
-                },
-            ),
-        ],
-        ..Default::default()
-    };
+    let module = scheduled(vec![
+        // `let mut total = 0;`
+        stmt(
+            0,
+            PirExpr::Let {
+                name: "total".into(),
+                qty: Quantity::Many,
+                mutability: Mutability::Mut,
+                value: Box::new(PirExpr::IntLit(0)),
+                body: Box::new(PirExpr::IntLit(0)),
+            },
+        ),
+        // `total = 42;`
+        stmt(
+            1,
+            PirExpr::Assign {
+                target: Box::new(PirExpr::Var("total".into())),
+                value: Box::new(PirExpr::IntLit(42)),
+            },
+        ),
+        // `result = total;` -- the read proves the write landed in the SAME slot.
+        stmt(
+            2,
+            PirExpr::Assign {
+                target: Box::new(PirExpr::Var(RESULT_GLOBAL.to_string())),
+                value: Box::new(PirExpr::Var("total".into())),
+            },
+        ),
+    ]);
     builder
         .build_module(&module)
         .expect("a cross-statement write must now lower");

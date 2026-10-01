@@ -11,6 +11,7 @@ pub mod context;
 pub mod error;
 pub mod validate;
 pub mod wgsl;
+pub mod wgsl_straight;
 
 #[cfg(feature = "cranelift")]
 pub mod cranelift;
@@ -41,6 +42,7 @@ pub use inkwell::targets::{InitializationConfig, Target, TargetMachine};
 
 // Re-export WGSL codegen
 pub use wgsl::{WgslTarget, generate_wgsl, verify_wgsl_linearity};
+pub use wgsl_straight::generate_wgsl_straight_line;
 
 /// Main entry point for code generation
 #[cfg(feature = "llvm")]
@@ -121,6 +123,12 @@ pub enum Backend {
     Llvm,
     Qir,
     Cranelift,
+    /// WGSL compute-shader text.
+    ///
+    /// Unlike the others this needs no LLVM: it is a text generator, so it is
+    /// available in a default build. It is currently the straight-line backend
+    /// only -- see `wgsl_straight`.
+    Wgsl,
 }
 
 /// Configuration for code generation

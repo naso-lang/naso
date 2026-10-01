@@ -6,6 +6,7 @@ use naso_compiler::lexer::Lexer;
 use naso_compiler::parser::parse_program;
 use naso_compiler::typecheck::check_program;
 
+use naso_compiler::codegen::generate_wgsl_straight_line;
 #[cfg(feature = "llvm")]
 use naso_compiler::codegen::{
     Backend, CodegenConfig, CodegenContext, CodegenPipeline, CodegenTarget, OptLevel,
@@ -48,7 +49,7 @@ fn print_usage() {
     eprintln!("  check <file>          Type check program");
     eprintln!("  build [options] <file>  Build program to target");
     eprintln!("Build options:");
-    eprintln!("  --target <llvm|qir|cranelift>  Target backend (default: llvm)");
+    eprintln!("  --target <llvm|qir|cranelift|wgsl>  Target backend (default: llvm)");
     eprintln!("  -o, --output <file>            Output file path");
     eprintln!("  --opt <0|1|2|3>                Optimization level (default: 2)");
     eprintln!("  --triple <target>              Target triple (host, nvptx64, wasm32, aarch64)");
@@ -111,8 +112,96 @@ fn run_frontend_command(command: &str, file: &str) {
     }
 }
 
+/// Emit WGSL for `--target wgsl`.
+///
+/// Deliberately independent of the LLVM feature: WGSL is a text generator, so
+/// this is the one backend that works in a default build. It does its own
+/// argument parsing for the two options that matter here and ignores the rest,
+/// so `--opt` / `--triple` / `--debug` do not change its behaviour.
+fn run_wgsl_build_command(args: &[String]) {
+    let mut input_file: Option<PathBuf> = None;
+    let mut output_path: Option<PathBuf> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--target" | "--opt" => i += 1, // value consumed; opt is irrelevant here
+            "-o" | "--output" => {
+                i += 1;
+                if i < args.len() {
+                    output_path = Some(PathBuf::from(&args[i]));
+                }
+            }
+            arg if arg.starts_with('-') => {}
+            path => {
+                if input_file.is_none() {
+                    input_file = Some(PathBuf::from(path));
+                }
+            }
+        }
+        i += 1;
+    }
+
+    let Some(input_file) = input_file else {
+        eprintln!("Missing input file");
+        std::process::exit(1);
+    };
+
+    let source = fs::read_to_string(&input_file).unwrap_or_else(|e| {
+        eprintln!("error: cannot read `{}`: {e}", input_file.display());
+        std::process::exit(1);
+    });
+
+    let mut program = match parse_program(&source) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("parse error: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // WGSL is emitted from a typechecked program: an untypechecked function
+    // could emit a shader that does not match the source's meaning.
+    let result = check_program(&mut program);
+    if !result.errors.is_empty() {
+        for e in &result.errors {
+            eprintln!("{e}");
+        }
+        std::process::exit(1);
+    }
+
+    let wgsl = match generate_wgsl_straight_line(&program) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("WGSL codegen error: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    match output_path {
+        Some(path) => {
+            fs::write(&path, &wgsl).unwrap_or_else(|e| {
+                eprintln!("Failed to write output: {e}");
+                std::process::exit(1);
+            });
+            println!("Written WGSL to {}", path.display());
+        }
+        None => print!("{wgsl}"),
+    }
+}
+
 #[cfg(feature = "llvm")]
 fn run_build_command(args: &[String]) {
+    // Keep `--target wgsl` identical in both builds: it does not need LLVM, so
+    // it must not depend on this function's feature gate.
+    if args
+        .windows(2)
+        .any(|w| w[0] == "--target" && w[1] == "wgsl")
+    {
+        run_wgsl_build_command(args);
+        return;
+    }
+
     let mut config = CodegenConfig::default();
     let mut input_file = None;
     let mut i = 0;
@@ -129,6 +218,7 @@ fn run_build_command(args: &[String]) {
                     "llvm" => Backend::Llvm,
                     "qir" => Backend::Qir,
                     "cranelift" => Backend::Cranelift,
+                    "wgsl" => Backend::Wgsl,
                     other => {
                         eprintln!("Unknown target: {other}. Use llvm, qir, or cranelift");
                         std::process::exit(1);
@@ -260,6 +350,24 @@ fn run_build_command(args: &[String]) {
                 print!("{ir}");
             }
         }
+        Backend::Wgsl => {
+            let wgsl = match generate_wgsl_straight_line(&program) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("WGSL codegen error: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if let Some(path) = config.output_path {
+                fs::write(&path, &wgsl).unwrap_or_else(|e| {
+                    eprintln!("Failed to write output: {e}");
+                    std::process::exit(1);
+                });
+                println!("Written WGSL to {}", path.display());
+            } else {
+                print!("{wgsl}");
+            }
+        }
         Backend::Qir => {
             let ir = match pipeline.emit_qir(&pir_module) {
                 Ok(ir) => ir,
@@ -290,8 +398,23 @@ fn run_build_command(args: &[String]) {
     }
 }
 
+/// Without the LLVM feature, only the WGSL target is available.
+///
+/// WGSL is emitted as text and needs no LLVM, so refusing it here would mean
+/// the one backend that works in a default build was unreachable. Every other
+/// target still reports the real reason.
 #[cfg(not(feature = "llvm"))]
-fn run_build_command(_args: &[String]) {
-    eprintln!("Build command requires LLVM backend. Compile with 'llvm' feature.");
-    std::process::exit(1);
+fn run_build_command(args: &[String]) {
+    let wants_wgsl = args
+        .windows(2)
+        .any(|w| w[0] == "--target" && w[1] == "wgsl");
+    if !wants_wgsl {
+        eprintln!(
+            "Build command requires the LLVM backend for llvm/qir/cranelift. \
+             Compile with the 'llvm' feature, or use `--target wgsl`, which \
+             needs no LLVM."
+        );
+        std::process::exit(1);
+    }
+    run_wgsl_build_command(args);
 }

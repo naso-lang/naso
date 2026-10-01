@@ -63,7 +63,7 @@ impl<'a> Parser<'a> {
     /// Parse an expression using precedence climbing (left-associative).
     pub fn parse_expr_precedence(&mut self, min_prec: u8) -> Expr {
         let mut lhs = self.parse_unary();
-        loop {
+        while !self.loop_should_stop() {
             let op = match self.peek_binary_op() {
                 Some(op) => op,
                 None => break,
@@ -129,7 +129,7 @@ impl<'a> Parser<'a> {
 
     fn parse_postfix(&mut self) -> Expr {
         let mut expr = self.parse_primary();
-        loop {
+        while !self.loop_should_stop() {
             if self.at(TK::LParen) {
                 self.bump();
                 let args = self.parse_args_until(TK::RParen);
@@ -188,7 +188,7 @@ impl<'a> Parser<'a> {
     /// Parse a comma-separated argument/field list, stopping at `closer`.
     fn parse_args_until(&mut self, closer: TK) -> Vec<Expr> {
         let mut args = Vec::new();
-        loop {
+        while !self.loop_should_stop() {
             if self.at(closer.clone()) {
                 break;
             }
@@ -231,7 +231,7 @@ impl<'a> Parser<'a> {
             Some(TK::Ident(_)) => self.parse_var(),
             Some(TK::TypeIdent(_)) => self.parse_struct_literal_or_var(),
             None => self.unexpected("an expression"),
-            Some(k) => self.unexpected(&format!("an expression, found `{k}`")),
+            Some(_) => self.unexpected("an expression"),
         }
     }
 
@@ -244,7 +244,13 @@ impl<'a> Parser<'a> {
             TK::Bool(b) => Literal::Bool(*b),
             TK::Str(s) => Literal::String(s.clone()),
             TK::Char(c) => Literal::Char(*c),
-            _ => unreachable!("parse_literal on {:?}", tok.kind),
+            // Unreachable in practice: every caller matches a literal token
+            // first. Recorded rather than asserted so that a future lexer token
+            // routed here by mistake produces a diagnostic instead of a trap.
+            other => {
+                let msg = format!("expected a literal, found `{other}`");
+                return self.fail(msg, span);
+            }
         };
         Expr::new(ExprKind::Literal(lit), span, next_id())
     }
@@ -265,7 +271,7 @@ impl<'a> Parser<'a> {
         if self.at(TK::LBrace) && !self.no_block_expr {
             self.bump();
             let mut fields = Vec::new();
-            loop {
+            while !self.loop_should_stop() {
                 if self.at(TK::RBrace) {
                     break;
                 }
@@ -331,7 +337,7 @@ impl<'a> Parser<'a> {
         let start = self.pos;
         self.expect(TK::LBracket);
         let mut items = Vec::new();
-        loop {
+        while !self.loop_should_stop() {
             if self.at(TK::RBracket) {
                 break;
             }
@@ -386,7 +392,7 @@ impl<'a> Parser<'a> {
         let scrutinee = self.parse_expr();
         self.expect(TK::LBrace);
         let mut arms = Vec::new();
-        loop {
+        while !self.loop_should_stop() {
             if self.at(TK::RBrace) {
                 break;
             }
@@ -432,7 +438,14 @@ impl<'a> Parser<'a> {
         let body = self.parse_block_expr();
         let body = match body.kind {
             ExprKind::Block(b) => *b,
-            _ => unreachable!("for loop body is always a block"),
+            // `parse_block_expr` always wraps in `ExprKind::Block`, so this arm is
+            // unreachable. It still records an error instead of asserting: an
+            // invariant that is wrong in a browser takes the module with it, and
+            // the diagnostic costs nothing when the arm is never taken.
+            _ => {
+                let msg = "internal parser error: loop body was not a block".to_string();
+                return self.fail(msg, self.error_span());
+            }
         };
         let span = self.span_from(start);
         Expr::new(
@@ -453,7 +466,7 @@ impl<'a> Parser<'a> {
 
         // Parse one or more comma-separated bindings
         let mut bindings = Vec::new();
-        loop {
+        while !self.loop_should_stop() {
             let var = self.parse_ident();
             self.expect(TK::In);
             let lower = self.parse_range_bound();
@@ -470,7 +483,14 @@ impl<'a> Parser<'a> {
         let body = self.parse_block_expr();
         let body = match body.kind {
             ExprKind::Block(b) => *b,
-            _ => unreachable!("forall loop body is always a block"),
+            // `parse_block_expr` always wraps in `ExprKind::Block`, so this arm is
+            // unreachable. It still records an error instead of asserting: an
+            // invariant that is wrong in a browser takes the module with it, and
+            // the diagnostic costs nothing when the arm is never taken.
+            _ => {
+                let msg = "internal parser error: loop body was not a block".to_string();
+                return self.fail(msg, self.error_span());
+            }
         };
 
         let span = self.span_from(start);
@@ -496,7 +516,7 @@ impl<'a> Parser<'a> {
         self.expect(TK::Forall);
 
         let mut bindings = Vec::new();
-        loop {
+        while !self.loop_should_stop() {
             let var = self.parse_ident();
             self.expect(TK::In);
             let lower = self.parse_range_bound();
@@ -513,7 +533,14 @@ impl<'a> Parser<'a> {
         let body = self.parse_block_expr();
         let body = match body.kind {
             ExprKind::Block(b) => *b,
-            _ => unreachable!("quantified body is always a block"),
+            // `parse_block_expr` always wraps in `ExprKind::Block`, so this arm is
+            // unreachable. It still records an error instead of asserting: an
+            // invariant that is wrong in a browser takes the module with it, and
+            // the diagnostic costs nothing when the arm is never taken.
+            _ => {
+                let msg = "internal parser error: loop body was not a block".to_string();
+                return self.fail(msg, self.error_span());
+            }
         };
 
         let span = self.span_from(start);
@@ -678,7 +705,7 @@ impl<'a> Parser<'a> {
             Some(TK::LParen) => self.parse_tuple_pattern(),
             Some(TK::Ident(_)) | Some(TK::TypeIdent(_)) => self.parse_ident_pattern(),
             None => self.unexpected("a pattern"),
-            Some(k) => self.unexpected(&format!("a pattern, found `{k}`")),
+            Some(_) => self.unexpected("a pattern"),
         }
     }
 
@@ -691,7 +718,10 @@ impl<'a> Parser<'a> {
             TK::Bool(b) => Literal::Bool(*b),
             TK::Str(s) => Literal::String(s.clone()),
             TK::Char(c) => Literal::Char(*c),
-            _ => unreachable!("parse_literal_pattern on {:?}", tok.kind),
+            other => {
+                let msg = format!("expected a literal pattern, found `{other}`");
+                return self.fail(msg, span);
+            }
         };
         Pattern::new(PatternKind::Literal(lit), span, next_id())
     }
@@ -700,7 +730,7 @@ impl<'a> Parser<'a> {
         let start = self.pos;
         self.expect(TK::LParen);
         let mut items = Vec::new();
-        loop {
+        while !self.loop_should_stop() {
             if self.at(TK::RParen) {
                 break;
             }
@@ -723,7 +753,10 @@ impl<'a> Parser<'a> {
         let (name, is_wildcard) = match &tok.kind {
             TK::Ident(s) => (Ident::new(s.clone(), span), s == "_"),
             TK::TypeIdent(s) => (Ident::new(s.clone(), span), false),
-            other => panic!("expected pattern identifier, found `{other}`"),
+            other => {
+                let msg = format!("expected pattern identifier, found `{other}`");
+                return self.fail(msg, span);
+            }
         };
         if is_wildcard {
             return Pattern::new(PatternKind::Wildcard, span, next_id());
@@ -731,7 +764,7 @@ impl<'a> Parser<'a> {
         if self.at(TK::LBrace) {
             self.bump();
             let mut fields = Vec::new();
-            loop {
+            while !self.loop_should_stop() {
                 if self.at(TK::RBrace) {
                     break;
                 }
@@ -751,7 +784,7 @@ impl<'a> Parser<'a> {
         if self.at(TK::LParen) {
             self.bump();
             let mut args = Vec::new();
-            loop {
+            while !self.loop_should_stop() {
                 if self.at(TK::RParen) {
                     break;
                 }

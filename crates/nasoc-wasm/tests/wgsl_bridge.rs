@@ -10,7 +10,6 @@
 //! memory otherwise -- and the shader still compiles, so nothing downstream catches
 //! it.
 
-use naso_compiler::parser::parse_program;
 use nasoc_wasm::compile_naso_wgsl;
 
 const SRC: &str = r#"
@@ -147,47 +146,57 @@ fn a_program_that_does_not_typecheck_yields_no_shader() {
     assert!(!r.diagnostics().is_empty(), "must explain the failure");
 }
 
-/// KNOWN GAP: malformed input still ABORTS the WASM module, and `catch_unwind`
-/// cannot fix it.
+/// Malformed input is a parse ERROR, not a trap.
 ///
-/// The parser has ~90 `panic!` / `unreachable!` sites for input it does not expect,
-/// so typing `fn f( {` into a playground traps the module: the whole compiler
-/// disappears, taking every later keystroke with it.
+/// This was the gap. The parser had ~90 `panic!` / `unreachable!` sites for input it
+/// did not expect, and in WebAssembly an unwind RAISES A TRAP that `catch_unwind`
+/// cannot intercept -- verified directly, a wasm32 binary whose whole body is
+/// `catch_unwind(|| panic!())` compiles cleanly and then throws
+/// `RuntimeError: unreachable`. So a user typing `fn f( {` into a playground lost
+/// the entire compiler module, not just the error message.
 ///
-/// The obvious fix is a `catch_unwind` around each stage, and it is a TRAP. Verified
-/// directly: a wasm32-unknown-unknown binary containing
-/// `catch_unwind(|| panic!())` COMPILES CLEANLY and then raises
-/// `RuntimeError: unreachable` at runtime. That target has no unwinder -- every
-/// panic is a trap -- so `catch_unwind` always re-panics. It passes a native test
-/// suite and does nothing in a browser.
+/// A `catch_unwind` guard was written here first. It passed `cargo test` on x86 and
+/// did nothing in a browser, so it was removed rather than shipped.
 ///
-/// A `catch_unwind` guard was written here, confirmed working under
-/// `cargo test` on x86, and REMOVED once the real artifact showed it trapping. It
-/// was worse than useless: it read as resilience in the diff while providing none.
-///
-/// Two real options, neither taken unilaterally:
-///   1. Convert the ~90 sites to `Result`. Correct, large, and the only fix that
-///      keeps the API honest. This is the right answer.
-///   2. Run the compiler in a Worker and restart it on trap. Cheap, keeps the module
-///      disposable, but a crash still costs the user's session.
-///
-/// Asserted here so the gap is recorded rather than forgotten: this is a test of the
-/// limitation's CURRENT shape, and it must change when option 1 lands.
+/// The parser now records a `ParseError` and returns `Err`. Asserted here through
+/// the bridge because that is the path a browser takes, and a native `#[test]`
+/// cannot reproduce wasm's behaviour.
 #[test]
-fn malformed_input_is_still_a_parser_panic_this_test_pins_the_gap() {
-    // Native runs abort rather than trap, so `catch_unwind` is used HERE ONLY to
-    // observe the panic and keep the test suite green. It is not a fix, and nothing
-    // in the shipped wasm path does this.
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let outcome = std::panic::catch_unwind(|| parse_program("fn f( {"));
-    std::panic::set_hook(prev);
+fn malformed_input_is_a_parse_error_not_a_trap() {
+    for src in [
+        "fn f( {",
+        "fn",
+        "fn f() {",
+        "fn f() { let",
+        "fn f() { for i in }",
+        "fn f(x: ) {}",
+        "struct",
+        "}}}",
+        "@@@",
+    ] {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = std::panic::catch_unwind(|| compile_naso_wgsl(src, "f"));
+        std::panic::set_hook(prev);
 
-    assert!(
-        outcome.is_err(),
-        "this test exists because the parser PANICS on `fn f( {{`. If it now returns \
-         Err instead, delete this test and implement option 1 -- the gap is closed."
-    );
+        assert!(
+            outcome.is_ok(),
+            "`{src}` must not unwind: an unwind is a trap in wasm, which takes the \
+             whole compiler module with it"
+        );
+        let r = outcome.unwrap();
+        assert!(!r.success(), "`{src}` must report failure");
+        assert!(r.wgsl().is_none(), "`{src}` must not produce a shader");
+        let msgs: Vec<String> = r
+            .diagnostics()
+            .iter()
+            .map(|d| d.message().to_string())
+            .collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("arse error")),
+            "`{src}` must be reported as a parse error, got: {msgs:?}"
+        );
+    }
 }
 
 /// An unknown kernel is an error with a shader-free result.

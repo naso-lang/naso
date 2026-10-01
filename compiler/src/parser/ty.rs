@@ -46,7 +46,7 @@ impl<'a> Parser<'a> {
     fn parse_type_args(&mut self) -> Vec<TypeArg> {
         self.expect(TK::LBracket);
         let mut args = Vec::new();
-        loop {
+        while !self.loop_should_stop() {
             if self.at(TK::RBracket) {
                 break;
             }
@@ -67,7 +67,7 @@ impl<'a> Parser<'a> {
     fn parse_tensor_dims(&mut self) -> Vec<Type> {
         self.expect(TK::LBracket);
         let mut dims = Vec::new();
-        loop {
+        while !self.loop_should_stop() {
             if self.at(TK::RBracket) {
                 break;
             }
@@ -290,7 +290,7 @@ impl<'a> Parser<'a> {
                 Type::new(TypeKind::UInt, Quantity::Many, Span::default())
             }
             None => self.unexpected("a type"),
-            Some(k) => self.unexpected(&format!("a type, found `{k}`")),
+            Some(_) => self.unexpected("a type"),
         }
     }
 
@@ -304,7 +304,10 @@ impl<'a> Parser<'a> {
             TK::TypeIdent(s) => Ident::new(s.clone(), span),
             TK::QRegister => Ident::new("QRegister".to_string(), span),
             TK::Tensor => Ident::new("Tensor".to_string(), span),
-            other => panic!("expected named type, found `{other}`"),
+            other => {
+                let msg = format!("expected named type, found `{other}`");
+                return self.fail(msg, span);
+            }
         };
         Type::new(TypeKind::Named(name, Vec::new()), Quantity::Many, span)
     }

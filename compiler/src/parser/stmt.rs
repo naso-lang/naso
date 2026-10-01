@@ -28,7 +28,7 @@ impl<'a> Parser<'a> {
         let mut stmts = Vec::new();
         let mut tail = None;
 
-        loop {
+        while !self.loop_should_stop() {
             debug_log(&format!("parse_stmt_list: peek={:?}", self.peek()));
             match self.peek() {
                 Some(TK::RBrace) | None => break,

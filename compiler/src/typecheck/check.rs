@@ -417,6 +417,24 @@ pub fn check_function(checker: &mut TypeChecker, func: &Function) -> Result<(), 
 
     let guard = checker.env.enter_scope();
 
+    // Bind Nat generic parameters as values, so they are usable as terms.
+    //
+    // `fn quantize[N: nat](t: Tensor[f32, N])` needs `N` available as a *value*
+    // -- `forall i in 0..N` is a loop over a term, and `t[i]` indexes by one.
+    // Binding only the type left `N` undefined as an expression, which made
+    // the parser panic with "expected identifier, found 'let'" when a loop body
+    // used it. Type parameters stay types; only Nat params are values.
+    for generic in &func.generics {
+        if generic.kind == GenericKind::Nat {
+            checker.env.bind_var(
+                generic.name.clone(),
+                Type::new(TypeKind::Nat, Quantity::Many, generic.span),
+                Quantity::Many,
+                Mutability::Immutable,
+            );
+        }
+    }
+
     // Bind function parameters with their quantities and mutabilities
     for param in &func.params {
         // Use the quantity from the type (e.g., `x: [1] i32`) as the authoritative quantity

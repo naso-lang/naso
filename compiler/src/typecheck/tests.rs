@@ -656,6 +656,35 @@ mod tests {
         ";
         assert!(check_source(src).is_ok());
     }
+    /// symbolic form crashed.
+    #[test]
+    fn test_symbolic_extent_as_loop_bound_parses() {
+        assert!(check_source(
+            "fn f[N: nat](t: Tensor[f32, N]) -> f32 { forall i in 0..N { let x = t[i]; } return 0.0; }"
+        )
+        .is_ok());
+        assert!(check_source("fn f[N: nat]() { forall i in 0..N { } }").is_ok());
+    }
+
+    /// A Nat generic is bound as a value, so it is usable as a term.
+    #[test]
+    fn test_nat_generic_is_usable_as_a_value() {
+        assert!(check_source("fn f[N: nat]() -> nat { return N; }").is_ok());
+        assert!(check_source("fn f[N: nat]() -> nat { let a = N; return a; }").is_ok());
+    }
+
+    /// The literal-extent form must keep working; the parser change touched
+    /// the shared `{` handling.
+    #[test]
+    fn test_literal_extent_loop_bound_still_parses() {
+        assert!(check_source("fn f() { forall i in 0..10 { let x = i; } }").is_ok());
+        assert!(
+            check_source(
+                "fn f(t: Tensor[f32, 4]) -> f32 { forall i in 0..4 { let x = t[i]; } return 0.0; }"
+            )
+            .is_ok()
+        );
+    }
 }
 
 /// Unit tests for quantity unification and lattice operations (TASK-205)

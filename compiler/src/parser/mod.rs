@@ -30,12 +30,35 @@ pub(crate) fn next_id() -> NodeId {
 pub struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
+    /// While set, `{` does not begin a block expression.
+    ///
+    /// Needed for range bounds. In `forall i in 0..N { ... }` the `{` is the
+    /// loop body, not a block attached to the expression `N`, but `parse_expr`
+    /// has no way to know that and consumes the brace as a trailing block --
+    /// which then parses the loop body's first statement as the block of `N`
+    /// and panics. Only an *identifier* bound (`N`) exposed this; a literal
+    /// bound (`10`) happened to produce an empty block and silently worked.
+    no_block_expr: bool,
 }
 
 impl<'a> Parser<'a> {
     /// Create a parser over `tokens`.
     pub fn new(tokens: &'a [Token]) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            no_block_expr: false,
+        }
+    }
+
+    /// Parse a range bound, where `{` starts the loop body rather than a block
+    /// expression. Restores the previous setting afterwards.
+    pub fn parse_range_bound(&mut self) -> Expr {
+        let prev = self.no_block_expr;
+        self.no_block_expr = true;
+        let expr = self.parse_expr();
+        self.no_block_expr = prev;
+        expr
     }
 
     // ===== Token-stream helpers =====

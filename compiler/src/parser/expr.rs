@@ -222,7 +222,9 @@ impl<'a> Parser<'a> {
             Some(TK::CNot) => self.parse_cnot(),
             Some(TK::Int(_)) | Some(TK::Float(_)) | Some(TK::Bool(_)) | Some(TK::Str(_))
             | Some(TK::Char(_)) => self.parse_literal(),
-            Some(TK::LBrace) => self.parse_block_expr(),
+            // `{` may be a trailing block on an expression, or the body of a
+            // construct whose bound is being parsed. See Parser::no_block_expr.
+            Some(TK::LBrace) if !self.no_block_expr => self.parse_block_expr(),
             Some(TK::LParen) => self.parse_tuple_or_paren(),
             Some(TK::LBracket) => self.parse_array(),
             Some(TK::Ident(_)) => self.parse_var(),
@@ -257,7 +259,9 @@ impl<'a> Parser<'a> {
     fn parse_struct_literal_or_var(&mut self) -> Expr {
         let start = self.pos;
         let name = self.parse_ident();
-        if self.at(TK::LBrace) {
+        // Same rule as the `{` primary: inside a range bound, the brace belongs
+        // to the enclosing construct, not to a struct literal.
+        if self.at(TK::LBrace) && !self.no_block_expr {
             self.bump();
             let mut fields = Vec::new();
             loop {
@@ -451,9 +455,9 @@ impl<'a> Parser<'a> {
         loop {
             let var = self.parse_ident();
             self.expect(TK::In);
-            let lower = self.parse_expr();
+            let lower = self.parse_range_bound();
             self.expect(TK::DotDot);
-            let upper = self.parse_expr();
+            let upper = self.parse_range_bound();
             bindings.push((var, lower, upper));
 
             if !self.at(TK::Comma) {
@@ -494,9 +498,9 @@ impl<'a> Parser<'a> {
         loop {
             let var = self.parse_ident();
             self.expect(TK::In);
-            let lower = self.parse_expr();
+            let lower = self.parse_range_bound();
             self.expect(TK::DotDot);
-            let upper = self.parse_expr();
+            let upper = self.parse_range_bound();
             bindings.push((var, lower, upper));
 
             if !self.at(TK::Comma) {

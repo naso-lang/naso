@@ -1,0 +1,76 @@
+// Scale and clamp kernel -- the f32 case, which DOES compile to WGSL.
+//
+// This kernel exists because kernels/quant_int8.naso is an `i8` kernel, and WGSL
+// has no `i8` storage type, so that file is correctly REFUSED at codegen rather
+// than silently widened into a shader that validates and is wrong.
+//
+// Everything here is `f32`, which WGSL can store exactly, so this file reaches a
+// real compute shader:
+//
+//   naso build --target wgsl --kernel scale_clamp_f32 \
+//       -o scale.wgsl kernels/scale_f32.naso
+//
+//   @group(0) @binding(0) var<storage, read>       input:  array<f32>;
+//   @group(0) @binding(1) var<storage, read_write> output: array<f32>;
+//
+//   @compute @workgroup_size(64)
+//   fn scale_clamp_f32_compute(
+//       scale: f32, lo: f32, hi: f32,
+//       @builtin(global_invocation_id) global_id: vec3<u32>,
+//   ) {
+//       let i = i32(global_id.x);
+//       if (i >= 1024) { return; }
+//       output[i] = clamp((input[i] * scale), lo, hi);
+//   }
+//
+// The scalar `scale`, `lo` and `hi` are entry-point ARGUMENTS rather than
+// bindings, because a scalar is a value and a uniform would be a needless
+// resource. `input` is `read` and `output` is `read_write` because that is what
+// the parameter annotations say: `[1]` linear input is read once, `inout` output
+// is written in place.
+//
+// STATUS:
+//   parses -> typechecks -> lowers to PIR with a 1-dimensional iteration domain
+//   0 <= i < 1024 -> emits a VALID WGSL compute shader, verified by an
+//   independent WGSL parser rather than by substring matching.
+//
+//   The arithmetic is correct for f32. What is NOT done: no vectorisation (one
+//   invocation per element, not four), no workgroup tuning (64 is a fixed
+//   constant, since occupancy is not modelled), no tiling or fusion, and no
+//   schedule transformation -- the loop runs in source order.
+//
+//   The proof block below is EASED but NOT DISCHARGED. Float reasoning is not
+//   supported by the prover, so `scale > 0.0` is reported as unproved rather
+//   than as proved. Nothing in this file claims otherwise.
+
+/// Elementwise scale and clamp: `out[i] = clamp(in[i] * scale, lo, hi)`.
+///
+/// input  [1]     linear, read exactly once
+/// output inout   linear, written in place
+/// scale f32      entry-point argument
+fn scale_clamp_f32(
+    input: [1] Tensor[f32, 1024],
+    output: inout [1] Tensor[f32, 1024],
+    scale: f32,
+    lo: f32,
+    hi: f32
+) {
+    proof {
+        assert(scale > 0.0);
+        assert(lo < hi);
+    }
+
+    forall i in 0..1024 {
+        let v = input[i] * scale;
+        output[i] = clamp(v, lo, hi);
+    }
+}
+
+/// Sum-reduction form, to show the same backend handles a scalar return.
+///
+/// This one is NOT a compute kernel: it reduces N elements to one value, so a
+/// single invocation cannot own it. It is emitted by the straight-line WGSL
+/// backend as a sequential function, which is the honest mapping.
+fn scale_one(a: f32, k: f32) -> f32 {
+    return a * k;
+}

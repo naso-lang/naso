@@ -119,6 +119,7 @@ pub fn lower_pir_module_types(
             quantity: *qty,
             span: Span::default(),
             nat_value: None,
+            int_width: None,
         };
         let lowered = lower_pir_type(&ty, &module.quantities)?;
         result.insert(name.clone(), lowered);

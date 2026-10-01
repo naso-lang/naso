@@ -21,31 +21,33 @@
 //
 // LOWERING AND CODEGEN (as of this commit):
 //   The lowering pass gives each `forall` a real iteration domain and schedule
-//   band, and there is now a WGSL COMPUTE backend:
+//   band, and there is a WGSL COMPUTE backend:
 //
-//     naso build --target wgsl --kernel quantize_int8_symmetric \
-//         -o quant.wgsl kernels/quant_int8.naso
+//     naso build --target wgsl --kernel <name> -o out.wgsl <file>
 //
-//   All three functions here emit a @compute entry point that an independent
-//   WGSL parser accepts. The tensors become storage bindings, and access mode is
-//   derived from the quantity/mutability annotations: `[1]` input is `read`,
-//   `inout` output is `read_write`.
+//   An f32 or i32 tensor kernel emits a valid @compute entry point: tensors
+//   become storage bindings, access mode comes from the quantity/mutability
+//   annotations ([1] input -> read, inout output -> read_write), and one
+//   invocation handles one element.
 //
-//   IMPORTANT CAVEAT: this kernel's `i8` is NOT correctly compiled. Naso's sized
-//   integers all parse to `TypeKind::Int`, which carries no width, and WGSL has
-//   no `i8` storage type. So `Tensor[i8, 1024]` binds as `array<i32>` and the
-//   `as i8` narrowing is DROPPED. The shader validates and is still WRONG. See
-//   the KNOWN CORRECTNESS LIMIT block in compiler/src/codegen/wgsl_compute.rs.
+//   THIS FILE IS REFUSED, AND THAT IS CORRECT. It is a genuine i8 kernel, and
+//   WGSL has no i8 storage type. Binding it as i32 would silently widen every
+//   element and drop the `as i8` narrowing below, producing a shader that
+//   VALIDATES and is still WRONG. So the backend refuses, naming the reason.
 //
-//   The extent used to be discarded by the parser entirely, so 1024 and 4 were
-//   indistinguishable in the AST; the parser now retains it, and the entry
-//   point guards on it.
+//   The width is now carried in the AST (Type::int_width) so that decision can
+//   be made rather than guessed; previously i8 and i32 were indistinguishable
+//   and the compiler widened silently. A narrower-than-i32 storage layout --
+//   packed 4x i8 per u32, say -- is the real fix and is NOT implemented.
+//
+//   The extent is likewise now retained by the parser, so the entry point's
+//   bounds guard is derived from the source rather than assumed.
 //
 //   So the ladder for this file: parses -> typechecks -> lowers to PIR with
-//   correct iteration domains -> emits a VALID WGSL compute shader whose
-//   arithmetic is correct except for the i8 width, which is wrong. The proof
-//   obligations are still NOT discharged (float reasoning is unsupported and
-//   reported as unproved, not as proved).
+//   correct iteration domains -> REFUSED at WGSL codegen with a stated reason.
+//   An f32 variant of this kernel WOULD emit. The proof obligations are still
+//   NOT discharged (float reasoning is unsupported and reported as unproved,
+//   not as proved).
 
 /// Quantize f32 -> i8 with a symmetric scale.
 ///

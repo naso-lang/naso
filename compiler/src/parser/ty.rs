@@ -33,7 +33,13 @@ impl<'a> Parser<'a> {
             other => other,
         };
         let span = self.span_from(start);
-        Type::new(kind, qty.unwrap_or(Quantity::Many), span)
+        let mut ty = Type::new(kind, qty.unwrap_or(Quantity::Many), span);
+        // Carry the width and any extent the BASE type resolved. Rebuilding with
+        // `Type::new` here dropped both, which is why `fn f(a: i8)` produced an
+        // `Int` with no width even though `parse_base_type` had recorded it.
+        ty.int_width = base.int_width;
+        ty.nat_value = base.nat_value;
+        ty
     }
 
     /// Parse `[ ... ]` generic type arguments.
@@ -177,44 +183,74 @@ impl<'a> Parser<'a> {
                 Type::new(TypeKind::Bool, Quantity::Many, Span::default())
             }
             Some(TK::Int8) => {
+                let span = self.peek_token().map(token_span).unwrap_or_default();
                 self.bump();
-                Type::new(TypeKind::Int, Quantity::Many, Span::default())
+                // The width is kept. It used to be discarded, which made
+                // `Tensor[i8, N]` indistinguishable from `Tensor[i32, N]`.
+                Type::int_width(8, span)
             }
             Some(TK::Int16) => {
+                let span = self.peek_token().map(token_span).unwrap_or_default();
                 self.bump();
-                Type::new(TypeKind::Int, Quantity::Many, Span::default())
+                // The width is kept. It used to be discarded, which made
+                // `Tensor[i8, N]` indistinguishable from `Tensor[i32, N]`.
+                Type::int_width(16, span)
             }
             Some(TK::Int32) => {
+                let span = self.peek_token().map(token_span).unwrap_or_default();
                 self.bump();
-                Type::new(TypeKind::Int, Quantity::Many, Span::default())
+                // The width is kept. It used to be discarded, which made
+                // `Tensor[i8, N]` indistinguishable from `Tensor[i32, N]`.
+                Type::int_width(32, span)
             }
             Some(TK::Int64) => {
+                let span = self.peek_token().map(token_span).unwrap_or_default();
                 self.bump();
-                Type::new(TypeKind::Int, Quantity::Many, Span::default())
+                // The width is kept. It used to be discarded, which made
+                // `Tensor[i8, N]` indistinguishable from `Tensor[i32, N]`.
+                Type::int_width(64, span)
             }
             Some(TK::ISize) => {
+                let span = self.peek_token().map(token_span).unwrap_or_default();
                 self.bump();
-                Type::new(TypeKind::Int, Quantity::Many, Span::default())
+                // The width is kept. It used to be discarded, which made
+                // `Tensor[i8, N]` indistinguishable from `Tensor[i32, N]`.
+                Type::int_width(64, span)
             }
             Some(TK::UInt8) => {
+                let span = self.peek_token().map(token_span).unwrap_or_default();
                 self.bump();
-                Type::new(TypeKind::UInt, Quantity::Many, Span::default())
+                // The width is kept. It used to be discarded, which made
+                // `Tensor[i8, N]` indistinguishable from `Tensor[i32, N]`.
+                Type::uint_width(8, span)
             }
             Some(TK::UInt16) => {
+                let span = self.peek_token().map(token_span).unwrap_or_default();
                 self.bump();
-                Type::new(TypeKind::UInt, Quantity::Many, Span::default())
+                // The width is kept. It used to be discarded, which made
+                // `Tensor[i8, N]` indistinguishable from `Tensor[i32, N]`.
+                Type::uint_width(16, span)
             }
             Some(TK::UInt32) => {
+                let span = self.peek_token().map(token_span).unwrap_or_default();
                 self.bump();
-                Type::new(TypeKind::UInt, Quantity::Many, Span::default())
+                // The width is kept. It used to be discarded, which made
+                // `Tensor[i8, N]` indistinguishable from `Tensor[i32, N]`.
+                Type::uint_width(32, span)
             }
             Some(TK::UInt64) => {
+                let span = self.peek_token().map(token_span).unwrap_or_default();
                 self.bump();
-                Type::new(TypeKind::UInt, Quantity::Many, Span::default())
+                // The width is kept. It used to be discarded, which made
+                // `Tensor[i8, N]` indistinguishable from `Tensor[i32, N]`.
+                Type::uint_width(64, span)
             }
             Some(TK::USize) => {
+                let span = self.peek_token().map(token_span).unwrap_or_default();
                 self.bump();
-                Type::new(TypeKind::UInt, Quantity::Many, Span::default())
+                // The width is kept. It used to be discarded, which made
+                // `Tensor[i8, N]` indistinguishable from `Tensor[i32, N]`.
+                Type::uint_width(64, span)
             }
             Some(TK::Float32) => {
                 self.bump();
@@ -463,5 +499,69 @@ mod tests {
                 other => panic!("{ty}: expected Float, got {:?}", other),
             }
         }
+    }
+
+    /// The width of a sized integer must survive parsing.
+    ///
+    /// It used to be discarded: every `iN` became a valueless `TypeKind::Int`, so
+    /// a backend could not tell `Tensor[i8, N]` from `Tensor[i32, N]`. That is
+    /// what made the WGSL compute backend silently widen an `i8` kernel.
+    #[test]
+    fn sized_integer_widths_survive_parsing() {
+        for (src, kind, width) in [
+            ("fn f(a: i8) { }", TypeKind::Int, 8),
+            ("fn f(a: i16) { }", TypeKind::Int, 16),
+            ("fn f(a: i32) { }", TypeKind::Int, 32),
+            ("fn f(a: i64) { }", TypeKind::Int, 64),
+            ("fn f(a: u8) { }", TypeKind::UInt, 8),
+            ("fn f(a: u32) { }", TypeKind::UInt, 32),
+        ] {
+            let prog = parse_program(src).expect(src);
+            let Item::Function(func) = &prog.items[0] else {
+                panic!("{src}: expected a function")
+            };
+            let ty = &func.params[0].ty;
+            assert_eq!(ty.kind, kind, "{src}");
+            assert_eq!(ty.int_width, Some(width), "{src}: width must survive");
+        }
+    }
+
+    /// The width must also survive inside a tensor's element type, which is
+    /// where the compute backend reads it.
+    #[test]
+    fn tensor_element_width_survives_parsing() {
+        let prog = parse_program("fn f(t: Tensor[i8, 64]) { }").expect("parse");
+        let Item::Function(func) = &prog.items[0] else {
+            panic!("expected a function")
+        };
+        let TypeKind::Tensor(dims) = &func.params[0].ty.kind else {
+            panic!("expected a tensor")
+        };
+        assert_eq!(dims.len(), 2, "element type then extent");
+        assert_eq!(dims[0].int_width, Some(8), "element width must survive");
+        assert_eq!(dims[1].nat_const(), Some(64), "extent must survive");
+    }
+
+    /// `isize`/`usize` have no fixed width; this target uses 64.
+    #[test]
+    fn isize_is_recorded_as_64_bits() {
+        let prog = parse_program("fn f(a: isize) { }").expect("parse");
+        let Item::Function(func) = &prog.items[0] else {
+            panic!("expected a function")
+        };
+        assert_eq!(func.params[0].ty.int_width, Some(64));
+    }
+
+    /// A bare `int` names no width, which is distinct from `i32`.
+    #[test]
+    fn bare_int_has_no_width() {
+        let prog = parse_program("fn f(a: int) { }").expect("parse");
+        let Item::Function(func) = &prog.items[0] else {
+            panic!("expected a function")
+        };
+        assert_eq!(
+            func.params[0].ty.int_width, None,
+            "a bare `int` is not `i32`"
+        );
     }
 }

@@ -13,6 +13,17 @@ pub struct Type {
     pub kind: TypeKind,
     pub quantity: Quantity,
     pub span: Span,
+    /// Bit width of an integer type, when the source spelled one out.
+    ///
+    /// `i8`, `i16`, `i32`, `i64` and `isize` ALL parse to `TypeKind::Int`, so
+    /// without this the width is discarded and a backend cannot tell an `i8`
+    /// tensor from an `i32` one. WGSL has no `i8` storage type, which made this
+    /// a live wrong-answer bug: a narrowing cast was silently dropped.
+    ///
+    /// `None` means the source did not name a width (a bare `int` literal
+    /// type). `isize`/`usize` are recorded as 64, the width this target uses;
+    /// a cross-target backend must consult the data layout rather than assume.
+    pub int_width: Option<u8>,
     /// The constant value of a `TypeKind::Nat` used as a tensor extent, e.g. the
     /// `1024` in `Tensor[f32, 1024]`.
     ///
@@ -35,6 +46,29 @@ impl Type {
             quantity,
             span,
             nat_value: None,
+            int_width: None,
+        }
+    }
+
+    /// An integer type of a specific bit width, as written in the source.
+    pub fn int_width(width: u8, span: Span) -> Self {
+        Self {
+            kind: TypeKind::Int,
+            quantity: Quantity::Many,
+            span,
+            nat_value: None,
+            int_width: Some(width),
+        }
+    }
+
+    /// An unsigned integer type of a specific bit width.
+    pub fn uint_width(width: u8, span: Span) -> Self {
+        Self {
+            kind: TypeKind::UInt,
+            quantity: Quantity::Many,
+            span,
+            nat_value: None,
+            int_width: Some(width),
         }
     }
 
@@ -45,6 +79,7 @@ impl Type {
             quantity: Quantity::Many,
             span,
             nat_value: Some(value),
+            int_width: None,
         }
     }
 

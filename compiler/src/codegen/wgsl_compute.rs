@@ -47,15 +47,17 @@
 //! * **No multi-kernel programs.** One entry point per compilation, from one
 //!   selected source function. Selecting which function is the kernel is a
 //!   command-line concern, not something guessed here.
-//! * **NARROW INTEGER TENSORS ARE WRONG.** Naso's sized integers (`i8`, `i16`,
-//!   `i32`, ...) all parse to `TypeKind::Int`, which carries no width, and WGSL
-//!   has no `i8` storage type. So `Tensor[i8, N]` is emitted as `array<i32>` and
-//!   a source `as i8` narrowing is dropped. The shader VALIDATES and is still
-//!   INCORRECT. See `KNOWN CORRECTNESS LIMIT` below. This affects
-//!   `kernels/quant_int8.naso`.
+//! * **Narrow integer tensors are refused, not compiled.** WGSL has no `i8` or
+//!   `i16` storage type, so a `Tensor[i8, N]` binding would have to widen to
+//!   `i32` and drop the source's narrowing -- a shader that validates and is
+//!   still wrong. The width is now carried in the AST, so the backend can
+//!   refuse with that reason instead of guessing. `i32`, `u32`, `f32` and
+//!   `bool` emit. This means `kernels/quant_int8.naso`, which is genuinely an
+//!   `i8` kernel, is REFUSED -- correctly, and loudly.
 
 use crate::ast::{
-    Expr, ExprKind, ForallLoop, Item, Literal, Mutability, Program, Span, Stmt, StmtKind, TypeKind,
+    Expr, ExprKind, ForallLoop, Item, Literal, Mutability, Program, Span, Stmt, StmtKind, Type,
+    TypeKind,
 };
 use crate::codegen::error::CodegenError;
 use crate::codegen::wgsl_straight::sanitize;
@@ -104,7 +106,7 @@ pub fn generate_wgsl_compute(program: &Program, kernel: &str) -> CodegenResult<S
     for p in &func.params {
         match &p.ty.kind {
             TypeKind::Tensor(dims) => {
-                let elem = tensor_element_wgsl(&p.ty.kind, p.span)?;
+                let elem = tensor_element_wgsl(&p.ty, p.span)?;
                 let _ = dims;
                 // `mut` and `inout` are both mutable; `inout` is the
                 // value-semantics projection and still writes through.
@@ -119,8 +121,8 @@ pub fn generate_wgsl_compute(program: &Program, kernel: &str) -> CodegenResult<S
                     index: bindings.len() as u32,
                 });
             }
-            other => {
-                let ty = scalar_wgsl(other, p.span)?;
+            _other => {
+                let ty = scalar_wgsl(&p.ty, p.span)?;
                 scalars.push((sanitize(&p.name.name), ty));
             }
         }
@@ -219,8 +221,8 @@ fn entry_name(kernel: &str) -> String {
     format!("{}_compute", sanitize(kernel))
 }
 
-fn tensor_element_wgsl(kind: &TypeKind, span: Span) -> CodegenResult<String> {
-    let (elem, _extent) = tensor_parts(kind, span)?;
+fn tensor_element_wgsl(ty: &Type, span: Span) -> CodegenResult<String> {
+    let (elem, _extent) = tensor_parts(&ty.kind, span)?;
     scalar_wgsl(elem, span)
 }
 
@@ -230,7 +232,7 @@ fn tensor_element_wgsl(kind: &TypeKind, span: Span) -> CodegenResult<String> {
 /// element type and the rest are extents, so `Tensor[f32, 1024]` is ONE
 /// dimension, not two. Counting the type arguments as dimensions would reject
 /// every real 1-D tensor.
-fn tensor_parts(kind: &TypeKind, span: Span) -> CodegenResult<(&TypeKind, &crate::ast::Type)> {
+fn tensor_parts(kind: &TypeKind, span: Span) -> CodegenResult<(&Type, &Type)> {
     let dims = match kind {
         TypeKind::Tensor(d) => d,
         _ => return Err(tensor_expected(span)),
@@ -243,7 +245,7 @@ fn tensor_parts(kind: &TypeKind, span: Span) -> CodegenResult<(&TypeKind, &crate
             dims.len()
         )));
     }
-    Ok((&dims[0].kind, &dims[1]))
+    Ok((&dims[0], &dims[1]))
 }
 
 /// The constant extent of a 1-D tensor, or a refusal.
@@ -277,26 +279,40 @@ fn tensor_expected(span: Span) -> CodegenError {
     ))
 }
 
-/// KNOWN CORRECTNESS LIMIT: integer width is not in the AST
-/// ---------------------------------------------------
-/// Naso has sized integers -- `i8`, `i16`, `i32`, `i64`, `isize` all parse -- but
-/// every one of them becomes `TypeKind::Int`, which carries no width. WGSL has
-/// no `i8` storage type, so a narrow integer tensor has no correct binding here.
+/// Reject an integer element type that WGSL cannot represent.
 ///
-/// `kernels/quant_int8.naso` hits exactly this: `Tensor[i8, 1024]` is emitted as
-/// `array<i32>` and the source's `as i8` narrowing is DROPPED. The shader
-/// therefore computes a different function from the one written: it would store
-/// -200 instead of saturating or wrapping to 56. The generated WGSL is valid and
-/// parses, and is still WRONG.
+/// WGSL has no `i8`/`i16` storage type. Binding a narrow integer tensor as
+/// `array<i32>` would silently WIDEN it, and a source narrowing cast would be
+/// dropped, so the shader would compute a different function from the one
+/// written -- it would store -200 where the source says to narrow to i8.
 ///
-/// This is called out in the module header and pinned by
-/// `test_narrow_int_tensor_is_emitted_as_i32_which_is_wrong`. Fixing it properly
-/// needs the width carried in the AST (a `TypeKind::Int(width)` or a side
-/// channel) plus a decision about packing narrow integers in a storage buffer.
-/// That is not done, and the emission above is NOT a claim of correctness for
-/// narrow integer tensors.
-fn scalar_wgsl(kind: &TypeKind, span: Span) -> CodegenResult<String> {
-    Ok(match kind {
+/// So this refuses. The width is available (`Type::int_width`) precisely so the
+/// decision can be made instead of guessed.
+fn refuse_unsupported_int(ty: &Type, span: Span) -> CodegenError {
+    let kind = if matches!(ty.kind, TypeKind::UInt) {
+        "unsigned"
+    } else {
+        "signed"
+    };
+    CodegenError::UnsupportedFeature(format!(
+        "{kind} integer at line {} has width {}, which WGSL has no storage type \
+         for. Binding it as i32 would silently widen it and drop the source's \
+         narrowing cast, so the shader would not compute what the source says. \
+         A narrow tensor needs a packed representation, which this backend does \
+         not model. Use f32, i32 or u32 here, or implement the packing.",
+        span.line,
+        ty.int_width.unwrap_or(0)
+    ))
+}
+
+/// Map a Naso scalar type to a WGSL type, refusing what WGSL cannot hold.
+fn scalar_wgsl(ty: &Type, span: Span) -> CodegenResult<String> {
+    // Only i32/u32 have a WGSL storage type. A narrower width is refused rather
+    // than widened -- see `refuse_unsupported_int`.
+    if matches!(ty.kind, TypeKind::Int | TypeKind::UInt) && ty.int_width.is_some_and(|w| w != 32) {
+        return Err(refuse_unsupported_int(ty, span));
+    }
+    Ok(match &ty.kind {
         TypeKind::Int => "i32".to_string(),
         TypeKind::UInt => "u32".to_string(),
         TypeKind::Float => "f32".to_string(),
@@ -686,34 +702,67 @@ fn quantize(input: [1] Tensor[f32, 1024], output: inout [1] Tensor[f32, 1024], s
         assert!(w.contains("b[i] ="), "loop body must survive: {w}");
     }
 
-    /// KNOWN BUG, pinned deliberately.
+    /// A narrow integer tensor must be REFUSED, not silently widened.
     ///
-    /// `i8` parses to `TypeKind::Int`, which carries no width, and WGSL has no
-    /// `i8` storage type -- so an `i8` tensor binds as `array<i32>` and the
-    /// source's narrowing is dropped. The shader VALIDATES and is WRONG.
-    ///
-    /// This test asserts the CURRENT behaviour so the bug cannot change
-    /// silently. When integer width is carried in the AST and a packing is
-    /// chosen, this test should be inverted to assert a refusal.
+    /// This test previously asserted the opposite -- that `Tensor[i8, 8]` emits
+    /// `array<i32>` -- because the parser discarded the width so the backend
+    /// could not tell `i8` from `i32`. With the width carried in the AST, the
+    /// backend can refuse instead of computing a different function.
     #[test]
-    fn test_narrow_int_tensor_is_emitted_as_i32_which_is_wrong() {
-        let src = "fn f(a: [1] Tensor[i8, 8], b: inout [1] Tensor[f32, 8]) {
-            forall i in 0..8 { b[i] = a[i] * 2.0; }
-        }";
-        let w = compute(src, "f").expect("currently emits");
-        assert!(
-            w.contains("var<storage, read> a: array<i32>"),
-            "KNOWN BUG: i8 widened to i32, narrowing dropped: {w}"
-        );
+    fn test_narrow_int_tensor_is_refused_not_widened() {
+        for (ty, w) in [("i8", 8), ("i16", 16), ("i64", 64), ("u8", 8)] {
+            let src = format!(
+                "fn f(a: [1] Tensor[{ty}, 8], b: inout [1] Tensor[{ty}, 8]) {{
+                     forall i in 0..8 {{ b[i] = a[i]; }}
+                 }}"
+            );
+            let err = compute(&src, "f").expect_err(&format!("{ty} must be refused, not widened"));
+            let m = err.to_string();
+            assert!(m.contains(&format!("width {w}")), "{ty}: {m}");
+            assert!(
+                m.contains("silently widen"),
+                "the reason must name the hazard: {m}"
+            );
+            assert!(
+                !m.contains("i32") || m.contains("would silently"),
+                "must not propose i32 as the answer: {m}"
+            );
+        }
     }
 
-    /// The element type must come from the tensor's first type argument.
+    /// `i32` and `u32` are exactly what WGSL can store, so they must emit.
+    #[test]
+    fn test_i32_and_u32_tensors_still_emit() {
+        for ty in ["i32", "u32"] {
+            let src = format!(
+                "fn f(a: [1] Tensor[{ty}, 8], b: inout [1] Tensor[{ty}, 8]) {{
+                     forall i in 0..8 {{ b[i] = a[i]; }}
+                 }}"
+            );
+            let w = compute(&src, "f").unwrap_or_else(|e| panic!("{ty} must emit: {e}"));
+            assert!(
+                w.contains("array<i32>") || w.contains("array<u32>"),
+                "{ty}: {w}"
+            );
+        }
+    }
+
+    /// The element type must come from the tensor's first type argument, not
+    /// the extent in the second. `Tensor[f32, 8]` is an f32 array of 8.
+    ///
+    /// This used to use `i8` for the input, which is now (correctly) refused,
+    /// so it uses `i32` and keeps asserting the same thing: the first type
+    /// argument is the element type.
     #[test]
     fn test_element_type_is_the_first_type_argument() {
-        let src = "fn f(a: [1] Tensor[i8, 8], b: inout [1] Tensor[f32, 8]) {
-            forall i in 0..8 { b[i] = a[i] * 2.0; }
+        // Mixed-width so the assertion is meaningful: if the element type were
+        // read from the second type argument (the extent, 8) both bindings would
+        // agree, and the test could not tell them apart.
+        let src = "fn f(a: [1] Tensor[i32, 8], b: inout [1] Tensor[f32, 8]) {
+            forall i in 0..8 { b[i] = a[i] as f32; }
         }";
         let w = compute(src, "f").expect("must emit");
+        assert!(w.contains("a: array<i32>"), "input element is i32: {w}");
         assert!(w.contains("b: array<f32>"), "output element is f32: {w}");
     }
 }

@@ -64,3 +64,34 @@ fn branch_on_a_plain_bool(cond: bool, x: i32) -> i32 {
         x + 2
     }
 }
+
+// Valid: a move through an intervening plain binding.
+//
+// An unannotated `let` used to default the new binding to `[*]`, widening a
+// `[1]` value and letting it be used twice. The binding now inherits the
+// initializer's quantity, so the linear discipline survives the intermediate
+// binding and this two-step move typechecks.
+fn move_via_intervening_let(x: [1] i32) {
+    let y = x;
+    let consume z = y;
+    let _ = z;
+}
+
+// Valid: a linear value moved through several bindings, then consumed once.
+fn move_via_two_bindings(x: [1] i32) {
+    let y = x;
+    let z = y;
+    let consume w = z;
+    let _ = w;
+}
+
+// Valid: a linear value returned directly, no consume needed.
+fn return_directly(x: [1] i32) -> [1] i32 {
+    x
+}
+
+// Valid: a linear value moved through a binding and then returned.
+fn return_via_binding(x: [1] i32) -> [1] i32 {
+    let y = x;
+    y
+}

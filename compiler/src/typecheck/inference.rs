@@ -673,11 +673,44 @@ fn infer_let(
         unify::unify_types(checker, &value_ty, ann_ty)?;
     }
 
+    // The binding's quantity is inherited from the initializer unless it was
+    // annotated. `parse_quantity` defaults an unannotated `let` to `Quantity::Many`,
+    // so without this a linear value is silently WIDENED by binding it:
+    //
+    //     fn f(x: [1] i32) { let y = x; let _ = y; let _ = y; }
+    //
+    // `y` became `[*]`, so the "use a `[1]` value twice" rule never applied to it,
+    // and the same widening also defeated the leak check on `x`:
+    //
+    //     fn f(x: [1] i32) { let y = x; let _ = y; }   // x never consumed: ACCEPTED
+    //
+    // That is a complete escape from the linear-type discipline through a single
+    // intervening `let`, which is the property this checker exists to enforce.
+    //
+    // Only `Quantity::Many` is replaced, since that is both the unannotated default
+    // and an explicit `[*]`. Inheriting on an explicit `[*]` is deliberate: widening
+    // a `[1]` value is never something to permit silently, and there is no way at
+    // this point to tell an explicit `[*]` from the default -- confirmed by
+    // `naso parse`, which reports `Many` for both. A mutation that always inherits
+    // is therefore behaviourally EQUIVALENT here, not merely untested.
+    //
+    // REACHABILITY: this function is currently dead. `ExprKind::Let` (a `let` used
+    // as an expression) has no parser production -- `let g = let x = 1;` panics the
+    // parser -- so only the `StmtKind::Let` path in check.rs is reachable today.
+    // The fix is kept here so the two `let` paths agree if let-as-expression is
+    // ever given a syntax, but it is NOT load-bearing yet and no test covers it,
+    // because nothing can exercise it.
+    let bound_quantity = if binding.quantity == Quantity::Many {
+        value_ty.quantity
+    } else {
+        binding.quantity
+    };
+
     // Bind the variable
     checker.env.bind_var(
         binding.name.clone(),
         value_ty.clone(),
-        binding.quantity,
+        bound_quantity,
         binding.mutability,
     );
 
@@ -1009,7 +1042,19 @@ fn infer_quantum_op(
                 // Fallback for non-variable expressions (shouldn't happen for measure)
                 checker.env.move_var(&target_ty.to_ident(), span)?;
             }
-            Ok(Type::new(TypeKind::Bool, Quantity::One, span))
+            // The RESULT is a classical bit, so `[*]`, not `[1]`.
+            //
+            // This arm is the one that actually runs: the parser builds a dedicated
+            // `QuantumOp::Measure` node, so `measure(q)` never resolves through the
+            // prelude signature. The prelude entry agrees, but editing only the
+            // prelude changes nothing -- which is why the same program was accepted
+            // by one path and rejected by the other during this work.
+            //
+            // A measurement READS a collapsed qubit. It is not a resource: copying
+            // it, branching on it, and discarding it are all fine. Returning `[1]`
+            // made every `let r = measure(q);` bind a linear `r`, so a correct
+            // program was rejected with "unused linear variable `r`".
+            Ok(Type::new(TypeKind::Bool, Quantity::Many, span))
         }
         QuantumOp::ApplyGate(_gate, args) => {
             // Quantum gates are in-place operations that borrow qubits temporarily

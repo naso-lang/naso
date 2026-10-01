@@ -125,9 +125,41 @@ fn check_let(checker: &mut TypeChecker, let_stmt: &LetStmt) -> Result<(), TypeEr
             }
         }
         (PatternKind::Ident(ident), _) => {
-            // Simple identifier binding
+            // Simple identifier binding.
+            //
+            // The quantity is inherited from the initializer unless the statement
+            // carries an explicit annotation. `parse_quantity` defaults an
+            // unannotated `let` -- and the pattern's own quantity -- to
+            // `Quantity::Many`, so reading `pattern.quantity` directly WIDENED a
+            // linear value on every plain `let`, escaping the linear-type discipline
+            // through a single intervening binding:
+            //
+            //     fn f(x: [1] i32) { let y = x; let _ = y; let _ = y; }
+            //
+            // `y` became `[*]`, so the "a `[1]` value is used exactly once" rule
+            // never applied to it. The same widening also defeated the leak check
+            // on `x` itself:
+            //
+            //     fn f(x: [1] i32) { let y = x; let _ = y; }   // x never consumed
+            //
+            // which is a false negative in the property this checker exists to
+            // enforce. The tuple arm below already inherited correctly; this arm
+            // did not, which is why a single-element binding slipped through while
+            // destructuring a tuple of them behaved.
+            //
+            // Only `Quantity::Many` is replaced, since that is both the unannotated
+            // default and an explicit `[*]`. Inheriting on an explicit `[*]` is
+            // deliberate: silently widening a `[1]` value is never something to
+            // permit, and there is no way here to tell an explicit `[*]` from the
+            // default -- `naso parse` reports `Many` for both, so a mutation that
+            // always inherits is behaviourally equivalent rather than untested.
+            let pattern_qty = if let_stmt.quantity == Quantity::Many {
+                init_ty.quantity
+            } else {
+                let_stmt.quantity
+            };
             bindings.push((ident.clone(), init_ty.clone()));
-            pattern_qtys.push(let_stmt.pattern.quantity);
+            pattern_qtys.push(pattern_qty);
         }
         _ => {
             // For other patterns (wildcard, struct, etc.), bind the whole value

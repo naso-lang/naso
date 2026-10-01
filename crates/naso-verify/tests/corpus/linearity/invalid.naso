@@ -68,3 +68,29 @@ fn leak_on_one_arm_of_three(n: i32, x: [1] i32) {
         }
     }
 }
+
+// Invalid: a linear value WIDENED by an intervening binding, then used twice.
+//
+// An unannotated `let` used to default the new binding to `[*]`, so the
+// "a `[1]` value is used exactly once" rule never applied to it. This is the
+// escape the quantity inheritance closes.
+fn widen_then_use_twice(x: [1] i32) {
+    let y = x;
+    let _ = y;
+    let _ = y;
+}
+
+// Invalid: the same escape, with the widening applied twice.
+fn widen_twice_then_use_twice(x: [1] i32) {
+    let y = x;
+    let z = y;
+    let _ = z;
+    let _ = z;
+}
+
+// Invalid: a linear tensor WIDENED by an intervening binding, then used twice.
+fn widen_tensor_then_use_twice(a: [1] Tensor[f32, 8]) {
+    let b = a;
+    let _ = b;
+    let _ = b;
+}

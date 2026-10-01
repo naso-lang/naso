@@ -258,6 +258,18 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
     }
     .insert(env);
 
+    //
+    // REACHABILITY WARNING: this entry is currently SHADOWED. The parser builds a
+    // dedicated `QuantumOp::Measure` node (parser/expr.rs), so `measure(q)` is
+    // typed by `infer_quantum_op`, never by this signature. The quantity here is
+    // kept correct so the two agree, but changing ONLY this line changes no
+    // behaviour -- which is what happened during this work, and why the real fix
+    // was in `infer_quantum_op`. If the dedicated node is ever removed, this
+    // signature becomes load-bearing.
+    //
+    // A builtin reachable only from a prelude table is NOT verified by a test that
+    // goes through the dedicated node. Grep for the AST construction before
+    // assuming a prelude entry is the live one.
     PreludeFn {
         name: "cnot",
         params: vec![
@@ -282,6 +294,19 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
     }
     .insert(env);
 
+    // `measure` CONSUMES its qubit argument -- the `[1]` param with
+    // `Mutability::Consume` below, which is correct. But the value it hands
+    // back is a classical readout of a collapsed qubit: copying it,
+    // branching on it, and discarding it are all fine. Typing the return
+    // `[1]` made every `let r = measure(q);` bind a linear `r`, so an unused
+    // `r` was reported as a linear leak:
+    //
+    //     fn f() { let [1] q: Qubit = qalloc(1); let r = measure(q); }
+    //     -> unused linear variable `r`
+    //
+    // That is a WRONG diagnostic on a correct program: the qubit WAS
+    // properly consumed, and the leftover classical bit is not a resource.
+    // The return is `[*]`.
     PreludeFn {
         name: "measure",
         params: vec![Param {
@@ -291,12 +316,16 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
             mutability: Mutability::Consume,
             span: Span::default(),
         }],
-        ret_ty: Some(Type::new(TypeKind::Bool, Quantity::One, Span::default())),
+        ret_ty: Some(Type::new(TypeKind::Bool, Quantity::Many, Span::default())),
         quantity: Quantity::Many,
         is_reversible: false,
     }
     .insert(env);
 
+    // `linear_free` CONSUMES its argument and releases it, so no linear value
+    // comes back -- the result is unit. Returning `Int [1]` would hand out
+    // a fresh linear value the caller must consume, from a function whose
+    // entire purpose is to get rid of one.
     PreludeFn {
         name: "linear_free",
         params: vec![Param {
@@ -306,7 +335,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
             mutability: Mutability::Consume,
             span: Span::default(),
         }],
-        ret_ty: Some(Type::new(TypeKind::Int, Quantity::One, Span::default())),
+        ret_ty: Some(Type::unit(Span::default())),
         quantity: Quantity::Many,
         is_reversible: false,
     }

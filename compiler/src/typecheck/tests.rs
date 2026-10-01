@@ -20,7 +20,14 @@ mod tests {
         let source = r#"
             fn test() {
                 let [1] x = 42;
-                let y = x; // consume x
+                // `y` INHERITS `[1]` from `x`, so it must be spent too. The comment
+                // used to read "consume x", but a plain `let` is not a consume: the
+                // binding inherits the linearity and the leak check applies to it.
+                // Before quantity inheritance, `y` was silently widened to `[*]` and
+                // this program passed while `x`'s linearity went unenforced.
+                let y = x;
+                let consume z = y;
+                let _ = z;
             }
         "#;
         assert!(check_source(source).is_ok());
@@ -255,6 +262,9 @@ mod tests {
             fn test() {
                 let [1] q = qalloc(); // OK
                 let r = measure(q); // consumes q
+                // `r` is a classical bit (`[*]`), so using it is not required --
+                // but reading it once documents that the qubit was consumed.
+                let _ = r;
             }
         "#;
         assert!(check_source(source).is_ok());
@@ -321,6 +331,7 @@ mod tests {
                 let [1] q = qalloc();
                 let r = measure(q); // consumes q
                 // q should be moved, cannot use again
+                let _ = r;
             }
         "#;
         assert!(check_source(source).is_ok());
@@ -335,6 +346,7 @@ mod tests {
                 let [1] q1 = qalloc();
                 let qr = entangle(q0, q1); // consumes both qubits
                 // q0, q1 moved, cannot use again
+                let _ = qr;
             }
         "#;
         assert!(check_source(source).is_ok());

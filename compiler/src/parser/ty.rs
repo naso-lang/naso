@@ -65,10 +65,19 @@ impl<'a> Parser<'a> {
             if self.at(TK::RBracket) {
                 break;
             }
-            // Parse either a natural number literal or a type
-            if let Some(TK::Int(_n)) = self.peek() {
+            // Parse either a natural number literal or a type.
+            //
+            // The literal's VALUE must be kept. It used to be matched as
+            // `TK::Int(_n)` and dropped, leaving a valueless `TypeKind::Nat` --
+            // so `Tensor[f32, 1024]` and `Tensor[f32, 4]` were indistinguishable
+            // in the AST, and a backend could not know the element count. The
+            // value is carried as `NatExpr::Lit`.
+            if let Some(TK::Int(n)) = self.peek() {
+                // Borrow the token for its span, then advance.
+                let span = self.peek_token().map(token_span).unwrap_or_default();
+                let n = *n;
                 self.bump();
-                dims.push(Type::new(TypeKind::Nat, Quantity::Many, Span::default()));
+                dims.push(Type::nat_lit(n as u64, span));
             } else {
                 dims.push(self.parse_type());
             }

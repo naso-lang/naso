@@ -24,6 +24,13 @@ impl Stmt {
 
 /// Statement kinds
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// `StmtKind` variants differ in size by a wide margin because several wrap
+// large inline structs. Recording a tensor extent on `Type` (which every
+// statement's pattern carries) pushed the largest variant past clippy's
+// `large_enum_variant` threshold. Boxing the large variants is the alternative
+// and touches many construction sites; the allow keeps that refactor separate
+// from the extent fix. Remove this allow when the variants are boxed.
+#[allow(clippy::large_enum_variant)]
 pub enum StmtKind {
     /// Let binding
     Let(LetStmt),

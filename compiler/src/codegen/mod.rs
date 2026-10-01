@@ -12,6 +12,7 @@ pub mod error;
 pub mod schedule_consumer;
 pub mod validate;
 pub mod wgsl;
+pub mod wgsl_compute;
 pub mod wgsl_straight;
 
 #[cfg(feature = "cranelift")]

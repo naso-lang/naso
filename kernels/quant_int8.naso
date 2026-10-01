@@ -20,45 +20,32 @@
 // using it at runtime is a type error, so it can never be a silent no-op.
 //
 // LOWERING AND CODEGEN (as of this commit):
-//   The lowering pass now gives each `forall` a real iteration domain and a
-//   real schedule band, and the WGSL backend emits loops as WGSL `for` loops.
-//   This file lowers: 3 statements, 3 bands, each 1-dimensional with the
-//   correct 0 <= i < 1024 domain.
+//   The lowering pass gives each `forall` a real iteration domain and schedule
+//   band, and there is now a WGSL COMPUTE backend:
 //
-//   It still does NOT produce a shader. `naso build --target wgsl` refuses it
-//   with an explicit reason: a tensor parameter has no WGSL equivalent in a
-//   function-parameter position, and `output[i] = ..` needs a buffer layout.
-//   Modelling that layout is the compute-pipeline work, and is not done.
+//     naso build --target wgsl --kernel quantize_int8_symmetric \
+//         -o quant.wgsl kernels/quant_int8.naso
 //
-//   So the ladder for this file is: parses -> typechecks -> lowers to PIR with
-//   correct iteration domains. It does NOT reach WGSL output, and its proof
+//   All three functions here emit a @compute entry point that an independent
+//   WGSL parser accepts. The tensors become storage bindings, and access mode is
+//   derived from the quantity/mutability annotations: `[1]` input is `read`,
+//   `inout` output is `read_write`.
+//
+//   IMPORTANT CAVEAT: this kernel's `i8` is NOT correctly compiled. Naso's sized
+//   integers all parse to `TypeKind::Int`, which carries no width, and WGSL has
+//   no `i8` storage type. So `Tensor[i8, 1024]` binds as `array<i32>` and the
+//   `as i8` narrowing is DROPPED. The shader validates and is still WRONG. See
+//   the KNOWN CORRECTNESS LIMIT block in compiler/src/codegen/wgsl_compute.rs.
+//
+//   The extent used to be discarded by the parser entirely, so 1024 and 4 were
+//   indistinguishable in the AST; the parser now retains it, and the entry
+//   point guards on it.
+//
+//   So the ladder for this file: parses -> typechecks -> lowers to PIR with
+//   correct iteration domains -> emits a VALID WGSL compute shader whose
+//   arithmetic is correct except for the i8 width, which is wrong. The proof
 //   obligations are still NOT discharged (float reasoning is unsupported and
 //   reported as unproved, not as proved).
-//
-// Still not implemented:
-//   1. Obligation discharge for floats. naso-verify DOES read proof blocks and
-//      discharges the obligations it can encode, but the SMT layer has no
-//      floating-point sort, so BOTH assertions here are reported
-//      NASO-OBL-002 "not discharged" at Warning severity. They are neither
-//      confirmed nor refuted. Encoding f32 as Real would silently prove a
-//      different, weaker claim, so the prover refuses instead.
-//   2. Symbolic extents (see N above).
-//
-// `forall` is a proposition in expression position and a loop in statement
-// position. A proof block is erased, so reading `input` in an obligation does
-// not consume it -- which is what lets an obligation be stated about a `[1]`
-// linear value at all.
-//
-// The per-element precondition that makes the i8 cast sound is now *stated*,
-// above, and the prover now reads proof blocks. But these particular
-// obligations are NOT established: they are floating-point, which the SMT
-// encoding cannot represent, so they come back as NASO-OBL-002 rather than as
-// proofs. So the clamp remains load-bearing rather than decorative -- it is
-// what keeps the narrowing in range if the precondition is violated at
-// runtime, and it is also what makes the operation lossy.
-//
-// Integer obligations of the same shape ARE discharged; see
-// crates/naso-verify/src/prover/obligations.rs.
 
 /// Quantize f32 -> i8 with a symmetric scale.
 ///

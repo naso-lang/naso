@@ -13,6 +13,19 @@ pub struct Type {
     pub kind: TypeKind,
     pub quantity: Quantity,
     pub span: Span,
+    /// The constant value of a `TypeKind::Nat` used as a tensor extent, e.g. the
+    /// `1024` in `Tensor[f32, 1024]`.
+    ///
+    /// `TypeKind::Nat` is a unit variant, so a bare `Nat` carries no value, and
+    /// the parser used to read the extent literal and DISCARD it -- which made
+    /// `Tensor[f32, 1024]` and `Tensor[f32, 4]` indistinguishable in the AST and
+    /// left any backend with no way to know the element count.
+    ///
+    /// Adding a variant to `TypeKind` instead would be the tidier shape, but that
+    /// is an exhaustive match in 11 places, and this field is what lets a codegen
+    /// backend emit a correct bounds guard. `None` means "not a known constant",
+    /// which is what a generic `N` or a bare `Nat` is.
+    pub nat_value: Option<u64>,
 }
 
 impl Type {
@@ -21,7 +34,23 @@ impl Type {
             kind,
             quantity,
             span,
+            nat_value: None,
         }
+    }
+
+    /// A `Nat` type carrying a known constant value, as a tensor extent.
+    pub fn nat_lit(value: u64, span: Span) -> Self {
+        Self {
+            kind: TypeKind::Nat,
+            quantity: Quantity::Many,
+            span,
+            nat_value: Some(value),
+        }
+    }
+
+    /// The constant value of this type, if it is a `Nat` with a known value.
+    pub fn nat_const(&self) -> Option<u64> {
+        self.nat_value
     }
 
     pub fn unit(span: Span) -> Self {
@@ -157,6 +186,12 @@ impl fmt::Display for MetaVar {
 /// Natural number expressions (for dependent types)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum NatExpr {
+    /// A literal constant, carried as its value.
+    ///
+    /// Encoding a literal as a chain of `Succ` nodes makes it O(n) in memory
+    /// and O(n) to read back, so `Tensor[f32, 1024]` cost ~1024 allocations for
+    /// a number that fits in a `u64`.
+    Lit(u64),
     Zero,
     Succ(Box<NatExpr>),
     Var(Ident),
@@ -168,15 +203,12 @@ pub enum NatExpr {
 
 impl NatExpr {
     pub fn from_u64(n: u64) -> Self {
-        let mut expr = NatExpr::Zero;
-        for _ in 0..n {
-            expr = NatExpr::Succ(Box::new(expr));
-        }
-        expr
+        NatExpr::Lit(n)
     }
 
     pub fn to_u64(&self) -> Option<u64> {
         match self {
+            NatExpr::Lit(n) => Some(*n),
             NatExpr::Zero => Some(0),
             NatExpr::Succ(inner) => inner.to_u64().map(|n| n + 1),
             _ => None,
@@ -187,6 +219,7 @@ impl NatExpr {
 impl fmt::Display for NatExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            NatExpr::Lit(n) => write!(f, "{n}"),
             NatExpr::Zero => write!(f, "0"),
             NatExpr::Succ(inner) => write!(f, "{} + 1", inner),
             NatExpr::Var(v) => write!(f, "{}", v),

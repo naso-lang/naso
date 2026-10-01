@@ -121,6 +121,8 @@ fn run_frontend_command(command: &str, file: &str) {
 fn run_wgsl_build_command(args: &[String]) {
     let mut input_file: Option<PathBuf> = None;
     let mut output_path: Option<PathBuf> = None;
+    // --kernel <name> selects the function to emit as a compute entry point.
+    let mut kernel: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -130,6 +132,12 @@ fn run_wgsl_build_command(args: &[String]) {
                 i += 1;
                 if i < args.len() {
                     output_path = Some(PathBuf::from(&args[i]));
+                }
+            }
+            "--kernel" => {
+                i += 1;
+                if i < args.len() {
+                    kernel = Some(args[i].clone());
                 }
             }
             arg if arg.starts_with('-') => {}
@@ -201,12 +209,26 @@ fn run_wgsl_build_command(args: &[String]) {
         }
     }
 
-    let wgsl = match generate_wgsl_straight_line(&program) {
-        Ok(w) => w,
-        Err(e) => {
-            eprintln!("WGSL codegen error: {e}");
-            std::process::exit(1);
+    // A kernel is selected with --kernel <name>; it is emitted as a compute
+    // entry point, because a tensor parameter has no WGSL function spelling.
+
+    let wgsl = match &kernel {
+        Some(name) => {
+            match naso_compiler::codegen::wgsl_compute::generate_wgsl_compute(&program, name) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("WGSL compute codegen error: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
+        None => match generate_wgsl_straight_line(&program) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("WGSL codegen error: {e}");
+                std::process::exit(1);
+            }
+        },
     };
 
     match output_path {

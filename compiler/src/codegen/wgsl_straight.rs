@@ -297,7 +297,7 @@ fn bound_text(b: &LoopBound) -> String {
 }
 
 /// Describe an expression kind for a diagnostic.
-fn describe_expr_kind(e: &ExprKind) -> &'static str {
+pub(crate) fn describe_expr_kind(e: &ExprKind) -> &'static str {
     match e {
         ExprKind::Literal(Literal::Float(_)) => "a float literal",
         ExprKind::Literal(_) => "a non-integer literal",
@@ -742,7 +742,7 @@ fn emit_expr_inline(out: &mut String, expr: &Expr) {
     }
 }
 
-fn emit_literal(lit: &Literal) -> String {
+pub(crate) fn emit_literal(lit: &Literal) -> String {
     match lit {
         Literal::Int(i) => format!("{i}i"),
         Literal::UInt(i) => format!("{i}u"),
@@ -788,7 +788,7 @@ fn builtin_from_name(name: &str) -> Option<Builtin> {
     })
 }
 
-fn wgsl_binop(op: &BinOp) -> Option<&'static str> {
+pub(crate) fn wgsl_binop(op: &BinOp) -> Option<&'static str> {
     Some(match op {
         BinOp::Add => "+",
         BinOp::Sub => "-",
@@ -807,7 +807,7 @@ fn wgsl_binop(op: &BinOp) -> Option<&'static str> {
     })
 }
 
-fn wgsl_unop(op: &crate::ast::UnOp) -> Option<&'static str> {
+pub(crate) fn wgsl_unop(op: &crate::ast::UnOp) -> Option<&'static str> {
     Some(match op {
         crate::ast::UnOp::Neg => "-",
         crate::ast::UnOp::Not => "!",
@@ -829,14 +829,14 @@ fn wgsl_type(kind: &TypeKind) -> Option<&'static str> {
     })
 }
 
-fn callee_name(expr: &Expr) -> String {
+pub(crate) fn callee_name(expr: &Expr) -> String {
     match &expr.kind {
         ExprKind::Var(v) => v.name.clone(),
         _ => String::new(),
     }
 }
 
-fn pattern_name(p: &crate::ast::Pattern) -> String {
+pub(crate) fn pattern_name(p: &crate::ast::Pattern) -> String {
     use crate::ast::PatternKind;
     match &p.kind {
         PatternKind::Ident(i) => i.name.clone(),
@@ -850,7 +850,7 @@ fn pattern_name(p: &crate::ast::Pattern) -> String {
 /// WGSL reserves a set of words, so a Naso parameter named `var` or `fn` would
 /// produce a shader that fails to compile with a confusing error. Prefixing
 /// keeps every Naso identifier usable and is trivially reversible by a reader.
-fn sanitize(name: &str) -> String {
+pub(crate) fn sanitize(name: &str) -> String {
     if WGSL_RESERVED.contains(&name) {
         format!("naso_{name}")
     } else {
@@ -899,7 +899,7 @@ const WGSL_RESERVED: &[&str] = &[
     "atomic",
 ];
 
-fn type_kind_name(kind: &TypeKind) -> &'static str {
+pub(crate) fn type_kind_name(kind: &TypeKind) -> &'static str {
     match kind {
         TypeKind::Int => "int",
         TypeKind::UInt => "uint",

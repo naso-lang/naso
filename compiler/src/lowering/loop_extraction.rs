@@ -158,17 +158,148 @@ fn unit_step(span: crate::ast::Span) -> Expr {
     )
 }
 
-/// Convert loop nest to schedule tree bands.
+/// Convert a loop nest into schedule-tree bands.
 ///
-/// Still unimplemented: the affine band construction needs a parameter
-/// environment that the schedule tree does not yet carry. It is kept honest by
-/// returning an empty Vec rather than a fabricated tree -- callers must treat
-/// empty as "no bands", which is why nothing depends on it yet.
+/// # What this produces
+///
+/// A `Band` whose scheduling dimensions are the identity in the iterator
+/// space: dimension `d` of the band maps iteration `d` to schedule time `d`,
+/// which is exactly "execute in source order, one level per iterator".
+///
+/// # Why identity, and not something cleverer
+///
+/// A band's purpose is to say *when* each iteration runs. Identity says "outer
+/// iterator first", which is what sequential source order means. Permutations,
+/// skewing and tiling are transformations that are only meaningful relative to
+/// the accesses in the body, and the accesses are not available here -- a
+/// LoopNest carries the loop structure alone. Claiming a permutation without
+/// having looked at the memory access pattern would be exactly the kind of
+/// unfounded claim this lowering path is meant to avoid.
+///
+/// `coincident` is set true for a 1-dimensional band, since one dimension has
+/// no loop to be serialised against and such iterations can run in parallel.
+/// For a multi-dimensional band the inner dimension carries the real ordering,
+/// so false is the honest answer.
+///
+/// # Domain
+///
+/// Each iterator contributes its bounds as inequality constraints over the
+/// iterator space. Only literal bounds are encoded; a symbolic bound such as
+/// `0..N` is left unconstrained rather than guessed, because encoding it would
+/// need a parameter dimension this function is not given. `contains` therefore
+/// under-approximates for symbolic bounds, which is the safe direction: it can
+/// admit too much, never too little.
+///
+/// # Not yet a tree
+///
+/// The innermost `Domain` leaf needs a StmtId identifying the body statement,
+/// which is not carried by LoopNest. Rather than invent one and produce a tree
+/// that points at the wrong statement, this returns the band with a `Sequence`
+/// of no children as the leaf placeholder and documents it. Wiring the body
+/// through requires extending LoopNest with its statement id.
+use crate::ir::affine_domain::{AffineConstraint, AffineDomain};
+use crate::ir::affine_map::{AffineMap, AffineMapPiece, Matrix};
+use crate::ir::schedule_tree::ScheduleNode;
+
+/// Convert a loop nest to schedule tree bands.
 pub fn loop_nest_to_bands(
-    _nest: &LoopNest,
+    nest: &LoopNest,
     _ctx: &mut super::LoweringContext,
-) -> Result<Vec<crate::ir::ScheduleNode>, super::LoweringError> {
-    Ok(Vec::<crate::ir::ScheduleNode>::new())
+) -> Result<Vec<ScheduleNode>, super::LoweringError> {
+    let depth = nest.depth();
+    if depth == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Domain over `depth` iterator dimensions, bounded by the loop bounds.
+    let domain = domain_from_nest(nest, depth);
+
+    // One scheduling dimension per loop level: schedule time d = iteration d,
+    // shifted so the first iteration of each loop sits at schedule time 0.
+    //
+    // One AffineMap per dimension, since ScheduleNode::Band documents
+    // `members` as "one per loop level". Each is a single-row map.
+    let mut lower_bounds: Vec<i64> = Vec::with_capacity(depth);
+    let mut level = nest;
+    loop {
+        lower_bounds.push(literal_int(&level.lower_bound).unwrap_or(0));
+        match &level.inner {
+            Some(next) => level = next,
+            None => break,
+        }
+    }
+
+    let members: Vec<AffineMap> = (0..depth)
+        .map(|d| {
+            let mut row = Matrix::new(1, depth);
+            row.set(0, d, 1);
+            // Matrix apply is `m*point + constant`, so schedule time is
+            // `i_d - lower_d`: the translation is NEGATIVE.
+            row.set_const(0, -lower_bounds[d]);
+            AffineMap {
+                pieces: vec![AffineMapPiece::new(domain.clone(), row)],
+            }
+        })
+        .collect();
+
+    // The leaf cannot be a Domain node: LoopNest does not carry the body
+    // statement's id, and a Domain node pointing at the wrong statement would
+    // be worse than an empty Sequence.
+    let leaf = ScheduleNode::Sequence {
+        children: Vec::new(),
+    };
+
+    let coincident = vec![depth == 1; depth];
+
+    Ok(vec![ScheduleNode::Band {
+        members,
+        coincident,
+        child: Box::new(leaf),
+    }])
+}
+
+/// The iteration domain implied by a nest: `depth` iterator dimensions,
+/// constrained by each level's literal bounds.
+fn domain_from_nest(nest: &LoopNest, depth: usize) -> AffineDomain {
+    let mut constraints = Vec::new();
+
+    // One coefficient per iterator dimension. Coeffs before the current level
+    // are zeroed: level d only constrains dimension d.
+    let mut level_index = 0usize;
+    let mut level = nest;
+    loop {
+        let mut coeffs = vec![0i64; depth];
+        if let Some(hi) = literal_int(&level.upper_bound) {
+            // i_d < hi  ==>  -i_d >= -(hi - 1) over the integers.
+            //
+            // Encoding this as -i_d >= -hi would be INCLUSIVE and would admit
+            // i_d == hi, which the language's `0..hi` does not iterate.
+            coeffs[level_index] = -1;
+            constraints.push(AffineConstraint::inequality(coeffs.clone(), -(hi - 1)));
+        }
+        if let Some(lo) = literal_int(&level.lower_bound) {
+            // i_d >= lo
+            coeffs[level_index] = 1;
+            constraints.push(AffineConstraint::inequality(coeffs, lo));
+        }
+        // A symbolic bound contributes no constraint, and `contains` then
+        // over-approximates -- safe, never under.
+        level_index += 1;
+        match &level.inner {
+            Some(next) => level = next,
+            None => break,
+        }
+    }
+
+    AffineDomain::new(depth, 0, constraints).with_name(format!("nest({})", nest.iterator))
+}
+
+/// The integer value of an int-literal expression, if it is one.
+fn literal_int(expr: &Expr) -> Option<i64> {
+    match &expr.kind {
+        ExprKind::Literal(Literal::Int(n)) => Some(*n),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -335,5 +466,289 @@ mod tests {
             );
         };
         assert_eq!(v.name, "N");
+    }
+    /// Build bands for a source and return the single band.
+    fn band_for(src: &str) -> crate::ir::schedule_tree::ScheduleNode {
+        let stmt = first_stmt(src);
+        let nest = extract_loop_nest(&stmt).expect("must extract a loop nest");
+        let mut ctx = super::super::LoweringContext::new();
+        let bands = loop_nest_to_bands(&nest, &mut ctx).expect("bands");
+        assert_eq!(bands.len(), 1, "expected exactly one band");
+        bands.into_iter().next().unwrap()
+    }
+
+    fn band_domain(node: &crate::ir::schedule_tree::ScheduleNode) -> &AffineDomain {
+        let crate::ir::schedule_tree::ScheduleNode::Band { members, .. } = node else {
+            panic!("expected a Band, got {node:?}");
+        };
+        &members[0].pieces[0].domain
+    }
+
+    /// The loop `forall i in 0..8` produces a domain that accepts exactly the
+    /// points in [0, 8) and rejects the endpoints. This is the property that
+    /// makes the band meaningful, so it is asserted on `contains` rather than
+    /// on the constraint representation.
+    #[test]
+    fn test_band_domain_accepts_exactly_the_loop_range() {
+        let band = band_for("fn f() { forall i in 0..8 { let x = i; } }");
+        let domain = band_domain(&band);
+        assert_eq!(domain.dims, 1);
+        assert_eq!(domain.n_iter, 1);
+
+        for i in 0..8 {
+            assert!(domain.contains(&[i]), "must contain {i}");
+        }
+        // Upper bound is EXCLUSIVE, matching `0..8` in the language.
+        assert!(!domain.contains(&[8]), "8 is out of range for 0..8");
+        assert!(!domain.contains(&[-1]), "-1 is below the lower bound");
+    }
+
+    /// A non-zero lower bound must shift the domain, not just bound from 0.
+    #[test]
+    fn test_band_domain_respects_nonzero_lower_bound() {
+        let band = band_for("fn f() { forall i in 4..8 { let x = i; } }");
+        let domain = band_domain(&band);
+        for i in 4..8 {
+            assert!(domain.contains(&[i]), "must contain {i}");
+        }
+        assert!(!domain.contains(&[3]), "3 is below the lower bound");
+        assert!(!domain.contains(&[8]), "8 is out of range");
+    }
+
+    /// Two levels means a 2-dimensional domain, and each dimension is bounded
+    /// by its own loop.
+    #[test]
+    fn test_two_level_band_domain_is_rectangular() {
+        let band = band_for(
+            "fn f(t: Tensor[f32,4]) { forall i in 0..4 { forall j in 2..8 { t[i] = 1.0; } } }",
+        );
+        let domain = band_domain(&band);
+        assert_eq!(domain.dims, 2, "two iterators");
+        for i in 0..4 {
+            for j in 2..8 {
+                assert!(domain.contains(&[i, j]), "must contain ({i}, {j})");
+            }
+        }
+        assert!(!domain.contains(&[4, 2]), "i out of range");
+        assert!(!domain.contains(&[0, 8]), "j out of range");
+        assert!(!domain.contains(&[0, 1]), "j below lower bound");
+    }
+
+    /// The band's scheduling map is the identity: schedule time d = iteration
+    /// d, translated by the lower bound. Anything else would be an unfounded
+    /// claim about ordering.
+    #[test]
+    fn test_band_map_is_identity_translated_by_lower_bound() {
+        let band = band_for("fn f() { forall i in 4..8 { let x = i; } }");
+        let crate::ir::schedule_tree::ScheduleNode::Band { members, .. } = &band else {
+            panic!("expected a Band");
+        };
+        let piece = &members[0].pieces[0];
+        // Identity: a single row selecting i with coefficient 1.
+        assert_eq!(piece.matrix.rows, 1, "one scheduling dimension per member");
+        assert_eq!(piece.matrix.get(0, 0), 1, "unit coefficient on i");
+        // Schedule time is i - lower, so the translation is negative.
+        assert_eq!(
+            piece.matrix.constant[0], -4,
+            "shifted so the first iteration is time 0"
+        );
+
+        // Applying it to a point gives the schedule time.
+        assert_eq!(piece.apply(&[4]), Some(vec![0]), "i=4 is schedule time 0");
+        assert_eq!(piece.apply(&[5]), Some(vec![1]), "i=5 is schedule time 1");
+    }
+
+    /// `coincident` is true only for a 1-D band. Claiming parallelism for a
+    /// multi-level band would assert an ordering independence that has not been
+    /// checked against the accesses.
+    #[test]
+    fn test_coincident_only_for_single_dimension_bands() {
+        let one = band_for("fn f() { forall i in 0..8 { let x = i; } }");
+        let crate::ir::schedule_tree::ScheduleNode::Band { coincident, .. } = &one else {
+            panic!("expected a Band");
+        };
+        assert_eq!(coincident, &vec![true], "1-D band can run in parallel");
+
+        let two = band_for(
+            "fn f(t: Tensor[f32,4]) { forall i in 0..4 { forall j in 0..8 { t[i] = 1.0; } } }",
+        );
+        let crate::ir::schedule_tree::ScheduleNode::Band { coincident, .. } = &two else {
+            panic!("expected a Band");
+        };
+        assert_eq!(coincident, &vec![false, false], "2-D band is ordered");
+    }
+
+    /// A symbolic bound must NOT be invented. The domain over-approximates
+    /// rather than pretending to know `N`, because a wrong bound would exclude
+    /// iterations that really run.
+    #[test]
+    fn test_symbolic_bound_leaves_domain_unconstrained() {
+        let band = band_for("fn f[N: nat](t: Tensor[f32,N]) { forall i in 0..N { t[i] = 1.0; } }");
+        let domain = band_domain(&band);
+        // Lower bound 0 is literal, so it is encoded; the upper bound is not.
+        assert!(
+            domain.contains(&[0]),
+            "point at the literal lower bound is in the domain"
+        );
+        // The upper bound is unknown, so a large point is admitted. That is the
+        // safe direction: over-approximating cannot exclude a real iteration.
+        assert!(
+            domain.contains(&[9999]),
+            "symbolic upper bound must not fabricate a constraint"
+        );
+    }
+
+    /// The leaf is an empty Sequence, not a Domain node: LoopNest carries no
+    /// statement id, and a Domain node would point at the wrong statement.
+    #[test]
+    fn test_leaf_is_not_a_fabricated_domain_node() {
+        let band = band_for("fn f() { forall i in 0..8 { let x = i; } }");
+        let crate::ir::schedule_tree::ScheduleNode::Band { child, .. } = &band else {
+            panic!("expected a Band");
+        };
+        match child.as_ref() {
+            crate::ir::schedule_tree::ScheduleNode::Sequence { children } => {
+                assert!(children.is_empty(), "leaf placeholder has no children")
+            }
+            other => panic!("leaf must not be a fabricated node, got {other:?}"),
+        }
+    }
+
+    /// Every iterator level contributes a scheduling dimension.
+    #[test]
+    fn test_band_has_one_member_per_level() {
+        for (src, want) in [
+            ("fn f() { forall i in 0..8 { let x = i; } }", 1usize),
+            (
+                "fn f(t: Tensor[f32,4]) { forall i in 0..4 { forall j in 0..8 { t[i]=1.0; } } }",
+                2,
+            ),
+        ] {
+            let band = band_for(src);
+            let crate::ir::schedule_tree::ScheduleNode::Band {
+                members,
+                coincident,
+                ..
+            } = &band
+            else {
+                panic!("expected a Band");
+            };
+            assert_eq!(members.len(), want, "members for {src}");
+            assert_eq!(coincident.len(), want, "coincident flags for {src}");
+        }
+    }
+
+    /// Brute-force cross-check.
+    ///
+    /// The hand-written cases above assert specific points. This enumerates a
+    /// window around and inside the range and compares `contains` against an
+    /// expectation computed straight from the loop bounds, so an off-by-one in
+    /// the constraint encoding cannot hide behind a case nobody thought to add.
+    #[test]
+    fn test_domain_agrees_with_bounds_over_a_window() {
+        // (source, per-dimension (lower, upper))
+        /// (source, label, per-dimension (lower, upper) exclusive)
+        type Ranges = Vec<(i64, i64)>;
+        let cases: &[(&str, &str, Ranges)] = &[
+            (
+                "fn f() { forall i in 0..8 { let x = i; } }",
+                "0..8",
+                vec![(0, 8)],
+            ),
+            (
+                "fn f() { forall i in 4..9 { let x = i; } }",
+                "4..9",
+                vec![(4, 9)],
+            ),
+            (
+                "fn f() { forall i in 2..3 { let x = i; } }",
+                "2..3",
+                vec![(2, 3)],
+            ),
+            (
+                "fn f(t: Tensor[f32,4]) { forall i in 0..4 { forall j in 0..3 { t[i]=1.0; } } }",
+                "0..4 x 0..3",
+                vec![(0, 4), (0, 3)],
+            ),
+            (
+                "fn f(t: Tensor[f32,4]) { forall i in 0..5 { forall j in 2..7 { t[i]=1.0; } } }",
+                "0..5 x 2..7",
+                vec![(0, 5), (2, 7)],
+            ),
+        ];
+
+        for (src, label, ranges) in cases {
+            let stmt = first_stmt(src);
+            let nest = extract_loop_nest(&stmt).expect("must extract");
+            let mut ctx = super::super::LoweringContext::new();
+            let bands = loop_nest_to_bands(&nest, &mut ctx).expect("bands");
+            let crate::ir::schedule_tree::ScheduleNode::Band { members, .. } = &bands[0] else {
+                panic!("expected a Band");
+            };
+            let domain = &members[0].pieces[0].domain;
+            let dims = ranges.len();
+
+            // Enumerate a window wide enough to cross both bounds on every
+            // dimension, including points outside the range.
+            let span = 4i64;
+            let lo = ranges.iter().map(|r| r.0 - span).collect::<Vec<_>>();
+            let hi = ranges.iter().map(|r| r.1 + span).collect::<Vec<_>>();
+
+            let mut total = 0usize;
+            let mut point = lo.clone();
+            loop {
+                let expect = point
+                    .iter()
+                    .zip(ranges)
+                    .all(|(p, &(l, h))| *p >= l && *p < h);
+                assert_eq!(
+                    domain.contains(&point),
+                    expect,
+                    "{label}: contains({point:?}) should be {expect}"
+                );
+                total += 1;
+
+                // odometer increment
+                let mut d = 0usize;
+                loop {
+                    point[d] += 1;
+                    if point[d] <= hi[d] {
+                        break;
+                    }
+                    point[d] = lo[d];
+                    d += 1;
+                    if d == dims {
+                        break;
+                    }
+                }
+                if d == dims && point[0] == lo[0] {
+                    break;
+                }
+                if total > 20000 {
+                    panic!("enumeration did not terminate for {label}");
+                }
+            }
+            assert!(total > 1, "enumerated at least one point for {label}");
+        }
+    }
+
+    /// Schedule time for the first iteration of each level is 0, and increases
+    /// by one per step. Checked over a window rather than two sample points.
+    #[test]
+    fn test_schedule_time_is_zero_based_and_unit_step() {
+        let stmt = first_stmt("fn f() { forall i in 4..12 { let x = i; } }");
+        let nest = extract_loop_nest(&stmt).expect("must extract");
+        let mut ctx = super::super::LoweringContext::new();
+        let bands = loop_nest_to_bands(&nest, &mut ctx).expect("bands");
+        let crate::ir::schedule_tree::ScheduleNode::Band { members, .. } = &bands[0] else {
+            panic!("expected a Band");
+        };
+        let piece = &members[0].pieces[0];
+        for (offset, i) in (4i64..12).enumerate() {
+            let t = piece
+                .apply(&[i])
+                .unwrap_or_else(|| panic!("{i} out of domain"));
+            assert_eq!(t[0], offset as i64, "schedule time of i={i}");
+        }
     }
 }

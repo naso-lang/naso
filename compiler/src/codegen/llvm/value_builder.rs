@@ -10,7 +10,10 @@ use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::module::Module;
 use inkwell::types::{BasicTypeEnum, FunctionType, StructType};
-use inkwell::values::{BasicValueEnum, FunctionValue, GlobalValue, InstructionValue, PointerValue};
+use inkwell::values::{
+    AnyValue, BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, GlobalValue,
+    InstructionValue, IntValue, MetadataValue, PointerValue,
+};
 use std::collections::HashMap;
 
 /// Typed value builder for LLVM IR construction
@@ -18,7 +21,13 @@ pub struct LlvmValueBuilder<'ctx> {
     builder: Builder<'ctx>,
     type_lowering: LlvmTypeLowering<'ctx>,
     /// Metadata nodes
-    metadata: HashMap<String, inkwell::metadata::MetadataValue<'ctx>>,
+    metadata: HashMap<String, MetadataValue<'ctx>>,
+    /// Pointee types for pointers handed out by this builder.
+    ///
+    /// LLVM 17 uses opaque pointers, so a `PointerValue` no longer carries the
+    /// type it points at. Loads and GEPs need that type explicitly, so we
+    /// remember it for every pointer we mint here (allocas, GEPs, struct GEPs).
+    ptr_pointee_types: HashMap<PointerValue<'ctx>, BasicTypeEnum<'ctx>>,
 }
 
 impl<'ctx> LlvmValueBuilder<'ctx> {
@@ -28,6 +37,7 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
             builder,
             type_lowering,
             metadata: HashMap::new(),
+            ptr_pointee_types: HashMap::new(),
         }
     }
 
@@ -79,10 +89,15 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
         // Build function body
         body_builder(self, &params)?;
 
-        // Verify function
-        function
-            .verify(true)
-            .map_err(|e| CodegenError::VerificationError(e.to_string()))?;
+        // Verify function. inkwell 0.10's `verify` reports through a bool and
+        // prints diagnostics to stderr when `print` is true, so on failure we
+        // surface the offending function body as the error message.
+        if !function.verify(true) {
+            return Err(CodegenError::VerificationError(format!(
+                "function `{name}` failed LLVM verification:\n{}",
+                function.print_to_string()
+            )));
+        }
 
         Ok(function)
     }
@@ -117,29 +132,22 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
         let entry = current_fn.get_first_basic_block().unwrap();
         let first_inst = entry.get_first_instruction();
 
-        // Save current position
-        let saved_block = self.builder.get_insert_block();
-        let saved_inst = self.builder.get_insert_point();
-
-        // Move to entry block
+        // Emit through a scratch builder positioned in the entry block so the
+        // caller's insertion point is left exactly where it was. (inkwell 0.10
+        // has no `get_insert_point`, so saving/restoring in place is not
+        // possible.)
+        let entry_builder = self.type_lowering.context().create_builder();
         if let Some(inst) = first_inst {
-            self.builder.position_before(&inst);
+            entry_builder.position_before(&inst);
         } else {
-            self.builder.position_at_end(entry);
+            entry_builder.position_at_end(entry);
         }
 
-        let alloca = self
-            .builder
+        let alloca = entry_builder
             .build_alloca(ty, name)
             .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
 
-        // Restore position
-        if let (Some(block), Some(inst)) = (saved_block, saved_inst) {
-            self.builder.position_before(&inst);
-        } else if let Some(block) = saved_block {
-            self.builder.position_at_end(block);
-        }
-
+        self.ptr_pointee_types.insert(alloca, ty);
         Ok(alloca)
     }
 
@@ -149,8 +157,17 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
         ptr: PointerValue<'ctx>,
         name: &str,
     ) -> CodegenResult<BasicValueEnum<'ctx>> {
+        // Opaque pointers: the load needs the pointee type explicitly. Recover
+        // it from the pointers this builder handed out.
+        let pointee = *self.ptr_pointee_types.get(&ptr).ok_or_else(|| {
+            CodegenError::InstructionError(format!(
+                "cannot load from {ptr:?}: unknown pointee type (opaque pointers \
+                 require the pointer to come from build_alloca/build_gep/build_struct_gep \
+                 on this value builder)"
+            ))
+        })?;
         self.builder
-            .build_load(ptr, name)
+            .build_load(pointee, ptr, name)
             .map_err(|e| CodegenError::InstructionError(e.to_string()))
     }
 
@@ -225,6 +242,7 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
                 .builder
                 .build_struct_gep(struct_ty, alloca, i as u32, "field_gep")
                 .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+            self.ptr_pointee_types.insert(gep, struct_ty.into());
             self.build_store(gep, *field)?;
         }
         self.build_load(alloca, "struct_val")
@@ -250,10 +268,16 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
         index: u32,
         name: &str,
     ) -> CodegenResult<BasicValueEnum<'ctx>> {
-        self.builder
+        let aggregate = self
+            .builder
             .build_insert_value(struct_val.into_struct_value(), value, index, name)
-            .map(|v| v.into())
-            .map_err(|e| CodegenError::InstructionError(e.to_string()))
+            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+        // `build_insert_value` yields an `AggregateValueEnum`, which has no
+        // `From<AggregateValueEnum> for BasicValueEnum`; widen it by hand.
+        Ok(match aggregate {
+            inkwell::values::AggregateValueEnum::ArrayValue(v) => v.into(),
+            inkwell::values::AggregateValueEnum::StructValue(v) => v.into(),
+        })
     }
 
     /// Build a GEP (getelementptr) for arrays/pointers
@@ -264,9 +288,26 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
         indices: &[inkwell::values::BasicValueEnum<'ctx>],
         name: &str,
     ) -> CodegenResult<PointerValue<'ctx>> {
-        self.builder
-            .build_gep(ty, ptr, indices, name)
-            .map_err(|e| CodegenError::InstructionError(e.to_string()))
+        // GEP indices are always integers.
+        let indices: Vec<inkwell::values::IntValue<'ctx>> = indices
+            .iter()
+            .map(|idx| {
+                IntValue::try_from(*idx).map_err(|_| {
+                    CodegenError::InstructionError("GEP indices must be integer values".to_string())
+                })
+            })
+            .collect::<CodegenResult<Vec<_>>>()?;
+
+        // SAFETY: `ty` is the element type of the pointee as tracked by
+        // `ptr_pointee_types` (or supplied by the caller), and the indices are
+        // integers, which is what LLVMBuildGEP2 requires.
+        let gep = unsafe {
+            self.builder
+                .build_gep(ty, ptr, &indices, name)
+                .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+        };
+        self.ptr_pointee_types.insert(gep, ty);
+        Ok(gep)
     }
 
     /// Build a struct GEP
@@ -277,9 +318,12 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
         index: u32,
         name: &str,
     ) -> CodegenResult<PointerValue<'ctx>> {
-        self.builder
+        let gep = self
+            .builder
             .build_struct_gep(struct_ty, ptr, index, name)
-            .map_err(|e| CodegenError::InstructionError(e.to_string()))
+            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+        self.ptr_pointee_types.insert(gep, struct_ty.into());
+        Ok(gep)
     }
 
     /// Build a function call
@@ -289,13 +333,17 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
         args: &[BasicValueEnum<'ctx>],
         name: &str,
     ) -> CodegenResult<BasicValueEnum<'ctx>> {
+        let args: Vec<BasicMetadataValueEnum<'ctx>> = args
+            .iter()
+            .map(|a| BasicMetadataValueEnum::from(*a))
+            .collect();
         let call_site = self
             .builder
-            .build_call(func, args, name)
+            .build_call(func, &args, name)
             .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
         call_site
             .try_as_basic_value()
-            .left()
+            .basic()
             .ok_or_else(|| CodegenError::InstructionError("Call returned void".to_string()))
     }
 
@@ -307,11 +355,15 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
         args: &[BasicValueEnum<'ctx>],
         name: &str,
     ) -> CodegenResult<BasicValueEnum<'ctx>> {
+        let args: Vec<BasicMetadataValueEnum<'ctx>> = args
+            .iter()
+            .map(|a| BasicMetadataValueEnum::from(*a))
+            .collect();
         let call_site = self
             .builder
-            .build_indirect_call(fn_ty, func_ptr, args, name)
+            .build_indirect_call(fn_ty, func_ptr, &args, name)
             .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
-        call_site.try_as_basic_value().left().ok_or_else(|| {
+        call_site.try_as_basic_value().basic().ok_or_else(|| {
             CodegenError::InstructionError("Indirect call returned void".to_string())
         })
     }
@@ -322,7 +374,7 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
         val: Option<BasicValueEnum<'ctx>>,
     ) -> CodegenResult<InstructionValue<'ctx>> {
         self.builder
-            .build_return(val)
+            .build_return(val.as_ref().map(|v| v as &dyn BasicValue<'ctx>))
             .map_err(|e| CodegenError::InstructionError(e.to_string()))
     }
 
@@ -365,7 +417,11 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
         phi: &inkwell::values::PhiValue<'ctx>,
         values: &[(&BasicValueEnum<'ctx>, BasicBlock<'ctx>)],
     ) {
-        let incoming: Vec<_> = values.iter().map(|(v, bb)| (*v, *bb)).collect();
+        // inkwell 0.10 takes `&[(&dyn BasicValue, BasicBlock)]`.
+        let incoming: Vec<(&dyn BasicValue<'ctx>, BasicBlock<'ctx>)> = values
+            .iter()
+            .map(|(v, bb)| (*v as &dyn BasicValue<'ctx>, *bb))
+            .collect();
         phi.add_incoming(&incoming);
     }
 
@@ -396,7 +452,16 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
 
     /// Build an undefined value for a type
     pub fn build_undef(&mut self, ty: BasicTypeEnum<'ctx>) -> BasicValueEnum<'ctx> {
-        ty.get_undef()
+        // `BasicTypeEnum` has no `get_undef` in inkwell 0.10; dispatch per variant.
+        match ty {
+            BasicTypeEnum::ArrayType(t) => t.get_undef().into(),
+            BasicTypeEnum::FloatType(t) => t.get_undef().into(),
+            BasicTypeEnum::IntType(t) => t.get_undef().into(),
+            BasicTypeEnum::PointerType(t) => t.get_undef().into(),
+            BasicTypeEnum::StructType(t) => t.get_undef().into(),
+            BasicTypeEnum::VectorType(t) => t.get_undef().into(),
+            BasicTypeEnum::ScalableVectorType(t) => t.get_undef().into(),
+        }
     }
 
     /// Build integer arithmetic
@@ -521,26 +586,31 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
         module: &Module<'ctx>,
         kind: &str,
         value: &str,
-    ) -> inkwell::metadata::MetadataValue<'ctx> {
-        let md_string = self.builder.get_context().create_string_metadata(value);
+    ) -> CodegenResult<MetadataValue<'ctx>> {
+        let md_string = self.type_lowering.context().metadata_string(value);
         let md_node = self
-            .builder
-            .get_context()
-            .create_metadata_node(&[md_string.into()]);
-        module.add_metadata(kind, &md_node);
-        md_node
+            .type_lowering
+            .context()
+            .metadata_node(&[BasicMetadataValueEnum::from(md_string)]);
+        module
+            .add_global_metadata(kind, &md_node)
+            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+        self.metadata.insert(kind.to_string(), md_node);
+        Ok(md_node)
     }
 
     /// Get or create debug location
+    ///
+    /// `DILocation`s can only be minted by a `DebugInfoBuilder`, so the caller
+    /// supplies one (inkwell has no way to attach a DIBuilder to a `Builder`).
     pub fn create_debug_location(
         &self,
+        debug_info: &inkwell::debug_info::DebugInfoBuilder<'ctx>,
         line: u32,
         col: u32,
         scope: inkwell::debug_info::DIScope<'ctx>,
     ) -> inkwell::debug_info::DILocation<'ctx> {
-        self.builder
-            .get_context()
-            .create_debug_location(line, col, scope, None)
+        debug_info.create_debug_location(self.type_lowering.context(), line, col, scope, None)
     }
 
     /// Set debug location for subsequent instructions
@@ -550,7 +620,7 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
 
     /// Clear debug location
     pub fn clear_debug_location(&mut self) {
-        self.builder.clear_current_debug_location();
+        self.builder.unset_current_debug_location();
     }
 }
 

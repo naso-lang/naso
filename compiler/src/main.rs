@@ -411,7 +411,8 @@ fn run_build_command(args: &[String]) {
     }
 
     // Lower to PIR
-    let pir_module = match lower_program(&program) {
+    #[cfg(feature = "llvm")]
+    let pir_module = match naso_compiler::lowering::lower_program(&program) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("lowering error: {e}");

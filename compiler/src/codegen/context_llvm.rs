@@ -18,7 +18,7 @@ use inkwell::targets::{
 #[cfg(feature = "llvm")]
 use std::path::Path;
 #[cfg(feature = "llvm")]
-use target_lexicon::{Architecture, BinaryFormat, Environment, OperatingSystem, Triple};
+use target_lexicon::{Architecture, BinaryFormat, Environment, OperatingSystem, Triple, Vendor};
 
 #[cfg(feature = "llvm")]
 /// LLVM-specific code generation context
@@ -68,7 +68,7 @@ impl CodegenContext {
                 &target_triple,
                 cpu,
                 features,
-                opt_level.into(),
+                inkwell_opt_level(opt_level),
                 RelocMode::Default,
                 CodeModel::Default,
             )
@@ -76,10 +76,14 @@ impl CodegenContext {
                 CodegenError::TargetError("Failed to create target machine".to_string())
             })?;
 
+        // inkwell 0.10's `DataLayout` has no `Display` impl; the layout string
+        // is a `&CStr` behind `as_str()`.
         let data_layout = target_machine
             .get_target_data()
             .get_data_layout()
-            .to_string();
+            .as_str()
+            .to_string_lossy()
+            .into_owned();
 
         Ok(Self {
             llvm_context,
@@ -125,7 +129,13 @@ impl CodegenContext {
 
     /// Get the pointer size in bits for this target
     pub fn pointer_size(&self) -> u32 {
-        self.target_machine.get_target_data().get_pointer_size() * 8
+        // inkwell 0.10 replaced `get_pointer_size()` with
+        // `get_pointer_byte_size(address_space)`; `None` means the default
+        // (data) address space.
+        self.target_machine
+            .get_target_data()
+            .get_pointer_byte_size(None)
+            * 8
     }
 
     /// Write the module to an object file
@@ -186,23 +196,39 @@ impl std::fmt::Debug for CodegenContext {
 }
 
 #[cfg(feature = "llvm")]
+/// Map the crate's `OptLevel` onto inkwell's `OptimizationLevel`.
+///
+/// inkwell 0.10 has no `From<OptLevel> for OptimizationLevel`, and the two are
+/// distinct types that only happen to share variant names.
+fn inkwell_opt_level(opt_level: OptLevel) -> OptimizationLevel {
+    match opt_level {
+        OptLevel::None => OptimizationLevel::None,
+        OptLevel::Less => OptimizationLevel::Less,
+        OptLevel::Default => OptimizationLevel::Default,
+        OptLevel::Aggressive => OptimizationLevel::Aggressive,
+    }
+}
+
+#[cfg(feature = "llvm")]
 /// Helper to convert target_lexicon Triple to inkwell TargetTriple
 fn to_inkwell_triple(triple: &Triple) -> TargetTriple {
+    // target-lexicon 0.12 represents absent components as `Unknown` enum
+    // variants rather than `Option`s, so they are filtered out by comparison.
     let mut s = String::new();
     s.push_str(triple.architecture.to_string().as_str());
-    if let Some(vendor) = triple.vendor {
+    if triple.vendor != Vendor::Unknown {
         s.push('-');
-        s.push_str(vendor.to_string().as_str());
+        s.push_str(triple.vendor.to_string().as_str());
     }
     s.push('-');
     s.push_str(triple.operating_system.to_string().as_str());
-    if let Some(env) = triple.environment {
+    if triple.environment != Environment::Unknown {
         s.push('-');
-        s.push_str(env.to_string().as_str());
+        s.push_str(triple.environment.to_string().as_str());
     }
-    if let Some(binary_format) = triple.binary_format {
+    if triple.binary_format != BinaryFormat::Unknown {
         s.push('-');
-        s.push_str(binary_format.to_string().as_str());
+        s.push_str(triple.binary_format.to_string().as_str());
     }
     TargetTriple::create(&s)
 }

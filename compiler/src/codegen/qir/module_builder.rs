@@ -11,8 +11,10 @@ use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder as LlvmBuilder;
 use inkwell::context::Context as LlvmContext;
 use inkwell::module::Module as LlvmModule;
-use inkwell::types::{FunctionType, IntType, PointerType, StructType, VoidType};
-use inkwell::values::{BasicValueEnum, FunctionValue, GlobalValue, PointerValue};
+use inkwell::types::{BasicTypeEnum, FunctionType, IntType, PointerType, StructType, VoidType};
+use inkwell::values::{
+    BasicMetadataValueEnum, BasicValueEnum, FunctionValue, GlobalValue, PointerValue,
+};
 use std::collections::HashMap;
 
 /// QIR Module Builder for generating quantum IR
@@ -30,8 +32,9 @@ pub struct QIRModuleBuilder<'ctx> {
     current_function: Option<FunctionValue<'ctx>>,
     /// Current basic block
     current_block: Option<BasicBlock<'ctx>>,
-    /// Variable allocations
-    variables: HashMap<String, PointerValue<'ctx>>,
+    /// Variable allocations: pointer plus the pointee type (required by
+    /// opaque-pointer `build_load` in inkwell 0.10)
+    variables: HashMap<String, (PointerValue<'ctx>, BasicTypeEnum<'ctx>)>,
     /// Declared intrinsics
     declared_intrinsics: HashMap<String, FunctionValue<'ctx>>,
 }
@@ -139,23 +142,29 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
     /// Add QIR module metadata
     fn add_qir_metadata(&mut self) -> CodegenResult<()> {
         // Add QIR version metadata
-        let version_md = self.llvm_context.create_string_metadata("1.0");
-        let version_node = self.llvm_context.create_metadata_node(&[version_md.into()]);
-        self.module.add_metadata("qir.version", &version_node);
+        let version_md = self.llvm_context.metadata_string("1.0");
+        let version_node = self.llvm_context.metadata_node(&[version_md.into()]);
+        self.module
+            .add_global_metadata("qir.version", &version_node)
+            .map_err(|e| CodegenError::EmissionError(e.to_string()))?;
 
         // Add profile metadata
         let profile_md = self
             .llvm_context
-            .create_string_metadata(self.profile.kind().as_str());
-        let profile_node = self.llvm_context.create_metadata_node(&[profile_md.into()]);
-        self.module.add_metadata("qir.profile", &profile_node);
+            .metadata_string(self.profile.kind().as_str());
+        let profile_node = self.llvm_context.metadata_node(&[profile_md.into()]);
+        self.module
+            .add_global_metadata("qir.profile", &profile_node)
+            .map_err(|e| CodegenError::EmissionError(e.to_string()))?;
 
         // Add target triple metadata
         let target_md = self
             .llvm_context
-            .create_string_metadata(self.context.target_triple().to_string().as_str());
-        let target_node = self.llvm_context.create_metadata_node(&[target_md.into()]);
-        self.module.add_metadata("qir.target", &target_node);
+            .metadata_string(self.context.target_triple().to_string().as_str());
+        let target_node = self.llvm_context.metadata_node(&[target_md.into()]);
+        self.module
+            .add_global_metadata("qir.target", &target_node)
+            .map_err(|e| CodegenError::EmissionError(e.to_string()))?;
 
         Ok(())
     }
@@ -176,14 +185,16 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
             .get_intrinsic(name)
             .ok_or_else(|| CodegenError::QirError(format!("Intrinsic '{}' not found", name)))?;
 
+        let meta_args: Vec<BasicMetadataValueEnum<'ctx>> =
+            args.iter().map(|a| (*a).into()).collect();
         let call_site = self
             .builder
-            .build_call(func, args, result_name)
+            .build_call(func, &meta_args, result_name)
             .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
 
         call_site
             .try_as_basic_value()
-            .left()
+            .basic()
             .ok_or_else(|| CodegenError::QirError(format!("Intrinsic '{}' returned void", name)))
     }
 
@@ -235,39 +246,23 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
         match expr {
             PirExpr::IntLit(val) => {
                 let int_type = self.llvm_context.i64_type();
-                Ok(self
-                    .builder
-                    .build_int_constant(int_type, *val as u64, "int_lit")
-                    .unwrap()
-                    .into())
+                Ok(int_type.const_int(*val as u64, false).into())
             }
             PirExpr::FloatLit(val) => {
                 let float_type = self.llvm_context.f64_type();
                 let parsed = val.parse::<f64>().unwrap_or(0.0);
-                Ok(self
-                    .builder
-                    .build_float_constant(float_type, parsed, "float_lit")
-                    .unwrap()
-                    .into())
+                Ok(float_type.const_float(parsed).into())
             }
-            PirExpr::BoolLit(val) => Ok(self
-                .builder
-                .build_int_constant(self.result_type, *val as u64, "bool_lit")
-                .unwrap()
-                .into()),
+            PirExpr::BoolLit(val) => Ok(self.result_type.const_int(*val as u64, false).into()),
             PirExpr::Var(name) => {
-                if let Some(ptr) = self.variables.get(name) {
+                if let Some((ptr, pointee_ty)) = self.variables.get(name) {
                     Ok(self
                         .builder
-                        .build_load(*ptr, name)
+                        .build_load(*pointee_ty, *ptr, name)
                         .map_err(|e| CodegenError::InstructionError(e.to_string()))?)
                 } else {
                     // Return zero for undefined
-                    Ok(self
-                        .builder
-                        .build_int_constant(self.llvm_context.i64_type(), 0, "undef")
-                        .unwrap()
-                        .into())
+                    Ok(self.llvm_context.i64_type().const_int(0, false).into())
                 }
             }
             PirExpr::Call { name, args } => {
@@ -288,14 +283,18 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
                     CodegenError::FunctionBuildError(format!("Function '{}' not found", name))
                 })?;
 
+                let meta_args: Vec<BasicMetadataValueEnum<'ctx>> =
+                    arg_values.iter().map(|a| (*a).into()).collect();
                 let call = self
                     .builder
-                    .build_call(func, &arg_values, "call")
+                    .build_call(func, &meta_args, "call")
                     .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                // A void call yields no value; callers of build_expr need a
+                // BasicValueEnum, so substitute the QIR result type's zero.
                 Ok(call
                     .try_as_basic_value()
-                    .left()
-                    .unwrap_or_else(|| self.llvm_context.void_type().const_zero().into()))
+                    .basic()
+                    .unwrap_or_else(|| self.result_type.const_zero().into()))
             }
             PirExpr::Let {
                 name, value, body, ..
@@ -308,7 +307,8 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
                 self.builder
                     .build_store(alloca, val)
                     .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
-                self.variables.insert(name.clone(), alloca);
+                self.variables
+                    .insert(name.clone(), (alloca, val.get_type()));
 
                 let result = self.build_expr(body)?;
 
@@ -386,6 +386,40 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
             PirExpr::Unary { op, expr } => {
                 let e = self.build_expr(expr)?;
                 self.build_unary_op(*op, e)
+            }
+            PirExpr::QuantumOp { op, args, qubits } => {
+                // Lower to the corresponding QIR intrinsic call, e.g. "h" ->
+                // "qir.h". Value arguments come first, then the qubits they
+                // act on.
+                let intrinsic_name = format!("qir.{}", op);
+                let func = self.get_intrinsic(&intrinsic_name).ok_or_else(|| {
+                    CodegenError::QirError(format!(
+                        "Unknown QIR intrinsic '{}' for quantum op '{}'",
+                        intrinsic_name, op
+                    ))
+                })?;
+
+                let mut arg_values: Vec<BasicValueEnum<'ctx>> = Vec::new();
+                for a in args {
+                    arg_values.push(self.build_expr(a)?);
+                }
+                for q in qubits {
+                    arg_values.push(self.build_expr(q)?);
+                }
+
+                let meta_args: Vec<BasicMetadataValueEnum<'ctx>> =
+                    arg_values.iter().map(|a| (*a).into()).collect();
+                let call = self
+                    .builder
+                    .build_call(func, &meta_args, op)
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+
+                // Void-returning intrinsics (gates, releases) produce no value;
+                // build_expr must return one, so yield the QIR result zero.
+                Ok(call
+                    .try_as_basic_value()
+                    .basic()
+                    .unwrap_or_else(|| self.result_type.const_zero().into()))
             }
         }
     }

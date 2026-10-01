@@ -68,13 +68,23 @@ impl LlvmAggregateType {
 
 #[cfg(feature = "llvm")]
 impl LlvmPointerType {
+    /// Lower this pointer type.
+    ///
+    /// LLVM 15+ uses opaque pointers, so the pointee is still lowered (to keep
+    /// errors for unlowerable pointees) but does not appear in the pointer
+    /// type itself. The address space is honoured and validated, not truncated.
     fn to_llvm_type<'ctx>(
         &self,
         lowering: &LlvmTypeLowering<'ctx>,
     ) -> CodegenResult<BasicTypeEnum<'ctx>> {
-        let pointee_type = self.pointee.to_llvm_type(lowering)?;
-        let ptr_type = pointee_type.ptr_type(inkwell::AddressSpace::from(self.address_space));
-        Ok(ptr_type.into())
+        let _pointee_type = self.pointee.to_llvm_type(lowering)?;
+        let addr_space = inkwell::AddressSpace::try_from(self.address_space).map_err(|_| {
+            CodegenError::TypeLoweringError(format!(
+                "Address space {} does not fit in LLVM's 24-bit address space",
+                self.address_space
+            ))
+        })?;
+        Ok(lowering.context().ptr_type(addr_space).into())
     }
 }
 

@@ -4,18 +4,32 @@
 //! Handles alias.scope metadata for [1]-quantity linearity verification.
 
 use crate::ast::Quantity;
-use crate::codegen::error::CodegenResult;
+use crate::codegen::error::{CodegenError, CodegenResult};
 use crate::codegen::llvm::value_builder::LlvmValueBuilder;
 use crate::ir::{
     access_relation::{AccessRelation, AccessType},
     pir_types::PirExpr,
 };
 use inkwell::types::BasicTypeEnum;
-use inkwell::values::{BasicValueEnum, PointerValue};
+use inkwell::values::{
+    AnyValue, BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, InstructionOpcode,
+    IntValue, PointerValue,
+};
 
 /// Access emitter for memory operations
 pub struct AccessEmitter<'ctx> {
     context: &'ctx inkwell::context::Context,
+}
+
+/// A resolved base address for an access: the pointer plus the element type its
+/// GEP must be built against.
+///
+/// LLVM 17 uses opaque pointers, so the pointee type cannot be recovered from
+/// the `PointerValue`; a GEP built with the wrong element type silently indexes
+/// the wrong memory, so the two are resolved together and never guessed.
+struct BasePointer<'ctx> {
+    ptr: PointerValue<'ctx>,
+    elem_type: BasicTypeEnum<'ctx>,
 }
 
 impl<'ctx> AccessEmitter<'ctx> {
@@ -31,17 +45,17 @@ impl<'ctx> AccessEmitter<'ctx> {
         _stmt_body: &PirExpr,
         quantities: &crate::ir::pir_types::QuantityMap,
     ) -> CodegenResult<()> {
-        // Get the array/base pointer
-        let base_ptr = self.get_base_pointer(value_builder, access)?;
+        // Get the array/base pointer (and the element type the GEP needs)
+        let base = self.get_base_pointer(value_builder, access)?;
 
         // Compute GEP indices from access map
         let indices = self.compute_gep_indices(value_builder, access)?;
 
         // Build GEP
-        let gep = self.build_gep(value_builder, base_ptr, access, &indices)?;
+        let gep = self.build_gep(value_builder, base, access, &indices)?;
 
         // Add alias.scope metadata for [1]-quantity variables
-        self.add_alias_metadata(value_builder, access, quantities, gep)?;
+        self.add_alias_metadata(gep, access, quantities)?;
 
         // Emit load or store based on access type
         match access.access_type {
@@ -63,86 +77,158 @@ impl<'ctx> AccessEmitter<'ctx> {
         Ok(())
     }
 
-    /// Get base pointer for the array
+    /// The function currently being built, as seen by `value_builder`.
+    fn current_function(
+        &self,
+        value_builder: &LlvmValueBuilder<'ctx>,
+    ) -> CodegenResult<FunctionValue<'ctx>> {
+        value_builder
+            .builder()
+            .get_insert_block()
+            .and_then(|block| block.get_parent())
+            .ok_or_else(|| {
+                CodegenError::InstructionError(
+                    "no function is currently being built (builder has no insertion block)"
+                        .to_string(),
+                )
+            })
+    }
+
+    /// Get base pointer for the array, together with the element type the GEP
+    /// must be built against.
+    ///
+    /// The base is an `alloca` in the current function named `array_name`.
+    /// `alloca` is the only place that still records an allocated type under
+    /// LLVM 17's opaque pointers, which is why it is the only acceptable base.
+    ///
+    /// If no such allocation exists the access cannot be lowered, and this
+    /// returns an error rather than a null pointer: a GEP against null is a
+    /// silently wrong address, which is worse than refusing to emit.
     fn get_base_pointer(
         &self,
         value_builder: &mut LlvmValueBuilder<'ctx>,
         access: &AccessRelation,
-    ) -> CodegenResult<PointerValue<'ctx>> {
-        // Look up the array name in variables
-        if let Some(array_name) = &access.array_name {
-            if let Some(ptr) = value_builder
-                .builder()
-                .get_insert_block()
-                .unwrap()
-                .get_parent()
-                .unwrap()
-                .get_param(0)
-            {
-                // Simplified: assume first parameter is the array
-                return Ok(ptr.into_pointer_value());
-            }
-            // Try to find as variable
-            if let Some(var_ptr) = value_builder.get_variable(array_name) {
-                return Ok(var_ptr);
+    ) -> CodegenResult<BasePointer<'ctx>> {
+        let array_name = access.array_name.as_deref().ok_or_else(|| {
+            CodegenError::InstructionError(format!(
+                "access relation for statement {:?} has no array_name, so its base pointer is unresolvable",
+                access.stmt_id
+            ))
+        })?;
+
+        let function = self.current_function(value_builder)?;
+
+        // 1. A function parameter of the same name. Under LLVM 17's opaque
+        //    pointers the pointee type is gone from the type system, so the
+        //    element type a GEP needs cannot be recovered from a parameter --
+        //    this is reported rather than guessed.
+        for param in function.get_params() {
+            if param.get_name().to_string_lossy() == array_name && param.is_pointer_value() {
+                return Err(CodegenError::InstructionError(format!(
+                    "base '{array_name}' is a pointer parameter of function '{}'; its pointee \
+                     type is not recoverable under opaque pointers, so no correct GEP can be built",
+                    function.get_name().to_string_lossy()
+                )));
             }
         }
 
-        // Return a dummy pointer for now
-        let int_type = value_builder
-            .type_lowering()
-            .int_type(crate::codegen::abi::IntWidth::I64);
-        let zero = value_builder.build_int_constant(int_type, 0, "null")?;
-        let ptr_type = int_type.ptr_type(inkwell::AddressSpace::default());
-        Ok(ptr_type.const_null())
+        // 2. A named alloca. `alloca` records the allocated type, which is
+        //    exactly the element type the GEP must use.
+        let mut block = function.get_first_basic_block();
+        while let Some(current) = block {
+            for inst in current.get_instructions() {
+                if inst.get_opcode() != InstructionOpcode::Alloca {
+                    continue;
+                }
+                if inst.get_name().map(|n| n.to_string_lossy()) != Some(array_name.into()) {
+                    continue;
+                }
+                // Operand 0 of an `alloca` is the pointer it defines.
+                let ptr = inst.get_operand(0).and_then(|op| op.value());
+                let elem_type = inst.get_allocated_type().map_err(|e| {
+                    CodegenError::InstructionError(format!("alloca '{array_name}': {e:?}"))
+                })?;
+                return Ok(BasePointer {
+                    ptr: ptr
+                        .ok_or_else(|| {
+                            CodegenError::InstructionError(format!(
+                                "alloca '{array_name}' has no pointer operand"
+                            ))
+                        })?
+                        .into_pointer_value(),
+                    elem_type,
+                });
+            }
+            block = current.get_next_basic_block();
+        }
+
+        Err(CodegenError::InstructionError(format!(
+            "no base pointer named '{array_name}' in function '{}': \
+             it is neither a parameter nor an alloca",
+            function.get_name().to_string_lossy()
+        )))
     }
 
     /// Compute GEP indices from access map
+    ///
+    /// One index is produced per output row of every piece of the access map:
+    /// `idx[i] = constant[i] + sum_d matrix[i][d] * x[d]`.
     fn compute_gep_indices(
         &self,
         value_builder: &mut LlvmValueBuilder<'ctx>,
         access: &AccessRelation,
     ) -> CodegenResult<Vec<BasicValueEnum<'ctx>>> {
-        // The access map gives us the affine function from statement instance to memory location
-        // For each output dimension of the access map, evaluate the affine expression
+        let function = self.current_function(value_builder)?;
+        let int_type = value_builder
+            .type_lowering()
+            .int_type(crate::codegen::abi::IntWidth::I64);
+
         let mut indices = Vec::new();
 
         for piece in &access.access_map.pieces {
-            // Evaluate the affine expression for this piece
-            // The piece domain should match the statement domain
-            for row in &piece.matrix.rows {
-                let mut expr_val: Option<BasicValueEnum<'ctx>> = None;
-                for (dim, &coeff) in row.iter().enumerate() {
-                    if coeff != 0 {
-                        // Get the value for this dimension (induction variable or parameter)
-                        let dim_val = self.get_dimension_value(value_builder, dim)?;
-                        let coeff_val = value_builder.build_int_constant(
-                            value_builder
-                                .type_lowering()
-                                .int_type(crate::codegen::abi::IntWidth::I64),
-                            coeff as u64,
-                            "coeff",
-                        )?;
-                        let term = value_builder.build_int_mul(
-                            dim_val.into_int_value(),
-                            coeff_val.into_int_value(),
-                            "term",
-                        )?;
+            let matrix = &piece.matrix;
+            if matrix.data.len() < matrix.rows * matrix.cols {
+                return Err(CodegenError::InstructionError(format!(
+                    "access map matrix claims {}x{} but holds {} coefficients",
+                    matrix.rows,
+                    matrix.cols,
+                    matrix.data.len()
+                )));
+            }
 
-                        if let Some(current) = expr_val {
-                            expr_val = Some(
-                                value_builder
-                                    .build_int_add(current.into_int_value(), term, "sum")?
-                                    .into(),
-                            );
-                        } else {
-                            expr_val = Some(term.into());
-                        }
+            for row in 0..matrix.rows {
+                let mut acc: Option<IntValue<'ctx>> = None;
+
+                // Translation term of this output row.
+                let constant = matrix.constant.get(row).copied().unwrap_or(0);
+                if constant != 0 {
+                    acc = Some(value_builder.build_int_constant(
+                        int_type,
+                        constant as u64,
+                        "gep_const",
+                    ));
+                }
+
+                for dim in 0..matrix.cols {
+                    let coeff = matrix.get(row, dim);
+                    if coeff == 0 {
+                        continue;
                     }
+                    let dim_val = self.get_dimension_value(function, dim)?.into_int_value();
+                    // `build_int_constant` takes the raw bit pattern, so a
+                    // negative coefficient arrives as its two's-complement i64.
+                    let coeff_val =
+                        value_builder.build_int_constant(int_type, coeff as u64, "coeff");
+                    let term = value_builder.build_int_mul(dim_val, coeff_val, "term")?;
+                    acc = Some(match acc {
+                        Some(current) => value_builder.build_int_add(current, term, "sum")?,
+                        None => term,
+                    });
                 }
-                if let Some(val) = expr_val {
-                    indices.push(val);
-                }
+
+                let index = acc
+                    .unwrap_or_else(|| value_builder.build_int_constant(int_type, 0, "gep_zero"));
+                indices.push(index.into());
             }
         }
 
@@ -150,77 +236,130 @@ impl<'ctx> AccessEmitter<'ctx> {
     }
 
     /// Get value for a dimension (induction variable or parameter)
+    ///
+    /// Looks for a live value named after the dimension, first among the
+    /// function's parameters and then among the instructions already emitted
+    /// in the function (an induction-variable phi or its loaded value). When no
+    /// such value exists this errors: emitting a constant `0` here would build a
+    /// GEP that points at the array origin and silently reads the wrong
+    /// element for every iteration but the first.
     fn get_dimension_value(
         &self,
-        value_builder: &mut LlvmValueBuilder<'ctx>,
+        function: FunctionValue<'ctx>,
         dim: usize,
     ) -> CodegenResult<BasicValueEnum<'ctx>> {
-        // In a real implementation, this would look up the induction variable
-        // or parameter value from the current scope
-        let int_type = value_builder
-            .type_lowering()
-            .int_type(crate::codegen::abi::IntWidth::I64);
-        Ok(value_builder
-            .build_int_constant(int_type, 0, &format!("dim_{}", dim))?
-            .into())
+        let dim_name = format!("dim_{dim}");
+        let iv_name = format!("iv_{dim}");
+
+        // Parameters.
+        for param in function.get_params() {
+            let name = param.get_name().to_string_lossy().into_owned();
+            if name == dim_name || name == iv_name {
+                if let Ok(int_val) = IntValue::try_from(param) {
+                    return Ok(int_val.into());
+                }
+            }
+        }
+
+        // Already-emitted instructions (phi nodes, loads, ...).
+        let mut block = function.get_first_basic_block();
+        while let Some(current) = block {
+            for inst in current.get_instructions() {
+                let name = match inst.get_name() {
+                    Some(name) => name.to_string_lossy().into_owned(),
+                    None => continue,
+                };
+                let matches = name == dim_name
+                    || name == iv_name
+                    // The loop emitter names its induction variable without a
+                    // dimension suffix; that is only unambiguous for dim 0.
+                    || (dim == 0 && (name == "iv_phi" || name == "iv_val"));
+                if !matches {
+                    continue;
+                }
+                if let Ok(int_val) = IntValue::try_from(inst.as_any_value_enum()) {
+                    return Ok(int_val.into());
+                }
+            }
+            block = current.get_next_basic_block();
+        }
+
+        Err(CodegenError::InstructionError(format!(
+            "dimension {dim} of the access map has no live value: expected a parameter \
+             or instruction named '{dim_name}' or '{iv_name}' in function '{}'",
+            function.get_name().to_string_lossy()
+        )))
     }
 
     /// Build GEP instruction
     fn build_gep(
         &self,
         value_builder: &mut LlvmValueBuilder<'ctx>,
-        base_ptr: PointerValue<'ctx>,
+        base: BasePointer<'ctx>,
         access: &AccessRelation,
         indices: &[BasicValueEnum<'ctx>],
     ) -> CodegenResult<PointerValue<'ctx>> {
-        // Get the element type from the access map output
-        let elem_type = self.get_element_type(value_builder, access)?;
-
         value_builder.build_gep(
-            elem_type,
-            base_ptr,
+            base.elem_type,
+            base.ptr,
             indices,
             &format!("gep_{}", access.array_name.as_deref().unwrap_or("mem")),
         )
     }
 
-    /// Get element type for GEP
-    fn get_element_type(
-        &self,
-        value_builder: &mut LlvmValueBuilder<'ctx>,
-        _access: &AccessRelation,
-    ) -> CodegenResult<BasicTypeEnum<'ctx>> {
-        // Simplified: return i64 for now
-        // Real implementation would derive from array type
-        Ok(value_builder
-            .type_lowering()
-            .int_type(crate::codegen::abi::IntWidth::I64)
-            .into())
-    }
-
-    /// Add alias.scope metadata for [1]-quantity variables
+    /// Attach `!alias.scope` and `!noalias` metadata to the GEP for [1]-quantity
+    /// variables.
+    ///
+    /// These are instruction-level metadata kinds in LLVM, not module-level named
+    /// metadata, so they are attached to the instruction the alias analysis
+    /// actually reads. `inkwell::builder::Builder` has no module accessor and
+    /// inkwell 0.10 exposes no way to recover the owning module from a
+    /// `FunctionValue`, so module-level attachment is not reachable from here.
     fn add_alias_metadata(
         &self,
-        value_builder: &mut LlvmValueBuilder<'ctx>,
+        gep: PointerValue<'ctx>,
         access: &AccessRelation,
         quantities: &crate::ir::pir_types::QuantityMap,
-        gep: PointerValue<'ctx>,
     ) -> CodegenResult<()> {
-        // Check if this access involves a [1]-quantity variable
-        if let Some(array_name) = &access.array_name {
-            if let Some(qty) = quantities.get(array_name) {
-                if matches!(qty, Quantity::One) {
-                    // Add noalias metadata for linear variables
-                    let metadata = value_builder.add_metadata(
-                        value_builder.builder().get_module().unwrap(),
-                        "noalias",
-                        &format!("linear_{}", array_name),
-                    );
-                    // Apply metadata to the GEP instruction (would need the actual instruction)
-                    // This is a simplified placeholder
-                }
-            }
+        let array_name = match access.array_name.as_deref() {
+            Some(name) => name,
+            None => return Ok(()),
+        };
+        if !matches!(quantities.get(array_name), Some(Quantity::One)) {
+            return Ok(());
         }
+
+        let scope_name = format!("linear_{array_name}");
+        let instruction = gep.as_instruction_value().ok_or_else(|| {
+            CodegenError::InstructionError(format!(
+                "GEP for '{array_name}' is not an instruction, so alias metadata cannot be attached"
+            ))
+        })?;
+
+        // LLVM expects `!alias.scope !{!0}` where `!0 = !{!"name"}`.
+        let scope = self.context.metadata_node(&[BasicMetadataValueEnum::from(
+            self.context.metadata_string(&scope_name),
+        )]);
+        let scope_list = self
+            .context
+            .metadata_node(&[BasicMetadataValueEnum::from(scope)]);
+
+        // `!noalias` must reference a distinct scope node.
+        let noalias_scope = self.context.metadata_node(&[BasicMetadataValueEnum::from(
+            self.context
+                .metadata_string(&format!("{scope_name}_noalias")),
+        )]);
+        let noalias_list = self
+            .context
+            .metadata_node(&[BasicMetadataValueEnum::from(noalias_scope)]);
+
+        instruction
+            .set_metadata(scope_list, self.context.get_kind_id("alias.scope"))
+            .map_err(|e| CodegenError::InstructionError(format!("alias.scope metadata: {e:?}")))?;
+        instruction
+            .set_metadata(noalias_list, self.context.get_kind_id("noalias"))
+            .map_err(|e| CodegenError::InstructionError(format!("noalias metadata: {e:?}")))?;
+
         Ok(())
     }
 
@@ -229,9 +368,9 @@ impl<'ctx> AccessEmitter<'ctx> {
         &self,
         value_builder: &mut LlvmValueBuilder<'ctx>,
         gep: PointerValue<'ctx>,
-        _access: &AccessRelation,
+        access: &AccessRelation,
     ) -> CodegenResult<BasicValueEnum<'ctx>> {
-        let name = _access.array_name.as_deref().unwrap_or("load");
+        let name = access.array_name.as_deref().unwrap_or("load");
         value_builder.build_load(gep, name)
     }
 
@@ -246,7 +385,7 @@ impl<'ctx> AccessEmitter<'ctx> {
         let int_type = value_builder
             .type_lowering()
             .int_type(crate::codegen::abi::IntWidth::I64);
-        let zero = value_builder.build_int_constant(int_type, 0, "store_zero")?;
+        let zero = value_builder.build_int_constant(int_type, 0, "store_zero");
         value_builder.build_store(gep, zero.into())?;
         Ok(())
     }
@@ -256,14 +395,14 @@ impl<'ctx> AccessEmitter<'ctx> {
         &self,
         value_builder: &mut LlvmValueBuilder<'ctx>,
         gep: PointerValue<'ctx>,
-        _access: &AccessRelation,
+        access: &AccessRelation,
     ) -> CodegenResult<()> {
         // Load current value, add new value, store back
-        let loaded = self.emit_load(value_builder, gep, _access)?;
+        let loaded = self.emit_load(value_builder, gep, access)?;
         let int_type = value_builder
             .type_lowering()
             .int_type(crate::codegen::abi::IntWidth::I64);
-        let one = value_builder.build_int_constant(int_type, 1, "red_one")?;
+        let one = value_builder.build_int_constant(int_type, 1, "red_one");
         let result = value_builder.build_int_add(loaded.into_int_value(), one, "red_add")?;
         value_builder.build_store(gep, result.into())?;
         Ok(())

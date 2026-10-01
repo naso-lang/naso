@@ -1,3 +1,4 @@
+use crate::ast::Quantity;
 /// OpenQASM 3.0 Exporter
 ///
 /// Lowers QIR operations into OpenQASM 3.0 string specifications including:
@@ -8,8 +9,9 @@
 
 #[cfg(feature = "llvm")]
 use crate::codegen::qir::{QIRModule, QIROperation};
-use crate::ast::Quantity;
-use crate::runtime::exporter::{ExportResult, ExportMetadata, ExporterError, HardwareExporter, TargetBackend, DecompositionRule};
+use crate::runtime::exporter::{
+    DecompositionRule, ExportMetadata, ExportResult, ExporterError, HardwareExporter, TargetBackend,
+};
 use std::collections::HashMap;
 
 /// OpenQASM 3.0 exporter
@@ -34,13 +36,26 @@ impl OpenQASMExporter {
         Self {
             include_definitions: true,
             target_gates: vec![
-                "h".to_string(), "x".to_string(), "y".to_string(), "z".to_string(),
-                "s".to_string(), "sdg".to_string(), "t".to_string(), "tdg".to_string(),
-                "rx".to_string(), "ry".to_string(), "rz".to_string(),
-                "cx".to_string(), "cy".to_string(), "cz".to_string(),
-                "swap".to_string(), "iswap".to_string(),
-                "ccx".to_string(), "cphase".to_string(),
-                "measure".to_string(), "reset".to_string(),
+                "h".to_string(),
+                "x".to_string(),
+                "y".to_string(),
+                "z".to_string(),
+                "s".to_string(),
+                "sdg".to_string(),
+                "t".to_string(),
+                "tdg".to_string(),
+                "rx".to_string(),
+                "ry".to_string(),
+                "rz".to_string(),
+                "cx".to_string(),
+                "cy".to_string(),
+                "cz".to_string(),
+                "swap".to_string(),
+                "iswap".to_string(),
+                "ccx".to_string(),
+                "cphase".to_string(),
+                "measure".to_string(),
+                "reset".to_string(),
             ],
             auto_barriers: true,
         }
@@ -80,7 +95,9 @@ impl OpenQASMExporter {
         }
 
         // Classical bit register for measurements
-        let measurement_count = module.operations.iter()
+        let measurement_count = module
+            .operations
+            .iter()
             .filter(|op| matches!(op, QIROperation::Measure { .. }))
             .count();
         if measurement_count > 0 {
@@ -106,11 +123,18 @@ impl OpenQASMExporter {
                     }
                 }
                 QIROperation::ReleaseQubit { index } => {
-                    let quantity = module.qubit_quantities.get(*index).cloned().unwrap_or(Quantity::Many);
+                    let quantity = module
+                        .qubit_quantities
+                        .get(*index)
+                        .cloned()
+                        .unwrap_or(Quantity::Many);
                     if quantity == Quantity::Zero {
                         // [0] qubit: emit reset to ensure uncomputation
                         output.push_str(&format!("reset q[{}];\n", index));
-                        operation_counts.entry("reset".to_string()).and_modify(|c| *c += 1).or_insert(1);
+                        operation_counts
+                            .entry("reset".to_string())
+                            .and_modify(|c| *c += 1)
+                            .or_insert(1);
                         metadata.gate_count += 1;
                     } else if quantity == Quantity::One {
                         // [1] qubit: verify single use via barrier
@@ -119,7 +143,11 @@ impl OpenQASMExporter {
                         }
                     }
                 }
-                QIROperation::Gate { name, qubits, params } => {
+                QIROperation::Gate {
+                    name,
+                    qubits,
+                    params,
+                } => {
                     let qasm_name = self.map_gate_name(name);
                     let gate_str = self.format_gate(&qasm_name, qubits, params);
                     output.push_str(&gate_str);
@@ -194,7 +222,7 @@ impl OpenQASMExporter {
             "rx" => "rx".to_string(),
             "ry" => "ry".to_string(),
             "rz" => "rz".to_string(),
-            "r1" => "rz".to_string(),  // R1 = RZ up to global phase
+            "r1" => "rz".to_string(), // R1 = RZ up to global phase
             "rt1" => "rz".to_string(),
             "cx" => "cx".to_string(),
             "cy" => "cy".to_string(),
@@ -207,15 +235,16 @@ impl OpenQASMExporter {
             "cry" => "cry".to_string(),
             "crz" => "crz".to_string(),
             "mz" => "measure".to_string(),
-            "mx" => "measure".to_string(),  // Will add H before
-            "my" => "measure".to_string(),  // Will add S†H before
+            "mx" => "measure".to_string(), // Will add H before
+            "my" => "measure".to_string(), // Will add S†H before
             _ => name.to_string(),
         }
     }
 
     /// Format a gate operation as OpenQASM
     fn format_gate(&self, name: &str, qubits: &[usize], params: &[f64]) -> String {
-        let qubit_str = qubits.iter()
+        let qubit_str = qubits
+            .iter()
             .map(|q| format!("q[{}]", q))
             .collect::<Vec<_>>()
             .join(", ");
@@ -223,7 +252,8 @@ impl OpenQASMExporter {
         if params.is_empty() {
             format!("{} {};", name, qubit_str)
         } else {
-            let param_str = params.iter()
+            let param_str = params
+                .iter()
                 .map(|p| format!("{:.10}", p))
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -255,7 +285,8 @@ impl OpenQASMExporter {
             _ => name,
         };
 
-        let qubit_str = qubits.iter()
+        let qubit_str = qubits
+            .iter()
             .map(|q| format!("q[{}]", q))
             .collect::<Vec<_>>()
             .join(", ");
@@ -264,7 +295,11 @@ impl OpenQASMExporter {
             format!("{} {};", adjoint_name, qubit_str)
         } else {
             // For parameterized gates, negate the angle for adjoint
-            let neg_params = params.iter().map(|p| format!("{:.10}", -p)).collect::<Vec<_>>().join(", ");
+            let neg_params = params
+                .iter()
+                .map(|p| format!("{:.10}", -p))
+                .collect::<Vec<_>>()
+                .join(", ");
             format!("{}({}) {};", adjoint_name, neg_params, qubit_str)
         }
     }
@@ -281,12 +316,9 @@ impl HardwareExporter for OpenQASMExporter {
 
     fn supported_gates(&self) -> &'static [&'static str] {
         &[
-            "h", "x", "y", "z", "s", "sdg", "t", "tdg",
-            "rx", "ry", "rz", "r1", "rt1",
-            "cx", "cy", "cz", "ccx",
-            "swap", "iswap",
-            "cphase", "crx", "cry", "crz",
-            "measure", "reset", "barrier",
+            "h", "x", "y", "z", "s", "sdg", "t", "tdg", "rx", "ry", "rz", "r1", "rt1", "cx", "cy",
+            "cz", "ccx", "swap", "iswap", "cphase", "crx", "cry", "crz", "measure", "reset",
+            "barrier",
         ]
     }
 
@@ -294,7 +326,12 @@ impl HardwareExporter for OpenQASMExporter {
         vec![
             DecompositionRule {
                 source_gate: "ccx".to_string(),
-                target_gates: vec!["h".to_string(), "cx".to_string(), "t".to_string(), "tdg".to_string()],
+                target_gates: vec![
+                    "h".to_string(),
+                    "cx".to_string(),
+                    "t".to_string(),
+                    "tdg".to_string(),
+                ],
                 is_exact: true,
                 error_bound: None,
             },
@@ -323,8 +360,8 @@ impl HardwareExporter for OpenQASMExporter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codegen::qir::{QIRModule, QIROperation};
     use crate::ast::Quantity;
+    use crate::codegen::qir::{QIRModule, QIROperation};
 
     #[test]
     fn test_openqasm_exporter_creation() {
@@ -347,7 +384,10 @@ mod tests {
         let exporter = OpenQASMExporter::new();
         assert_eq!(exporter.format_gate("h", &[0], &[]), "h q[0];");
         assert_eq!(exporter.format_gate("cx", &[0, 1], &[]), "cx q[0], q[1];");
-        assert_eq!(exporter.format_gate("rz", &[0], &[1.57]), "rz(1.5700000000) q[0];");
+        assert_eq!(
+            exporter.format_gate("rz", &[0], &[1.57]),
+            "rz(1.5700000000) q[0];"
+        );
     }
 
     #[test]
@@ -357,8 +397,16 @@ mod tests {
             qubit_count: 2,
             qubit_quantities: vec![Quantity::Many, Quantity::Many],
             operations: vec![
-                QIROperation::Gate { name: "h".to_string(), qubits: vec![0], params: vec![] },
-                QIROperation::Gate { name: "cx".to_string(), qubits: vec![0, 1], params: vec![] },
+                QIROperation::Gate {
+                    name: "h".to_string(),
+                    qubits: vec![0],
+                    params: vec![],
+                },
+                QIROperation::Gate {
+                    name: "cx".to_string(),
+                    qubits: vec![0, 1],
+                    params: vec![],
+                },
                 QIROperation::Measure { qubit: 0, basis: 0 },
                 QIROperation::Measure { qubit: 1, basis: 0 },
             ],
@@ -384,8 +432,15 @@ mod tests {
             qubit_count: 1,
             qubit_quantities: vec![Quantity::Zero],
             operations: vec![
-                QIROperation::AllocateQubit { index: 0, quantity: Quantity::Zero },
-                QIROperation::Gate { name: "h".to_string(), qubits: vec![0], params: vec![] },
+                QIROperation::AllocateQubit {
+                    index: 0,
+                    quantity: Quantity::Zero,
+                },
+                QIROperation::Gate {
+                    name: "h".to_string(),
+                    qubits: vec![0],
+                    params: vec![],
+                },
                 QIROperation::ReleaseQubit { index: 0 },
             ],
         };
@@ -402,8 +457,15 @@ mod tests {
             qubit_count: 1,
             qubit_quantities: vec![Quantity::One],
             operations: vec![
-                QIROperation::AllocateQubit { index: 0, quantity: Quantity::One },
-                QIROperation::Gate { name: "h".to_string(), qubits: vec![0], params: vec![] },
+                QIROperation::AllocateQubit {
+                    index: 0,
+                    quantity: Quantity::One,
+                },
+                QIROperation::Gate {
+                    name: "h".to_string(),
+                    qubits: vec![0],
+                    params: vec![],
+                },
                 QIROperation::ReleaseQubit { index: 0 },
             ],
         };

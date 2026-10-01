@@ -3,12 +3,16 @@
 //! Emits parallel loop constructs with LLVM metadata for OpenMP
 //! and automatic parallelization.
 
-use crate::codegen::error::CodegenResult;
+use crate::codegen::error::{CodegenError, CodegenResult};
 use crate::codegen::llvm::value_builder::LlvmValueBuilder;
 use crate::ir::affine_map::AffineMap;
 use inkwell::IntPredicate;
 use inkwell::basic_block::BasicBlock;
-use inkwell::values::{BasicValueEnum, FunctionValue};
+use inkwell::context::Context;
+use inkwell::llvm_sys::core::{LLVMMetadataAsValue, LLVMValueAsMetadata};
+use inkwell::llvm_sys::debuginfo::{LLVMMetadataReplaceAllUsesWith, LLVMTemporaryMDNode};
+use inkwell::llvm_sys::prelude::LLVMMetadataRef;
+use inkwell::values::{AsValueRef, BasicValue, BasicValueEnum, MetadataValue};
 
 /// Parallel emitter for parallel bands
 pub struct ParallelEmitter<'ctx> {
@@ -16,6 +20,45 @@ pub struct ParallelEmitter<'ctx> {
 }
 
 impl<'ctx> ParallelEmitter<'ctx> {
+    /// Build a self-referential `!llvm.loop` metadata node.
+    ///
+    /// LLVM's loop-metadata contract requires the node to reference itself as its
+    /// first two operands:
+    ///
+    /// ```text
+    /// !0 = distinct !{!0, !1, !1}
+    /// !1 = !{!"llvm.loop.parallel_accesses"}
+    /// ```
+    ///
+    /// `inkwell`'s safe API cannot express that cycle (a node cannot be an operand
+    /// of itself at construction time), so the node is built with a temporary
+    /// placeholder and the placeholder is patched to point at the finished node
+    /// via `LLVMMetadataReplaceAllUsesWith`.
+    fn loop_metadata(
+        context: &'ctx Context,
+        loop_property: MetadataValue<'ctx>,
+    ) -> MetadataValue<'ctx> {
+        // A temporary node stands in for the self-reference until it is known.
+        let temp = unsafe { LLVMTemporaryMDNode(context.raw(), std::ptr::null_mut(), 0) };
+        let temp_as_value = unsafe { LLVMMetadataAsValue(context.raw(), temp) };
+
+        // !0 = !{!temp, !temp, !1}
+        let node = context.metadata_node(&[
+            unsafe { MetadataValue::new(temp_as_value) }.into(),
+            unsafe { MetadataValue::new(temp_as_value) }.into(),
+            loop_property.into(),
+        ]);
+
+        // Patch the temporary operand so it becomes the node itself.
+        // `LLVMMetadataReplaceAllUsesWith` takes ownership of the temporary node
+        // and frees it, so it must NOT be disposed separately.
+        let node_ref = unsafe { LLVMValueAsMetadata(node.as_value_ref()) } as LLVMMetadataRef;
+        unsafe {
+            LLVMMetadataReplaceAllUsesWith(temp, node_ref);
+        }
+
+        node
+    }
     pub fn new(context: &'ctx inkwell::context::Context) -> CodegenResult<Self> {
         Ok(Self { context })
     }
@@ -73,19 +116,24 @@ impl<'ctx> ParallelEmitter<'ctx> {
         let int_type = value_builder
             .type_lowering()
             .int_type(crate::codegen::abi::IntWidth::I64);
-        let init_val = value_builder.build_int_constant(
-            int_type,
-            bounds.lower.into_int_value().get_zero_extended_constant() as u64,
-            "iv_init",
-        )?;
-        let iv_alloca = value_builder.build_alloca(int_type, "iv")?;
+        let lower_const = bounds
+            .lower
+            .into_int_value()
+            .get_zero_extended_constant()
+            .ok_or_else(|| {
+                CodegenError::InstructionError(
+                    "parallel loop lower bound is not an integer constant".to_string(),
+                )
+            })?;
+        let init_val = value_builder.build_int_constant(int_type, lower_const, "iv_init");
+        let iv_alloca = value_builder.build_alloca(int_type.into(), "iv")?;
         value_builder.build_store(iv_alloca, init_val.into())?;
         value_builder.build_unconditional_branch(header)?;
 
         // Header: phi node for induction variable
         value_builder.builder().position_at_end(header);
         let phi = value_builder.build_phi(int_type.into(), "iv_phi")?;
-        phi.add_incoming(&[(init_val.into(), preheader)]);
+        phi.add_incoming(&[(&init_val as &dyn BasicValue<'ctx>, preheader)]);
 
         // Load current induction variable value
         let iv_val = value_builder
@@ -102,21 +150,22 @@ impl<'ctx> ParallelEmitter<'ctx> {
         // Body
         value_builder.builder().position_at_end(body);
 
-        // Add parallel metadata to the loop
-        self.add_parallel_metadata(value_builder, header)?;
-
         body_builder(value_builder)?;
         value_builder.build_unconditional_branch(latch)?;
 
         // Latch: increment induction variable
         value_builder.builder().position_at_end(latch);
-        let step_val = value_builder.build_int_constant(int_type, bounds.step as u64, "iv_step")?;
+        let step_val = value_builder.build_int_constant(int_type, bounds.step as u64, "iv_step");
         let next_iv = value_builder.build_int_add(iv_val, step_val, "iv_next")?;
         value_builder.build_store(iv_alloca, next_iv.into())?;
 
         // Add incoming to phi
-        phi.add_incoming(&[(next_iv.into(), latch)]);
+        phi.add_incoming(&[(&next_iv as &dyn BasicValue<'ctx>, latch)]);
         value_builder.build_unconditional_branch(header)?;
+
+        // The `!llvm.loop` metadata is attached to the latch terminator (the back edge),
+        // which is the only place LLVM recognizes loop metadata on.
+        self.add_parallel_metadata(value_builder, latch)?;
 
         // Exit
         value_builder.builder().position_at_end(exit);
@@ -125,29 +174,46 @@ impl<'ctx> ParallelEmitter<'ctx> {
     }
 
     /// Add LLVM parallel loop metadata
+    ///
+    /// The metadata is a self-referential `!llvm.loop` node attached to the latch
+    /// terminator (the loop's back edge), which is the only instruction LLVM
+    /// recognizes loop metadata on:
+    ///
+    /// ```text
+    /// br label %header, !llvm.loop !{!0, !0, !1, !1}
+    /// !0 = distinct !{!0, !1, !1}
+    /// !1 = !{!"llvm.loop.parallel_accesses"}
+    /// ```
     fn add_parallel_metadata(
         &self,
         value_builder: &mut LlvmValueBuilder<'ctx>,
-        header: BasicBlock<'ctx>,
+        latch: BasicBlock<'ctx>,
     ) -> CodegenResult<()> {
         // Add llvm.loop.parallel_accesses metadata to the loop
         // This tells LLVM that iterations of this loop can be executed in parallel
-        let module = value_builder.builder().get_module().unwrap();
         let context = value_builder.type_lowering().context();
 
-        // Create metadata node for parallel loop
-        let parallel_md = context.create_string_metadata("llvm.loop.parallel_accesses");
-        let md_node = context.create_metadata_node(&[parallel_md.into()]);
+        let parallel_md = context.metadata_string("llvm.loop.parallel_accesses");
 
-        // Attach to the loop header's terminator instruction
-        // Note: In real implementation, we'd attach to the branch instruction in the latch
-        // For now, we add it as function-level metadata
-        module.add_metadata("llvm.loop.parallel_accesses", &md_node);
+        // Also record the OpenMP-compatible scheduling directive alongside it.
+        let omp_md = context.metadata_string("omp parallel for");
+        let omp_node = context.metadata_node(&[omp_md.into()]);
 
-        // Also add OpenMP-compatible metadata
-        let omp_md = context.create_string_metadata("omp parallel for");
-        let omp_node = context.create_metadata_node(&[omp_md.into()]);
-        module.add_metadata("llvm.loop.parallel_accesses", &omp_node);
+        // Clang's operand layout for !llvm.loop.parallel_accesses:
+        //   !{!"llvm.loop.parallel_accesses", <access list>, <loop control>}
+        let parallel_node =
+            context.metadata_node(&[parallel_md.into(), omp_node.into(), omp_node.into()]);
+        let loop_node = Self::loop_metadata(context, parallel_node);
+
+        let kind_id = context.get_kind_id("llvm.loop");
+        let latch_terminator = latch.get_last_instruction().ok_or_else(|| {
+            CodegenError::InstructionError(
+                "parallel loop latch has no terminator to attach metadata to".to_string(),
+            )
+        })?;
+        latch_terminator
+            .set_metadata(loop_node, kind_id)
+            .map_err(|e| CodegenError::InstructionError(format!("{e:?}")))?;
 
         Ok(())
     }
@@ -214,18 +280,23 @@ impl<'ctx> ParallelEmitter<'ctx> {
         let int_type = value_builder
             .type_lowering()
             .int_type(crate::codegen::abi::IntWidth::I64);
-        let init_val = value_builder.build_int_constant(
-            int_type,
-            bounds.lower.into_int_value().get_zero_extended_constant() as u64,
-            "iv_init",
-        )?;
-        let iv_alloca = value_builder.build_alloca(int_type, "iv")?;
+        let lower_const = bounds
+            .lower
+            .into_int_value()
+            .get_zero_extended_constant()
+            .ok_or_else(|| {
+                CodegenError::InstructionError(
+                    "SIMD loop lower bound is not an integer constant".to_string(),
+                )
+            })?;
+        let init_val = value_builder.build_int_constant(int_type, lower_const, "iv_init");
+        let iv_alloca = value_builder.build_alloca(int_type.into(), "iv")?;
         value_builder.build_store(iv_alloca, init_val.into())?;
         value_builder.build_unconditional_branch(header)?;
 
         value_builder.builder().position_at_end(header);
         let phi = value_builder.build_phi(int_type.into(), "iv_phi")?;
-        phi.add_incoming(&[(init_val.into(), preheader)]);
+        phi.add_incoming(&[(&init_val as &dyn BasicValue<'ctx>, preheader)]);
 
         let iv_val = value_builder
             .build_load(iv_alloca, "iv_val")?
@@ -237,9 +308,6 @@ impl<'ctx> ParallelEmitter<'ctx> {
 
         value_builder.builder().position_at_end(body);
 
-        // Add SIMD metadata
-        self.add_simd_metadata(value_builder, header, simd_width)?;
-
         body_builder(value_builder)?;
         value_builder.build_unconditional_branch(latch)?;
 
@@ -248,30 +316,50 @@ impl<'ctx> ParallelEmitter<'ctx> {
             int_type,
             (bounds.step * simd_width as i64) as u64,
             "iv_step",
-        )?;
+        );
         let next_iv = value_builder.build_int_add(iv_val, step_val, "iv_next")?;
         value_builder.build_store(iv_alloca, next_iv.into())?;
-        phi.add_incoming(&[(next_iv.into(), latch)]);
+        phi.add_incoming(&[(&next_iv as &dyn BasicValue<'ctx>, latch)]);
         value_builder.build_unconditional_branch(header)?;
+
+        // Attach the vectorization metadata to the latch back edge, where LLVM
+        // expects `!llvm.loop` to live.
+        self.add_simd_metadata(value_builder, latch, simd_width)?;
 
         value_builder.builder().position_at_end(exit);
         Ok(())
     }
 
     /// Add SIMD metadata
+    ///
+    /// Attached to the latch back edge as a self-referential `!llvm.loop` node
+    /// carrying `llvm.loop.vectorize.width`.
     fn add_simd_metadata(
         &self,
         value_builder: &mut LlvmValueBuilder<'ctx>,
-        _header: BasicBlock<'ctx>,
+        latch: BasicBlock<'ctx>,
         width: usize,
     ) -> CodegenResult<()> {
-        let module = value_builder.builder().get_module().unwrap();
         let context = value_builder.type_lowering().context();
 
-        let simd_md =
-            context.create_string_metadata(&format!("llvm.loop.vectorize.width {}", width));
-        let md_node = context.create_metadata_node(&[simd_md.into()]);
-        module.add_metadata("llvm.loop.vectorize", &md_node);
+        let i32_type = context.i32_type();
+        let width_md = context.metadata_string(&format!("llvm.loop.vectorize.width {width}"));
+        let width_node = context.metadata_node(&[
+            width_md.into(),
+            i32_type.const_int(width as u64, false).into(),
+        ]);
+
+        let loop_node = Self::loop_metadata(context, width_node);
+
+        let kind_id = context.get_kind_id("llvm.loop");
+        let latch_terminator = latch.get_last_instruction().ok_or_else(|| {
+            CodegenError::InstructionError(
+                "SIMD loop latch has no terminator to attach metadata to".to_string(),
+            )
+        })?;
+        latch_terminator
+            .set_metadata(loop_node, kind_id)
+            .map_err(|e| CodegenError::InstructionError(format!("{e:?}")))?;
 
         Ok(())
     }

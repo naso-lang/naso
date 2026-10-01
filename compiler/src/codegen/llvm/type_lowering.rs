@@ -11,7 +11,8 @@ use crate::codegen::error::{CodegenError, CodegenResult};
 use inkwell::AddressSpace;
 use inkwell::context::Context;
 use inkwell::types::{
-    BasicType, BasicTypeEnum, FloatType, IntType, PointerType, StructType, VoidType,
+    BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, IntType, PointerType, StructType,
+    VoidType,
 };
 use std::collections::HashMap;
 
@@ -144,11 +145,29 @@ impl<'ctx> LlvmTypeLowering<'ctx> {
     }
 
     /// Lower a pointer type
-    fn lower_pointer(&self, ptr: &LlvmPointerType) -> CodegenResult<BasicTypeEnum<'ctx>> {
-        let pointee_type = self.lower_quantity_aware(&ptr.pointee)?;
-        let addr_space = AddressSpace::from(ptr.address_space);
-        let ptr_type = pointee_type.ptr_type(addr_space);
-        Ok(ptr_type.into())
+    ///
+    /// LLVM 15+ uses opaque pointers, so the pointee only matters for its own
+    /// lowering validity, not for the resulting pointer type's identity. We
+    /// still lower the pointee first so invalid pointees are reported, then
+    /// build the pointer through the Context (the non-deprecated API).
+    fn lower_pointer(&mut self, ptr: &LlvmPointerType) -> CodegenResult<BasicTypeEnum<'ctx>> {
+        // Validate the pointee lowers cleanly even though opaque pointers
+        // erase it in the resulting type.
+        let _pointee_type = self.lower_quantity_aware(&ptr.pointee)?;
+        let addr_space = self.address_space(ptr.address_space)?;
+        Ok(self.context.ptr_type(addr_space).into())
+    }
+
+    /// Convert a raw address space id into an inkwell `AddressSpace`.
+    ///
+    /// Address spaces are 24-bit unsigned integers in LLVM; anything wider
+    /// cannot be represented and is rejected rather than silently truncated.
+    fn address_space(&self, address_space: u32) -> CodegenResult<AddressSpace> {
+        AddressSpace::try_from(address_space).map_err(|_| {
+            CodegenError::TypeLoweringError(format!(
+                "Address space {address_space} does not fit in LLVM's 24-bit address space"
+            ))
+        })
     }
 
     /// Get void type
@@ -156,9 +175,20 @@ impl<'ctx> LlvmTypeLowering<'ctx> {
         self.context.void_type()
     }
 
-    /// Get pointer type for given pointee
-    pub fn ptr_type(&self, pointee: BasicTypeEnum<'ctx>, address_space: u32) -> PointerType<'ctx> {
-        pointee.ptr_type(AddressSpace::from(address_space))
+    /// Get pointer type for the given address space.
+    ///
+    /// LLVM 15+ has opaque pointers, so the `pointee` argument does not
+    /// affect the pointer type; it is retained for call-site readability and
+    /// must still be a valid basic type. The address space is honoured.
+    pub fn ptr_type(
+        &self,
+        pointee: BasicTypeEnum<'ctx>,
+        address_space: u32,
+    ) -> CodegenResult<PointerType<'ctx>> {
+        // Keep the pointee meaningful: opaque pointers erase it in the IR, but
+        // dropping it entirely would lose the caller's intent silently.
+        let _ = pointee;
+        Ok(self.context.ptr_type(self.address_space(address_space)?))
     }
 
     /// Get function type
@@ -168,9 +198,10 @@ impl<'ctx> LlvmTypeLowering<'ctx> {
         params: &[BasicTypeEnum<'ctx>],
         is_var_args: bool,
     ) -> inkwell::types::FunctionType<'ctx> {
+        let params: Vec<BasicMetadataTypeEnum<'ctx>> = params.iter().map(|p| (*p).into()).collect();
         match ret {
-            Some(r) => r.fn_type(params, is_var_args),
-            None => self.void_type().fn_type(params, is_var_args),
+            Some(r) => r.fn_type(&params, is_var_args),
+            None => self.void_type().fn_type(&params, is_var_args),
         }
     }
 }

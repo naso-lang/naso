@@ -13,18 +13,22 @@
 use crate::codegen::context::CodegenContext;
 use crate::codegen::error::{CodegenError, CodegenResult};
 use crate::codegen::llvm::{
-    access_emission::AccessEmitter, loop_emission::LoopEmitter, parallel::ParallelEmitter,
-    polyhedral_opts::PolyhedralOptimizer, type_lowering::LlvmTypeLowering,
+    access_emission::AccessEmitter,
+    loop_emission::{LoopBounds as SequentialLoopBounds, LoopEmitter},
+    parallel::{LoopBounds as ParallelLoopBounds, ParallelEmitter},
+    polyhedral_opts::PolyhedralOptimizer,
+    type_lowering::LlvmTypeLowering,
     value_builder::LlvmValueBuilder,
 };
 use crate::ir::{
+    access_relation::AccessRelations,
     affine_domain::AffineDomain,
     affine_map::AffineMap,
-    pir_types::{AccessRelations, PirModule, PirStatement, QuantityMap},
+    pir_types::{PirModule, PirStatement, QuantityMap},
     schedule_tree::{ScheduleNode, ScheduleTree, StmtId},
 };
 use inkwell::basic_block::BasicBlock;
-use inkwell::values::{BasicValueEnum, FunctionValue, PointerValue};
+use inkwell::values::{AnyValue, BasicValueEnum, FunctionValue};
 use std::collections::HashMap;
 
 /// Main entry point for lowering a ScheduleTree to LLVM IR
@@ -38,8 +42,10 @@ pub fn lower_schedule_tree<'ctx>(
 ) -> CodegenResult<()> {
     let llvm_context = ctx.llvm_context();
     let builder = llvm_context.create_builder();
-    let mut type_lowering = LlvmTypeLowering::new(llvm_context);
-    let mut value_builder = LlvmValueBuilder::new(builder, type_lowering.clone());
+    // `LlvmValueLowering` is not `Clone` (it owns a named-struct cache), so the
+    // value builder takes sole ownership of it here.
+    let type_lowering = LlvmTypeLowering::new(llvm_context);
+    let mut value_builder = LlvmValueBuilder::new(builder, type_lowering);
 
     // Create entry block
     let entry = llvm_context.append_basic_block(function, "entry");
@@ -57,16 +63,24 @@ pub fn lower_schedule_tree<'ctx>(
     // Lower the root schedule node
     lowering.lower_node(&schedule.root)?;
 
-    // Build return
-    let void_type = lowering.value_builder.type_lowering().void_type();
-    value_builder
-        .builder()
-        .build_return(Some(&void_type.const_zero()))?;
+    // Build return. inkwell 0.10's `build_return` takes
+    // `Option<&dyn BasicValue>`; a void function returns `None`, while a typed
+    // function returns a zero value of its return type (`FunctionType` has no
+    // `Void` variant -- `None` *is* void).
+    let return_type = function.get_type().get_return_type();
+    let return_value = return_type.map(|ty| value_builder.build_zero(ty));
+    value_builder.build_return(return_value)?;
 
-    // Verify function
-    function
-        .verify(true)
-        .map_err(|e| CodegenError::VerificationError(e.to_string()))?;
+    // Verify function. inkwell 0.10's `verify` returns a `bool` rather than a
+    // `Result`, printing diagnostics to stderr when `print` is true; on failure
+    // surface the offending function body as the error message.
+    if !function.verify(true) {
+        return Err(CodegenError::VerificationError(format!(
+            "scheduled function `{}` failed LLVM verification:\n{}",
+            function.get_name().to_string_lossy(),
+            function.print_to_string()
+        )));
+    }
 
     Ok(())
 }
@@ -86,7 +100,7 @@ pub struct ScheduleLowering<'ctx, 'a> {
     /// Induction variable phi nodes
     induction_vars: HashMap<String, inkwell::values::PhiValue<'ctx>>,
     /// Loop metadata
-    loop_metadata: HashMap<String, inkwell::metadata::MetadataValue<'ctx>>,
+    loop_metadata: HashMap<String, inkwell::values::MetadataValue<'ctx>>,
 
     // Sub-emitters
     loop_emitter: LoopEmitter<'ctx>,
@@ -170,22 +184,69 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
         // Check if this band is parallelizable
         let is_parallel = coincident.iter().any(|&c| c);
 
+        // The emitters hand the child-lowering callback a *mock* lowering that
+        // only exposes the `LlvmValueBuilder` they positioned inside the loop
+        // body. To lower the real child we rebuild a `ScheduleLowering` over
+        // that builder; the immutable pieces (function, PIR module, quantities,
+        // access relations) are `Copy` handles into `self`, so no borrow of
+        // `self` is captured by the closure.
+        let function = self.function;
+        let pir_module = self.pir_module;
+        let quantities = self.quantities;
+        let access_relations = self.access_relations;
+
         // Emit the loop nest
         if is_parallel {
+            let par_bounds: Vec<ParallelLoopBounds<'ctx>> = bounds
+                .iter()
+                .map(|b| ParallelLoopBounds {
+                    iterator_dim: b.iterator_dim,
+                    lower: b.lower,
+                    upper: b.upper,
+                    step: b.step,
+                })
+                .collect();
             self.parallel_emitter.emit_parallel_band(
                 &mut self.value_builder,
-                &bounds,
+                &par_bounds,
                 members,
                 child,
-                |lowering| lowering.lower_node(child),
+                |lowering| {
+                    let mut inner = ScheduleLowering::new(
+                        lowering.value_builder(),
+                        function,
+                        pir_module,
+                        quantities,
+                        access_relations,
+                    )?;
+                    inner.lower_node(child)
+                },
             )?;
         } else {
+            let seq_bounds: Vec<SequentialLoopBounds<'ctx>> = bounds
+                .iter()
+                .map(|b| SequentialLoopBounds {
+                    iterator_dim: b.iterator_dim,
+                    lower: b.lower,
+                    upper: b.upper,
+                    step: b.step,
+                })
+                .collect();
             self.loop_emitter.emit_sequential_band(
                 &mut self.value_builder,
-                &bounds,
+                &seq_bounds,
                 members,
                 child,
-                |lowering| lowering.lower_node(child),
+                |lowering| {
+                    let mut inner = ScheduleLowering::new(
+                        lowering.value_builder(),
+                        function,
+                        pir_module,
+                        quantities,
+                        access_relations,
+                    )?;
+                    inner.lower_node(child)
+                },
             )?;
         }
 
@@ -193,16 +254,23 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
     }
 
     /// Check if a band is [0]-quantity (erased)
+    ///
+    /// KNOWN BUG (pre-existing, not fixed here): this is **not** scoped to the
+    /// band. `QuantityMap` is a flat `name -> Quantity` map with no link back to
+    /// statements or schedule-tree nodes, so a single `[0]`-quantity variable
+    /// *anywhere in the module* makes this return `true` for *every* band --
+    /// silently deleting all loops in the module. Correct behaviour requires
+    /// per-statement quantities (available as `PirStatement::quantity`) plus a
+    /// way to enumerate the statements covered by `members`; neither exists on
+    /// `AffineMap` today. Left as-is pending that IR support.
     fn is_band_erased(&self, _members: &[AffineMap]) -> bool {
-        // Check if any statement in this band's scope has [0] quantity
-        // For now, check if any statement in the module is erased
         self.quantities
             .values()
             .any(|q| matches!(q, crate::ast::Quantity::Zero))
     }
 
     /// Extract loop bounds from affine scheduling maps
-    fn extract_bounds(&self, members: &[AffineMap]) -> CodegenResult<Vec<LoopBounds>> {
+    fn extract_bounds(&mut self, members: &[AffineMap]) -> CodegenResult<Vec<LoopBounds<'ctx>>> {
         let mut bounds = Vec::new();
 
         for member in members {
@@ -227,18 +295,18 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
 
     /// Lower an affine expression to LLVM value
     fn lower_affine_expr(
-        &self,
+        &mut self,
         expr: &crate::ir::affine_domain::AffineExpr,
     ) -> CodegenResult<BasicValueEnum<'ctx>> {
-        // Simplified: just return the constant for now
-        // In reality, this would evaluate parameters and induction variables
+        // In a full implementation this would evaluate parameters and induction
+        // variables; `build_int_constant` returns the `IntValue` directly.
         let int_type = self
             .value_builder
             .type_lowering()
             .int_type(crate::codegen::abi::IntWidth::I64);
         Ok(self
             .value_builder
-            .build_int_constant(int_type, expr.constant as u64, "bound")?
+            .build_int_constant(int_type, expr.constant as u64, "bound")
             .into())
     }
 
@@ -297,7 +365,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
         // For now, combine all constraints with AND
         let mut predicate = bool_type.const_int(1, false);
 
-        for _constraint in &domain.constraints {
+        for constraint in &domain.constraints {
             let constraint_val = self.lower_constraint(constraint)?;
             predicate = self
                 .value_builder
@@ -380,9 +448,19 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
 
     /// Lower an extension node (tiling, unrolling)
     fn lower_extension(&mut self, sizes: &[usize], child: &ScheduleNode) -> CodegenResult<()> {
-        // Apply polyhedral optimization
+        // Apply polyhedral optimization. `apply_extension` takes a
+        // `&mut dyn FnMut(&ScheduleNode) -> CodegenResult<()>>` -- the callback it
+        // hands to the tiling pass is a *function*, not a schedule lowering, so
+        // it is invoked as `f(child)`.
+        //
+        // NOTE: `PolyhedralOptimizer::apply_tiling` is currently a placeholder
+        // that never invokes the callback, so relying on it alone would silently
+        // drop the entire extension subtree. We therefore lower the child
+        // ourselves as well; whoever implements real tiling must remove this
+        // direct lowering to avoid emitting the child twice.
         self.optimizer
-            .apply_extension(sizes, child, |lowering| lowering.lower_node(child))
+            .apply_extension(sizes, child, |lower_child| lower_child(child))?;
+        self.lower_node(child)
     }
 }
 
@@ -403,8 +481,8 @@ mod tests {
     use crate::ir::{
         affine_domain::AffineDomain,
         affine_map::{AffineMap, Matrix},
-        pir_types::{AccessRelations, PirModule, PirStatement, ScheduleTree, StmtId},
-        schedule_tree::ScheduleNode,
+        pir_types::{PirModule, PirStatement},
+        schedule_tree::{ScheduleNode, ScheduleTree, StmtId},
     };
     use std::collections::HashMap;
 

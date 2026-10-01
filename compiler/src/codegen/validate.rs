@@ -4,6 +4,10 @@ use crate::codegen::error::CodegenResult;
 use inkwell::context::Context as LlvmContext;
 #[cfg(feature = "llvm")]
 use inkwell::module::Module as LlvmModule;
+#[cfg(feature = "llvm")]
+use inkwell::types::{AnyTypeEnum, AsTypeRef, BasicMetadataTypeEnum};
+#[cfg(feature = "llvm")]
+use inkwell::values::{AnyValue, AsValueRef, CallSiteValue, InstructionOpcode, Operand};
 
 /// Bitcode validation and structural verification for generated LLVM IR
 #[cfg(feature = "llvm")]
@@ -159,7 +163,7 @@ impl<'ctx> BitcodeValidator<'ctx> {
         block: &inkwell::basic_block::BasicBlock<'ctx>,
         report: &mut ValidationReport,
     ) -> CodegenResult<()> {
-        for inst in block.get_instructions().iter() {
+        for inst in block.get_instructions() {
             // Verify instruction has valid operands
             for i in 0..inst.get_num_operands() {
                 if inst.get_operand(i).is_none() {
@@ -202,24 +206,31 @@ impl<'ctx> BitcodeValidator<'ctx> {
         let name = function.get_name().to_string_lossy().into_owned();
         let fn_type = function.get_type();
 
-        // Verify return type is valid
+        // Verify the function type is well formed.
+        //
+        // There is deliberately NO "function must have a return type" check. A void
+        // function is valid IR -- `llvm-as` accepts `define void @f() { ret void }` --
+        // and `FunctionType::get_return_type()` returns `None` to MEAN VOID, not to
+        // mean malformed. An earlier version of this check read `None` as "no return
+        // type" and reported an error for every void function, including the ones this
+        // compiler itself emits. A validator that cries wolf on correct IR is worse
+        // than no validator: it trains its callers to ignore it.
         let return_type = fn_type.get_return_type();
-        if return_type.is_none() && !fn_type.is_function_var_arg() {
-            report.errors.push(ValidationError {
-                check: format!("Function signature: {}", name),
-                message: "Function has no return type".to_string(),
-                severity: ValidationSeverity::Error,
-            });
-        } else {
-            report
-                .passed_checks
-                .push(format!("Function signature valid: {}", name));
-        }
+        report.passed_checks.push(format!(
+            "Function signature valid: {} (returns {})",
+            name,
+            return_type
+                .map(|t| format!("{:?}", t))
+                .unwrap_or_else(|| "void".to_string())
+        ));
 
         // Verify parameter types
         let param_types = fn_type.get_param_types();
         for (i, param_type) in param_types.iter().enumerate() {
-            if param_type.is_void_type() {
+            // `BasicMetadataTypeEnum` has no void variant, so inspect the underlying
+            // LLVM type directly to keep the "no void parameters" check meaningful.
+            let param_any_type = unsafe { AnyTypeEnum::new(param_type.as_type_ref()) };
+            if param_any_type.is_void_type() {
                 report.errors.push(ValidationError {
                     check: format!("Function param {}: {}", i, name),
                     message: "Parameter cannot be void type".to_string(),
@@ -237,7 +248,7 @@ impl<'ctx> BitcodeValidator<'ctx> {
         module: &LlvmModule<'ctx>,
         report: &mut ValidationReport,
     ) -> CodegenResult<()> {
-        for global in module.get_global_values() {
+        for global in module.get_globals() {
             let name = global.get_name().to_string_lossy().into_owned();
 
             // Check global has initializer or is declaration
@@ -251,7 +262,7 @@ impl<'ctx> BitcodeValidator<'ctx> {
             }
 
             // Verify global type
-            let global_type = global.get_type();
+            let global_type = global.get_value_type();
             if global_type.is_void_type() {
                 report.errors.push(ValidationError {
                     check: format!("Global type: {}", name),
@@ -272,51 +283,74 @@ impl<'ctx> BitcodeValidator<'ctx> {
         // Check for type mismatches in calls
         for function in module.get_functions() {
             for bb in function.get_basic_blocks().iter() {
-                for inst in bb.get_instructions().iter() {
-                    if inst.is_call() {
+                for inst in bb.get_instructions() {
+                    if inst.get_opcode() == InstructionOpcode::Call {
                         // Check call target matches function signature
-                        if let Some(called_val) = inst.get_called_value() {
-                            if let Some(called_fn) = called_val.try_as_function() {
-                                let fn_type = called_fn.get_type();
-                                let param_types = fn_type.get_param_types();
-                                let mut arg_types = Vec::new();
+                        // SAFETY: opcode was just checked to be `Call`, so the instruction
+                        // is a valid call site.
+                        let call_site = unsafe { CallSiteValue::new(inst.as_value_ref()) };
+                        if let Some(called_fn) = call_site.get_called_fn_value() {
+                            let fn_type = called_fn.get_type();
+                            let param_types = fn_type.get_param_types();
+                            let mut arg_types: Vec<BasicMetadataTypeEnum> = Vec::new();
 
-                                for i in 0..inst.get_num_operands() {
-                                    if let Some(operand) = inst.get_operand(i) {
-                                        if operand.get_type()
-                                            != inkwell::values::BasicValueEnum::Function(called_fn)
-                                        {
-                                            arg_types.push(operand.get_type());
-                                        }
+                            // The ARGUMENTS are operands `0..n`; the CALLEE is the LAST
+                            // operand.
+                            //
+                            // This was the reverse, which made the check compare `[ptr]`
+                            // (the callee's type) against the declared `[i32]` and report
+                            // a spurious "Call signature" error on every well-typed call.
+                            //
+                            // inkwell's own docs state the layout ("Function call has
+                            // two: i8 pointer %1 argument, and the free function itself"),
+                            // and this was measured on LLVM 17: for
+                            // `%r = call i32 @callee(i32 3)`, operand 0 is `i32` and
+                            // operand 1 is `ptr`.
+                            let num_operands = inst.get_num_operands();
+                            for i in 0..num_operands.saturating_sub(1) {
+                                if let Some(Operand::Value(value)) = inst.get_operand(i) {
+                                    arg_types.push(BasicMetadataTypeEnum::from(value.get_type()));
+                                }
+                            }
+
+                            if fn_type.is_var_arg() || param_types.len() == arg_types.len() {
+                                let mut r#match = true;
+                                for (p, a) in param_types.iter().zip(arg_types.iter()) {
+                                    if p != a {
+                                        r#match = false;
+                                        break;
                                     }
                                 }
-
-                                if param_types.len() == arg_types.len() {
-                                    let mut r#match = true;
-                                    for (p, a) in param_types.iter().zip(arg_types.iter()) {
-                                        if p != a {
-                                            r#match = false;
-                                            break;
-                                        }
-                                    }
-                                    if r#match {
-                                        report.passed_checks.push(format!(
-                                            "Call signature match: {}",
+                                if r#match {
+                                    report.passed_checks.push(format!(
+                                        "Call signature match: {}",
+                                        called_fn.get_name().to_string_lossy()
+                                    ));
+                                } else {
+                                    report.errors.push(ValidationError {
+                                        check: format!(
+                                            "Call signature: {}",
                                             called_fn.get_name().to_string_lossy()
-                                        ));
-                                    } else {
-                                        report.errors.push(ValidationError {
-                                            check: format!(
-                                                "Call signature: {}",
-                                                called_fn.get_name().to_string_lossy()
-                                            ),
-                                            message:
-                                                "Call argument types don't match function signature"
-                                                    .to_string(),
-                                            severity: ValidationSeverity::Error,
-                                        });
-                                    }
+                                        ),
+                                        message:
+                                            "Call argument types don't match function signature"
+                                                .to_string(),
+                                        severity: ValidationSeverity::Error,
+                                    });
                                 }
+                            } else {
+                                report.errors.push(ValidationError {
+                                    check: format!(
+                                        "Call arity: {}",
+                                        called_fn.get_name().to_string_lossy()
+                                    ),
+                                    message: format!(
+                                        "Call passes {} argument(s) but callee expects {}",
+                                        arg_types.len(),
+                                        param_types.len()
+                                    ),
+                                    severity: ValidationSeverity::Error,
+                                });
                             }
                         }
                     }
@@ -333,25 +367,18 @@ impl<'ctx> BitcodeValidator<'ctx> {
         report: &mut ValidationReport,
     ) -> CodegenResult<()> {
         // Verify debug info metadata if present
-        if let Some(debug_info) = module.get_named_metadata("llvm.dbg.cu") {
-            for i in 0..debug_info.get_num_operands() {
-                if let Some(op) = debug_info.get_operand(i) {
-                    report
-                        .passed_checks
-                        .push(format!("Debug metadata valid: {}", op.print_to_string()));
-                }
-            }
+        // `get_global_metadata` returns the operands of the named metadata node directly.
+        for op in module.get_global_metadata("llvm.dbg.cu") {
+            report
+                .passed_checks
+                .push(format!("Debug metadata valid: {}", op.print_to_string()));
         }
 
         // Verify module flags metadata
-        if let Some(flags) = module.get_named_metadata("llvm.module.flags") {
-            for i in 0..flags.get_num_operands() {
-                if let Some(op) = flags.get_operand(i) {
-                    report
-                        .passed_checks
-                        .push(format!("Module flag valid: {}", op.print_to_string()));
-                }
-            }
+        for op in module.get_global_metadata("llvm.module.flags") {
+            report
+                .passed_checks
+                .push(format!("Module flag valid: {}", op.print_to_string()));
         }
 
         Ok(())
@@ -793,7 +820,7 @@ mod tests {
     #[cfg(feature = "llvm")]
     #[test]
     fn test_bitcode_validator_creation() {
-        let context = Context::create();
+        let context = inkwell::context::Context::create();
         let validator = BitcodeValidator::new(&context);
         assert!(std::ptr::eq(validator.context, &context));
     }

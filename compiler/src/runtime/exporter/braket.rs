@@ -1,3 +1,4 @@
+use crate::ast::Quantity;
 /// Amazon Braket Hardware Backend Exporter
 ///
 /// Lowers QIR modules to Amazon Braket JSON AST structure for execution
@@ -5,10 +6,11 @@
 
 #[cfg(feature = "llvm")]
 use crate::codegen::qir::{QIRModule, QIROperation};
-use crate::ast::Quantity;
-use crate::runtime::exporter::{ExportResult, ExportMetadata, ExporterError, HardwareExporter, TargetBackend, DecompositionRule};
-use serde::{Serialize, Deserialize};
-use serde_json::{json, Value};
+use crate::runtime::exporter::{
+    DecompositionRule, ExportMetadata, ExportResult, ExporterError, HardwareExporter, TargetBackend,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 
 /// Braket IR (Intermediate Representation) types
@@ -79,19 +81,16 @@ pub enum BraketInstruction {
     #[serde(rename = "measurement")]
     Measurement {
         targets: Vec<usize>,
-        #[serde(rename = "type")]
+        /// Serde name must not collide with this enum's internal `type` tag;
+        /// the Braket schema field is `measurementType`.
         measurement_type: String,
     },
     /// Reset
     #[serde(rename = "reset")]
-    Reset {
-        target: usize,
-    },
+    Reset { target: usize },
     /// Barrier
     #[serde(rename = "barrier")]
-    Barrier {
-        targets: Vec<usize>,
-    },
+    Barrier { targets: Vec<usize> },
 }
 
 /// Braket result type
@@ -100,9 +99,7 @@ pub enum BraketInstruction {
 pub enum BraketResult {
     /// Sample measurement results
     #[serde(rename = "sample")]
-    Sample {
-        targets: Option<Vec<usize>>,
-    },
+    Sample { targets: Option<Vec<usize>> },
     /// Expectation value of observable
     #[serde(rename = "expectation")]
     Expectation {
@@ -111,14 +108,10 @@ pub enum BraketResult {
     },
     /// Probability of computational basis states
     #[serde(rename = "probability")]
-    Probability {
-        targets: Option<Vec<usize>>,
-    },
+    Probability { targets: Option<Vec<usize>> },
     /// Amplitude of specific states
     #[serde(rename = "amplitude")]
-    Amplitude {
-        states: Vec<String>,
-    },
+    Amplitude { states: Vec<String> },
     /// Variance of observable
     #[serde(rename = "variance")]
     Variance {
@@ -187,7 +180,11 @@ impl BraketExporter {
                     }
                 }
                 QIROperation::ReleaseQubit { index } => {
-                    let quantity = module.qubit_quantities.get(*index).cloned().unwrap_or(Quantity::Many);
+                    let quantity = module
+                        .qubit_quantities
+                        .get(*index)
+                        .cloned()
+                        .unwrap_or(Quantity::Many);
                     if quantity == Quantity::Zero {
                         // [0] qubit: emit reset
                         instructions.push(BraketInstruction::Reset { target: *index });
@@ -195,13 +192,19 @@ impl BraketExporter {
                         current_depth += 1;
                     } else if quantity == Quantity::One {
                         // [1] qubit: add barrier
-                        instructions.push(BraketInstruction::Barrier { targets: vec![*index] });
+                        instructions.push(BraketInstruction::Barrier {
+                            targets: vec![*index],
+                        });
                         *operation_counts.entry("barrier".to_string()).or_insert(0) += 1;
                         current_depth += 1;
                     }
                     gate_depth = gate_depth.max(current_depth);
                 }
-                QIROperation::Gate { name, qubits, params } => {
+                QIROperation::Gate {
+                    name,
+                    qubits,
+                    params,
+                } => {
                     let braket_gate = self.map_gate_name(name);
                     let instruction = self.format_gate(&braket_gate, qubits, params);
                     instructions.push(instruction);
@@ -259,12 +262,16 @@ impl BraketExporter {
                 instructions,
                 results,
             },
-            device_parameters: self.device_arn.as_ref().map(|arn| json!({ "deviceArn": arn })),
+            device_parameters: self
+                .device_arn
+                .as_ref()
+                .map(|arn| json!({ "deviceArn": arn })),
         };
 
         // Serialize to JSON
-        let output = serde_json::to_string_pretty(&braket_ir)
-            .map_err(|e| ExporterError::ExportFailed(format!("JSON serialization failed: {}", e)))?;
+        let output = serde_json::to_string_pretty(&braket_ir).map_err(|e| {
+            ExporterError::ExportFailed(format!("JSON serialization failed: {}", e))
+        })?;
 
         let mut metadata = ExportMetadata::default();
         metadata.qubit_count = module.qubit_count;
@@ -324,7 +331,11 @@ impl BraketExporter {
                 BraketInstruction::Gate {
                     gate_name: name.to_string(),
                     target: qubits[0],
-                    angle: if params.is_empty() { None } else { Some(params[0]) },
+                    angle: if params.is_empty() {
+                        None
+                    } else {
+                        Some(params[0])
+                    },
                     control: None,
                 }
             }
@@ -383,12 +394,30 @@ impl HardwareExporter for BraketExporter {
 
     fn supported_gates(&self) -> &'static [&'static str] {
         &[
-            "h", "x", "y", "z", "s", "si", "t", "ti",
-            "rx", "ry", "rz",
-            "cnot", "cy", "cz", "ccnot",
-            "swap", "iswap",
-            "cphaseshift", "crx", "cry", "crz",
-            "measure", "reset", "barrier",
+            "h",
+            "x",
+            "y",
+            "z",
+            "s",
+            "si",
+            "t",
+            "ti",
+            "rx",
+            "ry",
+            "rz",
+            "cnot",
+            "cy",
+            "cz",
+            "ccnot",
+            "swap",
+            "iswap",
+            "cphaseshift",
+            "crx",
+            "cry",
+            "crz",
+            "measure",
+            "reset",
+            "barrier",
         ]
     }
 
@@ -396,7 +425,12 @@ impl HardwareExporter for BraketExporter {
         vec![
             DecompositionRule {
                 source_gate: "ccx".to_string(),
-                target_gates: vec!["h".to_string(), "cnot".to_string(), "t".to_string(), "ti".to_string()],
+                target_gates: vec![
+                    "h".to_string(),
+                    "cnot".to_string(),
+                    "t".to_string(),
+                    "ti".to_string(),
+                ],
                 is_exact: true,
                 error_bound: None,
             },
@@ -438,8 +472,8 @@ impl HardwareExporter for BraketExporter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codegen::qir::{QIRModule, QIROperation};
     use crate::ast::Quantity;
+    use crate::codegen::qir::{QIRModule, QIROperation};
 
     #[test]
     fn test_braket_exporter_creation() {
@@ -465,8 +499,16 @@ mod tests {
             qubit_count: 2,
             qubit_quantities: vec![Quantity::Many, Quantity::Many],
             operations: vec![
-                QIROperation::Gate { name: "h".to_string(), qubits: vec![0], params: vec![] },
-                QIROperation::Gate { name: "cx".to_string(), qubits: vec![0, 1], params: vec![] },
+                QIROperation::Gate {
+                    name: "h".to_string(),
+                    qubits: vec![0],
+                    params: vec![],
+                },
+                QIROperation::Gate {
+                    name: "cx".to_string(),
+                    qubits: vec![0, 1],
+                    params: vec![],
+                },
                 QIROperation::Measure { qubit: 0, basis: 0 },
                 QIROperation::Measure { qubit: 1, basis: 0 },
             ],
@@ -475,7 +517,10 @@ mod tests {
         let result = exporter.export(&module).unwrap();
         let braket_ir: BraketIR = serde_json::from_str(&result.output).unwrap();
 
-        assert_eq!(braket_ir.braket_schema_header.name, "braket.ir.jaqcd.program");
+        assert_eq!(
+            braket_ir.braket_schema_header.name,
+            "braket.ir.jaqcd.program"
+        );
         assert_eq!(braket_ir.circuit.qubit_count, 2);
         assert_eq!(braket_ir.circuit.instructions.len(), 4); // h, cnot, measure, measure
         assert_eq!(result.metadata.qubit_count, 2);
@@ -490,8 +535,15 @@ mod tests {
             qubit_count: 1,
             qubit_quantities: vec![Quantity::Zero],
             operations: vec![
-                QIROperation::AllocateQubit { index: 0, quantity: Quantity::Zero },
-                QIROperation::Gate { name: "h".to_string(), qubits: vec![0], params: vec![] },
+                QIROperation::AllocateQubit {
+                    index: 0,
+                    quantity: Quantity::Zero,
+                },
+                QIROperation::Gate {
+                    name: "h".to_string(),
+                    qubits: vec![0],
+                    params: vec![],
+                },
                 QIROperation::ReleaseQubit { index: 0 },
             ],
         };
@@ -500,9 +552,11 @@ mod tests {
         let braket_ir: BraketIR = serde_json::from_str(&result.output).unwrap();
 
         // [0] qubit should have reset on release
-        let has_reset = braket_ir.circuit.instructions.iter().any(|i| {
-            matches!(i, BraketInstruction::Reset { .. })
-        });
+        let has_reset = braket_ir
+            .circuit
+            .instructions
+            .iter()
+            .any(|i| matches!(i, BraketInstruction::Reset { .. }));
         assert!(has_reset);
     }
 
@@ -513,8 +567,15 @@ mod tests {
             qubit_count: 1,
             qubit_quantities: vec![Quantity::One],
             operations: vec![
-                QIROperation::AllocateQubit { index: 0, quantity: Quantity::One },
-                QIROperation::Gate { name: "h".to_string(), qubits: vec![0], params: vec![] },
+                QIROperation::AllocateQubit {
+                    index: 0,
+                    quantity: Quantity::One,
+                },
+                QIROperation::Gate {
+                    name: "h".to_string(),
+                    qubits: vec![0],
+                    params: vec![],
+                },
                 QIROperation::ReleaseQubit { index: 0 },
             ],
         };
@@ -523,9 +584,11 @@ mod tests {
         let braket_ir: BraketIR = serde_json::from_str(&result.output).unwrap();
 
         // [1] qubit should have barrier on release
-        let has_barrier = braket_ir.circuit.instructions.iter().any(|i| {
-            matches!(i, BraketInstruction::Barrier { .. })
-        });
+        let has_barrier = braket_ir
+            .circuit
+            .instructions
+            .iter()
+            .any(|i| matches!(i, BraketInstruction::Barrier { .. }));
         assert!(has_barrier);
     }
 
@@ -544,9 +607,10 @@ mod tests {
         let braket_ir: BraketIR = serde_json::from_str(&result.output).unwrap();
 
         // X basis measurement should have H before measure
-        let has_h = braket_ir.circuit.instructions.iter().any(|i| {
-            matches!(i, BraketInstruction::Gate { gate_name, .. } if gate_name == "h")
-        });
+        let has_h =
+            braket_ir.circuit.instructions.iter().any(
+                |i| matches!(i, BraketInstruction::Gate { gate_name, .. } if gate_name == "h"),
+            );
         assert!(has_h);
     }
 
@@ -557,13 +621,21 @@ mod tests {
             qubit_count: 2,
             qubit_quantities: vec![Quantity::Many, Quantity::Many],
             operations: vec![
-                QIROperation::Gate { name: "h".to_string(), qubits: vec![0], params: vec![] },
-                QIROperation::Gate { name: "cx".to_string(), qubits: vec![0, 1], params: vec![] },
+                QIROperation::Gate {
+                    name: "h".to_string(),
+                    qubits: vec![0],
+                    params: vec![],
+                },
+                QIROperation::Gate {
+                    name: "cx".to_string(),
+                    qubits: vec![0, 1],
+                    params: vec![],
+                },
             ],
         };
 
         let result = exporter.export(&module).unwrap();
-        
+
         // Verify valid JSON
         let value: Value = serde_json::from_str(&result.output).unwrap();
         assert!(value.get("braketSchemaHeader").is_some());

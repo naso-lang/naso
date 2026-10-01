@@ -32,6 +32,12 @@ rand = { version = "0.8", features = ["std", "small_rng"] }
 walkdir = "2.5"
 web-sys = { version = "0.3", features = ["console"], optional = true }
 
+[dev-dependencies]
+# compiler/tests/codegen_property_tests.rs has used proptest since it was written, but it was
+# never declared here -- so the file never compiled, and nothing ran. Tests that do not build
+# are not tests.
+proptest = "1"
+
 [[bin]]
 name = "naso"
 path = "src/main.rs"

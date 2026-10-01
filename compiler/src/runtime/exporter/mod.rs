@@ -5,6 +5,11 @@ use crate::ast::Quantity;
 /// including OpenQASM 3.0, Amazon Braket, and other quantum hardware targets.
 
 #[cfg(feature = "llvm")]
+mod braket;
+#[cfg(feature = "llvm")]
+mod openqasm;
+
+#[cfg(feature = "llvm")]
 use crate::codegen::qir::QIRModule;
 use thiserror::Error;
 

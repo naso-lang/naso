@@ -4,7 +4,7 @@
 
 use crate::codegen::qir::module_builder::QIRModuleBuilder;
 use inkwell::AddressSpace;
-use inkwell::types::{BasicType, BasicTypeEnum, FunctionType, IntType, PointerType, VoidType};
+use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FunctionType, IntType};
 
 /// QIR Primitive Types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,25 +69,47 @@ pub enum QirIntrinsicParamType {
 }
 
 impl QirIntrinsic {
+    /// Get the LLVM function type for this intrinsic.
+    ///
+    /// `custom_width_int_type` returns a `Result` in inkwell 0.10 (LLVM rejects
+    /// widths outside 1..=8388608). The QIR intrinsic table is static data, so
+    /// an out-of-range width is a hard programming error and is reported as
+    /// such rather than being papered over with a default width.
+    fn int_type_of_width<'ctx>(builder: &QIRModuleBuilder<'ctx>, width: i32) -> IntType<'ctx> {
+        assert!(
+            width > 0,
+            "QIR intrinsic integer width must be positive, got {width}"
+        );
+        let bits = u32::try_from(width).expect("QIR intrinsic integer width must fit in u32");
+        let nz = std::num::NonZeroU32::new(bits).expect("width must be non-zero");
+        builder
+            .llvm_context()
+            .custom_width_int_type(nz)
+            .unwrap_or_else(|err| panic!("invalid QIR intrinsic integer width {width}: {err}"))
+    }
+
     /// Get the LLVM function type for this intrinsic
     pub fn function_type<'ctx>(&self, builder: &QIRModuleBuilder<'ctx>) -> FunctionType<'ctx> {
-        let ret: BasicTypeEnum<'ctx> = match self.ret_type {
-            QirIntrinsicRetType::Void => builder.llvm_context().void_type().into(),
-            QirIntrinsicRetType::Qubit => builder.qubit_type().into(),
-            QirIntrinsicRetType::Result => builder.result_type().into(),
-            QirIntrinsicRetType::Double => builder.llvm_context().f64_type().into(),
-            QirIntrinsicRetType::Int(w) => {
-                let nz = std::num::NonZeroU32::new(w as u32).expect("width must be non-zero");
-                builder.llvm_context().custom_width_int_type(nz).into()
-            }
-            QirIntrinsicRetType::Ptr => builder
-                .llvm_context()
-                .ptr_type(AddressSpace::from(0))
-                .into(),
-            QirIntrinsicRetType::QubitArray => builder
-                .llvm_context()
-                .ptr_type(AddressSpace::from(0))
-                .into(),
+        // A void return is `None` in inkwell 0.10: `BasicTypeEnum` has no Void
+        // variant and there is no `From<VoidType> for BasicTypeEnum`.
+        let ret: Option<BasicTypeEnum<'ctx>> = match self.ret_type {
+            QirIntrinsicRetType::Void => None,
+            QirIntrinsicRetType::Qubit => Some(builder.qubit_type().into()),
+            QirIntrinsicRetType::Result => Some(builder.result_type().into()),
+            QirIntrinsicRetType::Double => Some(builder.llvm_context().f64_type().into()),
+            QirIntrinsicRetType::Int(w) => Some(Self::int_type_of_width(builder, w).into()),
+            QirIntrinsicRetType::Ptr => Some(
+                builder
+                    .llvm_context()
+                    .ptr_type(AddressSpace::from(0))
+                    .into(),
+            ),
+            QirIntrinsicRetType::QubitArray => Some(
+                builder
+                    .llvm_context()
+                    .ptr_type(AddressSpace::from(0))
+                    .into(),
+            ),
         };
 
         let params: Vec<BasicTypeEnum<'ctx>> = self
@@ -97,10 +119,7 @@ impl QirIntrinsic {
                 QirIntrinsicParamType::Qubit => builder.qubit_type().into(),
                 QirIntrinsicParamType::Result => builder.result_type().into(),
                 QirIntrinsicParamType::Double => builder.llvm_context().f64_type().into(),
-                QirIntrinsicParamType::Int(w) => {
-                    let nz = std::num::NonZeroU32::new(*w as u32).expect("width must be non-zero");
-                    builder.llvm_context().custom_width_int_type(nz).into()
-                }
+                QirIntrinsicParamType::Int(w) => Self::int_type_of_width(builder, *w).into(),
                 QirIntrinsicParamType::Ptr => builder
                     .llvm_context()
                     .ptr_type(AddressSpace::from(0))
@@ -116,9 +135,15 @@ impl QirIntrinsic {
             })
             .collect();
 
-        let param_types: Vec<inkwell::types::BasicMetadataTypeEnum<'ctx>> =
+        let param_types: Vec<BasicMetadataTypeEnum<'ctx>> =
             params.iter().map(|p| (*p).into()).collect();
-        ret.fn_type(&param_types, self.is_var_args)
+        match ret {
+            Some(r) => r.fn_type(&param_types, self.is_var_args),
+            None => builder
+                .llvm_context()
+                .void_type()
+                .fn_type(&param_types, self.is_var_args),
+        }
     }
 }
 

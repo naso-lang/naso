@@ -20,9 +20,12 @@
 // using it at runtime is a type error, so it can never be a silent no-op.
 //
 // Still not implemented:
-//   1. Obligation discharge. naso-verify does not read proof blocks yet, so
-//      the assertions below are typechecked but never checked for truth. They
-//      are obligations, not results.
+//   1. Obligation discharge for floats. naso-verify DOES read proof blocks and
+//      discharges the obligations it can encode, but the SMT layer has no
+//      floating-point sort, so BOTH assertions here are reported
+//      NASO-OBL-002 "not discharged" at Warning severity. They are neither
+//      confirmed nor refuted. Encoding f32 as Real would silently prove a
+//      different, weaker claim, so the prover refuses instead.
 //   2. Symbolic extents (see N above).
 //
 // `forall` is a proposition in expression position and a loop in statement
@@ -31,11 +34,15 @@
 // linear value at all.
 //
 // The per-element precondition that makes the i8 cast sound is now *stated*,
-// above. It is still NOT *established*: nothing checks that it holds. So the
-// clamp remains load-bearing rather than decorative -- it is what keeps the
-// narrowing in range if the precondition is violated at runtime, and it is
-// also what makes the operation lossy. This kernel is typechecked but
-// unverified.
+// above, and the prover now reads proof blocks. But these particular
+// obligations are NOT established: they are floating-point, which the SMT
+// encoding cannot represent, so they come back as NASO-OBL-002 rather than as
+// proofs. So the clamp remains load-bearing rather than decorative -- it is
+// what keeps the narrowing in range if the precondition is violated at
+// runtime, and it is also what makes the operation lossy.
+//
+// Integer obligations of the same shape ARE discharged; see
+// crates/naso-verify/src/prover/obligations.rs.
 
 /// Quantize f32 -> i8 with a symmetric scale.
 ///

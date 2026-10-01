@@ -7,6 +7,7 @@
 pub mod cfg;
 #[cfg(feature = "z3")]
 pub mod linearity;
+pub mod obligations;
 #[cfg(feature = "z3")]
 pub mod uncomputation;
 
@@ -23,6 +24,8 @@ use naso_compiler::ast::Program;
 #[cfg(feature = "z3")]
 pub use linearity::prove_linearity;
 #[cfg(feature = "z3")]
+pub use obligations::prove_obligations;
+#[cfg(feature = "z3")]
 pub use uncomputation::prove_uncomputation;
 
 /// Main prover entry point: run all provers on an AST.
@@ -36,7 +39,17 @@ pub fn run_all_provers(program: &Program) -> Result<Vec<VerifyDiagnostic>, Verif
     // Run linearity prover
     diagnostics.extend(linearity::prove_linearity(program)?);
 
+    // Run the proof-obligation prover: actually check the `assert`s written in
+    // `proof { .. }` blocks.
+    diagnostics.extend(obligations::prove_obligations(program)?);
+
     Ok(diagnostics)
+}
+
+/// Run only the proof-obligation prover.
+#[cfg(feature = "z3")]
+pub fn run_obligation_prover(program: &Program) -> Result<Vec<VerifyDiagnostic>, VerifyError> {
+    obligations::prove_obligations(program)
 }
 
 /// Run only the uncomputation prover.

@@ -195,6 +195,32 @@ pub enum ParamKind {
     /// (`i * cols + j`) when the column count is known. Carrying the whole
     /// shape is what makes that a GEP instead of a refusal, and it is why a
     /// matrix kernel and a vector kernel share one ABI.
+    ///
+    /// # The shape is a CHECK, not just a stride
+    ///
+    /// The LLVM backend passes a tensor parameter as `(ptr, i64 len)` and compares
+    /// `len` against the product of `shape` before the body runs; see
+    /// [`crate::codegen::llvm::abi_guard`]. That is the only part of a `[1]`
+    /// resource's contract that survives at a raw-pointer ABI, and it is worth
+    /// being exact about the rest:
+    ///
+    /// - CONSUMED EXACTLY ONCE is a property of how many times the function BODY
+    ///   reads the name. The typechecker counts that statically and refuses a
+    ///   double use. It is not re-checked at run time, and at this boundary it
+    ///   could not be: a `ptr` does not know how many times it was read.
+    /// - NOT OUTLIVING ITS SCOPE cannot be checked at all. A raw pointer carries
+    ///   no lifetime, so nothing here can observe whether the caller's buffer is
+    ///   still alive, and nothing prevents the callee from retaining the pointer.
+    /// - LINEAR vs UNRESTRICTED (`inout` vs `[1]`) are the SAME `ptr` in this ABI
+    ///   and are deliberately not distinguished. They could only be distinguished
+    ///   with `noalias` / `readonly`, both of which would be false: a caller may
+    ///   legitimately pass the SAME buffer as the read-only input and the writable
+    ///   output (in-place elementwise scaling), and either attribute turns that
+    ///   correct program into undefined behaviour.
+    ///
+    /// So the guarantee this type carries is its EXTENT, enforced against the
+    /// caller's buffer at run time. The linearity is enforced by the typechecker
+    /// over the body, and stops at the call boundary.
     Tensor {
         elem: ElemType,
         shape: Option<Vec<u64>>,

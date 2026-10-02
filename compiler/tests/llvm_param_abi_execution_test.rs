@@ -20,6 +20,11 @@
 //! - `Tensor[T, N]` / `QRegister` -> `ptr` to `T`. The pointer IS the data: nothing
 //!   is allocated and nothing is zero-filled, because a callee-allocated tensor is
 //!   one the caller cannot supply.
+//! - `Tensor[T, N]` -> `ptr` PLUS an `i64` element count. A bare pointer carries no
+//!   length, so a declared extent the compiler knows could not be checked against
+//!   anything; the count makes the caller's obligation part of the ABI. The check
+//!   itself, and the exit codes it produces, are in
+//!   `llvm_abi_guard_execution_test.rs`.
 //! - scalar `f32` -> `double`, by value. The AST carries no float width (`f32` and
 //!   `f64` are the same `TypeKind::Float`), so `double` is the only representable
 //!   choice without inventing a width field.
@@ -95,8 +100,10 @@ impl Drop for CaseDir {
 /// in-range element can pass by luck while the rest of the array is wrong.
 fn driver_c(n: usize) -> String {
     format!(
-        r#"#include <stdio.h>
-extern void naso_entry(double *input, double *output, double scale, double lo, double hi);
+        r#"#include <stdint.h>
+#include <stdio.h>
+extern void naso_entry(double *input, int64_t input_len, double *output, int64_t output_len,
+                       double scale, double lo, double hi);
 
 // Values chosen so that clamp() is exercised on BOTH sides and in the middle:
 // below `lo`, strictly between, and above `hi`. A kernel that computed the product
@@ -107,7 +114,7 @@ static double out[{n}];
 int main(void) {{
     for (int i = 0; i < {n}; ++i) in[i] = (double)i - (double)({n} / 2);
     for (int i = 0; i < {n}; ++i) out[i] = -12345.0;   // poison, so an unwritten slot is visible
-    naso_entry(in, out, 3.0, -4.0, 10.0);
+    naso_entry(in, {n}, out, {n}, 3.0, -4.0, 10.0);
     for (int i = 0; i < {n}; ++i) {{
         if (i) putchar(' ');
         printf("%.17g", out[i]);
@@ -144,6 +151,13 @@ fn execute(ir: &str, n: usize) -> Vec<f64> {
     std::fs::write(&csrc, driver_c(n)).expect("write C driver");
     run(
         Command::new(tool("llc"))
+            // `-relocation-model=pic` is REQUIRED, not an optimisation. The ABI guard
+            // puts C string literals in the module (the violation messages), and LLVM's
+            // default STATIC relocation model refers to them by absolute address, which
+            // cannot be linked into the position-independent executable clang produces
+            // by default: `relocation R_X86_64_32 against '.rodata.str1.1' can not be
+            // used when making a PIE object`.
+            .arg("-relocation-model=pic")
             .arg("-filetype=obj")
             .arg(&ll)
             .arg("-o")
@@ -245,6 +259,49 @@ fn tensor_parameters_are_pointers_in_the_entry_signature() {
     assert!(
         !ir.contains("alloca double, align 8\n  store double 0.0"),
         "a tensor parameter must not become a zero-filled local buffer:\n{ir}"
+    );
+}
+
+/// A tensor parameter also carries the CALLER'S element count, and that count is what
+/// makes the declared extent checkable at all.
+///
+/// This is a signature assertion, not a behavioural one -- the behaviour is in
+/// `llvm_abi_guard_execution_test.rs`, which executes a short buffer and reads the
+/// process exit status. What is pinned here is that the obligation is VISIBLE in the
+/// ABI: a `ptr` with nothing beside it cannot be checked against the 64 elements
+/// `Tensor[f32, 64]` declares, and a backend that dropped the length argument would
+/// restore exactly the unguarded pointer this work removed while every other
+/// assertion in this file still passed.
+#[test]
+fn every_tensor_parameter_carries_the_callers_element_count() {
+    let ir = build_ir(SCALE_F32);
+    let sig = ir
+        .lines()
+        .find(|l| l.starts_with("define "))
+        .expect("module must define an entry function");
+    // `(ptr, i64 len)` immediately after each tensor's pointer, in declaration order.
+    assert!(
+        sig.contains("ptr %input, i64 %input_len"),
+        "`input` must be followed by its caller's element count, got: {sig}"
+    );
+    assert!(
+        sig.contains("ptr %output, i64 %output_len"),
+        "`output` must be followed by its caller's element count, got: {sig}"
+    );
+    // The scalars still come last, so the tensor pair did not reorder anything.
+    let idx = |needle: &str| {
+        sig.find(needle)
+            .unwrap_or_else(|| panic!("{needle} in {sig}"))
+    };
+    assert!(
+        idx("i64 %output_len") < idx("double %scale"),
+        "the length arguments belong with their tensors, before the scalars: {sig}"
+    );
+    // And the guard that consumes them is present in the body.
+    assert!(
+        ir.contains("icmp slt i64 %input_len, 64"),
+        "the entry block must compare the caller's count against the declared 64 \
+         elements, got:\n{ir}"
     );
 }
 
@@ -488,13 +545,14 @@ fn transpose2d(a: [1] Tensor[f32, 2, 3], b: inout [1] Tensor[f32, 3, 2]) {
     std::fs::write(
         &driver,
         r#"
+#include <stdint.h>
 #include <stdio.h>
-void naso_entry(double*, double*);
+void naso_entry(double*, int64_t, double*, int64_t);
 int main(void) {
   double a[6], b[6];
   for (int i = 0; i < 6; i++) a[i] = (double)(i + 1);
   for (int i = 0; i < 6; i++) b[i] = -1.0;
-  naso_entry(a, b);
+  naso_entry(a, 6, b, 6);
   for (int i = 0; i < 6; i++) printf("%g ", b[i]);
   printf("\n");
   return 0;

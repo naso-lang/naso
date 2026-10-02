@@ -3,6 +3,8 @@
 //! Provides LLVM IR generation via inkwell bindings.
 
 #[cfg(feature = "llvm")]
+pub mod abi_guard;
+#[cfg(feature = "llvm")]
 pub mod access_emission;
 #[cfg(feature = "llvm")]
 pub mod expr_lowering;

@@ -43,13 +43,38 @@ pub struct LLVMModuleBuilder<'ctx> {
     current_block: Option<BasicBlock<'ctx>>,
 }
 
-/// One slot of the entry function's signature.
+/// One DECLARED parameter's share of the entry function's signature.
+///
+/// A tensor occupies TWO LLVM arguments -- its pointer and its element count -- so
+/// this is not one slot but a small run of them. `arg_index` is where the run starts
+/// and `len_arg_index` is the second argument of a tensor's run. Keeping both on one
+/// struct is what stops the signature builder and the guard emitter from disagreeing
+/// about which argument is which: they read the same numbers from the same value
+/// rather than each re-deriving an index from a position in a list.
+///
+/// # Why a tensor carries its length
+///
+/// `Tensor[f32, 4]` declares four elements, and this backend knew that and then did
+/// nothing with it: a bare `ptr` cannot be checked against anything, because the
+/// caller supplies no length to check against. The fix is to make the caller's
+/// obligation part of the ABI rather than an assumption. See
+/// [`crate::codegen::llvm::abi_guard`] for the guard, the failure codes, and an exact
+/// statement of which QTT guarantees stop at this boundary.
 pub struct EntryParam<'ctx> {
     /// The name the body reads this value by.
     pub name: String,
-    /// The LLVM type of the slot. A tensor parameter's slot is `ptr`; a scalar's is
-    /// its own type.
+    /// The LLVM type of the FIRST argument of this parameter's run. A tensor's is
+    /// `ptr`; a scalar's is its own type.
     pub ty: BasicTypeEnum<'ctx>,
+    /// Index of this parameter's first LLVM argument.
+    pub arg_index: u32,
+    /// For a tensor with a known extent: index of the `i64` element count that
+    /// follows its pointer. `None` for every other kind.
+    ///
+    /// `None` for a scalar (its value carries its own extent) and unreachable for a
+    /// tensor with a symbolic extent, which `build_entry_signature` refuses before
+    /// this is ever read.
+    pub len_arg_index: Option<u32>,
     /// What the slot holds, for the binding step.
     ///
     /// A tensor's `elem` is the ELEMENT type, not `ptr`: it is what a `getelementptr`
@@ -65,21 +90,46 @@ pub struct EntryParam<'ctx> {
 /// binds arguments by INDEX into this same list, so both sides must compute it
 /// identically -- hence one function, exported, rather than two traversals.
 ///
-/// Each entry is `(name, slot type, kind)`. The slot type and the kind are computed
-/// together because a tensor's slot is a pointer while its kind carries the element
-/// type; deriving one from the other separately is how they drift apart.
+/// Each entry records the LLVM arguments its declared parameter occupies: ONE for a
+/// scalar, TWO for a tensor (pointer, then element count). The types are computed
+/// together with the kind because a tensor's slot is a pointer while its kind carries
+/// the element type; deriving one from the other separately is how they drift apart.
+///
+/// # The element-count argument
+///
+/// A tensor's second argument is the caller's obligation made explicit: the number of
+/// ELEMENTS the buffer holds, which [`crate::codegen::llvm::abi_guard`] compares
+/// against the product of the declared extents. Without it the declared extent is
+/// knowledge the compiler has and cannot use -- a `Tensor[f32, 4]` kernel handed a
+/// one-element buffer reads three elements past the end and says nothing.
+///
+/// The width is `i64` because that is what loop bounds are computed in throughout this
+/// backend. The guard's comparison is SIGNED (`icmp slt`) for a reason worth stating
+/// here, since this is where the argument's type is chosen: an unsigned `ult` against
+/// a declared count treats `i64 -1` as `u64::MAX`, the largest possible buffer, so a
+/// caller passing a negative length would sail past the check. Signed comparison
+/// catches that for free, because `-1 < 4`.
 pub fn build_entry_signature<'ctx>(
     type_lowering: &mut LlvmTypeLowering<'ctx>,
     pir_module: &PirModule,
 ) -> CodegenResult<Vec<EntryParam<'ctx>>> {
     let mut out: Vec<EntryParam<'ctx>> = Vec::new();
+    // Every argument index handed out so far. A tensor consumes two, so the next
+    // index cannot be `out.len()` -- which is exactly the bug a naive `enumerate`
+    // over `out` would introduce: binding the second tensor's pointer to the first
+    // tensor's element count, and reading a length where a buffer is expected.
+    let mut next_arg: u32 = 0;
     for param in &pir_module.function_params {
         let (ty, kind) = param_slot(type_lowering, param)?;
+        let takes_length = matches!(kind, ParamKind::Tensor { .. });
         out.push(EntryParam {
             name: param.name.clone(),
             ty,
+            arg_index: next_arg,
+            len_arg_index: takes_length.then_some(next_arg + 1),
             kind,
         });
+        next_arg += if takes_length { 2 } else { 1 };
     }
     // A symbolic constant the schedule names but no function declared. It is an i64
     // because loop bounds are computed in i64 throughout this backend, and it is a real
@@ -93,10 +143,56 @@ pub fn build_entry_signature<'ctx>(
         out.push(EntryParam {
             name,
             ty: i64_type.into(),
+            arg_index: next_arg,
+            len_arg_index: None,
             kind: ParamKind::Scalar(crate::ir::pir_types::ElemType::I64),
         });
+        next_arg += 1;
     }
     Ok(out)
+}
+
+/// Flatten [`build_entry_signature`]'s entries into the entry function's LLVM
+/// parameter types, in argument order.
+///
+/// A tensor contributes two types (`ptr`, then `i64`). This fills by the recorded
+/// `arg_index` rather than assuming a fixed stride, so the type list and the argument
+/// indices cannot come from two different assumptions about the same layout.
+pub fn entry_arg_types<'ctx>(
+    type_lowering: &LlvmTypeLowering<'ctx>,
+    abi: &[EntryParam<'ctx>],
+) -> CodegenResult<Vec<BasicTypeEnum<'ctx>>> {
+    let i64_type: BasicTypeEnum<'ctx> = type_lowering
+        .int_type(crate::codegen::abi::IntWidth::I64)
+        .into();
+    let total = abi
+        .iter()
+        .map(|e| e.arg_index + 1 + u32::from(e.len_arg_index.is_some()))
+        .max()
+        .unwrap_or(0);
+    let mut types: Vec<Option<BasicTypeEnum<'ctx>>> = vec![None; total as usize];
+    for entry in abi {
+        types[entry.arg_index as usize] = Some(entry.ty);
+        if let Some(len_index) = entry.len_arg_index {
+            types[len_index as usize] = Some(i64_type);
+        }
+    }
+    // A hole means two parameters claimed the same argument index, which is an
+    // internal inconsistency between the two functions that read this layout.
+    types
+        .into_iter()
+        .enumerate()
+        .map(|(i, t)| {
+            t.ok_or_else(|| {
+                CodegenError::InstructionError(format!(
+                    "entry argument {i} was claimed by no parameter. \
+                     `build_entry_signature` and `entry_arg_types` disagree about the \
+                     argument layout, so the generated function would have an unnamed \
+                     or untyped argument."
+                ))
+            })
+        })
+        .collect()
 }
 
 /// The LLVM slot type and binding kind for one declared parameter.
@@ -328,8 +424,16 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
             // A module with no symbolic bounds gets the previous `void()` signature,
             // so nothing about a constant-bounded program changes.
             // THE ABI. The entry function takes one real argument per parameter the
-            // SOURCE declared -- a tensor by pointer, a scalar by value -- and then one
-            // `i64` per symbolic constant the schedule names but no function declared.
+            // SOURCE declared -- a tensor by pointer PLUS the caller's element count,
+            // a scalar by value -- and then one `i64` per symbolic constant the
+            // schedule names but no function declared.
+            //
+            // A tensor's element count is a second argument rather than an implicit
+            // obligation because it is the only thing that makes the declared extent
+            // checkable: the compiler knows `Tensor[f32, 4]` is four elements, and
+            // without the caller stating how many it actually has, that knowledge
+            // cannot be turned into a check. `codegen::llvm::abi_guard` emits the
+            // comparison and fails loudly on a short or null buffer.
             //
             // The symbolic constants come second and only for names not already bound,
             // because `extract_parameters` only ever recorded `main`'s. That ordering is
@@ -338,15 +442,22 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
             // A borrow of `self.type_lowering` ends before `self.module` is used, so
             // the two disjoint fields can be held at once.
             let abi = build_entry_signature(&mut self.type_lowering, pir_module)?;
-            let param_types: Vec<inkwell::types::BasicTypeEnum<'ctx>> =
-                abi.iter().map(|e| e.ty).collect();
+            let param_types = entry_arg_types(&self.type_lowering, &abi)?;
             let fn_type = self.type_lowering.fn_type(None, &param_types, false); // `None` is void
             let function = self.module.add_function(ENTRY_NAME, fn_type, None);
             // Name the arguments in the IR so the printed module says where each value
-            // came from -- which argument is a caller's buffer and which is a trip count.
-            for (i, entry) in abi.iter().enumerate() {
-                if let Some(arg) = function.get_nth_param(i as u32) {
+            // came from -- which argument is a caller's buffer, which is its element
+            // count, and which is a trip count. Named by the recorded index rather than
+            // by position, because a tensor's count is the argument AFTER its pointer.
+            for entry in abi.iter() {
+                if let Some(arg) = function.get_nth_param(entry.arg_index) {
                     arg.set_name(&entry.name);
+                }
+                if let Some(arg) = entry
+                    .len_arg_index
+                    .and_then(|len_index| function.get_nth_param(len_index))
+                {
+                    arg.set_name(&format!("{}_len", entry.name));
                 }
             }
             self.set_current_function(function);

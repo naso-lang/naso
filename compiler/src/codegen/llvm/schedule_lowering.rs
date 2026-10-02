@@ -129,8 +129,8 @@ pub fn lower_schedule_tree_into<'ctx>(
     // value" model that makes `input[i]` ambiguous between a load of the pointer and a
     // load of the element.
     let abi = build_entry_signature(&mut LlvmTypeLowering::new(llvm_context), pir_module)?;
-    for (index, entry) in abi.iter().enumerate() {
-        let Some(arg) = function.get_nth_param(index as u32) else {
+    for entry in abi.iter() {
+        let Some(arg) = function.get_nth_param(entry.arg_index) else {
             // Fewer arguments than the ABI names. A hand-built module may legitimately
             // do this; a body that actually reads the missing name is refused by the
             // `Var` arm rather than given a substitute value.
@@ -185,6 +185,26 @@ pub fn lower_schedule_tree_into<'ctx>(
             }
         }
     }
+
+    // The ABI BOUNDARY CHECK, emitted after the arguments are bound and before any
+    // tensor element is loaded or stored.
+    //
+    // It sits here because this is the last point that is provably before every read:
+    // binding a tensor is a name lookup and binding a scalar is an alloca plus a store
+    // of the scalar's OWN value, so neither touches a caller's buffer. Everything the
+    // schedule lowering emits afterwards may.
+    //
+    // The builder is left positioned in the guard's last continuation block, which is
+    // open and unterminated, so `ScheduleLowering` appends the body into it. A module
+    // with no tensor parameter emits nothing here and the builder stays in `entry`, so
+    // a scalar-only kernel's block structure is unchanged.
+    crate::codegen::llvm::abi_guard::emit_abi_guard(
+        llvm_context,
+        module,
+        function,
+        value_builder.builder(),
+        &abi,
+    )?;
 
     // Create schedule lowering context
     let mut lowering = ScheduleLowering::new(

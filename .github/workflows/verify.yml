@@ -193,8 +193,19 @@ jobs:
           llc --version | head -2
           clang --version | head -1
 
+      # These are the files that shell out to `llc` and `clang`, so they are the ones
+      # that genuinely need the tools on PATH. `llvm_abi_guard_execution_test` is here
+      # because the ABI guard is only real if a short or null buffer actually fails the
+      # process, and `llvm_shipped_kernel_execution_test` because it compiles
+      # `kernels/scale_f32.naso` through the production path at its real extent.
       - name: Re-run the CPU execution tests with llc/clang on PATH
-        run: cargo test --features llvm --test llvm_execution_test --test llvm_forall_execution_test
+        run: |
+          cargo test --features llvm \
+            --test llvm_execution_test \
+            --test llvm_forall_execution_test \
+            --test llvm_abi_guard_execution_test \
+            --test llvm_param_abi_execution_test \
+            --test llvm_shipped_kernel_execution_test
 
       - name: Clippy with the llvm feature
         run: cargo clippy --features llvm --all-targets -- -D warnings

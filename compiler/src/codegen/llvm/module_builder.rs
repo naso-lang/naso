@@ -5,7 +5,9 @@
 use crate::ast::{Span, Type, TypeKind};
 use crate::codegen::context::CodegenContext;
 use crate::codegen::error::{CodegenError, CodegenResult};
-use crate::codegen::llvm::schedule_lowering::{lower_schedule_tree_into, statements_under};
+use crate::codegen::llvm::schedule_lowering::{
+    lower_schedule_tree_into, schedule_parameters, statements_under,
+};
 use crate::codegen::llvm::type_lowering::LlvmTypeLowering;
 use crate::codegen::llvm::value_builder::LlvmValueBuilder;
 use crate::ir::pir_types::PirModule;
@@ -167,8 +169,36 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
         // the verification. Nothing is emitted here, so there is exactly one return
         // and no block is terminated twice.
         if !pir_module.statements.is_empty() {
-            let fn_type = self.type_lowering.fn_type(None, &[], false); // `None` is void
+            // The entry function takes one `i64` argument per symbolic constant the
+            // SCHEDULE names -- see `schedule_parameters`. A `forall i in 0..n` is the
+            // motivating case: `n` is a runtime value, and there is nowhere else for it
+            // to come from. Inventing one (zero, a constant from the source text) would
+            // compile a program that iterates a different number of times than it was
+            // told to, so the signature carries the value instead.
+            //
+            // The width is i64 because loop bounds are computed in i64 throughout this
+            // backend, and `PirModule::parameters` carries names only -- a narrower
+            // source-level parameter type is not represented in PIR yet. Nothing is
+            // converted: the argument IS the i64 the bound arithmetic uses. That is a
+            // deliberate limitation, not a widening conversion.
+            //
+            // A module with no symbolic bounds gets the previous `void()` signature,
+            // so nothing about a constant-bounded program changes.
+            let param_names = schedule_parameters(&pir_module.schedule);
+            let i64_type = self
+                .type_lowering
+                .int_type(crate::codegen::abi::IntWidth::I64);
+            let param_types: Vec<inkwell::types::BasicTypeEnum<'ctx>> =
+                param_names.iter().map(|_| i64_type.into()).collect();
+            let fn_type = self.type_lowering.fn_type(None, &param_types, false); // `None` is void
             let function = self.module.add_function(ENTRY_NAME, fn_type, None);
+            // Name the arguments in the IR so the printed module says where each
+            // symbolic value came from.
+            for (i, name) in param_names.iter().enumerate() {
+                if let Some(arg) = function.get_nth_param(i as u32) {
+                    arg.set_name(name);
+                }
+            }
             self.set_current_function(function);
 
             // The value builder is the ONE scope for the whole function. It is the

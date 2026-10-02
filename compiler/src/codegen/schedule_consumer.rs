@@ -127,6 +127,7 @@ fn walk(node: &ScheduleNode, out: &mut Vec<BandSummary>) {
             members,
             coincident,
             child,
+            ..
         } => {
             let mut stmt_id = String::from("none");
             let mut leaf_domain = None;

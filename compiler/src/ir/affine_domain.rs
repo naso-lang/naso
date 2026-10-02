@@ -85,7 +85,28 @@ pub struct AffineDomain {
     pub n_param: usize,
     /// Affine constraints defining the domain
     pub constraints: Vec<AffineConstraint>,
-    /// Optional name for debugging
+    /// The NAMES of this domain's parameter dimensions, in dimension order.
+    ///
+    /// A domain with `n_param > 0` has constraints that mention dimensions
+    /// `n_iter..dims`, and without a name for each one nothing downstream can say
+    /// what those dimensions MEAN. Codegen needs the name to find the value: the
+    /// `-i + N >= 1` constraint for `forall i in 0..N` is only lowerable to a real
+    /// trip count if dimension 1 is known to be `N`.
+    ///
+    /// An empty list means "these parameter dimensions are unnamed". That is a real
+    /// state -- hand-built domains carry parameter dimensions with no names -- and a
+    /// backend that meets it must refuse rather than substitute a value.
+    ///
+    /// This is deliberately not a debug label: it is the index-to-name mapping that
+    /// makes a symbolic bound lowerable, and it is checked for length against
+    /// `n_param` by `validate_domain`.
+    pub parameter_names: Vec<String>,
+    /// A debug LABEL for this domain, shown by `pretty_print` and diagnostics.
+    ///
+    /// It carries no semantics. It used to double as the channel by which a loop's
+    /// iterator name reached codegen (as `nest(i)`, recovered by
+    /// `AffineDomain::nest_iterator`), which coupled a format string to program
+    /// meaning. That is now `ScheduleNode::Band::iterators`, a real field.
     pub name: Option<String>,
 }
 
@@ -97,6 +118,7 @@ impl AffineDomain {
             n_iter,
             n_param,
             constraints: Vec::new(),
+            parameter_names: Vec::new(),
             name: None,
         }
     }
@@ -112,37 +134,32 @@ impl AffineDomain {
             n_iter,
             n_param,
             constraints,
+            parameter_names: Vec::new(),
             name: None,
         }
+    }
+
+    /// Name this domain's parameter dimensions, in dimension order.
+    ///
+    /// `names` may be empty (the parameter dimensions stay unnamed) or at most
+    /// `n_param` long. A shorter list names the FIRST few parameter dimensions and
+    /// leaves the rest unnamed, which is the honest reading: an unnamed trailing
+    /// dimension is not a dimension whose value may be guessed.
+    pub fn with_parameter_names(mut self, names: Vec<String>) -> Self {
+        assert!(
+            names.len() <= self.n_param,
+            "a domain with {} parameter dimensions cannot name {} of them",
+            self.n_param,
+            names.len()
+        );
+        self.parameter_names = names;
+        self
     }
 
     /// Create a named domain
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
-    }
-
-    /// The source-level iterator a `nest(...)` domain was built for, if any.
-    ///
-    /// `lowering::loop_extraction::domain_from_nest` names the domain it derives
-    /// from a `forall i in lo..hi` as `nest(i)`. That name is currently the ONLY
-    /// channel by which the iterator's spelling reaches the backend: neither
-    /// `AffineDomain` nor `AffineMap` nor `ScheduleNode::Band` carries an
-    /// iterator name as data. Without it the loop emitter can emit a correct loop
-    /// with a correct induction variable and still have no way to bind the name
-    /// the loop BODY refers to, so `i` read as an unbound name.
-    ///
-    /// This accessor is deliberately strict: it returns `None` for any name that
-    /// is not exactly `nest(<non-empty>)`, so a domain with no name, a `None`
-    /// name, or a debug name of some other shape is reported as "no iterator
-    /// name" rather than guessed at.
-    pub fn nest_iterator(&self) -> Option<&str> {
-        let inner = self
-            .name
-            .as_deref()?
-            .strip_prefix("nest(")?
-            .strip_suffix(')')?;
-        if inner.is_empty() { None } else { Some(inner) }
     }
 
     /// Add a constraint to the domain
@@ -168,6 +185,10 @@ impl AffineDomain {
             n_iter: self.n_iter,
             n_param: self.n_param,
             constraints,
+            // The parameter dimensions are inherited unchanged, so their names
+            // are too. Dropping them here would leave a domain that constrains
+            // dimensions nobody can name.
+            parameter_names: self.parameter_names.clone(),
             name: None,
         }
     }
@@ -235,11 +256,22 @@ impl AffineDomain {
             })
             .collect();
 
+        // The kept parameter dimensions keep their names, in their new order. A
+        // projected-away parameter's name is dropped with it, so the list can end
+        // up shorter than `new_n_param`; the remaining dimensions are then unnamed,
+        // which is what they are.
+        let parameter_names: Vec<String> = (self.n_iter..self.dims)
+            .filter(|&i| keep[i])
+            .enumerate()
+            .filter_map(|(p, _)| self.parameter_names.get(p).cloned())
+            .collect();
+
         Self {
             dims: new_dims,
             n_iter: new_n_iter,
             n_param: new_n_param,
             constraints,
+            parameter_names,
             name: None,
         }
     }
@@ -326,7 +358,26 @@ impl AffineDomain {
     }
 
     /// Get iterator bounds for a specific dimension (if bounded)
-    /// Returns (lower_bound, upper_bound) as affine expressions in parameters
+    ///
+    /// Returns `(lower_bound, upper_bound)` as affine expressions in this domain's
+    /// PARAMETERS. A constraint that mentions only `iter_dim` and parameter
+    /// dimensions yields a bound that depends on those parameters; one that mentions
+    /// another iterator does not bound this dimension on its own and is ignored.
+    ///
+    /// The returned expressions' `coefficients` are indexed by the domain's
+    /// PARAMETER index (`0` is `parameter_names[0]`), NOT by the domain dimension.
+    /// That is the only indexing under which an expression makes sense: a loop bound
+    /// cannot depend on the induction variable it bounds, so the iterator dimensions
+    /// are already resolved out. `evaluate` on such an expression therefore takes the
+    /// parameter values as its point.
+    ///
+    /// # Divisibility
+    ///
+    /// A bound is only produced when the dividing coefficient divides the constant
+    /// and every parameter coefficient EXACTLY. Truncating division would floor a
+    /// bound -- `3i >= 8` would become `i >= 2` instead of admitting the domain is
+    /// not a simple range -- and a wrong bound is a wrong trip count, so the
+    /// constraint is skipped instead and the caller ends up with no bound to lower.
     pub fn iterator_bounds(&self, iter_dim: usize) -> Option<(AffineExpr, AffineExpr)> {
         if iter_dim >= self.n_iter {
             return None;
@@ -336,35 +387,72 @@ impl AffineDomain {
         let mut upper = None;
 
         for c in &self.constraints {
-            // Look for constraints of form: x_i >= expr or -x_i >= -expr
-            if c.coefficients[iter_dim] != 0
-                && c.coefficients
+            if c.ctype != ConstraintType::Inequality {
+                continue;
+            }
+            // Constraint must involve this iterator and no OTHER iterator. A
+            // constraint coupling two iterators says nothing about either one alone.
+            if c.coefficients[iter_dim] == 0
+                || c.coefficients
                     .iter()
                     .enumerate()
-                    .all(|(i, &coeff)| i == iter_dim || coeff == 0)
+                    .any(|(i, &coeff)| i < self.n_iter && i != iter_dim && coeff != 0)
             {
-                // Constraint only involves this iterator (and maybe constant)
-                let coeff = c.coefficients[iter_dim];
-                if coeff > 0 && c.ctype == ConstraintType::Inequality {
-                    // x_i >= constant
-                    lower = Some(AffineExpr::constant(c.constant / coeff));
-                } else if coeff < 0 && c.ctype == ConstraintType::Inequality {
-                    // `coeff * x_i >= C` with `coeff < 0` means `x_i <= C / coeff`.
-                    //
-                    // The division by a negative coefficient is what flips the direction;
-                    // negating `C` as well inverted the bound a second time. For
-                    // `-i >= -3` (i.e. `i <= 3`) this returned `-3 / -1 = -3` -- an UPPER
-                    // bound of -3 -- so every generated loop had `iv < -3`, never
-                    // entered its body, and produced a silently wrong answer with no
-                    // diagnostic. The only test covering this compensated by writing the
-                    // constraint with a POSITIVE constant, which is why it passed.
-                    upper = Some(AffineExpr::constant(c.constant / coeff));
-                }
+                continue;
+            }
+            let coeff = c.coefficients[iter_dim];
+            // Skip a constraint whose division is not exact rather than aborting: the
+            // point is that this constraint does not yield a usable bound. If that
+            // leaves `lower` or `upper` unset, `lower.zip(upper)` below yields `None`
+            // and the caller refuses the band rather than inventing a trip count.
+            let Some(expr) = exact_bound(c, self.n_iter, coeff) else {
+                continue;
+            };
+            if coeff > 0 {
+                lower = Some(expr);
+            } else {
+                upper = Some(expr);
             }
         }
 
         lower.zip(upper)
     }
+}
+
+/// Solve `coeff * x + sum_j b_j p_j >= C` for `x` as an affine expression in the
+/// parameters, or `None` when the division is not exact.
+///
+/// The caller guarantees `coeff != 0` and that the constraint mentions no iterator
+/// other than the one being solved for.
+fn exact_bound(c: &AffineConstraint, n_iter: usize, coeff: i64) -> Option<AffineExpr> {
+    debug_assert_ne!(coeff, 0);
+    // `a*x >= K`  ==>  `x >= K/a` for a > 0, and `x <= K/a` for a < 0. Both
+    // directions are the same division; only the side of the inequality differs,
+    // which the caller reads off the sign of `coeff`. The division by a negative
+    // coefficient is what flips the direction, and negating `C` as well would flip
+    // it a second time.
+    let mut expr = AffineExpr {
+        coefficients: Vec::new(),
+        constant: c.constant,
+    };
+    for (p, &b) in c.coefficients[n_iter..].iter().enumerate() {
+        let q = -b;
+        if q % coeff != 0 {
+            // Not exact: refuse rather than truncate.
+            return None;
+        }
+        // Keep the slot so the vector is indexed by parameter position even when
+        // this parameter's coefficient happens to be zero.
+        while expr.coefficients.len() <= p {
+            expr.coefficients.push(0);
+        }
+        expr.coefficients[p] = q / coeff;
+    }
+    if c.constant % coeff != 0 {
+        return None;
+    }
+    expr.constant = c.constant / coeff;
+    Some(expr)
 }
 
 /// Affine expression: sum(a_i * x_i) + c

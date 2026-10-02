@@ -409,15 +409,28 @@ impl LoweringContext {
         nest: self::loop_extraction::LoopNest,
         expr: &crate::ast::Expr,
     ) -> Result<(), LoweringError> {
-        // The band carries the domain, so this is the single source of truth
-        // for the loop's extent.
-        let bands = self::loop_extraction::loop_nest_to_bands(&nest, self)?;
-        let (members, coincident) = match bands.first() {
+        // The band's `coincident` flags are a dependence claim about the accesses
+        // this loop body performs, so the access relations are handed in. The
+        // front end records none for a `forall` body yet, which makes every level
+        // sequential -- see `loop_extraction::level_is_parallel` -- and that is the
+        // correct answer for "nothing was examined", not a fallback.
+        //
+        // The context is borrowed mutably by `loop_nest_to_bands` and the access
+        // relations immutably, which are disjoint fields of `self`; going through
+        // `std::mem::take` on the (currently empty) access set avoids the aliasing
+        // and hands over an owned value, which is also the honest shape for a
+        // function that only reads it.
+        let accesses = std::mem::take(&mut self.accesses);
+        let bands = self::loop_extraction::loop_nest_to_bands(&nest, &accesses, self);
+        self.accesses = accesses;
+        let bands = bands?;
+        let (members, coincident, iterators) = match bands.first() {
             Some(ScheduleNode::Band {
                 members,
                 coincident,
+                iterators,
                 ..
-            }) => (members.clone(), coincident.clone()),
+            }) => (members.clone(), coincident.clone(), iterators.clone()),
             _ => {
                 return Err(LoweringError::Unsupported(
                     "loop nest produced no band".to_string(),
@@ -488,6 +501,7 @@ impl LoweringContext {
         self.schedule_nodes.push(ScheduleNode::Band {
             members,
             coincident,
+            iterators,
             child: Box::new(leaf),
         });
         Ok(())

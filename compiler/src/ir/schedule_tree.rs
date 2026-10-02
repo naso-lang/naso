@@ -29,7 +29,30 @@ pub enum ScheduleNode {
         /// Scheduling dimensions (one per loop level in the band)
         members: Vec<AffineMap>,
         /// Coincident flags: true if iterations can be executed in parallel
+        ///
+        /// This is a DEPENDENCE claim, not a statement about shape. `true` on a level
+        /// means the accesses covered by this band were found to carry no dependence
+        /// that is serialised by that level. A level whose accesses were not examined,
+        /// or were examined and found to conflict, is `false`.
         coincident: Vec<bool>,
+        /// The SOURCE SPELLING of each level's induction variable, outermost first.
+        ///
+        /// One entry per level, the same shape and length as `members` and `coincident`.
+        /// The loop body refers to its iterator by that name (`forall i in .. { i }`), so
+        /// a backend that emits a real induction variable still has to bind this name to
+        /// it or the body reads an unbound name.
+        ///
+        /// An EMPTY string means "this level's iterator is not declared". That is a real
+        /// state, not a placeholder: a hand-built band with no source iterator emits a
+        /// correct loop whose induction variable is simply not reachable by name, and a
+        /// body that reads the name is then a diagnostic rather than a wrong value. An
+        /// empty string never falls back to a neighbouring level's name.
+        ///
+        /// This field used to be smuggled through `AffineDomain::name` as
+        /// `nest(i)` and recovered by string-parsing, which meant the debug label and the
+        /// semantics were one field and a typo in a format string silently unbound every
+        /// body.
+        iterators: Vec<String>,
         /// Child node
         child: Box<ScheduleNode>,
     },
@@ -61,14 +84,50 @@ pub enum ScheduleNode {
 }
 
 impl ScheduleNode {
-    /// Create a band node
+    /// Create a band node with no declared iterators.
+    ///
+    /// Every level gets an EMPTY iterator name, meaning "this band does not say what its
+    /// induction variables are called". A backend may still emit a real loop; a body that
+    /// reads the iterator is then unbound, which is a diagnostic rather than a silently
+    /// wrong value. Callers that DO know the source spelling use
+    /// [`ScheduleNode::band_with_iterators`].
     pub fn band(members: Vec<AffineMap>, coincident: Vec<bool>, child: ScheduleNode) -> Self {
+        let iterators = vec![String::new(); members.len()];
+        Self::band_with_iterators(members, coincident, iterators, child)
+    }
+
+    /// Create a band node whose levels have known iterator names.
+    ///
+    /// `iterators` must be the same length as `members` and `coincident`: one entry per
+    /// loop level, outermost first. An empty string is allowed and means "not declared".
+    pub fn band_with_iterators(
+        members: Vec<AffineMap>,
+        coincident: Vec<bool>,
+        iterators: Vec<String>,
+        child: ScheduleNode,
+    ) -> Self {
         assert_eq!(members.len(), coincident.len());
+        assert_eq!(members.len(), iterators.len());
         ScheduleNode::Band {
             members,
             coincident,
+            iterators,
             child: Box::new(child),
         }
+    }
+
+    /// The declared iterator name for `level`, or `None` when it is not declared.
+    ///
+    /// An empty name is reported as absent rather than returned as `Some("")`, so a
+    /// caller can never bind a variable to the empty string.
+    pub fn iterator_at(&self, level: usize) -> Option<&str> {
+        let ScheduleNode::Band { iterators, .. } = self else {
+            return None;
+        };
+        iterators
+            .get(level)
+            .map(String::as_str)
+            .filter(|s| !s.is_empty())
     }
 
     /// Create a filter node
@@ -173,6 +232,7 @@ impl ScheduleNode {
             ScheduleNode::Band {
                 members,
                 coincident,
+                iterators,
                 child,
             } => {
                 if members.is_empty() {
@@ -180,6 +240,12 @@ impl ScheduleNode {
                 }
                 if members.len() != coincident.len() {
                     return Err(ScheduleValidationError::CoincidentLengthMismatch);
+                }
+                // The same length rule for the iterator names. A mismatch here would mean
+                // the band binds level `d`'s induction variable under a name that belongs
+                // to a different level, so it is rejected rather than tolerated.
+                if members.len() != iterators.len() {
+                    return Err(ScheduleValidationError::IteratorLengthMismatch);
                 }
                 // Check all members have same input dimension
                 let input_dims = members[0].pieces[0].domain.dims;
@@ -229,16 +295,23 @@ impl ScheduleNode {
             ScheduleNode::Band {
                 members,
                 coincident,
+                iterators,
                 child,
             } => {
                 let mut s = format!("{}Band ({} dims):\n", prefix, members.len());
                 for (i, (m, c)) in members.iter().zip(coincident.iter()).enumerate() {
                     s += &format!(
-                        "{}  [{}] {} {}\n",
+                        "{}  [{}] {} {}{}\n",
                         prefix,
                         i,
                         if *c { "coincident" } else { "sequential" },
-                        m
+                        m,
+                        // An empty iterator name is shown as such rather than omitted, so
+                        // a reader can tell "no iterator declared" from "name not printed".
+                        match iterators.get(i).map(String::as_str) {
+                            Some(name) if !name.is_empty() => format!("  iterator {name}"),
+                            _ => "  iterator <undeclared>".to_string(),
+                        }
                     );
                 }
                 s += &child.pretty_print(indent + 1);
@@ -327,6 +400,7 @@ impl ScheduleTree {
 pub enum ScheduleValidationError {
     EmptyBand,
     CoincidentLengthMismatch,
+    IteratorLengthMismatch,
     BandDimensionMismatch,
     EmptyFilterDomain,
     EmptySequence,
@@ -341,6 +415,12 @@ impl fmt::Display for ScheduleValidationError {
             ScheduleValidationError::EmptyBand => write!(f, "Band node has no members"),
             ScheduleValidationError::CoincidentLengthMismatch => {
                 write!(f, "Coincident flags length doesn't match band members")
+            }
+            ScheduleValidationError::IteratorLengthMismatch => {
+                write!(
+                    f,
+                    "Iterator names length doesn't match band members, so a level's induction variable would be bound under another level's name"
+                )
             }
             ScheduleValidationError::BandDimensionMismatch => {
                 write!(f, "Band members have different input dimensions")

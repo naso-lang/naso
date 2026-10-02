@@ -209,6 +209,11 @@ fn build_loop_ir() -> String {
         ScheduleNode::Band {
             members: vec![map],
             coincident: vec![false],
+            // This hand-built band declares no iterator, and the statement body
+            // never reads one. Leaving the name empty is the honest encoding of
+            // that: the loop is real, its induction variable simply has no source
+            // spelling to bind.
+            iterators: vec![String::new()],
             child: Box::new(ScheduleNode::domain(
                 StmtId(0),
                 AffineDomain::universe(1, 0),

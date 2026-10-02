@@ -124,6 +124,29 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
         self.variables.remove(name);
     }
 
+    /// Bind a function argument to `name`, so the body can read it by name.
+    ///
+    /// The argument is stored into an alloca rather than left as a bare SSA value
+    /// because every other binding in this scope is an allocation: `PirExpr::Var`
+    /// resolves through `variables` and loads, and loop bounds are lowered as
+    /// `sum c_j * P_j` loads of exactly these slots. An argument that stayed an SSA
+    /// value would need a second, parallel name-resolution path.
+    ///
+    /// The pointee type is recorded in `ptr_pointee_types` as well as in
+    /// `variables`, for the same reason `build_load` requires it: LLVM 17 opaque
+    /// pointers do not carry it.
+    ///
+    /// The argument's own type is used, not an assumed `i64`. A function whose
+    /// parameter is not an integer cannot be a loop bound, and giving it an integer
+    /// type here would be inventing a conversion.
+    pub fn bind_argument(&mut self, name: &str, arg: BasicValueEnum<'ctx>) -> CodegenResult<()> {
+        let ty = arg.get_type();
+        let alloca = self.build_alloca(ty, name)?;
+        self.build_store(alloca, arg)?;
+        self.add_variable(name.to_string(), alloca, ty);
+        Ok(())
+    }
+
     /// Drop every binding. Called when a function body finishes.
     pub fn clear_variables(&mut self) {
         self.variables.clear();

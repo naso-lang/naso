@@ -248,6 +248,10 @@ fn parse_domain(name: &str, lines: &[String]) -> Result<AffineDomain, String> {
         n_iter,
         n_param,
         constraints,
+        // The `.pir` text format has no syntax for parameter names, so a fixture's
+        // parameter dimensions are unnamed. That is a real state, not a default:
+        // nothing downstream may substitute a value for an unnamed parameter.
+        parameter_names: Vec::new(),
         name: Some(name.to_string()),
     })
 }

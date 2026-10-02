@@ -116,16 +116,11 @@ impl<'ctx> ParallelEmitter<'ctx> {
         let int_type = value_builder
             .type_lowering()
             .int_type(crate::codegen::abi::IntWidth::I64);
-        let lower_const = bounds
-            .lower
-            .into_int_value()
-            .get_zero_extended_constant()
-            .ok_or_else(|| {
-                CodegenError::InstructionError(
-                    "parallel loop lower bound is not an integer constant".to_string(),
-                )
-            })?;
-        let init_val = value_builder.build_int_constant(int_type, lower_const, "iv_init");
+        // The lower bound is the initial value directly; it is not required to be a
+        // constant, so a symbolic lower bound reaches here as a real `i64` value of
+        // the same type the phi and the compare use. See the matching note in
+        // `loop_emission::LoopEmitter::emit_single_loop`.
+        let init_val = bounds.lower.into_int_value();
         let iv_alloca = value_builder.build_alloca(int_type.into(), "iv")?;
         value_builder.build_store(iv_alloca, init_val.into())?;
         value_builder.build_unconditional_branch(header)?;

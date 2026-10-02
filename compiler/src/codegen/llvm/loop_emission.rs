@@ -125,16 +125,14 @@ impl<'ctx> LoopEmitter<'ctx> {
         let int_type = value_builder
             .type_lowering()
             .int_type(crate::codegen::abi::IntWidth::I64);
-        let lower_const = bounds
-            .lower
-            .into_int_value()
-            .get_zero_extended_constant()
-            .ok_or_else(|| {
-                CodegenError::InstructionError(
-                    "loop lower bound is not an integer constant".to_string(),
-                )
-            })?;
-        let init_val = value_builder.build_int_constant(int_type, lower_const, "iv_init");
+        // The lower bound is used as the induction variable's initial value directly.
+        //
+        // It used to be required to be a CONSTANT (`get_zero_extended_constant`), which
+        // meant a symbolic lower bound (`forall i in n..m`) had nowhere to go even
+        // though the value was already a real `i64` computed from the parameter. The
+        // value is an `IntValue` of the same `i64` type the phi and the compare use, so
+        // passing it through is not a conversion.
+        let init_val = bounds.lower.into_int_value();
         let iv_alloca = value_builder.build_alloca(int_type.into(), "iv")?;
         value_builder.build_store(iv_alloca, init_val.into())?;
         value_builder.build_unconditional_branch(header)?;

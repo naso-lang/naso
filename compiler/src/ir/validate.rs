@@ -299,6 +299,18 @@ pub fn validate_domain(domain: &AffineDomain) -> Result<(), String> {
         }
     }
 
+    // More names than parameter dimensions is a contradiction: a name would exist
+    // for a dimension that does not, and every index-to-name lookup downstream would
+    // be off by the difference. A SHORTER list is legal and means the trailing
+    // parameter dimensions are unnamed.
+    if domain.parameter_names.len() > domain.n_param {
+        return Err(format!(
+            "Domain names {} parameter dimensions but declares only {}",
+            domain.parameter_names.len(),
+            domain.n_param
+        ));
+    }
+
     Ok(())
 }
 
@@ -362,6 +374,7 @@ pub fn validate_schedule_detailed(
             ScheduleNode::Band {
                 members,
                 coincident,
+                iterators,
                 child,
             } => {
                 *band_count += 1;
@@ -371,6 +384,12 @@ pub fn validate_schedule_detailed(
                 if members.len() != coincident.len() {
                     warnings.push(format!(
                         "Band at depth {}: coincident length mismatch",
+                        depth
+                    ));
+                }
+                if members.len() != iterators.len() {
+                    warnings.push(format!(
+                        "Band at depth {}: iterator-name length mismatch",
                         depth
                     ));
                 }
@@ -609,6 +628,7 @@ mod tests {
             n_iter: 2,
             n_param: 2, // Wrong: 2+2 != 3
             constraints: vec![],
+            parameter_names: vec![],
             name: None,
         };
         assert!(validate_domain(&bad_domain).is_err());

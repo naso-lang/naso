@@ -112,6 +112,22 @@ pub fn lower_schedule_tree_into<'ctx>(
     let entry = llvm_context.append_basic_block(function, "entry");
     value_builder.builder().position_at_end(entry);
 
+    // Bind the function's symbolic-constant arguments to their names BEFORE the
+    // schedule is lowered, because a symbolic loop bound reads them.
+    //
+    // `naso_entry`'s signature is built by `LLVMModuleBuilder::build_module` from
+    // `schedule_parameters(&pir_module.schedule)`, so argument `j` is exactly the
+    // name of the schedule's `j`-th symbolic constant. A function with FEWER
+    // arguments than names is accepted (a hand-built module may declare names it
+    // does not carry) but a bound that actually needs one is refused by
+    // `load_parameter_value` rather than being given a substitute value.
+    for (index, name) in schedule_parameters(&pir_module.schedule).iter().enumerate() {
+        let Some(arg) = function.get_nth_param(index as u32) else {
+            break;
+        };
+        value_builder.bind_argument(name, arg)?;
+    }
+
     // Create schedule lowering context
     let mut lowering = ScheduleLowering::new(
         value_builder,
@@ -156,6 +172,47 @@ pub fn statements_under(node: &ScheduleNode) -> Vec<StmtId> {
     let mut ids = Vec::new();
     collect_statements(node, &mut ids);
     ids
+}
+
+/// The symbolic constants the schedule's domains name, in a fixed order.
+///
+/// This is the entry function's parameter list. It is derived from the SCHEDULE
+/// rather than from `PirModule::parameters` because the schedule is what actually
+/// needs a value: a `forall i in 0..n` encodes `n` as a named dimension of its
+/// band's domain, and that domain is the only place the need is recorded.
+///
+/// Names come out in tree order, first appearance first occurrence, deduplicated.
+/// The order is the ABI: `lower_schedule_tree_into` binds argument `j` to element
+/// `j` of this list, so both sides must compute it the same way -- hence one
+/// function rather than two traversals.
+pub fn schedule_parameters(schedule: &ScheduleTree) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut domains = Vec::new();
+    collect_domains(&schedule.root, &mut domains);
+    for domain in domains {
+        for name in &domain.parameter_names {
+            if !name.is_empty() && !out.iter().any(|q| q == name) {
+                out.push(name.clone());
+            }
+        }
+    }
+    out
+}
+
+fn collect_domains(node: &ScheduleNode, out: &mut Vec<AffineDomain>) {
+    match node {
+        ScheduleNode::Domain { domain, .. } => out.push(domain.clone()),
+        ScheduleNode::Band { child, .. }
+        | ScheduleNode::Filter { child, .. }
+        | ScheduleNode::Context { child, .. }
+        | ScheduleNode::Extension { child, .. } => collect_domains(child, out),
+        ScheduleNode::Sequence { children } => {
+            for child in children {
+                collect_domains(child, out);
+            }
+        }
+        ScheduleNode::Empty => {}
+    }
 }
 
 fn collect_statements(node: &ScheduleNode, out: &mut Vec<StmtId>) {
@@ -248,8 +305,9 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
             ScheduleNode::Band {
                 members,
                 coincident,
+                iterators,
                 child,
-            } => self.lower_band(members, coincident, child),
+            } => self.lower_band(members, coincident, iterators, child),
             ScheduleNode::Filter { domain, child } => self.lower_filter(domain, child),
             ScheduleNode::Sequence { children } => self.lower_sequence(children),
             ScheduleNode::Context { domain, child } => self.lower_context(domain, child),
@@ -264,6 +322,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
         &mut self,
         members: &[AffineMap],
         coincident: &[bool],
+        iterators: &[String],
         child: &ScheduleNode,
     ) -> CodegenResult<()> {
         // Check if this band should be erased ([0] quantity)
@@ -273,7 +332,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
         }
 
         // Extract loop bounds from scheduling maps
-        let bounds = self.extract_bounds(members)?;
+        let bounds = self.extract_bounds(members, iterators)?;
 
         // A band whose domain pins no iterator to a constant range has NO bounds,
         // and `emit_sequential_band` emits one loop PER bound -- so with no bounds it
@@ -302,8 +361,21 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
             )));
         }
 
-        // Check if this band is parallelizable
-        let is_parallel = coincident.iter().any(|&c| c);
+        // Is the band parallel?
+        //
+        // `coincident` is a PER-LEVEL flag, and the parallel emitter here
+        // parallelises the WHOLE band: it attaches `llvm.loop.parallel_accesses` /
+        // `omp parallel for` to every loop it emits. So a band may only take the
+        // parallel path when EVERY level it would parallelise is genuinely parallel.
+        //
+        // This used to be `coincident.iter().any(|&c| c)`. That is wrong in the
+        // unsound direction: ONE true flag -- say the inner level of a 2-D band --
+        // parallelised the outer level too, which the dependence analysis never
+        // cleared. `.all()` is the conjunction the emitter's behaviour actually
+        // requires. A band with mixed flags falls to the sequential emitter, which
+        // is slower and correct; `coincident` mixing true and false is honest about
+        // the band and is not something this emitter can yet express.
+        let is_parallel = !coincident.is_empty() && coincident.iter().all(|&c| c);
 
         // The emitters hand the child-lowering callback a *mock* lowering that
         // only exposes the `LlvmValueBuilder` they positioned inside the loop
@@ -423,13 +495,26 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
     /// Extract loop bounds from affine scheduling maps
     //
     // This can return FEWER bounds than the band has dimensions, or none at all,
-    // when the band's domain does not pin an iterator to a constant range: a
-    // symbolic `forall i in 0..n` encodes only `i >= 0`, and
-    // `AffineDomain::iterator_bounds` requires BOTH a lower and an upper
-    // constraint to answer. `lower_band` treats an empty result as an error
-    // rather than emitting a body once, because emitting the body once is a
-    // silent wrong answer -- precisely the bug this schedule path exists to fix.
-    fn extract_bounds(&mut self, members: &[AffineMap]) -> CodegenResult<Vec<LoopBounds<'ctx>>> {
+    // when the band's domain does not pin an iterator to a range it can express:
+    // an unrepresentable bound such as `n + 1` encodes no constraint at all.
+    // `lower_band` treats an empty result as an error rather than emitting a body
+    // once, because emitting the body once is a silent wrong answer -- precisely the
+    // bug this schedule path exists to fix.
+    //
+    // A SYMBOLIC bound (`0..n`) is no longer in that category: the domain encodes
+    // it as `-i + n >= 1` over a named parameter dimension, so the bound comes back
+    // as an `AffineExpr` with a coefficient on `n` and `lower_affine_expr` turns it
+    // into a real LLVM value.
+    //
+    // `iterators` is the band's own `ScheduleNode::Band::iterators`: the source
+    // spelling of each level's induction variable, one entry per level, outermost
+    // first. It used to be recovered by parsing `AffineDomain::name` for a
+    // `nest(i)` prefix, which coupled a debug label to program meaning.
+    fn extract_bounds(
+        &mut self,
+        members: &[AffineMap],
+        iterators: &[String],
+    ) -> CodegenResult<Vec<LoopBounds<'ctx>>> {
         let mut bounds = Vec::new();
 
         // A band's `members` are its SCHEDULING maps -- one per loop level. Each
@@ -449,15 +534,20 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
             // full `n_iter` would repeat earlier levels once per member.
             for iter_dim in [level] {
                 if let Some((lower, upper)) = domain.iterator_bounds(iter_dim) {
+                    // The band's own iterator list is where the source spelling of
+                    // this level's induction variable lives. An empty or absent entry
+                    // means the band does not declare one, and the induction variable
+                    // is then left unbound -- a body that reads it is a diagnostic,
+                    // never a silent zero.
+                    let iterator_name = match iterators.get(level) {
+                        Some(name) if !name.is_empty() => Some(name.clone()),
+                        _ => None,
+                    };
                     bounds.push(LoopBounds {
                         iterator_dim: iter_dim,
-                        lower: self.lower_affine_expr(&lower)?,
-                        // The domain's own name is where the source spelling of the
-                        // iterator lives. It is read here and nowhere else, so the
-                        // binding decision is made once, next to the loop bound that
-                        // it describes.
-                        iterator_name: domain.nest_iterator().map(str::to_string),
-                        upper: self.lower_affine_expr(&upper)?,
+                        lower: self.lower_affine_expr(&domain.parameter_names, &lower)?,
+                        iterator_name,
+                        upper: self.lower_affine_expr(&domain.parameter_names, &upper)?,
                         step: 1, // Default step of 1
                     });
                 }
@@ -467,21 +557,108 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
         Ok(bounds)
     }
 
-    /// Lower an affine expression to LLVM value
+    /// Lower an affine expression in the domain's parameters to an LLVM value.
+    ///
+    /// `expr` is `sum_j expr.coefficients[j] * P_j + expr.constant`, where `P_j` is
+    /// the domain's parameter dimension `j` and `parameter_names[j]` is its name.
+    ///
+    /// # Where a parameter's value comes from
+    ///
+    /// From the generated function's own argument of that name, and nowhere else.
+    /// `LLVMModuleBuilder::build_module` gives `naso_entry` one `i64` argument per
+    /// symbolic constant the schedule's domains name, and
+    /// `lower_schedule_tree_into` stores each argument into an alloca bound to that
+    /// name before the schedule is lowered. So a `forall i in 0..n` bound reads the
+    /// `n` the caller passed, and the same binding makes `n` readable in the loop
+    /// body.
+    ///
+    /// Nothing here invents a value. A parameter dimension with no name, or a name
+    /// with no binding, is a diagnostic: substituting zero for a trip count is a
+    /// program that runs the wrong number of iterations and says nothing.
     fn lower_affine_expr(
         &mut self,
+        parameter_names: &[String],
         expr: &crate::ir::affine_domain::AffineExpr,
     ) -> CodegenResult<BasicValueEnum<'ctx>> {
-        // In a full implementation this would evaluate parameters and induction
-        // variables; `build_int_constant` returns the `IntValue` directly.
         let int_type = self
             .value_builder
             .type_lowering()
             .int_type(crate::codegen::abi::IntWidth::I64);
-        Ok(self
-            .value_builder
-            .build_int_constant(int_type, expr.constant as u64, "bound")
-            .into())
+
+        // An expression with no parameter term is a constant, which is the common
+        // case for a literal bound.
+        let mut acc: Option<inkwell::values::IntValue<'ctx>> = None;
+        for (j, &coeff) in expr.coefficients.iter().enumerate() {
+            if coeff == 0 {
+                continue;
+            }
+            let name = parameter_names.get(j).map(String::as_str).unwrap_or("");
+            let value = self.load_parameter_value(name, j)?;
+            let term = if coeff == 1 {
+                value
+            } else {
+                // `coeff as u64` is the two's-complement bit pattern, which is what
+                // `const_int` wants: `mul` by `2^64 - c` is `-c` in wrapping i64
+                // arithmetic, so a negative coefficient needs no special case and no
+                // unsigned/signed reinterpretation of a value.
+                self.value_builder.build_int_mul(
+                    value,
+                    int_type.const_int(coeff as u64, false),
+                    "bound_scale",
+                )?
+            };
+            acc = Some(match acc {
+                None => term,
+                Some(prev) => self.value_builder.build_int_add(prev, term, "bound_sum")?,
+            });
+        }
+
+        let constant =
+            self.value_builder
+                .build_int_constant(int_type, expr.constant as u64, "bound");
+        Ok(match acc {
+            None => constant.into(),
+            Some(sum) => self
+                .value_builder
+                .build_int_add(sum, constant, "bound")?
+                .into(),
+        })
+    }
+
+    /// Load the i64 value of the parameter named `name` (domain parameter `index`).
+    fn load_parameter_value(
+        &mut self,
+        name: &str,
+        index: usize,
+    ) -> CodegenResult<inkwell::values::IntValue<'ctx>> {
+        if name.is_empty() {
+            return Err(CodegenError::UnsupportedFeature(format!(
+                "a loop bound depends on parameter dimension {index}, which this domain \
+                 does not name. A symbolic bound can only be lowered when the \
+                 parameter's name is known, because the name is how its value is \
+                 found; the value is NOT invented."
+            )));
+        }
+        let (ptr, ty) = self.value_builder.variable(name).ok_or_else(|| {
+            CodegenError::UnsupportedFeature(format!(
+                "a loop bound depends on the symbolic constant `{name}`, which has no \
+                 value in the generated function. `naso_entry` takes one argument per \
+                 symbolic constant the schedule names, so this means the band refers \
+                 to a parameter the entry signature does not carry."
+            ))
+        })?;
+        // The width is checked, not assumed: loading an i32 slot as i64 would read
+        // past it, and silently widening a parameter is the kind of implicit
+        // conversion this backend must not insert.
+        match ty {
+            inkwell::types::BasicTypeEnum::IntType(t) if t.get_bit_width() == 64 => {
+                Ok(self.value_builder.build_load(ptr, name)?.into_int_value())
+            }
+            other => Err(CodegenError::UnsupportedFeature(format!(
+                "symbolic constant `{name}` is bound to {other:?}, but loop bounds are \
+                 computed in i64. Widening it here would change the value."
+            ))),
+        }
     }
 
     /// Lower a filter node (conditional domain restriction)
@@ -780,7 +957,7 @@ mod tests {
         > = Box::leak(Box::new(
             crate::codegen::llvm::value_builder::LlvmValueBuilder::new(builder, type_lowering),
         ));
-        let lowering = ScheduleLowering::new(
+        ScheduleLowering::new(
             value_builder,
             module,
             function,
@@ -788,8 +965,7 @@ mod tests {
             &pir_module.quantities,
             &pir_module.accesses,
         )
-        .expect("lowering construction");
-        lowering
+        .expect("lowering construction")
     }
 
     /// A band whose statements are all `[0]` is erased: the loop is dropped entirely.

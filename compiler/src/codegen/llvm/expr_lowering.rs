@@ -117,6 +117,14 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                     // programs real allocations first, which is a separate change. Note
                     // that `Assign` is strict where this is lenient, so a write to an
                     // unknown name is still refused -- only the READ is approximate.
+                    //
+                    // This is also where a band that does not declare its iterator
+                    // lands: `ScheduleNode::Band::iterators` holds the level's source
+                    // spelling, and an EMPTY entry binds nothing, so a body reading the
+                    // iterator hits this arm and reads zero. See
+                    // `llvm_forall_execution_test::
+                    // a_band_with_no_declared_iterator_does_not_bind_the_wrong_one`,
+                    // which pins that nothing ELSE is substituted for it.
                     let int_type = self
                         .value_builder
                         .type_lowering()

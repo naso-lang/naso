@@ -102,6 +102,23 @@ pub enum PirExpr {
         /// recover it, so guessing here is a wrong answer rather than a default: `zext`
         /// of a negative value wraps, and `sext` of a large unsigned value goes negative.
         signed: bool,
+        /// The cast target is a FLOAT, not an integer.
+        ///
+        /// `width` alone cannot express `x as f32`: a float target has no bit width in
+        /// the integer sense, and `width` is `None` for it, which previously read as
+        /// "an i32" -- so `input[i] as f32` on an `i8` buffer emitted a SIGN-EXTENDING
+        /// INTEGER conversion and then multiplied an `i32` by a `double`. That is a
+        /// silent wrong answer: the program compiles, verifies, and computes nonsense.
+        ///
+        /// So the target's SORT is recorded explicitly rather than inferred from a
+        /// `None` width. `None` keeps the original integer behaviour byte for byte;
+        /// `Some(_)` means `sitofp`/`uitofp`, with the sign flag still carried because
+        /// LLVM integer types are signless and nothing downstream can recover it.
+        ///
+        /// No float WIDTH is carried, because this backend has one: `f32` and `f64` are
+        /// already the same type in the IR (`ElemType` documents why), so recording a
+        /// width would record a distinction that does not exist.
+        float_target: Option<ElemType>,
     },
     /// A sequence of statements evaluated for effect, yielding no value.
     ///
@@ -265,6 +282,88 @@ pub struct PirStatement {
 /// Quantity map: variable name -> Quantity (from type checker)
 pub type QuantityMap = HashMap<String, Quantity>;
 
+/// What a Naso function returns.
+///
+/// `None` in the AST (`fn f() { .. }`) and `Some(f64)` are both representable, and the
+/// difference is exactly what a call site needs to know: whether the call yields a
+/// value or not. Carrying it is what lets a backend emit a typed `ret` and refuse a
+/// call that uses a void result as a value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FnReturn {
+    /// No return type declared. The function yields nothing.
+    Void,
+    /// A scalar, returned by value.
+    Scalar(ElemType),
+    /// A declared return type with no slot in this ABI.
+    ///
+    /// Recorded rather than dropped, so a backend refuses it NAMING the type instead
+    /// of silently emitting a void function whose callers then bind a value that does
+    /// not exist. That is the same rule [`ParamKind::Unsupported`] follows.
+    Unsupported(String),
+}
+
+/// One Naso function, with its own parameters, statements, schedule and names.
+///
+/// # Why this exists
+///
+/// A `PirModule` used to have NO function structure: `lower_item` walked every
+/// `Item::Function` and concatenated all their bodies into one flat `statements` list,
+/// and `LLVMModuleBuilder::build_module` emitted that list as a single `naso_entry`.
+/// Every function's parameters therefore shared one namespace in one LLVM function
+/// body, which made `kernels/quant_int8.naso` uncompilable: its three functions each
+/// declare `input`/`output`/`scale`, and `Tensor[f32, 1024]` is not
+/// `Tensor[i8, 1024]`. Lowering refused with "declared with two different types".
+///
+/// LLVM has exact `i8` storage and `as i8` narrows correctly, so the obstacle was
+/// never the width -- it was the flattening. This type is the flattening's replacement:
+/// each function owns its parameters, its statements, its schedule tree and its
+/// quantity map, so two functions may bind the same name at different types.
+///
+/// # Linearity is per function, and that is the point
+///
+/// `quantities` and `statements` are per function rather than shared because a `[1]`
+/// resource is consumed exactly once *by the body that owns it*. `input` is `[1]` in
+/// all three functions of `quant_int8.naso`, and each consumes its own once; counted
+/// across a flattened module that is three uses of one name and PIR validation rejects
+/// the file. Scoping the count to the function is not a loosening -- it is the same
+/// rule applied at the right granularity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PirFunction {
+    /// The name as written in the source.
+    pub name: String,
+    /// This function's declared parameters, in source order.
+    pub params: Vec<FunctionParam>,
+    /// This function's statements. `StmtId`s are unique across the whole module.
+    pub statements: Vec<PirStatement>,
+    /// The schedule for THIS function's statements.
+    pub schedule: ScheduleTree,
+    /// Access relations for this function's statements.
+    pub accesses: AccessRelations,
+    /// Quantity annotations for the names THIS function binds.
+    pub quantities: QuantityMap,
+    /// What the function returns.
+    pub return_type: FnReturn,
+    /// The statement holding this function's RETURN VALUE, if it returns one.
+    ///
+    /// `lower_stmt` turns `return e` into an ordinary statement whose body is the
+    /// lowered `e`. That is enough for a `void` function, where the value is
+    /// computed and discarded. It is NOT enough for a function that returns a value:
+    /// the backend has to `ret` the computed value, and the flat statement list gives
+    /// it no way to know which statement is the return rather than a discarded
+    /// expression. This field names it.
+    ///
+    /// The statement is REMOVED from `schedule` when this is set, so the return value
+    /// is evaluated once, in the function's exit block, and not also as a scheduled
+    /// side-effecting statement.
+    ///
+    /// `None` for a `void` function, and for a value-returning function whose return
+    /// statement is not the function's last statement -- which is REFUSED at lowering
+    /// rather than lowered to a silently zero return.
+    pub return_stmt: Option<crate::ir::schedule_tree::StmtId>,
+    /// Source location, for a diagnostic that can point at the function.
+    pub span: Option<crate::ast::Span>,
+}
+
 /// Complete PIR Module
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PirModule {
@@ -286,14 +385,37 @@ pub struct PirModule {
     /// backend reads to build a function signature, so it carries every
     /// parameter of every function in the program, in source order.
     ///
-    /// Parameters from DIFFERENT functions are merged into one list because a
-    /// `PirModule` is one statement list with no function structure: the
-    /// backend emits one entry function containing every function's body. Two
-    /// functions binding the same name with different types is refused by the
-    /// backend rather than silently given one of the two types.
+    /// Parameters from DIFFERENT functions are merged into one list, deduplicated by
+    /// name. That union is the compatibility surface for a backend that still emits
+    /// ONE function for the whole module; a backend that emits one symbol per function
+    /// reads [`PirModule::functions`] and each function's own `params` instead, which
+    /// is why two functions may now bind the same name at different types without a
+    /// refusal. When two declarations of one name disagree, the FIRST wins here and
+    /// the per-function lists carry both types correctly.
     pub function_params: Vec<FunctionParam>,
     /// Function signatures for external calls
     pub extern_functions: Vec<ExternFunction>,
+    /// The program's functions, each with its own scope.
+    ///
+    /// # Relationship to the flat fields above
+    ///
+    /// `statements`, `schedule`, `accesses`, `quantities` and `function_params` are the
+    /// CONCATENATION of every function's, in source order. They are kept because a
+    /// great deal of code reads them -- `ir::validate`, `codegen::wgsl`, the
+    /// `pretty_print` dump, and every hand-built module in the test suite, including
+    /// the `.pir` fixtures in `compiler/tests/fixtures/` which have no function
+    /// sections at all.
+    ///
+    /// So the flat list is the COMPATIBILITY SURFACE and `functions` is the STRUCTURE.
+    /// A backend that emits one symbol per function reads `functions`; a backend that
+    /// still emits one function for the whole module keeps reading the flat list and
+    /// is unaffected by this field being populated.
+    ///
+    /// `function_params` is the union of every function's parameters. Two functions
+    /// binding the same name at DIFFERENT types is no longer a conflict, because each
+    /// function reads its own `params`; the union keeps the first declaration so a
+    /// backend still reading it gets one entry per name rather than duplicates.
+    pub functions: Vec<PirFunction>,
 }
 
 impl Default for PirModule {
@@ -310,6 +432,7 @@ impl Default for PirModule {
             parameters: Vec::new(),
             function_params: Vec::new(),
             extern_functions: Vec::new(),
+            functions: Vec::new(),
         }
     }
 }
@@ -348,6 +471,10 @@ impl PirModule {
             // hand-constructed module genuinely has no function parameters.
             function_params: Vec::new(),
             extern_functions: Vec::new(),
+            // Likewise: a hand-constructed module (every `.pir` fixture, and every
+            // test that builds one by hand) has one implicit entry body and no
+            // function structure. Populating this is the lowering pass's job.
+            functions: Vec::new(),
         }
     }
 
@@ -385,18 +512,29 @@ impl PirModule {
 
         // Check [1] vars appear exactly once in schedule (linearity)
         // This is a simplified check - full linearity requires dataflow analysis
-        for (var, qty) in &self.quantities {
-            if qty == &Quantity::One {
-                // Only a CONSUMING operation counts; gates borrow. See
-                // `ir::validate` step 6 for why `count == 0` is not an error here:
-                // "must be consumed" is a source-level property enforced by the
-                // typechecker, which can see branches and returns and PIR cannot.
-                let count = self.count_var_occurrences(var);
-                if count > 1 {
-                    errors.push(ValidationError::LinearVarUsedMultipleTimes(
-                        var.clone(),
-                        count,
-                    ));
+        //
+        // Run once per FUNCTION, not once per module: a `[1]` binding is consumed by
+        // the body that owns it, so `input` being `[1]` and used once in each of three
+        // functions is three correct single uses, not a triple use of one name.
+        // Counting across the flattened statement list rejected `kernels/
+        // quant_int8.naso`, which is exactly the flattening this type removes.
+        for (statements, quantities) in self.quantity_scopes() {
+            for (var, qty) in quantities {
+                if qty == &Quantity::One {
+                    // Only a CONSUMING operation counts; gates borrow. See
+                    // `ir::validate` step 6 for why `count == 0` is not an error here:
+                    // "must be consumed" is a source-level property enforced by the
+                    // typechecker, which can see branches and returns and PIR cannot.
+                    let count = statements
+                        .iter()
+                        .map(|s| self.count_in_expr(&s.body, var))
+                        .sum();
+                    if count > 1 {
+                        errors.push(ValidationError::LinearVarUsedMultipleTimes(
+                            var.clone(),
+                            count,
+                        ));
+                    }
                 }
             }
         }
@@ -459,11 +597,44 @@ impl PirModule {
         }
     }
 
-    fn count_var_occurrences(&self, var: &str) -> usize {
-        self.statements
-            .iter()
-            .map(|s| self.count_in_expr(&s.body, var))
-            .sum()
+    /// The (statements, quantities) pairs a quantity-dependent check must run over.
+    ///
+    /// One pair per [`PirFunction`] when the module has function structure, and a
+    /// single pair over the flat fields otherwise -- which is what every hand-built
+    /// module and every `.pir` fixture has, so their behaviour is unchanged.
+    ///
+    /// The fallback is the whole point of keeping the flat fields: a module with no
+    /// `functions` still gets its quantity checks, over exactly the statements it has.
+    pub fn quantity_scopes(&self) -> Vec<(&[PirStatement], &QuantityMap)> {
+        if self.functions.is_empty() {
+            vec![(self.statements.as_slice(), &self.quantities)]
+        } else {
+            self.functions
+                .iter()
+                .map(|f| (f.statements.as_slice(), &f.quantities))
+                .collect()
+        }
+    }
+
+    /// The name of the function that becomes the module's entry point.
+    ///
+    /// `main` if the program declares one, otherwise the FIRST function in source
+    /// order. A module with no `functions` at all -- a hand-built one, a `.pir`
+    /// fixture -- has no entry name and returns `None`, and its single body is the
+    /// entry by construction.
+    ///
+    /// The rule is stated rather than inferred so that a multi-function program has a
+    /// DEFINED entry instead of several equally plausible candidates. `main` wins
+    /// because it is what the source says; first-in-source-order is the fallback
+    /// because it is the order the reader wrote them in, and it is deterministic.
+    pub fn entry_function_name(&self) -> Option<&str> {
+        if self.functions.is_empty() {
+            return None;
+        }
+        if let Some(main) = self.functions.iter().find(|f| f.name == "main") {
+            return Some(&main.name);
+        }
+        self.functions.first().map(|f| f.name.as_str())
     }
 
     fn count_in_expr(&self, expr: &PirExpr, var: &str) -> usize {
@@ -626,12 +797,18 @@ fn pir_expr_to_string(expr: &PirExpr, _indent: usize) -> String {
             expr,
             width,
             signed,
-        } => format!(
-            "{} as {}i{}",
-            pir_expr_to_string(expr, 0),
-            if *signed { "" } else { "u" },
-            width.unwrap_or(32)
-        ),
+            float_target,
+        } => match float_target {
+            // A float target is printed as a float. Printing it as `i{width}` would be
+            // a lie about the conversion the dump claims to be showing.
+            Some(_) => format!("{} as f64", pir_expr_to_string(expr, 0)),
+            None => format!(
+                "{} as {}i{}",
+                pir_expr_to_string(expr, 0),
+                if *signed { "" } else { "u" },
+                width.unwrap_or(32)
+            ),
+        },
         PirExpr::Stmts(parts) => {
             let inner: Vec<String> = parts.iter().map(|p| pir_expr_to_string(p, 0)).collect();
             if inner.is_empty() {

@@ -12,7 +12,7 @@
 
 use crate::codegen::context::CodegenContext;
 use crate::codegen::error::{CodegenError, CodegenResult};
-use crate::codegen::llvm::module_builder::build_entry_signature;
+use crate::codegen::llvm::module_builder::{EntryParam, build_entry_signature};
 use crate::codegen::llvm::value_builder::TensorBinding;
 use crate::codegen::llvm::{
     access_emission::AccessEmitter,
@@ -28,12 +28,13 @@ use crate::ir::{
     access_relation::AccessRelations,
     affine_domain::AffineDomain,
     affine_map::AffineMap,
-    pir_types::{PirModule, PirStatement, QuantityMap},
+    pir_types::{PirExpr, PirModule, PirStatement, QuantityMap},
     schedule_tree::{ScheduleNode, ScheduleTree, StmtId},
 };
 use inkwell::basic_block::BasicBlock;
 use inkwell::types::BasicTypeEnum;
 use inkwell::values::{AnyValue, BasicValueEnum, FunctionValue};
+use std::collections::HashMap;
 
 /// Main entry point for lowering a ScheduleTree to LLVM IR
 ///
@@ -59,6 +60,7 @@ pub fn lower_schedule_tree<'ctx>(
     let type_lowering = LlvmTypeLowering::new(llvm_context);
     let mut value_builder = LlvmValueBuilder::new(builder, type_lowering);
 
+    let abi = build_entry_signature(&mut LlvmTypeLowering::new(llvm_context), pir_module)?;
     lower_schedule_tree_into(
         ctx,
         module,
@@ -68,6 +70,9 @@ pub fn lower_schedule_tree<'ctx>(
         pir_module,
         quantities,
         access_relations,
+        abi.as_slice(),
+        None,
+        None,
     )
 }
 
@@ -102,6 +107,9 @@ pub fn lower_schedule_tree_into<'ctx>(
     pir_module: &PirModule,
     quantities: &QuantityMap,
     access_relations: &AccessRelations,
+    abi: &[EntryParam<'ctx>],
+    return_value: Option<&PirExpr>,
+    callee_params: Option<&HashMap<String, Vec<ParamKind>>>,
 ) -> CodegenResult<()> {
     let llvm_context = ctx.llvm_context();
 
@@ -128,7 +136,16 @@ pub fn lower_schedule_tree_into<'ctx>(
     // would still work for reading, but it re-introduces the "tensor is a slot holding a
     // value" model that makes `input[i]` ambiguous between a load of the pointer and a
     // load of the element.
-    let abi = build_entry_signature(&mut LlvmTypeLowering::new(llvm_context), pir_module)?;
+    // The arguments are bound from the ABI the CALLER built for this function.
+    //
+    // Previously this rebuilt the ABI from `pir_module.function_params`, which was
+    // correct when there was exactly one function per module and is wrong now: that
+    // field is the program-wide UNION of every function's parameters, so rebuilding
+    // from it would bind argument `j` to whichever function declared that name first.
+    // For `kernels/quant_int8.naso` that means binding `input` -- declared
+    // `Tensor[f32, 1024]` by the first function -- to a function whose `input` is
+    // `Tensor[i8, 1024]`: a load of the wrong width, with nothing in the IR to say so.
+    // The ABI is now passed in, so the signature and the binding cannot disagree.
     for entry in abi.iter() {
         let Some(arg) = function.get_nth_param(entry.arg_index) else {
             // Fewer arguments than the ABI names. A hand-built module may legitimately
@@ -139,12 +156,22 @@ pub fn lower_schedule_tree_into<'ctx>(
         match entry.kind {
             ParamKind::Tensor { elem, ref shape } => {
                 let elem_ty = scalar_slot_type(value_builder, &elem);
+                // The length argument, recorded on the binding so a CALL can forward
+                // the caller's real element count to the callee. Forwarding the count
+                // the caller was given -- rather than one recomputed from the shape --
+                // is what makes the callee's own guard a real check on the caller's
+                // buffer instead of a comparison of two invented numbers.
+                let len = entry
+                    .len_arg_index
+                    .and_then(|i| function.get_nth_param(i))
+                    .map(|v| v.into_int_value());
                 value_builder.bind_tensor(
                     &entry.name,
                     TensorBinding {
                         base: arg.into_pointer_value(),
                         elem: elem_ty,
                         shape: shape.clone(),
+                        len,
                     },
                 );
             }
@@ -164,6 +191,9 @@ pub fn lower_schedule_tree_into<'ctx>(
                             .int_type(crate::codegen::abi::IntWidth::I8)
                             .into(),
                         shape: None,
+                        // A `QRegister` occupies ONE argument, not the `(ptr, len)`
+                        // pair a tensor does, so there is no length to forward.
+                        len: None,
                     },
                 );
             }
@@ -203,7 +233,7 @@ pub fn lower_schedule_tree_into<'ctx>(
         module,
         function,
         value_builder.builder(),
-        &abi,
+        abi,
     )?;
 
     // Create schedule lowering context
@@ -214,6 +244,7 @@ pub fn lower_schedule_tree_into<'ctx>(
         pir_module,
         quantities,
         access_relations,
+        callee_params,
     )?;
 
     // Lower the root schedule node
@@ -221,15 +252,70 @@ pub fn lower_schedule_tree_into<'ctx>(
 
     // Build return. inkwell 0.10's `build_return` takes
     // `Option<&dyn BasicValue>`; a void function returns `None`, while a typed
-    // function returns a zero value of its return type (`FunctionType` has no
-    // `Void` variant -- `None` *is* void).
+    // function returns the value the function computes.
     //
     // This is the ONE return for the function. A band emits its own `ret`-free
     // exit block and leaves the builder positioned there, so appending here
     // terminates the exit rather than an already-terminated block.
+    //
+    // # The RETURN VALUE, not a zero
+    //
+    // This used to return `build_zero(return_type)`. That is correct ONLY for a
+    // function whose return value is never read, and it is a silent wrong answer for
+    // every other one: a caller would receive 0 for `fn f(x) { x + 1 }` and nothing in
+    // the IR would say the value was invented. So `return_value` -- the expression the
+    // function's `return` statement lowered to, evaluated HERE, in the exit block --
+    // is what is returned.
+    //
+    // # A function with a return TYPE but no `return` statement
+    //
+    // Returns ZERO, which is a KNOWN LIMITATION and not a claim of correctness.
+    //
+    // `-> i64` with no `return e` is accepted by the typechecker, and several existing
+    // tests rely on that: they declare a return type, end the body with an assignment
+    // to a global, and read the GLOBAL rather than the return value. Refusing here
+    // would break seven passing tests over a case none of them is testing.
+    //
+    // What is NOT true is that such a function returns zero -- it returns an
+    // unspecified value that happens to be spelled `zero`. The distinction matters and
+    // is recorded rather than papered over: `PirFunction::return_stmt` is `None` here,
+    // so this is distinguishable from a function that genuinely computed zero. Making
+    // it an error, or making the tail expression the return value, is the right fix and
+    // is NOT done here, because both change what existing programs compile to.
     let return_type = function.get_type().get_return_type();
-    let return_value = return_type.map(|ty| lowering.value_builder.build_zero(ty));
-    lowering.value_builder.build_return(return_value)?;
+    let returned = match (return_type, return_value) {
+        (None, _) => None,
+        (Some(ty), Some(expr)) => {
+            let mut lowerer = PirExprLowerer {
+                value_builder: lowering.value_builder,
+                module,
+                current_function: function,
+                callee_params: lowering.callee_params,
+                in_statement_position: false,
+            };
+            let value = lowerer.build_expr(expr, quantities)?;
+            // A type mismatch here is REFUSED rather than converted: the return type
+            // came from the function's declaration and the value from its body, and if
+            // they disagree the source does not say what the function returns. Casting
+            // one to the other would invent an answer.
+            if value.get_type() != ty {
+                return Err(CodegenError::UnsupportedFeature(format!(
+                    "function `{}` declares it returns `{}` but its `return` expression \
+                     evaluates to `{}`. Nothing is converted between them: a cast here \
+                     would be a value the source never wrote.",
+                    function.get_name().to_string_lossy(),
+                    ty,
+                    value.get_type(),
+                )));
+            }
+            Some(value)
+        }
+        // No `return` was lowered for this function. See the comment above: zero is a
+        // documented limitation, preserved so a program that declares a return type and
+        // never returns one still compiles as it always has.
+        (Some(ty), None) => Some(lowering.value_builder.build_zero(ty)),
+    };
+    lowering.value_builder.build_return(returned)?;
 
     // Verify function. inkwell 0.10's `verify` returns a `bool` rather than a
     // `Result`, printing diagnostics to stderr when `print` is true; on failure
@@ -341,6 +427,13 @@ pub struct ScheduleLowering<'ctx, 'a> {
     pir_module: &'a PirModule,
     quantities: &'a QuantityMap,
     access_relations: &'a AccessRelations,
+    /// Each Naso function's declared parameter kinds, so a `Call` inside a loop body
+    /// marshals its arguments the same way one at statement level does.
+    ///
+    /// Taken from the whole program rather than from this function alone: a loop body
+    /// can call any function in the module, not only a sibling. `None` for a
+    /// hand-built module with no `functions`, where every callee is an `extern`.
+    callee_params: Option<&'a HashMap<String, Vec<ParamKind>>>,
 
     // Sub-emitters
     loop_emitter: LoopEmitter<'ctx>,
@@ -357,6 +450,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
         pir_module: &'a PirModule,
         quantities: &'a QuantityMap,
         access_relations: &'a AccessRelations,
+        callee_params: Option<&'a HashMap<String, Vec<ParamKind>>>,
     ) -> CodegenResult<Self> {
         let loop_emitter = LoopEmitter::new(value_builder.type_lowering().context())?;
         let access_emitter = AccessEmitter::new(value_builder.type_lowering().context())?;
@@ -370,6 +464,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
             pir_module,
             quantities,
             access_relations,
+            callee_params,
             loop_emitter,
             access_emitter,
             optimizer,
@@ -470,6 +565,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
         let pir_module = self.pir_module;
         let quantities = self.quantities;
         let access_relations = self.access_relations;
+        let callee_params = self.callee_params;
 
         // Emit the loop nest
         if is_parallel {
@@ -496,6 +592,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
                         pir_module,
                         quantities,
                         access_relations,
+                        callee_params,
                     )?;
                     inner.lower_node(child)
                 },
@@ -524,6 +621,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
                         pir_module,
                         quantities,
                         access_relations,
+                        callee_params,
                     )?;
                     inner.lower_node(child)
                 },
@@ -892,6 +990,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
             value_builder: self.value_builder,
             module: self.module,
             current_function: self.function,
+            callee_params: self.callee_params,
             in_statement_position: true,
         };
         // The value is discarded because a statement body's result is not the point --
@@ -987,6 +1086,7 @@ mod tests {
             &pir_module,
             &pir_module.quantities,
             &pir_module.accesses,
+            None,
         );
         assert!(lowering.is_ok());
     }
@@ -1044,6 +1144,7 @@ mod tests {
             pir_module,
             &pir_module.quantities,
             &pir_module.accesses,
+            None,
         )
         .expect("lowering construction")
     }

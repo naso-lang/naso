@@ -198,6 +198,12 @@ jobs:
       # because the ABI guard is only real if a short or null buffer actually fails the
       # process, and `llvm_shipped_kernel_execution_test` because it compiles
       # `kernels/scale_f32.naso` through the production path at its real extent.
+      #
+      # `llvm_multifunction_execution_test` is here for the same reason and more: it is
+      # the only file that executes a NASO-TO-NASO call, so it is the only place a
+      # reversed operand list, a stale length, or a scope shared between two functions
+      # would be caught. It also executes `kernels/quant_int8.naso`, the kernel that
+      # multi-function compilation exists to unblock.
       - name: Re-run the CPU execution tests with llc/clang on PATH
         run: |
           cargo test --features llvm \
@@ -205,6 +211,7 @@ jobs:
             --test llvm_forall_execution_test \
             --test llvm_abi_guard_execution_test \
             --test llvm_param_abi_execution_test \
+            --test llvm_multifunction_execution_test \
             --test llvm_shipped_kernel_execution_test
 
       - name: Clippy with the llvm feature

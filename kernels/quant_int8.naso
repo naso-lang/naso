@@ -35,16 +35,47 @@
 //   element and drop the `as i8` narrowing below, producing a shader that
 //   VALIDATES and is still WRONG. So the backend refuses, naming the reason.
 //
-//   FOR LLVM (`--target llvm`) this file is refused for a DIFFERENT reason, which
-//   this file previously did not document at all. LLVM does have exact `i8`
-//   storage and `as i8` narrows correctly, so width is NOT the obstacle. The
-//   obstacle is that its three functions each declare `input`/`output`/`scale`
-//   at a DIFFERENT type -- `Tensor[f32, 1024]` in one, `Tensor[i8, 1024]` in
-//   another -- and a PIR module is one flat statement list with no function
-//   structure, so the generated entry function has ONE slot per name and cannot
-//   give one name two types. The lowering refuses, naming both types. Giving each
-//   function its own LLVM symbol would remove the name clash but not the
-//   flattening, so that is a larger change than it looks.
+//   FOR LLVM (`--target llvm`) THIS FILE NOW COMPILES AND RUNS.
+//
+//   It used to be refused, and the reason is worth keeping because it explains
+//   the shape of the fix. LLVM does have exact `i8` storage and `as i8` narrows
+//   correctly, so WIDTH was never the obstacle. The obstacle was that its three
+//   functions each declare `input`/`output`/`scale` at a DIFFERENT type --
+//   `Tensor[f32, 1024]` in one, `Tensor[i8, 1024]` in another -- and a PIR module
+//   was one flat statement list with no function structure, so the generated
+//   entry function had ONE slot per name and could not give one name two types.
+//
+//   One thing this work turned up and fixed: a function that declared a return type
+//   but had no `return` statement used to compile and return ZERO, silently. Zero
+//   is the one answer that can never be distinguished from a real zero result, so
+//   the backend now refuses such a function and names it. None of these three is
+//   affected -- all are void -- but `fn f(x: f32) -> f32 { let mut y = x * 3.0; }`
+//   would have evaluated to 0.0 where 15.0 was correct.
+//
+//   `PirModule::functions` now carries one `PirFunction` per Naso function, each
+//   with its own parameters, statements, schedule and quantity map, and each
+//   becomes its own LLVM symbol `naso_<name>`. So this file emits:
+//
+//     naso_quantize_int8_symmetric  (double *input, i8 *output)
+//     naso_dequantize_int8_symmetric (i8 *input, double *output)
+//     naso_normalize_f32            (double *input, double *output)
+//     naso_entry                    (the conventional entry, forwarding to the
+//                                    first of the above)
+//
+//   `input` is indexed as `double` in two of them and as `i8` in the third, from
+//   the same source name. Each function also emits its own ABI guard, so a short
+//   buffer passed to any of them -- not just the entry -- exits 91 rather than
+//   reading past the caller's allocation.
+//
+//   `dequantize_int8_symmetric` needs `input[i] as f32`, which needed one more
+//   thing: `PirExpr::Cast` carried only an INTEGER width and a sign, so a float
+//   target read as "i32" and the cast became a sign-extending integer conversion.
+//   `Cast` now records that its target is a float, and emits `sitofp`.
+//
+//   Proved by EXECUTION, not by reading the IR: with `input[i] = i - 512` and
+//   `scale = 1.0`, `compiler/tests/llvm_multifunction_execution_test.rs` checks
+//   all 1024 quantized bytes against `max(-128, min(127, i - 512))` -- derived
+//   from the source above -- plus a checksum over the whole buffer.
 //
 //   The width is now carried in the AST (Type::int_width) so that decision can
 //   be made rather than guessed; previously i8 and i32 were indistinguishable
@@ -55,10 +86,12 @@
 //   bounds guard is derived from the source rather than assumed.
 //
 //   So the ladder for this file: parses -> typechecks -> lowers to PIR with
-//   correct iteration domains -> REFUSED at WGSL codegen with a stated reason.
-//   An f32 variant of this kernel WOULD emit. The proof obligations are still
-//   NOT discharged (float reasoning is unsupported and reported as unproved,
-//   not as proved).
+//   correct iteration domains -> emits and executes for LLVM -> still REFUSED at
+//   WGSL codegen with a stated reason (WGSL has no i8 storage, and binding it as
+//   i32 would silently widen every element and drop the `as i8` narrowing). The
+//   proof obligations are still NOT discharged (float reasoning is unsupported
+//   and reported as unproved, not as proved), so the clamp below remains
+//   load-bearing rather than decorative.
 
 /// Quantize f32 -> i8 with a symmetric scale.
 ///

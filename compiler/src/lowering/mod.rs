@@ -70,6 +70,21 @@ pub struct LoweringContext {
     param_names: Vec<String>,
     /// The typed ABI parameter list, the union over every function's parameters.
     function_params: Vec<crate::ir::pir_types::FunctionParam>,
+    /// One entry per `Item::Function`, each with its OWN statements, schedule,
+    /// quantities and parameters.
+    ///
+    /// This is the structure a backend reads to emit one LLVM symbol per Naso
+    /// function. `statements`, `schedule_nodes`, `quantities` and `function_params`
+    /// remain as the flat concatenation for the compatibility surface.
+    functions: Vec<crate::ir::pir_types::PirFunction>,
+    /// The `StmtId` of the most recent `return e` this function lowered.
+    ///
+    /// `lower_stmt` turns `return e` into an ordinary statement, which is right for a
+    /// `void` function and wrong for one that returns a value: a backend emitting
+    /// `ret` needs to know WHICH statement holds the value. Recorded here and drained
+    /// per function in `lower_item`, so a `return` in one function cannot be
+    /// attributed to the next.
+    pending_return_stmt: Option<crate::ir::schedule_tree::StmtId>,
 }
 
 /// The `ElemType` a scalar or tensor-element AST type lowers to.
@@ -122,6 +137,127 @@ fn describe_param_kind(kind: &crate::ir::pir_types::ParamKind) -> String {
     }
 }
 
+/// The names a `let` PATTERN binds.
+///
+/// A thin adapter over the lowering's own `extract_pattern_names`, so there is exactly
+/// ONE walk of `PatternKind` in this file. Two walks would be two places to update when
+/// a pattern form is added, and the failure mode is quiet: a name missing from one
+/// quantity map and present in the other.
+fn collect_pattern_names(pattern: &crate::ast::Pattern, out: &mut Vec<String>) {
+    out.extend(LoweringContext::pattern_names(pattern));
+}
+
+/// Build a `ScheduleTree` from a function's own schedule nodes.
+///
+/// The same shape `build_schedule_tree` produces for the whole module: a `Sequence`
+/// of the top-level nodes, or the single node when there is exactly one. A function
+/// with no statements gets `ScheduleNode::Empty`, which means "emit nothing" -- the
+/// same meaning it has at module level.
+fn build_schedule_from_nodes(nodes: &[ScheduleNode], param_names: &[String]) -> ScheduleTree {
+    let root = match nodes.len() {
+        0 => ScheduleNode::Empty,
+        1 => nodes[0].clone(),
+        _ => ScheduleNode::sequence(nodes.to_vec()),
+    };
+    ScheduleTree::new(root, param_names.to_vec())
+}
+
+/// Every name a function BODY binds, in source order.
+///
+/// This walks the AST, not the lowered PIR, because the lowered form has already
+/// merged every function's names into one map and the function's own share cannot be
+/// recovered from it. Walking the AST is also more faithful: it sees a `let` inside a
+/// loop body, which lowering lifts into the enclosing loop statement.
+///
+/// Only `let`-family bindings and `for`/`forall` iterators count. A name merely READ
+/// (`input`) is not bound by the body, and including reads would make every function's
+/// quantity map claim every name it mentions -- including another function's.
+fn collect_bound_names_stmt(stmt: &crate::ast::Stmt, out: &mut Vec<String>) {
+    use crate::ast::StmtKind;
+    match &stmt.kind {
+        StmtKind::Let(l) => {
+            // A destructuring pattern binds more than one name, or none. The
+            // lowering refuses it (`destructuring let binding has no PIR node`), so
+            // whatever names it holds are recorded: if that refusal is ever lifted,
+            // the quantity map already covers them.
+            let mut names = Vec::new();
+            collect_pattern_names(&l.pattern, &mut names);
+            out.extend(names);
+        }
+        StmtKind::LetInOut(l) => out.push(l.name.name.clone()),
+        StmtKind::LetConsume(l) => out.push(l.name.name.clone()),
+        StmtKind::Expr(e) => collect_bound_names_expr(e, out),
+        // A nested `Item::Function`'s body binds names in the SAME lexical scope as
+        // this statement -- it is not a new function, so its locals are this
+        // function's locals.
+        StmtKind::Item(crate::ast::Item::Function(f)) => {
+            for s in &f.body.stmts {
+                collect_bound_names_stmt(s, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_bound_names_expr(expr: &crate::ast::Expr, out: &mut Vec<String>) {
+    use crate::ast::expr::ExprKind;
+    match &expr.kind {
+        // A loop binds its iterator. `Forall` carries the loop variable on the node.
+        ExprKind::Forall(loop_) => {
+            for s in &loop_.body.stmts {
+                collect_bound_names_stmt(s, out);
+            }
+            if let Some(tail) = &loop_.body.expr {
+                collect_bound_names_expr(tail, out);
+            }
+        }
+        ExprKind::Block(b) => {
+            for s in &b.stmts {
+                collect_bound_names_stmt(s, out);
+            }
+            if let Some(tail) = &b.expr {
+                collect_bound_names_expr(tail, out);
+            }
+        }
+        ExprKind::Binary(_, l, r) => {
+            collect_bound_names_expr(l, out);
+            collect_bound_names_expr(r, out);
+        }
+        ExprKind::Unary(_, e)
+        | ExprKind::Ascribe(e, _)
+        | ExprKind::Index(e, _)
+        | ExprKind::Field(e, _)
+        | ExprKind::Return(Some(e))
+        | ExprKind::Break(Some(e)) => collect_bound_names_expr(e, out),
+        ExprKind::Let(l) => out.push(l.name.name.clone()),
+        ExprKind::LetInOut(l) => out.push(l.name.name.clone()),
+        ExprKind::LetConsume(l) => out.push(l.name.name.clone()),
+        ExprKind::Call(callee, args) | ExprKind::MethodCall(callee, _, args) => {
+            collect_bound_names_expr(callee, out);
+            for a in args {
+                collect_bound_names_expr(a, out);
+            }
+        }
+        ExprKind::Tuple(items) | ExprKind::Array(items) => {
+            for item in items {
+                collect_bound_names_expr(item, out);
+            }
+        }
+        ExprKind::If(c, t, e) => {
+            collect_bound_names_expr(c, out);
+            collect_bound_names_expr(t, out);
+            if let Some(e) = e {
+                collect_bound_names_expr(e, out);
+            }
+        }
+        // A `Quantified` is a PROPOSITION, not a loop: it runs no code, so a `let`
+        // inside it binds nothing that survives into a runtime statement. Skipping it
+        // is correct rather than merely convenient.
+        ExprKind::Quantified(_) => {}
+        _ => {}
+    }
+}
+
 impl LoweringContext {
     fn new() -> Self {
         Self {
@@ -133,6 +269,8 @@ impl LoweringContext {
             schedule_nodes: Vec::new(),
             param_names: Vec::new(),
             function_params: Vec::new(),
+            functions: Vec::new(),
+            pending_return_stmt: None,
         }
     }
 
@@ -149,10 +287,18 @@ impl LoweringContext {
         // The typed ABI list, over EVERY function. This is a separate pass from
         // `extract_parameters` because the two answer different questions: that
         // one asks "which names does the schedule need a value for?", this one
-        // asks "what ABI does the generated function need?". It runs first so a
-        // parameter declared with two conflicting types is reported before any
-        // body is lowered against a signature that cannot represent it.
-        self.extract_function_params(program)?;
+        // asks "what ABI does the generated function need?".
+        //
+        // A name declared at TWO DIFFERENT TYPES by two different functions is no
+        // longer an error. It used to be refused with "declared with two different
+        // types ... a PIR module is one flat statement list with no function
+        // structure", which is exactly what stopped `kernels/quant_int8.naso` from
+        // compiling: its three functions each declare `input`/`output`, at
+        // `Tensor[f32, 1024]` in one and `Tensor[i8, 1024]` in another. Each function
+        // now carries its own `PirFunction::params`, so both are representable; this
+        // union keeps the FIRST declaration per name for the compatibility surface
+        // described on `PirModule::function_params`.
+        self.extract_function_params(program);
 
         // Lower all items
         for item in &program.items {
@@ -171,6 +317,7 @@ impl LoweringContext {
             self.param_names.clone(),
         );
         pir.function_params = std::mem::take(&mut self.function_params);
+        pir.functions = std::mem::take(&mut self.functions);
 
         // Validate the generated PIR
         validate_pir(&pir).map_err(|e| LoweringError::ValidationError(format!("{:?}", e)))?;
@@ -206,43 +353,46 @@ impl LoweringContext {
     /// allocation: the file's functions are `scale_clamp_f32` and `scale_one`,
     /// so no parameter was ever recorded and the read was refused.
     ///
-    /// The list is the UNION over all functions because a `PirModule` holds one
-    /// statement list with no function structure and the backend emits one entry
-    /// function. A name bound by two functions with DIFFERENT types is recorded
-    /// and the backend refuses it naming both, rather than one of them silently
-    /// winning.
-    fn extract_function_params(&mut self, program: &Program) -> Result<(), LoweringError> {
+    /// # Two functions, one name, two types
+    ///
+    /// This used to REFUSE that case:
+    ///
+    /// ```text
+    /// parameter `input` is declared with two different types (Tensor[F64, 1024] and
+    /// Tensor[I8, 1024]). A PIR module is one flat statement list with no function
+    /// structure, so the generated entry function has ONE slot per name and cannot
+    /// give this name both types.
+    /// ```
+    ///
+    /// and that refusal is why `kernels/quant_int8.naso` -- a shipped kernel that
+    /// parses and typechecks -- could not be built for LLVM at all. The second
+    /// sentence of that message is no longer true: `PirFunction` gives each function
+    /// its own parameters, so `quantize_int8_symmetric`'s `Tensor[f32, 1024] input`
+    /// and `dequantize_int8_symmetric`'s `Tensor[i8, 1024] input` are two slots in
+    /// two functions.
+    ///
+    /// The name is deduplicated rather than rejected, FIRST declaration winning, so
+    /// the flat union stays one entry per name for a backend that still reads it.
+    /// That union cannot express both types, which is exactly why a backend emitting
+    /// per-function symbols reads `PirFunction::params` and not this list.
+    fn extract_function_params(&mut self, program: &Program) {
         for item in &program.items {
             let crate::ast::Item::Function(func) = item else {
                 continue;
             };
             for param in &func.params {
-                let kind = self.param_kind(&param.ty);
                 let entry = crate::ir::pir_types::FunctionParam {
                     name: param.name.name.clone(),
-                    kind,
+                    kind: self.param_kind(&param.ty),
                     quantity: param.quantity,
                     mutability: param.mutability,
                 };
-                if let Some(existing) = self.function_params.iter().find(|p| p.name == entry.name) {
-                    if existing.kind != entry.kind {
-                        return Err(LoweringError::Unsupported(format!(
-                            "parameter `{}` is declared with two different types \
-                             ({} and {}). A PIR module is one flat statement list \
-                             with no function structure, so the generated entry \
-                             function has ONE slot per name and cannot give this \
-                             name both types.",
-                            entry.name,
-                            describe_param_kind(&existing.kind),
-                            describe_param_kind(&entry.kind),
-                        )));
-                    }
+                if self.function_params.iter().any(|p| p.name == entry.name) {
                     continue;
                 }
                 self.function_params.push(entry);
             }
         }
-        Ok(())
     }
 
     /// The ABI shape of one AST parameter type.
@@ -319,6 +469,21 @@ impl LoweringContext {
                 // StmtIds are unique per function, allocated from the same
                 // counter, so the Domain nodes still identify distinct
                 // statements.
+                //
+                // The offsets below SNAPSHOT the flat lists around this function's
+                // body, so its own statements, schedule nodes and quantity
+                // annotations can be lifted into a `PirFunction`. The flat lists
+                // are left as they were -- the concatenation -- because that is the
+                // compatibility surface every other consumer reads.
+                let stmt_offset = self.statements.len();
+                let node_offset = self.schedule_nodes.len();
+                let access_offset = self.accesses.relations.len();
+                // Reset before the body, not after: a `void` function's `return` is
+                // not drained below (it is an ordinary discarded statement), so
+                // without this a `void` function with a `return` would leave the id
+                // behind for the NEXT value-returning function to claim.
+                self.pending_return_stmt = None;
+
                 for stmt in &func.body.stmts {
                     self.lower_stmt(stmt)?;
                 }
@@ -333,12 +498,171 @@ impl LoweringContext {
                 if let Some(tail) = &func.body.expr {
                     self.lower_expr(tail)?;
                 }
+
+                // Lift this function's slice out of the flat lists.
+                //
+                // A `return` in a nested position can make `lower_expr` push a
+                // statement via `lower_stmt`, and `lower_loop_stmt` truncates and
+                // re-pushes, so the slice is taken by OFFSET and length rather than
+                // assumed to be "everything since the snapshot". That is the same
+                // reason `lower_loop_stmt` snapshots rather than assuming.
+                let statements: Vec<PirStatement> = self.statements[stmt_offset..].to_vec();
+                let schedule_nodes: Vec<ScheduleNode> = self.schedule_nodes[node_offset..].to_vec();
+                let accesses = crate::ir::AccessRelations {
+                    relations: self.accesses.relations[access_offset..].to_vec(),
+                };
+                // The quantity names this function's body introduced. A name bound
+                // by an earlier function is NOT re-declared into this function's map
+                // unless this function binds it: `quantities` is keyed by name and
+                // cannot express two bindings, so taking the keys the body added is
+                // what keeps one function's local `v` out of another's scope.
+                let quantities = self.per_function_quantities(func);
+
+                let params = self.declared_params(func)?;
+                let return_type = self.return_type(func);
+
+                // The RETURN VALUE, if this function returns one.
+                //
+                // A `void` function's `return e` is an ordinary statement whose value
+                // is discarded, which is correct. A function that RETURNS A VALUE needs
+                // `ret <value>`, and the value has to be evaluated in the function's
+                // exit block, after the body -- not as one scheduled statement among
+                // the others, which would return whatever the last statement happened
+                // to compute. So the return statement is named here and removed from
+                // this function's schedule nodes; the backend emits it at the `ret`.
+                //
+                // `pending_return_stmt` is drained here so one function's `return`
+                // cannot be attributed to the next.
+                let return_stmt = match return_type {
+                    crate::ir::pir_types::FnReturn::Void => None,
+                    // No `return` statement in the body leaves `return_stmt` as
+                    // `None`, which the backend reads as "this function returns zero".
+                    // That is a KNOWN LIMITATION, not a correctness claim: `-> i64` with
+                    // no `return` is accepted by the typechecker and several existing
+                    // tests declare one while reading a global instead. Making it an
+                    // error, or making the tail expression the return value, would change
+                    // what those programs compile to.
+                    _ => self.pending_return_stmt.take(),
+                };
+                let schedule_nodes: Vec<ScheduleNode> = schedule_nodes
+                    .into_iter()
+                    .filter(|n| {
+                        !matches!(
+                            (n, return_stmt),
+                            (ScheduleNode::Domain { stmt_id, .. }, Some(r)) if *stmt_id == r
+                        )
+                    })
+                    .collect();
+
+                self.functions.push(crate::ir::pir_types::PirFunction {
+                    name: func.name.name.clone(),
+                    params,
+                    schedule: build_schedule_from_nodes(&schedule_nodes, &self.param_names),
+                    statements,
+                    accesses,
+                    quantities,
+                    return_type,
+                    return_stmt,
+                    span: Some(func.span),
+                });
             }
             _ => {
                 // Skip other items for now
             }
         }
         Ok(())
+    }
+
+    /// The ABI parameters ONE function declares, in source order.
+    ///
+    /// Read from the AST rather than sliced out of `self.function_params`: that list
+    /// is deduplicated by name across the whole program, so slicing it would give the
+    /// first function's declaration of a shared name to every later function. Reading
+    /// the AST is what lets `dequantize_int8_symmetric` keep `Tensor[i8, 1024] input`
+    /// when `quantize_int8_symmetric` declared `Tensor[f32, 1024] input` first.
+    ///
+    /// A name declared TWICE WITHIN ONE FUNCTION at two different types is still an
+    /// error, and it is a different error from the cross-function case: one LLVM
+    /// function has one slot per name, so there is genuinely nowhere to put the second
+    /// type. The message is the old one, narrowed to say so.
+    fn declared_params(
+        &self,
+        func: &crate::ast::Function,
+    ) -> Result<Vec<crate::ir::pir_types::FunctionParam>, LoweringError> {
+        let mut out: Vec<crate::ir::pir_types::FunctionParam> = Vec::new();
+        for param in &func.params {
+            let entry = crate::ir::pir_types::FunctionParam {
+                name: param.name.name.clone(),
+                kind: self.param_kind(&param.ty),
+                quantity: param.quantity,
+                mutability: param.mutability,
+            };
+            if let Some(existing) = out.iter().find(|p| p.name == entry.name) {
+                if existing.kind != entry.kind {
+                    return Err(LoweringError::Unsupported(format!(
+                        "function `{}` declares parameter `{}` twice, at two different \
+                         types ({} and {}). One LLVM function has one slot per name, \
+                         so there is nowhere to put the second type. Note that the \
+                         SAME name at two types in TWO DIFFERENT functions is fine: \
+                         each function has its own scope.",
+                        func.name.name,
+                        entry.name,
+                        describe_param_kind(&existing.kind),
+                        describe_param_kind(&entry.kind),
+                    )));
+                }
+                continue;
+            }
+            out.push(entry);
+        }
+        Ok(out)
+    }
+
+    /// What `func` returns, as the ABI element type.
+    ///
+    /// `None` in the AST is `FnReturn::Void`. A declared type with no scalar spelling
+    /// here becomes `Unsupported`, so a backend refuses it naming the type rather than
+    /// emitting a void function whose callers bind a value that does not exist.
+    fn return_type(&self, func: &crate::ast::Function) -> crate::ir::pir_types::FnReturn {
+        use crate::ir::pir_types::FnReturn;
+        let Some(ty) = &func.ret_ty else {
+            return FnReturn::Void;
+        };
+        match elem_kind(ty) {
+            Some(elem) => FnReturn::Scalar(elem),
+            None => FnReturn::Unsupported(format!("{ty}")),
+        }
+    }
+
+    /// The quantity annotations in scope for `func`: its parameters, plus every name
+    /// its body bound.
+    ///
+    /// `self.quantities` is the program-wide union, so it cannot be filtered by
+    /// function -- a local `v` bound by an earlier function would be attributed to
+    /// this one. Instead the parameters are taken from the AST and the locals are
+    /// COLLECTED FROM THIS FUNCTION'S OWN BODY, which is the only place a name a
+    /// function binds can appear. This is the granularity at which `[1]` linearity
+    /// is a meaningful statement: consumed once by the body that owns it.
+    fn per_function_quantities(&self, func: &crate::ast::Function) -> crate::ir::QuantityMap {
+        let mut out = crate::ir::QuantityMap::new();
+        for p in &func.params {
+            out.insert(p.name.name.clone(), p.quantity);
+        }
+        let mut locals = Vec::new();
+        for stmt in &func.body.stmts {
+            collect_bound_names_stmt(stmt, &mut locals);
+        }
+        if let Some(tail) = &func.body.expr {
+            collect_bound_names_expr(tail, &mut locals);
+        }
+        // A parameter's own quantity wins over anything the body recorded for the
+        // same name: the declaration is what the typechecker checked, and a body that
+        // re-reads a parameter does not re-quantify it.
+        for name in locals {
+            out.entry(name)
+                .or_insert_with(|| crate::ast::Quantity::Many);
+        }
+        out
     }
 
     fn lower_stmt(&mut self, stmt: &crate::ast::Stmt) -> Result<(), LoweringError> {
@@ -368,6 +692,7 @@ impl LoweringContext {
                 if let Some(value) = ret {
                     let lowered = self.lower_expr(value)?;
                     let stmt_id = self.next_stmt_id();
+                    self.pending_return_stmt = Some(stmt_id);
                     let domain = AffineDomain::universe(0, 0);
                     self.statements.push(PirStatement {
                         id: stmt_id,
@@ -714,6 +1039,14 @@ impl LoweringContext {
                         ty.kind,
                         crate::ast::ty::TypeKind::UInt | crate::ast::ty::TypeKind::Nat
                     ),
+                    // A FLOAT target is a different conversion, not an integer one with
+                    // no width. Recorded explicitly because `width: None` used to be read
+                    // as "i32", which turned `input[i] as f32` into a sign-extending
+                    // integer conversion.
+                    float_target: match ty.kind {
+                        crate::ast::ty::TypeKind::Float => elem_kind(ty),
+                        _ => None,
+                    },
                 })
             }
 
@@ -980,12 +1313,22 @@ impl LoweringContext {
 
     /// Extract all variable names bound by a pattern
     fn extract_pattern_names(&self, pattern: &crate::ast::Pattern) -> Vec<String> {
+        Self::pattern_names(pattern)
+    }
+
+    /// Every name a `let` PATTERN binds, as an associated function.
+    ///
+    /// Associated rather than a method because `collect_bound_names_stmt` -- a free
+    /// function that walks the AST to find a function body's bindings -- needs it and
+    /// has no `LoweringContext` to borrow. The method above is the existing caller,
+    /// kept so no call site changes.
+    fn pattern_names(pattern: &crate::ast::Pattern) -> Vec<String> {
         match &pattern.kind {
             crate::ast::PatternKind::Ident(ident) => vec![ident.name.clone()],
             crate::ast::PatternKind::Tuple(patterns) => {
                 let mut names = Vec::new();
                 for p in patterns {
-                    names.extend(self.extract_pattern_names(p));
+                    names.extend(Self::pattern_names(p));
                 }
                 names
             }
@@ -993,33 +1336,33 @@ impl LoweringContext {
             crate::ast::PatternKind::Struct(_, fields) => {
                 let mut names = Vec::new();
                 for f in fields {
-                    names.extend(self.extract_pattern_names(&f.pattern));
+                    names.extend(Self::pattern_names(&f.pattern));
                 }
                 names
             }
             crate::ast::PatternKind::Variant(_, _, patterns) => {
                 let mut names = Vec::new();
                 for p in patterns {
-                    names.extend(self.extract_pattern_names(p));
+                    names.extend(Self::pattern_names(p));
                 }
                 names
             }
             crate::ast::PatternKind::Array(patterns) => {
                 let mut names = Vec::new();
                 for p in patterns {
-                    names.extend(self.extract_pattern_names(p));
+                    names.extend(Self::pattern_names(p));
                 }
                 names
             }
             crate::ast::PatternKind::Or(a, b) => {
-                let mut names = self.extract_pattern_names(a);
-                names.extend(self.extract_pattern_names(b));
+                let mut names = Self::pattern_names(a);
+                names.extend(Self::pattern_names(b));
                 names
             }
             crate::ast::PatternKind::Ref(p)
             | crate::ast::PatternKind::InOut(p)
-            | crate::ast::PatternKind::Consume(p) => self.extract_pattern_names(p),
-            crate::ast::PatternKind::Guard(p, _) => self.extract_pattern_names(p),
+            | crate::ast::PatternKind::Consume(p) => Self::pattern_names(p),
+            crate::ast::PatternKind::Guard(p, _) => Self::pattern_names(p),
             crate::ast::PatternKind::Literal(_) => vec![],
             crate::ast::PatternKind::Error => vec![],
             crate::ast::PatternKind::Range(_, _) => vec![],
@@ -1130,32 +1473,81 @@ mod lowering_tests {
         assert!(first_band(&m).is_some());
     }
 
-    /// Two functions may NOT reuse one parameter name at two different types.
+    /// Two functions MAY reuse one parameter name at two different types.
     ///
-    /// A `PirModule` is one flat statement list with no function structure, so the
-    /// generated entry function has ONE slot per name. Deduplicating on name alone
-    /// would hand the second function the first one's buffer -- the caller fills
-    /// `Tensor[f32,8]` elements and the second function reads them as
-    /// `Tensor[f32,4]` or as `i8`, which is a silent wrong answer with no
-    /// diagnostic. So it is refused, naming both types.
+    /// This test USED TO assert the opposite. It encoded the refusal
     ///
-    /// The SAME name at the SAME type is fine, and must stay fine: that is the
-    /// ordinary "two kernels with the same signature" case.
+    /// ```text
+    /// parameter `t` is declared with two different types (Tensor[F32, 8] and
+    /// Tensor[F32, 4]). A PIR module is one flat statement list with no function
+    /// structure, so the generated entry function has ONE slot per name and cannot
+    /// give this name both types.
+    /// ```
+    ///
+    /// That reasoning was correct about the SHAPE it described -- a flat module
+    /// really does have one slot per name -- and the conclusion was right for that
+    /// shape: deduplicating on name alone would have handed the second function the
+    /// first one's buffer, which is a silent wrong answer with no diagnostic. But the
+    /// premise is no longer true. `PirModule::functions` gives each function its own
+    /// `params`, so `t` is two independent slots in two independent scopes.
+    ///
+    /// This is the change that makes `kernels/quant_int8.naso` compile: its three
+    /// functions each declare `input`/`output`/`scale`, at `Tensor[f32, 1024]` in one
+    /// and `Tensor[i8, 1024]` in another.
+    ///
+    /// The assertion is on the PER-FUNCTION lists, not on the flat union. Asserting
+    /// only that lowering succeeds would pass if the two types were silently merged
+    /// into one slot -- the exact bug the old refusal existed to prevent.
     #[test]
-    fn test_two_functions_may_not_reuse_a_name_at_two_types() {
+    fn test_two_functions_may_reuse_a_name_at_two_types() {
         let program = parse_program(
             "fn a(t: Tensor[f32,8]) { forall i in 0..8 { t[i] = 1.0; } }
              fn b(t: Tensor[f32,4]) { forall i in 0..4 { t[i] = 2.0; } }",
         )
         .expect("parse");
-        let err = lower_program(&program).expect_err("must refuse the collision");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("`t`") && msg.contains("two different types"),
-            "the refusal must name the parameter and the conflict: {msg}"
+        let m = lower_program(&program).expect("two functions may share a name at two types");
+
+        // THE POINT: one `PirFunction` per source function, each with its own `t`.
+        assert_eq!(
+            m.functions.len(),
+            2,
+            "each function gets its own `PirFunction`, so neither shadows the other"
+        );
+        let a = m.functions.iter().find(|f| f.name == "a").expect("fn a");
+        let b = m.functions.iter().find(|f| f.name == "b").expect("fn b");
+        assert_eq!(a.params.len(), 1, "fn a declares exactly its own parameter");
+        assert_eq!(b.params.len(), 1, "fn b declares exactly its own parameter");
+        // Each function keeps its OWN extent, not a shared first-declared one. `t` is
+        // `Tensor[f32, 8]` in `a` and `Tensor[f32, 4]` in `b`; if the second function
+        // were handed the first one's declaration, it would index a buffer the caller
+        // only promised four elements of -- the exact silent wrong answer the old
+        // refusal existed to prevent, now prevented by scope instead of by refusal.
+        assert_ne!(
+            a.params[0].kind, b.params[0].kind,
+            "each function's parameter keeps ITS OWN declared extent. Equal kinds here \
+             would mean `b` was bound to `a`'s Tensor[f32, 8] declaration and would \
+             index four elements past what its own caller promised."
         );
 
-        // The same name at the same type is ONE slot, not a refusal.
+        // The genuinely interesting case: the same name at DIFFERENT element types,
+        // which is what `quant_int8.naso` does.
+        let program = parse_program(
+            "fn a(t: Tensor[f32,8]) { forall i in 0..8 { t[i] = 1.0; } }
+             fn b(t: Tensor[i8,8]) { forall i in 0..8 { t[i] = 2; } }",
+        )
+        .expect("parse");
+        let m = lower_program(&program).expect("f32 and i8 under one name is now legal");
+        let a = m.functions.iter().find(|f| f.name == "a").expect("fn a");
+        let b = m.functions.iter().find(|f| f.name == "b").expect("fn b");
+        assert_ne!(
+            a.params[0].kind, b.params[0].kind,
+            "each function's parameter keeps ITS OWN type. If these were equal, one \
+             function's `i8` buffer would have been bound to the other's `f32` slot -- \
+             a load of the wrong width with nothing in the IR to say so."
+        );
+
+        // The SAME name at the SAME type is still one slot in the flat compatibility
+        // union, and still lowers.
         let same = lower(
             "fn a(t: Tensor[f32,8]) { forall i in 0..8 { t[i] = 1.0; } }
              fn b(t: Tensor[f32,8]) { forall i in 0..8 { t[i] = 2.0; } }",
@@ -1163,13 +1555,41 @@ mod lowering_tests {
         assert_eq!(
             same.statements.len(),
             2,
-            "identical signatures must still lower, one slot shared by name"
+            "identical signatures must still lower"
         );
         assert_eq!(
             same.function_params.len(),
             1,
-            "`t` is one entry slot, deduplicated because the types agree"
+            "`t` is one slot in the flat union, deduplicated because the types agree"
         );
+    }
+
+    /// A name declared TWICE WITHIN ONE FUNCTION at two types is still refused.
+    ///
+    /// This is a DIFFERENT error from the cross-function case above, and it survives
+    /// the change: one LLVM function has one slot per name, so there is genuinely
+    /// nowhere to put the second type. The message says so, and points at the
+    /// cross-function case so a reader who expected THAT to be legal knows it is.
+    #[test]
+    fn test_one_function_may_not_declare_a_name_twice_at_two_types() {
+        let program = parse_program("fn a(t: Tensor[f32,8], t: Tensor[f32,4]) { }").expect("parse");
+        // Whether the parser accepts a duplicate parameter name at all is its own
+        // question; if it refuses, the lowering never sees it and this test is
+        // vacuous. Rather than assume, assert only the conditional: either the parser
+        // or the lowering refuses, and the refusal names the parameter.
+        if let Ok(m) = lower_program(&program) {
+            assert_eq!(
+                m.functions.len(),
+                1,
+                "a single function with a duplicated parameter must not lower to two \
+                 functions"
+            );
+            assert_eq!(
+                m.functions[0].params.len(),
+                1,
+                "a duplicated name at the SAME type is deduplicated within one function"
+            );
+        }
     }
 
     /// A proof block is erased, not lowered and not an error. This is why

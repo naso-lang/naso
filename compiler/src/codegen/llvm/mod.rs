@@ -9,6 +9,8 @@ pub mod access_emission;
 #[cfg(feature = "llvm")]
 pub mod expr_lowering;
 #[cfg(feature = "llvm")]
+pub mod function_emission;
+#[cfg(feature = "llvm")]
 pub mod loop_emission;
 #[cfg(feature = "llvm")]
 pub mod module_builder;

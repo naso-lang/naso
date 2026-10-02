@@ -282,6 +282,7 @@ fn a_float_to_i64_cast_produces_the_truncated_integer_on_the_cpu() {
         expr: Box::new(PirExpr::FloatLit("5.7".into())),
         width: Some(64),
         signed: true,
+        float_target: None,
     });
     assert_eq!(got, 5, "5.7 as i64 must be 5. Got {got}.\n--- IR ---\n{ir}");
 }
@@ -292,6 +293,7 @@ fn a_float_cast_truncates_toward_zero_rather_than_rounding() {
         expr: Box::new(PirExpr::FloatLit("300.7".into())),
         width: Some(64),
         signed: true,
+        float_target: None,
     });
     assert_eq!(
         got, 300,
@@ -305,6 +307,7 @@ fn a_widening_cast_preserves_the_value() {
         expr: Box::new(PirExpr::IntLit(700)),
         width: Some(64),
         signed: true,
+        float_target: None,
     });
     assert_eq!(
         got, 700,
@@ -320,6 +323,7 @@ fn a_negative_source_widens_by_sign_extension() {
         expr: Box::new(PirExpr::IntLit(-5)),
         width: Some(64),
         signed: true,
+        float_target: None,
     });
     assert_eq!(
         got, -5,
@@ -367,6 +371,7 @@ fn a_narrowing_integer_cast_drops_the_high_bits_on_the_cpu() {
             expr: Box::new(PirExpr::IntLit(700)),
             width: Some(8),
             signed: true,
+            float_target: None,
         },
         naso_compiler::codegen::abi::IntWidth::I8,
     );
@@ -385,6 +390,7 @@ fn a_narrowing_cast_of_a_positive_value_truncates_to_the_low_byte() {
             expr: Box::new(PirExpr::IntLit(300)),
             width: Some(8),
             signed: true,
+            float_target: None,
         },
         naso_compiler::codegen::abi::IntWidth::I8,
     );
@@ -406,6 +412,7 @@ fn a_float_to_i32_cast_truncates_into_the_narrow_slot() {
             expr: Box::new(PirExpr::FloatLit("300.7".into())),
             width: Some(32),
             signed: true,
+            float_target: None,
         },
         naso_compiler::codegen::abi::IntWidth::I32,
     );
@@ -427,6 +434,7 @@ fn a_negative_float_to_int_cast_is_signed() {
         expr: Box::new(PirExpr::FloatLit("-5.7".into())),
         width: Some(64),
         signed: true,
+        float_target: None,
     });
     assert_eq!(
         got, -5,
@@ -447,6 +455,7 @@ fn a_negative_narrowing_cast_sign_extends_rather_than_zero_extends() {
             expr: Box::new(PirExpr::IntLit(-300)),
             width: Some(8),
             signed: true,
+            float_target: None,
         },
         naso_compiler::codegen::abi::IntWidth::I8,
     );
@@ -473,11 +482,13 @@ fn a_narrow_then_widen_cast_round_trips_a_negative_value() {
         expr: Box::new(PirExpr::IntLit(-300)),
         width: Some(8),
         signed: true,
+        float_target: None,
     };
     let (got, ir) = eval(PirExpr::Cast {
         expr: Box::new(inner),
         width: Some(64),
         signed: true,
+        float_target: None,
     });
     assert_eq!(
         got, -44,
@@ -494,11 +505,13 @@ fn a_narrow_then_widen_cast_round_trips_a_positive_value() {
         expr: Box::new(PirExpr::IntLit(300)),
         width: Some(8),
         signed: true,
+        float_target: None,
     };
     let (got, ir) = eval(PirExpr::Cast {
         expr: Box::new(inner),
         width: Some(64),
         signed: true,
+        float_target: None,
     });
     assert_eq!(
         got, 44,
@@ -522,11 +535,13 @@ fn an_unsigned_widening_cast_uses_zero_extension() {
         width: Some(8),
         // Narrowing: the bit pattern is all that matters here.
         signed: false,
+        float_target: None,
     };
     let (got, ir) = eval(PirExpr::Cast {
         expr: Box::new(inner),
         width: Some(64),
         signed: false,
+        float_target: None,
     });
     assert_eq!(
         got, 200,

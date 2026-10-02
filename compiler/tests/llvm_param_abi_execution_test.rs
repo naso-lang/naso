@@ -236,9 +236,17 @@ fn tensor_parameters_are_pointers_in_the_entry_signature() {
         .expect("module must define an entry function");
     // A tensor is a `ptr`, and it is the CALLER's pointer: no `alloca` of the
     // element type may stand in for it.
+    // The primary symbol is `naso_<name>`; `naso_entry` is the conventional entry shim
+    // emitted alongside it. Both carry the same signature, so this asserts the shape
+    // through the primary and the shim is checked by the scalar-only guard test.
     assert!(
-        sig.contains("naso_entry(ptr %input"),
+        sig.contains("naso_scale_clamp_f32(ptr %input"),
         "entry must take `input` as a pointer, got: {sig}"
+    );
+    assert!(
+        ir.contains("define void @naso_entry(ptr %input, i64 %input_len"),
+        "the conventional entry symbol must exist and carry the same ABI, so an \
+         external caller is unaffected by the per-function change:\n{ir}"
     );
     assert!(
         sig.contains("ptr %output"),
@@ -455,14 +463,29 @@ fn q(input: [1] Tensor[f32, 16], output: inout [1] Tensor[i8, 16], scale: f32) {
     }
 }
 
+/// Two functions reusing a parameter name at DIFFERENT types now compile, each into
+/// its own LLVM symbol with its own slot for that name.
+///
+/// This test USED TO assert the opposite, and pinned the refusal as "the deliberate
+/// limitation":
+///
+/// ```text
+/// parameter `input` is declared with two different types (Tensor[F32, 8] and
+/// Tensor[I8, 8]). A PIR module is one flat statement list with no function structure,
+/// so the generated entry function has ONE slot per name.
+/// ```
+///
+/// The reasoning about the flat shape was right; the shape is no longer flat.
+/// `PirModule::functions` gives each function its own parameters, statements, schedule
+/// and quantity map, and each becomes its own `define`. This is what makes
+/// `kernels/quant_int8.naso` -- the shipped kernel this limitation blocked -- compile.
+///
+/// The assertion is deliberately about the TWO SIGNATURES, not merely that the build
+/// succeeded. A build that "succeeded" by handing both functions the first one's
+/// declaration would still verify and still read an `i8` buffer at `f64` width, which
+/// is the silent wrong answer the old refusal existed to prevent.
 #[test]
-fn two_functions_reusing_a_parameter_name_with_different_types_are_refused() {
-    // The deliberate limitation, pinned. A `PirModule` is ONE flat statement list with
-    // no function structure, so the generated entry has one slot per NAME. Two
-    // functions that both declare `input` at different element types cannot both be
-    // satisfied by one slot. Deduplicating on name alone would silently give the
-    // second function the first one's buffer -- the exact class of silent wrong answer
-    // this work exists to remove -- so it is a named refusal instead.
+fn two_functions_reusing_a_parameter_name_at_different_types_get_their_own_slots() {
     let src = r#"
 fn a(input: [1] Tensor[f32, 8]) {
     let v = input[0];
@@ -471,16 +494,79 @@ fn b(input: [1] Tensor[i8, 8]) {
     let v = input[0];
 }
 "#;
+    let ir = try_build_ir(src).unwrap_or_else(|e| panic!("must compile: {e}"));
+
+    // One `define` per function, under the documented `naso_<name>` convention.
+    assert!(
+        ir.contains("define void @naso_a("),
+        "fn `a` must get its own symbol:\n{ir}"
+    );
+    assert!(
+        ir.contains("define void @naso_b("),
+        "fn `b` must get its own symbol:\n{ir}"
+    );
+
+    // THE POINT. Both take `(ptr, i64 len)`, so the parameter lists look alike; what
+    // differs is the ELEMENT TYPE each one loads and stores, which is what the old
+    // single slot could not express.
+    assert!(
+        ir.contains("getelementptr double, ptr %input, i64"),
+        "fn `a`'s `input` must be indexed as `double`, its declared element type:\n{ir}"
+    );
+    assert!(
+        ir.contains("getelementptr i8, ptr %input, i64"),
+        "fn `b`'s `input` must be indexed as `i8`, its declared element type. A `double` \
+         index here would mean the second function was handed the first one's buffer -- \
+         reading eight bytes where the caller promised one:\n{ir}"
+    );
+    // And the LOAD widths must match, not just the index strides. A `double` stride
+    // paired with an `i8` load would read one byte of the right buffer at the right
+    // offset and still be wrong.
+    assert!(
+        ir.contains("load double, ptr %elem_addr"),
+        "fn `a` must LOAD a `double`:\n{ir}"
+    );
+    assert!(
+        ir.contains("load i8, ptr %elem_addr"),
+        "fn `b` must LOAD an `i8`:\n{ir}"
+    );
+
+    // Each function's own guard compares against ITS OWN declared extent. Both are 8
+    // here, so the two guards must both be present: a guard emitted only on the entry
+    // would leave the other function an unguarded hole.
+    assert_eq!(
+        ir.matches("icmp slt i64 %input_len, 8").count(),
+        2,
+        "EVERY function with a tensor parameter must guard its own buffer, not just the \
+         entry:\n{ir}"
+    );
+}
+
+/// A function whose name collides at two types WITHIN ITSELF is still refused.
+///
+/// A different error from the cross-function case, and it survives the change: one LLVM
+/// function has one slot per name, so there is nowhere to put the second type.
+#[test]
+fn one_function_declaring_a_name_twice_at_two_types_is_refused() {
+    let src = r#"
+fn a(input: [1] Tensor[f32, 8], input: [1] Tensor[i8, 8]) {
+    let v = input[0];
+}
+"#;
     match try_build_ir(src) {
         Err(e) => {
             let msg = e.to_string();
             assert!(
-                msg.contains("`input`") && msg.contains("two different types"),
-                "refusal must name the colliding parameter, got: {msg}"
+                msg.contains("`input`"),
+                "the refusal must name the duplicated parameter, got: {msg}"
             );
         }
+        // The parser may reject a duplicate parameter name before lowering sees it. In
+        // that case there is nothing for codegen to refuse, and the program does not
+        // compile -- which is the outcome this test is about either way.
         Ok(ir) => panic!(
-            "two conflicting declarations of `input` must be refused, but it compiled:\n{ir}"
+            "a name declared twice at two types within ONE function must not compile \
+             silently:\n{ir}"
         ),
     }
 }

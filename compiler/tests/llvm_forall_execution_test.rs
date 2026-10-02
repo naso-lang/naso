@@ -249,7 +249,7 @@ fn build_and_run(src: &str) -> (i64, String) {
 #[test]
 fn a_forall_in_naso_source_sums_every_iteration_on_the_cpu() {
     let src = "\
-fn sum_to_4() -> i64 {
+fn sum_to_4() {
     let mut total = 0;
     forall i in 0..4 {
         total = total + i;
@@ -273,7 +273,7 @@ fn sum_to_4() -> i64 {
 #[test]
 fn a_forall_in_naso_source_iterates_exactly_its_trip_count() {
     let src = "\
-fn count_iterations() -> i64 {
+fn count_iterations() {
     let mut n = 0;
     forall i in 0..4 {
         n = n + 1;
@@ -298,7 +298,7 @@ fn count_iterations() -> i64 {
 #[test]
 fn a_forall_with_a_nonzero_lower_bound_starts_at_that_bound() {
     let src = "\
-fn sum_from_two() -> i64 {
+fn sum_from_two() {
     let mut total = 0;
     forall i in 2..5 {
         total = total + i;
@@ -386,7 +386,7 @@ fn a_statement_the_schedule_tree_does_not_cover_is_refused() {
 #[test]
 fn a_symbolic_loop_bound_takes_its_trip_count_from_the_caller() {
     let src = "\
-fn sum_to(n: i64) -> i64 {
+fn sum_to(n: i64) {
     let mut total = 0;
     forall i in 0..n {
         total = total + i;
@@ -416,7 +416,7 @@ fn sum_to(n: i64) -> i64 {
 #[test]
 fn a_symbolic_loop_bound_runs_zero_times_when_the_caller_passes_zero() {
     let src = "\
-fn count_up(n: i64) -> i64 {
+fn count_up(n: i64) {
     let mut seen = 0;
     forall i in 0..n {
         seen = seen + 1;
@@ -458,7 +458,7 @@ fn count_up(n: i64) -> i64 {
 #[test]
 fn a_loop_carried_dependence_is_not_tagged_parallel_and_still_computes() {
     let src = "\
-fn sum_to_4() -> i64 {
+fn sum_to_4() {
     let mut total = 0;
     forall i in 0..4 {
         total = total + i;
@@ -894,7 +894,7 @@ fn a_band_with_no_declared_iterator_is_refused_rather_than_reading_zero() {
 #[test]
 fn a_nested_forall_nests_rather_than_sequences() {
     let src = "\
-fn nested() -> i64 {
+fn nested() {
     let mut total = 0;
     forall i in 0..3 {
         forall j in 0..2 {

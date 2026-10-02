@@ -231,6 +231,11 @@ fn build_loop_ir() -> String {
         // function keeps the bare `void()` signature these tests call.
         function_params: vec![],
         extern_functions: vec![],
+        // A hand-built module has no `PirFunction`s, so it is lowered as ONE synthetic
+        // function carrying the flat fields above. See `module_builder`'s
+        // `synthetic_single_function`: a `[statements]`-shaped module describes one
+        // function, and this is what it is.
+        functions: vec![],
     };
 
     lower_schedule_tree(

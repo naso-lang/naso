@@ -523,13 +523,48 @@ fn scale_one(a: f32, k: f32) -> f32 {
 }
 "#;
     let ir = build_ir(src);
-    let sig = ir
+
+    // TWO symbols, and this is the part the multi-function change introduced. The
+    // function itself is `naso_scale_one` -- the `naso_<name>` convention every
+    // generated function uses, so a call site resolves every callee by the same rule.
+    // `naso_entry` is the conventional ENTRY name, emitted as a thin call into the
+    // primary so an external C driver still has a stable symbol to link against.
+    //
+    // Previously this module had ONE `define`, `naso_entry`, and that is all. So the
+    // scalar-only property is now asserted on the primary's signature, and the entry
+    // is asserted to be a forwarding shim rather than a second copy of the body: a
+    // second copy would double the emitted code for no benefit.
+    let primary = ir
         .lines()
-        .find(|l| l.starts_with("define "))
-        .expect("module must define an entry function");
+        .find(|l| l.starts_with("define double @naso_scale_one("))
+        .expect("the function must be emitted under `naso_<name>`");
     assert_eq!(
-        sig, "define void @naso_entry(double %a, double %k) {",
-        "a scalar-only signature must be unchanged by the tensor-length ABI:\n{ir}"
+        primary, "define double @naso_scale_one(double %a, double %k) {",
+        "a scalar-only signature must be unchanged by the tensor-length ABI -- no \
+         length arguments, because there is no tensor to check:\n{ir}"
+    );
+    // The declared return type is honoured: `-> f32` is a `double` return, not void.
+    // Asserted because a `void` here would be a caller binding a value that does not
+    // exist -- a compile that succeeds and computes nothing.
+    assert!(
+        ir.contains("ret double %fmul"),
+        "a value-returning function must return the value it computed, not zero or \
+         nothing:\n{ir}"
+    );
+
+    let entry_shim = ir
+        .lines()
+        .find(|l| l.starts_with("define double @naso_entry("))
+        .expect("the entry symbol must exist for external callers");
+    assert_eq!(
+        entry_shim, "define double @naso_entry(double %a, double %k) {",
+        "the entry shim must carry the same signature as the function it forwards to:\n{ir}"
+    );
+    assert!(
+        ir.contains("call double @naso_scale_one(double %a, double %k)"),
+        "the entry must CALL the function, not duplicate its body. A second copy of \
+         the body would double the emitted code and make every backtrace point at a \
+         function the author never wrote:\n{ir}"
     );
     assert!(
         !ir.contains("declare void @exit"),

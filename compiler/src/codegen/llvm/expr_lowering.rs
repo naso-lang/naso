@@ -33,7 +33,7 @@
 use crate::ast::Quantity;
 use crate::codegen::error::{CodegenError, CodegenResult};
 use crate::codegen::llvm::value_builder::LlvmValueBuilder;
-use crate::ir::pir_types::{BinaryOp, PirExpr, UnaryOp};
+use crate::ir::pir_types::{BinaryOp, ParamKind, PirExpr, UnaryOp};
 use inkwell::module::Module;
 use inkwell::types::BasicTypeEnum;
 use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue};
@@ -44,6 +44,35 @@ use std::collections::HashMap;
 /// `PirExpr`'s `Debug` is the AST's debug output, so an error message built from it
 /// shows Rust enum syntax (`Var("input")`, `Index { .. }`) rather than the `input` and
 /// `output[i]` the reader wrote. This is what names the construct instead.
+/// The LLVM type a `ParamKind::Scalar` occupies in a call's argument list.
+///
+/// Matched against what `build_expr` produced, so a call refuses a wrong-width
+/// argument by NAME rather than letting LLVM reject the operand by index. One
+/// function because the declaration-side spelling lives in `module_builder::param_slot`
+/// and the call side has to agree with it: a `f64` slot read as an `f32` argument is a
+/// wrong answer, not a diagnostic.
+fn scalar_arg_type<'ctx>(
+    value_builder: &LlvmValueBuilder<'ctx>,
+    param: &ParamKind,
+) -> CodegenResult<BasicTypeEnum<'ctx>> {
+    use crate::codegen::abi::{FloatWidth, IntWidth};
+    use crate::ir::pir_types::ElemType;
+    let tl = value_builder.type_lowering();
+    Ok(match param {
+        ParamKind::Scalar(ElemType::F64) => tl.float_type(FloatWidth::F64).into(),
+        ParamKind::Scalar(ElemType::I8) => tl.int_type(IntWidth::I8).into(),
+        ParamKind::Scalar(ElemType::I16) => tl.int_type(IntWidth::I16).into(),
+        ParamKind::Scalar(ElemType::I32) => tl.int_type(IntWidth::I32).into(),
+        ParamKind::Scalar(ElemType::I64) => tl.int_type(IntWidth::I64).into(),
+        ParamKind::Scalar(ElemType::Bool) => tl.int_type(IntWidth::I1).into(),
+        other => {
+            return Err(CodegenError::UnsupportedFeature(format!(
+                "`{other:?}` is not a scalar, so it has no single-argument call slot."
+            )));
+        }
+    })
+}
+
 /// Split a subscript chain into its root tensor and ALL its subscripts.
 ///
 /// `C[i][j]` is parsed as `Index { base: Index { base: Var(C), indices: [i] },
@@ -91,6 +120,21 @@ pub struct PirExprLowerer<'ctx, 'a> {
     pub module: &'a Module<'ctx>,
     /// The function instructions are being emitted into. `If` appends its blocks here.
     pub current_function: FunctionValue<'ctx>,
+    /// Each Naso function's DECLARED parameter kinds, by function name.
+    ///
+    /// A call site needs this to marshal arguments, and it is not derivable from the
+    /// expression: `PirExpr::Call { name, args }` carries one `PirExpr` per SOURCE
+    /// argument, but a tensor argument occupies TWO LLVM arguments (`ptr`, then the
+    /// caller's `i64` element count). Without the callee's declaration the call site
+    /// would have to guess how many LLVM arguments each source argument expands to, and
+    /// a guess that is off by one produces a `call` that verifies and computes the wrong
+    /// thing: the argument after a tensor's pointer would be read as a buffer.
+    ///
+    /// `None` -- or a name absent from the map -- means the callee is not one of this
+    /// module's Naso functions: a prelude intrinsic or a declared `extern`. Those are
+    /// called with exactly the arguments the source wrote, one LLVM argument each,
+    /// because nothing in this backend declares an `extern` with a length parameter.
+    pub callee_params: Option<&'a HashMap<String, Vec<ParamKind>>>,
     /// True while lowering a PIR STATEMENT rather than an expression.
     ///
     /// A statement-position `let` is a binding that outlives its own expression, so it
@@ -187,6 +231,14 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 self.build_unary_op(*op, e)
             }
             PirExpr::Call { name, args } => {
+                // A call to a NASO FUNCTION marshals through the callee's own
+                // declaration, because a tensor argument occupies TWO LLVM arguments
+                // and only the callee knows that. Anything else -- a prelude intrinsic,
+                // an `extern` -- takes exactly the arguments the source wrote.
+                if self.callee_params.is_some_and(|p| p.contains_key(name)) {
+                    return self.build_naso_call(name, args, quantities);
+                }
+
                 let arg_values: CodegenResult<Vec<_>> = args
                     .iter()
                     .map(|a| self.build_expr(a, quantities))
@@ -202,20 +254,62 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                     return Ok(v);
                 }
 
-                let func = self.module.get_function(name).ok_or_else(|| {
-                    CodegenError::FunctionBuildError(format!("Function '{}' not found", name))
-                })?;
+                // Resolve the callee.
+                //
+                // A NASO FUNCTION is emitted under `naso_<name>`, so a Naso-to-Naso
+                // call has to be rewritten to that symbol. Resolution goes through
+                // `function_emission::symbol_for` -- the SAME function emission used to
+                // name the definition -- so the two cannot disagree about the
+                // convention. A second guess here, spelled `format!("naso_{name}")`,
+                // would compile cleanly right up until a call landed on a symbol that
+                // happened to exist and meant something else.
+                //
+                // By the time control reaches here the callee is NOT a Naso function in
+                // this module -- those returned above through `build_naso_call`. What is
+                // left is a prelude intrinsic or a declared `extern`, both of which are
+                // emitted under their own name. The prefixed fallback is kept as a
+                // safety net for a callee that IS a generated function but was not in
+                // `callee_params` (a hand-built module with a `functions` list the call
+                // site did not see), so the diagnostic below names both spellings
+                // rather than only the one that was tried.
+                let func = self
+                    .module
+                    .get_function(name)
+                    .or_else(|| {
+                        self.module.get_function(
+                            &crate::codegen::llvm::function_emission::symbol_for(name),
+                        )
+                    })
+                    .ok_or_else(|| {
+                        CodegenError::FunctionBuildError(format!(
+                            "call to `{name}` resolved to neither `{}` nor `{}`. \
+                             A Naso function is emitted under `naso_<name>`, so a call \
+                             to a function that is neither this module's nor a declared \
+                             `extern` has no target. Nothing is substituted for it.",
+                            name,
+                            crate::codegen::llvm::function_emission::symbol_for(name),
+                        ))
+                    })?;
 
                 // inkwell 0.10 takes call arguments as `BasicMetadataValueEnum`.
+                //
+                // The operand ORDER is arguments first, callee LAST: operands
+                // `0 .. num_operands - 1` are the arguments and the last one is the
+                // function pointer. `build_call` takes them as a slice in that order and
+                // appends the callee itself, so passing them the other way round -- or
+                // passing the callee in the slice -- produces IR that parses, verifies,
+                // and computes the wrong thing. There is no way to catch that by reading
+                // the IR; it is caught by executing the callee and checking the value.
                 let arg_metadata: Vec<BasicMetadataValueEnum<'ctx>> = arg_values
                     .into_iter()
                     .map(BasicMetadataValueEnum::from)
                     .collect();
 
+                // inkwell 0.10 takes call arguments as `BasicMetadataValueEnum`.
                 let call = self
                     .value_builder
                     .builder()
-                    .build_call(func, &arg_metadata, "call")
+                    .build_call(func, &arg_metadata, &format!("naso.call.{name}"))
                     .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
 
                 // A void call yields no value; `ValueKind::Instruction` is that case.
@@ -372,8 +466,42 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 expr,
                 width,
                 signed,
+                float_target,
             } => {
                 let v = self.build_expr(expr, quantities)?;
+
+                // A FLOAT TARGET: `sitofp`/`uitofp`.
+                //
+                // Checked BEFORE the integer path, because the integer path reads a
+                // `None` width as "i32" -- so an integer conversion would be emitted for
+                // a float cast, sign-extending an `i8` buffer to `i32` and leaving a
+                // `double` multiply with an integer operand. That compiles, verifies,
+                // and computes nonsense.
+                //
+                // The SOURCE must be an integer for this to mean anything. A float source
+                // is REFUSED rather than converted: `as f32` on a `double` is either a
+                // no-op the typechecker should have removed, or a width change this IR
+                // does not represent, and neither is a value to invent.
+                if let Some(target) = float_target {
+                    let float_ty = self
+                        .value_builder
+                        .type_lowering()
+                        .float_type(crate::codegen::abi::FloatWidth::F64);
+                    let int_value = v.into_int_value();
+                    let converted = if *signed {
+                        self.value_builder
+                            .builder()
+                            .build_signed_int_to_float(int_value, float_ty, "cast")
+                    } else {
+                        self.value_builder
+                            .builder()
+                            .build_unsigned_int_to_float(int_value, float_ty, "cast")
+                    }
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                    let _ = target;
+                    return Ok(converted.into());
+                }
+
                 let target_w = u32::from(width.unwrap_or(32));
                 let source_ty = v.get_type();
                 let is_float = matches!(source_ty, BasicTypeEnum::FloatType(_));
@@ -919,6 +1047,181 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Lower a call to a NASO FUNCTION in this module.
+    ///
+    /// # Argument marshalling, and why the callee's declaration is needed
+    ///
+    /// One source argument is not one LLVM argument. A tensor parameter occupies TWO:
+    /// its buffer pointer, then the caller's `i64` element count. That count is not a
+    /// detail -- it is what the callee's ABI guard compares against its own declared
+    /// extent, and it is the only thing that makes the declared extent checkable at
+    /// all. So a call forwards the length the CALLER was given, read off the caller's
+    /// own `TensorBinding`, and never a number recomputed from a shape: recomputing it
+    /// would make the callee's guard compare the caller's INVENTED length against the
+    /// callee's declaration and pass, having checked nothing about the caller's
+    /// actual allocation.
+    ///
+    /// ## Arity
+    ///
+    /// A mismatch between the number of source arguments and the number of declared
+    /// parameters is REFUSED, naming both. Passing the wrong count to `build_call`
+    /// produces a `call` whose operand list is the wrong length, which LLVM rejects
+    /// with a verifier message that names neither the Naso function nor the parameter
+    /// that is missing.
+    ///
+    /// ## Operand order
+    ///
+    /// inkwell 0.10 takes call arguments in a slice, ARGUMENTS FIRST, and appends the
+    /// callee itself as the last operand. Passing them the other way round produces IR
+    /// that parses, verifies, and computes the wrong thing; that failure is caught by
+    /// executing the callee and checking the value, not by reading the IR.
+    ///
+    /// ## Void, value, and discarded results
+    ///
+    /// All three are handled by the same path. A void callee's `build_call` yields no
+    /// basic value, and the `void_placeholder` stands in for it -- which is what a
+    /// statement body wants, since a statement body's side effects are the point and
+    /// its result is discarded. A value-returning callee's value flows out to
+    /// whatever expression the call was embedded in. A call whose result is discarded
+    /// reads as a statement body and takes the same path as a void one.
+    fn build_naso_call(
+        &mut self,
+        name: &str,
+        args: &[PirExpr],
+        quantities: &HashMap<String, Quantity>,
+    ) -> CodegenResult<BasicValueEnum<'ctx>> {
+        let params = self
+            .callee_params
+            .and_then(|p| p.get(name))
+            .cloned()
+            .unwrap_or_default();
+        if params.len() != args.len() {
+            return Err(CodegenError::FunctionBuildError(format!(
+                "call to `{name}` passes {} argument(s) but the function declares {} \
+                 parameter(s). Nothing is padded or dropped: an invented argument would \
+                 be a value the caller never computed, and a dropped one would shift \
+                 every later parameter.",
+                args.len(),
+                params.len()
+            )));
+        }
+
+        let mut values: Vec<BasicValueEnum<'ctx>> = Vec::with_capacity(args.len());
+        for (arg, param) in args.iter().zip(params.iter()) {
+            match param {
+                ParamKind::Tensor { .. } => {
+                    // A tensor argument is a NAME, not a general expression. Accepting
+                    // an arbitrary expression here would mean computing a fresh buffer
+                    // and passing a pointer to it, which the callee would then fill --
+                    // and whose length the caller could not state. Refusing keeps the
+                    // one honest case (forwarding a buffer the caller was given) the
+                    // only case.
+                    let PirExpr::Var(tensor_name) = arg else {
+                        return Err(CodegenError::UnsupportedFeature(format!(
+                            "call to `{name}` passes a tensor parameter, so its argument \
+                             must be a tensor NAME the caller holds. This one is not: \
+                             `{arg:?}`. Passing a computed buffer would mean passing a \
+                             length the caller cannot state, and the callee's guard would \
+                             have nothing real to check."
+                        )));
+                    };
+                    let Some(binding) = self.value_builder.tensor(tensor_name) else {
+                        return Err(CodegenError::InstructionError(format!(
+                            "call to `{name}` passes `{tensor_name}` as a tensor, but \
+                             this function's scope has no tensor by that name. A name \
+                             from another function's scope cannot be passed here: each \
+                             function has its own, and none of them is visible."
+                        )));
+                    };
+                    let Some(len) = binding.len else {
+                        return Err(CodegenError::UnsupportedFeature(format!(
+                            "call to `{name}` passes `{tensor_name}`, whose length the \
+                             caller never received, so there is no count to forward. \
+                             Passing a number computed from the declared shape instead \
+                             would make the callee's guard check an invented length \
+                             rather than the caller's buffer."
+                        )));
+                    };
+                    // Pointer first, then the count: the ABI's own order, which is the
+                    // order `build_entry_signature` recorded in `len_arg_index`.
+                    values.push(binding.base.into());
+                    values.push(len.into());
+                }
+                ParamKind::QRegister => {
+                    // One argument, like the ABI slot: a quantum register is a
+                    // caller-owned pointer with no element count. Nothing in this
+                    // backend indexes one, so a read stays a diagnostic.
+                    let PirExpr::Var(name) = arg else {
+                        return Err(CodegenError::UnsupportedFeature(format!(
+                            "call to `{name}` passes a quantum register, which is a \
+                             caller-owned pointer, so its argument must be a NAME. \
+                             `{arg:?}` is not."
+                        )));
+                    };
+                    let Some(binding) = self.value_builder.tensor(name) else {
+                        return Err(CodegenError::InstructionError(format!(
+                            "call to `{name}` passes `{name}` as a quantum register, but \
+                             this function's scope has none by that name."
+                        )));
+                    };
+                    values.push(binding.base.into());
+                }
+                // A scalar is passed BY VALUE, evaluated as an ordinary expression.
+                //
+                // A WIDTH MISMATCH is refused rather than converted: the callee declared
+                // this parameter's type, and converting to it would compute a value the
+                // source never wrote. LLVM would also reject the call, but with a
+                // message naming an operand index rather than the parameter.
+                ParamKind::Scalar(_) => {
+                    let v = self.build_expr(arg, quantities)?;
+                    if v.get_type() != scalar_arg_type(self.value_builder, param)? {
+                        return Err(CodegenError::UnsupportedFeature(format!(
+                            "call to `{name}` passes an argument of type `{}` where the \
+                             callee declares `{param:?}`. Nothing is converted: a cast \
+                             here would be a value the source never wrote.",
+                            v.get_type(),
+                        )));
+                    }
+                    values.push(v);
+                }
+                ParamKind::Unsupported(ty) => {
+                    return Err(CodegenError::UnsupportedFeature(format!(
+                        "call to `{name}` passes a parameter of type `{ty}`, which has no \
+                         slot in this ABI. Nothing is substituted for it."
+                    )));
+                }
+            }
+        }
+
+        let symbol = crate::codegen::llvm::function_emission::symbol_for(name);
+        let func = self.module.get_function(&symbol).ok_or_else(|| {
+            CodegenError::FunctionBuildError(format!(
+                "call to `{name}` looked for `{symbol}`, which is not in the module. \
+                 Every function's signature is declared before any body is emitted, so \
+                 this means the call names a function the lowering did not record."
+            ))
+        })?;
+
+        let arg_metadata: Vec<BasicMetadataValueEnum<'ctx>> = values
+            .into_iter()
+            .map(BasicMetadataValueEnum::from)
+            .collect();
+        let call = self
+            .value_builder
+            .builder()
+            .build_call(func, &arg_metadata, &format!("naso.call.{name}"))
+            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+
+        // A void callee yields no basic value. `void_placeholder` is what a statement
+        // body wants anyway: its side effects were emitted before this point, and its
+        // result is discarded. A value-returning callee flows out to the enclosing
+        // expression.
+        Ok(call
+            .try_as_basic_value()
+            .basic()
+            .unwrap_or_else(|| self.void_placeholder()))
     }
 
     /// Call a `double -> double` LLVM intrinsic, declaring it on first use.

@@ -7,7 +7,7 @@
 use super::access_relation::AccessRelations;
 use super::affine_domain::AffineDomain;
 use super::affine_map::AffineMap;
-use super::pir_types::{PirExpr, PirModule, ValidationError};
+use super::pir_types::{PirExpr, PirModule, PirStatement, ValidationError};
 use super::schedule_tree::{ScheduleNode, ScheduleTree};
 use crate::ast::Quantity;
 use serde::{Deserialize, Serialize};
@@ -65,11 +65,19 @@ pub fn validate_pir(module: &PirModule) -> Result<(), Vec<ValidationError>> {
     }
 
     // 5. Quantity consistency: [0] vars should not appear in runtime schedule
-    for (var, qty) in &module.quantities {
-        if qty == &Quantity::Zero {
-            for stmt in &module.statements {
-                if expr_contains_var(&stmt.body, var) {
-                    errors.push(ValidationError::ZeroQuantityInRuntime(var.clone(), stmt.id));
+    //
+    // Run per FUNCTION when the module has function structure. A `[0]` name is erased
+    // at compile time, so it must not survive into the schedule of the function that
+    // binds it; another function binding the same name is a different binding with its
+    // own erasure decision. On a module with no `functions` this is the one flat scope
+    // over the whole statement list, exactly as before.
+    for (statements, quantities) in module.quantity_scopes() {
+        for (var, qty) in quantities {
+            if qty == &Quantity::Zero {
+                for stmt in statements {
+                    if expr_contains_var(&stmt.body, var) {
+                        errors.push(ValidationError::ZeroQuantityInRuntime(var.clone(), stmt.id));
+                    }
                 }
             }
         }
@@ -101,14 +109,23 @@ pub fn validate_pir(module: &PirModule) -> Result<(), Vec<ValidationError>> {
     // borrowed and left for the caller, looks identical to a leak at this level.
     // Flagging it would trade a false positive for a false negative on the very
     // property the language exists to guarantee.
-    for (var, qty) in &module.quantities {
-        if qty == &Quantity::One {
-            let count = count_var_occurrences(module, var);
-            if count > 1 {
-                errors.push(ValidationError::LinearVarUsedMultipleTimes(
-                    var.clone(),
-                    count,
-                ));
+    //
+    // Scoped per FUNCTION (see `PirModule::quantity_scopes`). A `[1]` binding belongs
+    // to the function that declares it and is consumed by that function's body; the
+    // same name declared `[1]` by three different functions is three separate
+    // resources, each spent once. Counting them as one name across a flattened module
+    // made every multi-function program fail to validate, which is the flattening this
+    // scoping removes.
+    for (statements, quantities) in module.quantity_scopes() {
+        for (var, qty) in quantities {
+            if qty == &Quantity::One {
+                let count = count_var_occurrences(statements, var);
+                if count > 1 {
+                    errors.push(ValidationError::LinearVarUsedMultipleTimes(
+                        var.clone(),
+                        count,
+                    ));
+                }
             }
         }
     }
@@ -217,13 +234,13 @@ pub fn is_consuming_quantum_op(op: &str) -> bool {
     matches!(op, "measure")
 }
 
-/// Count variable occurrences in module
-fn count_var_occurrences(module: &PirModule, var: &str) -> usize {
-    module
-        .statements
-        .iter()
-        .map(|s| count_in_expr(&s.body, var))
-        .sum()
+/// Count variable occurrences in one function's statements.
+///
+/// Takes the statement SLICE rather than the whole module: the count is a
+/// per-function property, because a `[1]` name is a resource of one function's body.
+/// See `PirModule::quantity_scopes`.
+fn count_var_occurrences(statements: &[PirStatement], var: &str) -> usize {
+    statements.iter().map(|s| count_in_expr(&s.body, var)).sum()
 }
 
 fn count_in_expr(expr: &PirExpr, var: &str) -> usize {

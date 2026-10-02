@@ -5,6 +5,7 @@
 use crate::ast::{Span, Type, TypeKind};
 use crate::codegen::context::CodegenContext;
 use crate::codegen::error::{CodegenError, CodegenResult};
+use crate::codegen::llvm::function_emission;
 use crate::codegen::llvm::schedule_lowering::{
     lower_schedule_tree_into, schedule_parameters, statements_under,
 };
@@ -16,14 +17,7 @@ use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder as LlvmBuilder;
 use inkwell::module::Module as LlvmModule;
 use inkwell::types::BasicTypeEnum;
-use inkwell::values::{FunctionValue, PointerValue};
-/// The single entry function generated for a whole [`PirModule`].
-///
-/// A `PirModule` is one program's statement list, so all of its statements go into one
-/// function. Emitting a separate function per statement (the previous behaviour) made
-/// bindings unreachable across statements and left `forall` bodies unlowerable.
-const ENTRY_NAME: &str = "naso_entry";
-
+use inkwell::values::{AnyValue, BasicMetadataValueEnum, FunctionValue, PointerValue};
 use std::collections::HashMap;
 
 // LLVM Module Builder for constructing LLVM IR from PIR
@@ -41,6 +35,14 @@ pub struct LLVMModuleBuilder<'ctx> {
     current_function: Option<FunctionValue<'ctx>>,
     // Current basic block
     current_block: Option<BasicBlock<'ctx>>,
+    // Each Naso function's declared parameter kinds, by name.
+    //
+    // Read by the expression lowering at a CALL SITE, which needs the CALLEE's
+    // declaration to marshal arguments: one source argument is two LLVM arguments for
+    // a tensor. Held here rather than recomputed at each call because a call inside a
+    // loop body is lowered deep inside `ScheduleLowering`, which has no access to the
+    // module's function list.
+    callee_params: Option<HashMap<String, Vec<ParamKind>>>,
 }
 
 /// One DECLARED parameter's share of the entry function's signature.
@@ -277,6 +279,137 @@ fn param_slot<'ctx>(
     })
 }
 
+/// Name a generated function's arguments from its ABI.
+///
+/// A tensor's element count is the argument AFTER its pointer, so both indices come
+/// from the recorded `EntryParam` rather than from a position in the parameter list.
+/// A mismatch here is not cosmetic: `lower_schedule_tree_into` binds argument `j` to
+/// `EntryParam::arg_index == j`, so a parameter bound to the wrong argument is a
+/// function that reads a length where a buffer is expected.
+fn name_arguments<'ctx>(function: FunctionValue<'ctx>, abi: &[EntryParam<'ctx>]) {
+    for entry in abi {
+        if let Some(arg) = function.get_nth_param(entry.arg_index) {
+            arg.set_name(&entry.name);
+        }
+        if let Some(arg) = entry.len_arg_index.and_then(|i| function.get_nth_param(i)) {
+            arg.set_name(&format!("{}_len", entry.name));
+        }
+    }
+}
+
+/// The LLVM return type of one Naso function, or `None` for void.
+///
+/// `FnReturn::Unsupported` is REFUSED here rather than mapped to void: a void function
+/// whose callers bind a value is a compile that succeeds and computes nothing, which is
+/// the failure this compiler is built to avoid. The message names the type, because
+/// "unsupported return type" without the type sends the reader looking through the
+/// whole type system for it.
+pub fn function_return_type<'ctx>(
+    type_lowering: &mut LlvmTypeLowering<'ctx>,
+    func: &crate::ir::pir_types::PirFunction,
+) -> CodegenResult<Option<BasicTypeEnum<'ctx>>> {
+    use crate::codegen::abi::{FloatWidth, IntWidth};
+    use crate::ir::pir_types::{ElemType, FnReturn};
+    Ok(Some(match &func.return_type {
+        FnReturn::Void => return Ok(None),
+        FnReturn::Scalar(ElemType::F64) => type_lowering.float_type(FloatWidth::F64).into(),
+        FnReturn::Scalar(ElemType::I8) => type_lowering.int_type(IntWidth::I8).into(),
+        FnReturn::Scalar(ElemType::I16) => type_lowering.int_type(IntWidth::I16).into(),
+        FnReturn::Scalar(ElemType::I32) => type_lowering.int_type(IntWidth::I32).into(),
+        FnReturn::Scalar(ElemType::I64) => type_lowering.int_type(IntWidth::I64).into(),
+        FnReturn::Scalar(ElemType::Bool) => type_lowering.int_type(IntWidth::I1).into(),
+        FnReturn::Unsupported(ty) => {
+            return Err(CodegenError::UnsupportedFeature(format!(
+                "function `{}` returns `{ty}`, which has no slot in this ABI. Nothing \
+                 is substituted for it: an invented return type would let a caller bind \
+                 a value the function never produces.",
+                func.name
+            )));
+        }
+    }))
+}
+
+/// A `PirModule` view holding exactly ONE function's state.
+///
+/// Built from the `PirFunction`, never by filtering the flat module. That direction
+/// matters: a filter would have to decide which of several `input` bindings belongs to
+/// this function, and getting it wrong reproduces exactly the bug that made
+/// `kernels/quant_int8.naso` uncompilable -- silently binding one function's
+/// `Tensor[i8, 1024] input` slot to another function's `Tensor[f32, 1024]`.
+///
+/// `extern_functions` is carried through unchanged: an `extern` declaration is visible
+/// to every function, which is what an extern means.
+pub fn function_view(
+    func: &crate::ir::pir_types::PirFunction,
+    pir_module: &PirModule,
+) -> PirModule {
+    PirModule {
+        statements: func.statements.clone(),
+        schedule: func.schedule.clone(),
+        accesses: func.accesses.clone(),
+        quantities: func.quantities.clone(),
+        parameters: pir_module.parameters.clone(),
+        function_params: func.params.clone(),
+        extern_functions: pir_module.extern_functions.clone(),
+        functions: vec![func.clone()],
+    }
+}
+
+/// The one synthetic function a `PirFunction`-less module is lowered as.
+///
+/// # Why this exists
+///
+/// A module with no `functions` is a HAND-BUILT one: a `.pir` fixture parsed by
+/// `compiler/tests/codegen_tests.rs`, or a test constructing a `PirModule` literal.
+/// Those describe one flat statement list, which under the old backend was one LLVM
+/// function. Making that explicit as a single `PirFunction` means the multi-function
+/// path needs no special case beyond this, and the fixtures keep working with NO change
+/// -- a `[statements]` fixture needs no function section because a fixture describes
+/// one function.
+///
+/// The name is `PirModule`'s own, not `main`: `entry_function_index` picks the first
+/// function when there is no `main`, and there is exactly one, so this is the entry
+/// whatever it is called. Naming it `main` would be a lie about a fixture that never
+/// mentioned `main`.
+fn synthetic_single_function(pir_module: &PirModule) -> crate::ir::pir_types::PirFunction {
+    crate::ir::pir_types::PirFunction {
+        name: "entry".to_string(),
+        params: pir_module.function_params.clone(),
+        statements: pir_module.statements.clone(),
+        schedule: pir_module.schedule.clone(),
+        accesses: pir_module.accesses.clone(),
+        quantities: pir_module.quantities.clone(),
+        return_type: crate::ir::pir_types::FnReturn::Void,
+        return_stmt: None,
+        span: None,
+    }
+}
+
+/// The expression a function RETURNS, taken from the statement lowering named.
+///
+/// Refused rather than substituted if the id names no statement: a `return_stmt` that
+/// does not resolve means lowering and codegen disagree about the function's body, and
+/// emitting `undef` there would return an arbitrary value that still passes every check
+/// downstream.
+fn return_expression(
+    func: &crate::ir::pir_types::PirFunction,
+    id: crate::ir::schedule_tree::StmtId,
+) -> CodegenResult<&crate::ir::pir_types::PirExpr> {
+    func.statements
+        .iter()
+        .find(|s| s.id == id)
+        .map(|s| &s.body)
+        .ok_or_else(|| {
+            CodegenError::InstructionError(format!(
+                "function `{}` records its return statement as {} but no statement with \
+                 that id exists. Lowering and codegen disagree about the function's \
+                 body, and returning an unspecified value would be a silent wrong \
+                 answer.",
+                func.name, id.0
+            ))
+        })
+}
+
 /// A throwaway integer type used only to build an opaque pointer.
 ///
 /// LLVM 17 pointers are opaque, so the pointee is erased in the resulting type and the
@@ -306,6 +439,7 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
             value_builder: Some(value_builder),
             current_function: None,
             current_block: None,
+            callee_params: None,
         })
     }
 
@@ -380,137 +514,173 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
             .map(|(ptr, _)| ptr)
     }
 
-    // Build the entire PIR module
+    // Build the entire PIR module.
+    //
+    // # One LLVM symbol per Naso function
+    //
+    // This used to emit ONE `naso_entry` for the whole `PirModule`, because a
+    // `PirModule` WAS one flat statement list with no function structure: `lower_item`
+    // concatenated every function's body into it. Every function's parameters and
+    // locals therefore shared one namespace in one LLVM body, and
+    // `kernels/quant_int8.naso` could not compile at all -- its three functions each
+    // declare `input`/`output`/`scale`, at `Tensor[f32, 1024]` in one and
+    // `Tensor[i8, 1024]` in another, and one LLVM function has ONE slot per name.
+    //
+    // `PirModule::functions` now carries one `PirFunction` per Naso function, each with
+    // its own parameters, statements, schedule, accesses and quantities, and each becomes
+    // its own `define`. See `codegen::llvm::function_emission` for the naming
+    // convention, the entry selection rule, and the recursion refusal.
+    //
+    // # The per-function PIR VIEW, and why it is built here
+    //
+    // `lower_schedule_tree_into` and `ScheduleLowering` read a `&PirModule`. Rather than
+    // thread a second parallel set of `&PirFunction` parameters through both of them --
+    // and change a signature that eight arguments already strain -- each function is
+    // lowered against a SYNTHESIZED single-function `PirModule` view: the same flat
+    // shape, holding only this function's statements, schedule, quantities, accesses
+    // and parameters.
+    //
+    // That is not a lossy copy. Every field those two read is per-function anyway, and
+    // the view is built FROM `PirFunction` rather than filtered out of the flat module,
+    // so it cannot accidentally inherit a name from a sibling function. The very bug
+    // that made `quant_int8.naso` uncompilable cannot survive here, because the flat
+    // `function_params` union is never consulted on this path.
+    //
+    // # Why the SCHEDULE emits the body, not the statement list
+    //
+    // The schedule, not the statement list, decides execution order and loop structure.
+    // Walking `statements` directly cannot express a loop at all: a `forall` appears as
+    // ONE statement whose domain is `nest(i)`, so walking statements ran its body
+    // exactly once -- arithmetically wrong, with no diagnostic, while the band that
+    // recorded the iteration bounds sat in the schedule tree unread.
+    // `lower_schedule_tree_into` emits a real loop nest (preheader / header with a phi /
+    // body / latch / exit) and honours the bands. It also owns the function BODY: the
+    // `entry` block, the ABI guard, the single return and the verification.
     pub fn build_module(&mut self, pir_module: &PirModule) -> CodegenResult<()> {
         // Declare external functions
         for extern_fn in &pir_module.extern_functions {
             self.declare_extern_function(extern_fn)?;
         }
 
-        // ONE function for the whole PIR module.
+        // The functions to emit.
         //
-        // This used to emit a separate `define void @stmt_N()` per statement. That made
-        // cross-statement references impossible: an alloca created for `let mut total`
-        // lived in `stmt_0`, so `total = total + i` in `stmt_1` had no destination and
-        // the Assign arm had to refuse it. A `PirModule` is one program's statement
-        // list -- it has no function structure of its own -- so a single function is
-        // both correct and what makes bindings visible across statements.
+        // A module with an EMPTY `functions` list is a hand-built one: a `.pir` fixture
+        // parsed by `compiler/tests/codegen_tests.rs`, or a test that constructs a
+        // `PirModule` literal. Those have no `PirFunction`s and never will, so they are
+        // lowered as ONE synthetic function carrying the module's flat fields -- exactly
+        // the behaviour that was the only behaviour before. That is what keeps the
+        // `.pir` fixture tests passing with no change to their fixtures: a `[statements]`
+        // fixture describes one function, and a synthetic function is what it is.
+        let synthesized: Vec<crate::ir::pir_types::PirFunction>;
+        let functions: &[crate::ir::pir_types::PirFunction] = if pir_module.functions.is_empty() {
+            synthesized = vec![synthetic_single_function(pir_module)];
+            &synthesized
+        } else {
+            &pir_module.functions
+        };
+
+        // Each function's declared parameter kinds, for call-site marshalling.
         //
-        // The SCHEDULE, not the statement list, decides execution order and loop
-        // structure. Walking `pir_module.statements` directly cannot express a loop at
-        // all: a `forall` appears as ONE statement whose domain is `nest(i)`, so
-        // walking statements ran its body exactly once -- arithmetically wrong, with
-        // no diagnostic, while the band that recorded the iteration bounds sat in the
-        // schedule tree unread. `lower_schedule_tree_into` emits a real loop nest
-        // (preheader / header with a phi / body / latch / exit) and honours the bands.
+        // Built once, from the SAME `functions` slice emission walks, so a call cannot
+        // marshal against one function's declaration while another function is emitted.
+        self.callee_params = Some(
+            functions
+                .iter()
+                .map(|f| {
+                    (
+                        f.name.clone(),
+                        f.params.iter().map(|p| p.kind.clone()).collect(),
+                    )
+                })
+                .collect(),
+        );
+
+        // Callee before caller, and recursion refused. Checked BEFORE anything is
+        // emitted, so a recursive module produces a diagnostic naming the cycle rather
+        // than a module whose `call`s silently become an infinite chain at run time.
+        let order = function_emission::emission_order(functions)?;
+        let entry = function_emission::entry_function_index(functions);
+
+        // Every function's SIGNATURE, built and declared before any body is emitted.
         //
-        // It also owns the function BODY: the `entry` block, the single return, and
-        // the verification. Nothing is emitted here, so there is exactly one return
-        // and no block is terminated twice.
-        if !pir_module.statements.is_empty() {
-            // The entry function takes one `i64` argument per symbolic constant the
-            // SCHEDULE names -- see `schedule_parameters`. A `forall i in 0..n` is the
-            // motivating case: `n` is a runtime value, and there is nowhere else for it
-            // to come from. Inventing one (zero, a constant from the source text) would
-            // compile a program that iterates a different number of times than it was
-            // told to, so the signature carries the value instead.
-            //
-            // The width is i64 because loop bounds are computed in i64 throughout this
-            // backend, and `PirModule::parameters` carries names only -- a narrower
-            // source-level parameter type is not represented in PIR yet. Nothing is
-            // converted: the argument IS the i64 the bound arithmetic uses. That is a
-            // deliberate limitation, not a widening conversion.
-            //
-            // A module with no symbolic bounds gets the previous `void()` signature,
-            // so nothing about a constant-bounded program changes.
-            // THE ABI. The entry function takes one real argument per parameter the
-            // SOURCE declared -- a tensor by pointer PLUS the caller's element count,
-            // a scalar by value -- and then one `i64` per symbolic constant the
-            // schedule names but no function declared.
-            //
-            // A tensor's element count is a second argument rather than an implicit
-            // obligation because it is the only thing that makes the declared extent
-            // checkable: the compiler knows `Tensor[f32, 4]` is four elements, and
-            // without the caller stating how many it actually has, that knowledge
-            // cannot be turned into a check. `codegen::llvm::abi_guard` emits the
-            // comparison and fails loudly on a short or null buffer.
-            //
-            // The symbolic constants come second and only for names not already bound,
-            // because `extract_parameters` only ever recorded `main`'s. That ordering is
-            // what keeps `fn sum_to(n: i64)`'s `n` an ordinary declared parameter while
-            // a `forall i in 0..n` naming something undeclared still gets a slot.
-            // A borrow of `self.type_lowering` ends before `self.module` is used, so
-            // the two disjoint fields can be held at once.
-            let abi = build_entry_signature(&mut self.type_lowering, pir_module)?;
+        // Two reasons this is a separate pass rather than emission order:
+        //
+        //  * A call site must be able to resolve a callee. `emission_order` already
+        //    guarantees callee-before-caller, but declaring first means the resolution
+        //    does not DEPEND on that ordering being right -- a bug in the order
+        //    produces a wrong order, not a dangling symbol.
+        //  * `add_function` is what creates the `define`; appending basic blocks to the
+        //    returned `FunctionValue` fills in the body. The signature and the body are
+        //    therefore built from the SAME `PirFunction` and cannot disagree.
+        let mut declared: Vec<(FunctionValue<'ctx>, Vec<EntryParam<'ctx>>)> =
+            Vec::with_capacity(functions.len());
+        for (i, func) in functions.iter().enumerate() {
+            let view = function_view(func, pir_module);
+            let abi = build_entry_signature(&mut self.type_lowering, &view)?;
             let param_types = entry_arg_types(&self.type_lowering, &abi)?;
-            let fn_type = self.type_lowering.fn_type(None, &param_types, false); // `None` is void
-            let function = self.module.add_function(ENTRY_NAME, fn_type, None);
+            let ret_type = function_return_type(&mut self.type_lowering, func)?;
+            let fn_type = self.type_lowering.fn_type(ret_type, &param_types, false);
+            let symbol = function_emission::primary_symbol(i, functions);
+            let function = self.module.add_function(&symbol, fn_type, None);
             // Name the arguments in the IR so the printed module says where each value
             // came from -- which argument is a caller's buffer, which is its element
             // count, and which is a trip count. Named by the recorded index rather than
             // by position, because a tensor's count is the argument AFTER its pointer.
-            for entry in abi.iter() {
-                if let Some(arg) = function.get_nth_param(entry.arg_index) {
-                    arg.set_name(&entry.name);
-                }
-                if let Some(arg) = entry
-                    .len_arg_index
-                    .and_then(|len_index| function.get_nth_param(len_index))
-                {
-                    arg.set_name(&format!("{}_len", entry.name));
-                }
-            }
-            self.set_current_function(function);
-
-            // The value builder is the ONE scope for the whole function. It is the
-            // builder `add_variable` writes into, so a name bound before this call is
-            // visible inside a band body; passing a different builder in would give
-            // the loop body an empty scope and silently drop every outer binding.
-            //
-            // `self.module` and `self.value_builder` are borrowed separately because
-            // the callee needs the module immutably and the value builder mutably,
-            // and both are fields of the same `&mut self`.
-            let module = &self.module;
-            let value_builder = self
-                .value_builder
-                .as_mut()
-                .expect("value_builder not initialized");
-            lower_schedule_tree_into(
-                self.context,
-                module,
-                function,
-                value_builder,
-                &pir_module.schedule,
-                pir_module,
-                &pir_module.quantities,
-                &pir_module.accesses,
-            )?;
-            self.value_builder().clear_variables();
-
-            self.current_function = None;
-            self.current_block = None;
-            self.value_builder().clear_variables();
+            name_arguments(function, &abi);
+            declared.push((function, abi));
         }
 
-        // Every statement must be REACHABLE from the schedule tree, or it will not be
-        // emitted. This is checked AFTER lowering, because the schedule tree is now
-        // the only thing that emits a statement: walking the statement list as well
-        // would emit it twice.
-        //
-        // Silently accepting a statement the schedule never mentions would compile it
-        // to nothing -- the same class of silent wrong answer as the loop-once body.
-        // A `[0]`-quantity statement IS in the tree and is deliberately skipped by
-        // `lower_domain`, which is erasure, not a coverage gap, so it is not reported.
-        let scheduled: Vec<StmtId> = statements_under(&pir_module.schedule.root);
-        for stmt in &pir_module.statements {
-            if !scheduled.contains(&stmt.id) {
-                return Err(CodegenError::UnsupportedFeature(format!(
-                    "PIR statement {} is in `statements` but no `Domain` node in the \
-                     schedule tree covers it, so the LLVM backend would emit nothing \
-                     for it. Add a schedule node naming it, or drop the statement.",
-                    stmt.id
-                )));
+        for i in order {
+            let func = &functions[i];
+            let (function, abi) = &declared[i];
+            let view = function_view(func, pir_module);
+            // The value builder is the ONE scope for this function, cleared before and
+            // after, so a local bound in one function cannot be read in the next. That
+            // separation is the entire point of emitting them as separate symbols.
+            self.emit_one_function(func, *function, abi, &view)?;
+            self.current_function = None;
+            self.current_block = None;
+
+            // Every statement must be REACHABLE from this function's schedule tree, or it
+            // will not be emitted. Checked AFTER lowering, because the schedule tree is
+            // the only thing that emits a statement: walking the statement list as well
+            // would emit it twice.
+            //
+            // Silently accepting an uncovered statement would compile it to nothing --
+            // the same class of silent wrong answer as the loop-once body. A
+            // `[0]`-quantity statement IS in the tree and is deliberately skipped by
+            // `lower_domain`, which is erasure rather than a coverage gap.
+            let scheduled: Vec<StmtId> = statements_under(&func.schedule.root);
+            for stmt in &func.statements {
+                // The RETURN statement is deliberately not in the tree: it is evaluated
+                // in the function's exit block, not as a scheduled statement. It is
+                // covered by construction, so it is not reported here.
+                if func.return_stmt == Some(stmt.id) {
+                    continue;
+                }
+                if !scheduled.contains(&stmt.id) {
+                    return Err(CodegenError::UnsupportedFeature(format!(
+                        "statement {} of function `{}` is in `statements` but no \
+                         `Domain` node in its schedule tree covers it, so the LLVM \
+                         backend would emit nothing for it. Add a schedule node naming \
+                         it, or drop the statement.",
+                        stmt.id, func.name
+                    )));
+                }
             }
+        }
+
+        // The entry's second symbol, for external callers: existing C drivers and the
+        // shipped-kernel execution tests call `naso_entry`.
+        //
+        // A thin `tail call` into the primary rather than a second `define` of the same
+        // body, because two defines would emit the code twice. And not an LLVM `alias`,
+        // because an alias requires the two symbols to have IDENTICAL function types and
+        // this shim is the one place a signature is deliberately restated -- which is
+        // exactly the kind of restatement that should be visible in the IR.
+        if let Some(entry_index) = entry {
+            let (target, abi) = &declared[entry_index];
+            self.emit_entry_shim(*target, abi)?;
         }
 
         // Verify the module
@@ -518,6 +688,152 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
             .verify()
             .map_err(|e| CodegenError::VerificationError(e.to_string()))?;
 
+        Ok(())
+    }
+
+    /// Emit ONE Naso function's body into its already-declared LLVM function.
+    ///
+    /// `function` comes from the declaration pass, so its signature is already fixed and
+    /// a `call` in another function can already resolve it. Here only the body is
+    /// appended: the `entry` block, the ABI guard, the schedule, and the single return.
+    ///
+    /// The ABI guard is emitted by `lower_schedule_tree_into` for EVERY function, not
+    /// just the entry. That is the point: a function reachable only by call would
+    /// otherwise be an unguarded hole, and a short buffer passed to it would read past
+    /// the end of the caller's allocation with nothing to say so.
+    fn emit_one_function(
+        &mut self,
+        func: &crate::ir::pir_types::PirFunction,
+        function: FunctionValue<'ctx>,
+        abi: &[EntryParam<'ctx>],
+        view: &PirModule,
+    ) -> CodegenResult<()> {
+        self.set_current_function(function);
+        // The RETURN VALUE, evaluated in the function's exit block.
+        //
+        // Read out of the function's own statements by `return_stmt`, which lowering
+        // recorded and removed from the schedule. It cannot be a scheduled statement:
+        // that would compute it in the middle of the body and return whatever the last
+        // statement happened to leave behind.
+        let return_value = match (func.return_stmt, func.return_type.clone()) {
+            (None, crate::ir::pir_types::FnReturn::Void) => None,
+            (Some(id), _) => Some(return_expression(func, id)?),
+            // No `return` statement but the function DECLARES a return type.
+            //
+            // This used to fall through to returning zero, which is the one answer
+            // that can never be right: `fn f(x: f32) -> f32 { let mut y = x * 3.0; }`
+            // compiled cleanly, printed `0.0`, and was wrong. A caller gets no signal
+            // that the function computed nothing.
+            //
+            // Returning the trailing expression instead would be a guess too -- the
+            // parser folds a function's last expression into `Block::expr`, so for
+            // `fn f() -> f32 { x * 3.0 }` the value IS there, while for the example
+            // above it is a `let` whose binding is discarded. Distinguishing those is a
+            // real design question, and until it is answered the honest answer is to
+            // refuse and name the function.
+            (None, crate::ir::pir_types::FnReturn::Scalar(_)) => {
+                return Err(CodegenError::UnsupportedFeature(format!(
+                    "function `{}` declares a return type but has no `return` statement, \
+                     so there is no value to return. Returning zero would be silently \
+                     wrong: the caller cannot distinguish it from a computed zero. Add \
+                     an explicit `return`, or drop the return type to make the function \
+                     `void`.",
+                    func.name
+                )));
+            }
+            (None, _) => None,
+        };
+        // `FnReturn::Unsupported` is checked here rather than in the declaration pass so
+        // the refusal names the function whose return type could not be lowered.
+        if let crate::ir::pir_types::FnReturn::Unsupported(ty) = &func.return_type {
+            return Err(CodegenError::UnsupportedFeature(format!(
+                "function `{}` returns `{ty}`, which has no slot in this ABI. Nothing \
+                 is substituted for it: an invented return type would let a caller bind \
+                 a value the function never produces.",
+                func.name
+            )));
+        }
+
+        // `self.module` and `self.value_builder` are borrowed separately because the
+        // callee needs the module immutably and the value builder mutably, and both are
+        // fields of the same `&mut self`.
+        let module = &self.module;
+        let value_builder = self
+            .value_builder
+            .as_mut()
+            .expect("value_builder not initialized");
+        lower_schedule_tree_into(
+            self.context,
+            module,
+            function,
+            value_builder,
+            &view.schedule,
+            view,
+            &view.quantities,
+            &view.accesses,
+            abi,
+            return_value,
+            self.callee_params.as_ref(),
+        )?;
+        Ok(())
+    }
+
+    /// Emit `naso_entry` as a `tail call` into the entry function's primary symbol.
+    ///
+    /// The shim exists so an EXTERNAL caller has a stable name to link against while
+    /// the Naso-to-Naso call sites use the `naso_<name>` convention. It is a call and
+    /// not a jump so the target's own ABI guard still runs: `tail call` is not a jump
+    /// that bypasses the callee's prologue, and every argument is forwarded unchanged,
+    /// so the guard sees exactly the lengths the external caller supplied.
+    fn emit_entry_shim(
+        &mut self,
+        target: FunctionValue<'ctx>,
+        abi: &[EntryParam<'ctx>],
+    ) -> CodegenResult<()> {
+        // The shim's type IS the target's type, reused verbatim rather than rebuilt
+        // from the ABI. A rebuilt signature is a second place the entry ABI is spelled,
+        // and the two would be free to disagree about how many arguments a tensor
+        // occupies.
+        let fn_type = target.get_type();
+        let param_count = fn_type.count_param_types();
+        let shim = self
+            .module
+            .add_function(function_emission::ENTRY_SYMBOL, fn_type, None);
+        name_arguments(shim, abi);
+        let entry = self
+            .context
+            .llvm_context()
+            .append_basic_block(shim, "entry");
+        let builder = self.context.llvm_context().create_builder();
+        builder.position_at_end(entry);
+        let args: Vec<BasicMetadataValueEnum<'ctx>> = (0..param_count)
+            .filter_map(|i| shim.get_nth_param(i))
+            .map(BasicMetadataValueEnum::from)
+            .collect();
+        let call = builder
+            .build_call(target, &args, "entry")
+            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+        // `musttail` is NOT used: it requires the caller's signature to be IDENTICAL to
+        // the callee's AND forbids intervening instructions. Both hold today, but a
+        // `musttail` that stops holding is a hard verifier error, and an ordinary
+        // `tail`-position call is correct in every case with one extra frame.
+        // `.basic()` yields `None` for a void call and the value otherwise, which is
+        // exactly the `Option` `build_return` takes. Boxed because `build_return` wants
+        // `&dyn BasicValue` and `BasicValueEnum` is unsized-coercible into it.
+        let returned = call
+            .try_as_basic_value()
+            .basic()
+            .map(|v| Box::new(v) as Box<dyn inkwell::values::BasicValue<'ctx>>);
+        builder
+            .build_return(returned.as_deref())
+            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+        if !shim.verify(true) {
+            return Err(CodegenError::VerificationError(format!(
+                "entry shim `{}` failed LLVM verification:\n{}",
+                function_emission::ENTRY_SYMBOL,
+                shim.print_to_string()
+            )));
+        }
         Ok(())
     }
 

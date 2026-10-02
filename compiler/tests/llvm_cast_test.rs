@@ -47,6 +47,7 @@ fn a_cast_to_an_unsupported_bit_width_is_refused() {
             expr: Box::new(PirExpr::IntLit(1)),
             width: Some(24),
             signed: true,
+            float_target: None,
         },
         quantity: Quantity::Many,
         mutability: Mutability::Immutable,

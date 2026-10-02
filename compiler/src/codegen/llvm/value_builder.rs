@@ -72,6 +72,21 @@ pub struct TensorBinding<'ctx> {
     /// needs `cols`. A one-extent binding could only index the first dimension, which
     /// would silently return the wrong element of a matrix.
     pub shape: Option<Vec<u64>>,
+    /// The `i64` element count the CALLER passed for this buffer, when the name is a
+    /// tensor PARAMETER.
+    ///
+    /// Recorded because a call must forward the caller's real length, not a number
+    /// recomputed from the shape. The two are the same only when the caller was honest
+    /// about its buffer, and the whole point of the ABI guard is to make a dishonest
+    /// caller fail loudly -- in the callee. If a call site instead passed
+    /// `product(shape)`, the callee's guard would compare the caller's INVENTED length
+    /// against the callee's own declaration and pass, having checked nothing about the
+    /// caller's actual allocation.
+    ///
+    /// `None` for a tensor that is not a parameter (a local alloca, or a parameter in a
+    /// module built before the ABI carried lengths), and for a symbolic extent. A call
+    /// passing such a tensor is REFUSED rather than given a length of zero.
+    pub len: Option<IntValue<'ctx>>,
 }
 
 impl<'ctx> LlvmValueBuilder<'ctx> {

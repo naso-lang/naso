@@ -292,9 +292,17 @@ mod tests {
     /// reports every extent rather than only the first.
     #[test]
     fn test_each_function_contributes_its_own_band() {
+        // The second function's parameter is named `u`, not `t`. Both functions
+        // declaring `t` at different extents is now a REFUSAL, not a band: a `PirModule`
+        // is one flat statement list with no function structure, so the generated entry
+        // has one slot per NAME and cannot give `t` both `Tensor[f32,8]` and
+        // `Tensor[f32,4]`. That refusal is pinned by
+        // `lowering::lowering_tests::test_two_functions_may_not_reuse_a_name_at_two_types`.
+        // What this test is about is one band per FUNCTION, which needs two distinct
+        // names to say at all.
         let bands = bands_for(
             "fn a(t: Tensor[f32,8]) { forall i in 0..8 { t[i] = 1.0; } }
-             fn b(t: Tensor[f32,4]) { forall i in 0..4 { t[i] = 2.0; } }",
+             fn b(u: Tensor[f32,4]) { forall i in 0..4 { u[i] = 2.0; } }",
         );
         assert_eq!(bands.len(), 2, "one band per function");
         assert!(

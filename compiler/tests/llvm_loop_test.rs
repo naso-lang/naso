@@ -227,6 +227,9 @@ fn build_loop_ir() -> String {
         accesses: AccessRelations::new(),
         quantities: HashMap::new(),
         parameters: vec![],
+        // A hand-built module declares no function parameters, so the entry
+        // function keeps the bare `void()` signature these tests call.
+        function_params: vec![],
         extern_functions: vec![],
     };
 

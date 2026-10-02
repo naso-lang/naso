@@ -6,6 +6,25 @@ N = 128
 M = 128
 K = 128
 
+[loops]
+# The loop nest this kernel's bodies are written against. The harness builds a
+# real Band from these names and the statement's own domain, so `i`, `j`, `k`
+# are bound induction variables rather than unbound reads.
+#
+# Without this the schedule was a flat Sequence of domains, so no loop existed,
+# and every `A[i][k]` silently read as i64 zero.
+iterators = i, j, k
+
+[function_params]
+# The ABI slots this kernel's arrays occupy. A PIR fixture has no function
+# structure, so the arrays a body subscripts must be declared here to be
+# bindable; an undeclared subscripted name is a refusal, not a zero.
+#
+# `f64`/`i64` is the element type and the numbers are the shape, outermost
+# first. `twiddle[stage][k]` needs two extents because linearising it is
+# `stage * 1024 + k`, and a shape is what makes that a GEP.
+u = Tensor[f64, 16, 16, 16]
+
 [domain stencil_domain]
 dims = 3
 n_iter = 3

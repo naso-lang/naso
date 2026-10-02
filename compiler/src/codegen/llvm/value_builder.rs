@@ -39,6 +39,39 @@ pub struct LlvmValueBuilder<'ctx> {
     /// The pointee type is stored alongside the pointer for the same opaque-pointer
     /// reason as `ptr_pointee_types`: LLVM 17 cannot recover it from the pointer.
     variables: HashMap<String, (PointerValue<'ctx>, BasicTypeEnum<'ctx>)>,
+    /// Caller-owned tensor buffers (name -> base pointer, element type, shape).
+    ///
+    /// SEPARATE from `variables` because a tensor is not a slot holding a value: it
+    /// is a base pointer plus an element type and an extent, and `t[i]` is a GEP
+    /// against those. Putting a tensor in `variables` would type it as "a slot of
+    /// `ptr`", so `Var(name)` would load the pointer as if it were the element --
+    /// the alloca-and-load mistake this replaces.
+    tensors: HashMap<String, TensorBinding<'ctx>>,
+}
+
+/// A caller-owned tensor buffer: where it starts and what a stride is.
+///
+/// A GEP needs the ELEMENT type, not the array type: `getelementptr double, ptr %p,
+/// i64 %i` steps by one `double`. That is why the element type is recorded here
+/// rather than derived from a `double` array type nobody has.
+#[derive(Debug, Clone)]
+pub struct TensorBinding<'ctx> {
+    /// The base pointer the CALLER supplied. Never an alloca: a tensor parameter
+    /// is data the caller fills.
+    pub base: PointerValue<'ctx>,
+    /// What one index step means, and what a load from this buffer returns.
+    pub elem: BasicTypeEnum<'ctx>,
+    /// Extent of each dimension, outermost first, when all were compile-time
+    /// constants.
+    ///
+    /// `None` is a symbolic extent. The entry signature cannot be built for one, so
+    /// `build_module` refuses it; the field is kept so the refusal can NAME it
+    /// rather than reporting a bare "bad parameter".
+    ///
+    /// The whole SHAPE, not one extent, because `t[i][j]` is `i * cols + j` and that
+    /// needs `cols`. A one-extent binding could only index the first dimension, which
+    /// would silently return the wrong element of a matrix.
+    pub shape: Option<Vec<u64>>,
 }
 
 impl<'ctx> LlvmValueBuilder<'ctx> {
@@ -50,6 +83,7 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
             metadata: HashMap::new(),
             ptr_pointee_types: HashMap::new(),
             variables: HashMap::new(),
+            tensors: HashMap::new(),
         }
     }
 
@@ -114,9 +148,28 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
         self.variables.get(name).copied()
     }
 
+    /// Bind a caller-owned tensor buffer to `name`.
+    ///
+    /// The pointer IS the data. Nothing is allocated and nothing is zero-filled,
+    /// because a tensor the callee allocated would be a tensor the caller cannot
+    /// fill -- the function would build clean and compute on data no one supplied,
+    /// which is the silent wrong answer this ABI exists to eliminate.
+    pub fn bind_tensor(&mut self, name: &str, binding: TensorBinding<'ctx>) {
+        self.tensors.insert(name.to_string(), binding);
+    }
+
+    /// Look up a tensor buffer and its element type and extent.
+    pub fn tensor(&self, name: &str) -> Option<TensorBinding<'ctx>> {
+        self.tensors.get(name).cloned()
+    }
+
     /// The names currently in scope, for a diagnostic that says what IS available.
     pub fn variable_names(&self) -> Vec<String> {
-        self.variables.keys().cloned().collect()
+        let mut names: Vec<String> = self.variables.keys().cloned().collect();
+        // Tensor buffers are in scope too, and a diagnostic that omits them points
+        // the reader at the wrong place when the name IS bound -- just as a tensor.
+        names.extend(self.tensors.keys().cloned());
+        names
     }
 
     /// Bring a name out of scope (a non-statement-position `let` leaving its body).
@@ -150,6 +203,7 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
     /// Drop every binding. Called when a function body finishes.
     pub fn clear_variables(&mut self) {
         self.variables.clear();
+        self.tensors.clear();
     }
 
     /// Build a function with the given signature and body builder

@@ -14,8 +14,10 @@ use naso_compiler::codegen::validate::StructuralVerifier;
 use naso_compiler::codegen::validate::{StructuralReport, ValidationReport};
 use naso_compiler::ir::access_relation::AccessRelations;
 use naso_compiler::ir::affine_domain::{AffineConstraint, AffineDomain};
+use naso_compiler::ir::affine_map::{AffineMap, Matrix};
 use naso_compiler::ir::pir_types::{
-    BinaryOp, ExternFunction, PirExpr, PirModule, PirStatement, QuantityMap,
+    BinaryOp, ElemType, ExternFunction, FunctionParam, ParamKind, PirExpr, PirModule, PirStatement,
+    QuantityMap,
 };
 use naso_compiler::ir::schedule_tree::{ScheduleNode, ScheduleTree, StmtId};
 use std::collections::HashMap;
@@ -763,65 +765,113 @@ fn parse_pir(content: &str) -> Result<PirModule, String> {
         });
     }
 
-    // Every array a body reads must be a real binding, or the backend is asked to
-    // load a name it has no allocation for. A fixture declares its arrays in
-    // `[accesses]` as `array_name = "A"`, and the body string reads `A[i][k]`, so
-    // `[accesses]` is the only place the two can be connected.
+    // Every array a body reads must be a real ABI SLOT, or the backend is asked to
+    // index a name it has no buffer for. A fixture declares them in `[function_params]`
+    // as `A = Tensor[f64, 64, 64]`, which is what gives `C[i][j]` a pointer to step
+    // through.
     //
-    // This was not done, and the missing binding was invisible because an unbound
-    // READ returned an i64 zero instead of a diagnostic. So `C[i][j] += A[i][k] * B[k][j]`
-    // compiled to `add i64 0, 0` and the six tests that load this fixture passed on
-    // IR shape alone -- they never checked that a matmul read anything. The backend
-    // read arm is now strict, and these bindings are what make it honest.
-    let mut arrays: Vec<String> = Vec::new();
-    for (hdr, lines) in &secs {
-        // `sections()` strips the brackets, so the header is the bare section name.
-        if hdr != "accesses" {
+    // These used to be bound instead as `Let(A, IntLit(0))` -- a SCALAR slot holding
+    // the integer 0, gathered from `[accesses]`. That made `A[i][k]` read slot zero of
+    // a scalar rather than element (i,k) of a matrix, and it only ever "worked" because
+    // an unbound read returned an i64 zero with no diagnostic. The bindings are now
+    // tensor parameters with a real shape.
+    let mut function_params: Vec<FunctionParam> = Vec::new();
+    for line in section("function_params").into_iter().flatten() {
+        let Some((name, spec)) = kv(line) else {
             continue;
+        };
+        let spec = spec.trim();
+        let Some(inner) = spec
+            .strip_prefix("Tensor[")
+            .and_then(|r| r.strip_suffix(']'))
+        else {
+            return Err(format!(
+                "function_params entry {name:?} must be `Tensor[Elem, N...]`, got {spec:?}"
+            ));
+        };
+        let mut parts = inner.split(',').map(str::trim);
+        let elem = parts.next().unwrap_or_default();
+        let elem = match elem {
+            "f64" => ElemType::F64,
+            "f32" => ElemType::F64, // the AST has no float width; see pir_types
+            "i8" => ElemType::I8,
+            "i16" => ElemType::I16,
+            "i32" => ElemType::I32,
+            "i64" => ElemType::I64,
+            other => return Err(format!("unknown element type {other:?} in {name:?}")),
+        };
+        let mut shape = Vec::new();
+        for extent in parts {
+            let n: u64 = extent
+                .parse()
+                .map_err(|_| format!("extent {extent:?} of {name:?} is not a literal"))?;
+            shape.push(n);
         }
-        for line in lines {
-            if let Some(rest) = line.trim().strip_prefix("array_name") {
-                let name = rest.trim_start().trim_start_matches('=').trim();
-                let name = name.trim_matches('"');
-                if !name.is_empty() && !arrays.iter().any(|a| a == name) {
-                    arrays.push(name.to_string());
-                }
-            }
-        }
-    }
-    if !arrays.is_empty() {
-        // Wrap EACH statement's body in the array bindings rather than adding a
-        // statement of its own. A synthetic leading statement would change
-        // `statements.len()`, which several tests assert against the fixture's real
-        // count (`assert_eq!(pir.statements.len(), 1, "matmul fixture has one
-        // statement")`), so the fixture would stop describing itself.
-        //
-        // The bindings are prepended to each body, so a name the body reads resolves
-        // for that body, and `Let` keeps the binding for the rest of the statement
-        // because statement position does not scope it away.
-        for stmt in &mut statements {
-            let mut body = stmt.body.clone();
-            for name in arrays.iter().rev() {
-                body = PirExpr::Let {
-                    name: name.clone(),
-                    qty: Quantity::Zero,
-                    mutability: Mutability::Immutable,
-                    value: Box::new(PirExpr::IntLit(0)),
-                    body: Box::new(body),
-                };
-            }
-            stmt.body = body;
-        }
+        function_params.push(FunctionParam {
+            name: name.to_string(),
+            kind: ParamKind::Tensor {
+                elem,
+                shape: Some(shape),
+            },
+            quantity: Quantity::Zero,
+            mutability: Mutability::Immutable,
+        });
     }
 
-    // Neither module builder reads the schedule tree or the access relations,
-    // so they are left empty rather than guessed at; the statement domains
-    // above are what codegen actually consumes.
+    // `[loops]` names the loop nest the bodies are written against. Each name becomes
+    // a real Band level whose bounds are that dimension's own constraints, so `i`, `j`
+    // and `k` are BOUND induction variables.
+    //
+    // The schedule used to be a flat `Sequence` of domain leaves, which means no loop
+    // existed at all: every `A[i][k]` in a body was then an unbound read that returned
+    // i64 zero, and the fixture tests passed while asserting nothing about iteration.
+    // A band per statement is what makes `C[i][j]` mean `C[i * 64 + j]` with `i` and `j`
+    // actually ranging over their domains.
+    let iterators: Vec<String> = section("loops")
+        .into_iter()
+        .flatten()
+        .find_map(|l| kv(l))
+        .map(|(_, v)| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // One band's members are one affine map per loop level, and `extract_bounds` reads
+    // level `L`'s range as `member[L].pieces[0].domain.iterator_bounds(L)`. So every
+    // member carries the WHOLE statement domain and differs only in which dimension
+    // its single row selects -- a member's domain is not a projection onto its own
+    // level. The bounds come from the statement's own per-dimension constraints, so
+    // `i`, `j` and `k` range over exactly the extents the fixture wrote down.
     let schedule = ScheduleTree::new(
         ScheduleNode::Sequence {
             children: statements
                 .iter()
-                .map(|s| ScheduleNode::domain(s.id, s.domain.clone()))
+                .map(|s| {
+                    // Clamped to the statement's own dimension count: a fixture's two
+                    // statements need not have the same rank, and a level with no
+                    // dimension to select would index past the domain's coefficients.
+                    let levels = iterators.len().min(s.domain.dims);
+                    if levels == 0 {
+                        return ScheduleNode::domain(s.id, s.domain.clone());
+                    }
+                    let members: Vec<_> = (0..levels)
+                        .map(|level| {
+                            let mut m = Matrix::new(1, s.domain.dims);
+                            m.set(0, level, 1);
+                            AffineMap::total(s.domain.clone(), m)
+                        })
+                        .collect();
+                    ScheduleNode::band_with_iterators(
+                        members,
+                        vec![false; levels],
+                        iterators[..levels].to_vec(),
+                        ScheduleNode::domain(s.id, s.domain.clone()),
+                    )
+                })
                 .collect(),
         },
         Vec::new(),
@@ -835,6 +885,7 @@ fn parse_pir(content: &str) -> Result<PirModule, String> {
         parameters,
     );
     module.extern_functions = fixture_externs();
+    module.function_params = function_params;
     Ok(module)
 }
 // ---------------------------------------------------------------------------
@@ -982,7 +1033,12 @@ mod llvm_codegen_tests {
         // This used to be a function per statement, which made any cross-statement
         // write unlowerable.
         assert!(
-            llvm_ir.contains("define void @naso_entry()"),
+            // The signature now carries the kernel's arrays as POINTERS -- this is the
+            // parameter ABI, not a cosmetic change. The assertion is on the `define`
+            // line and the parameter list, because "one function" is what it is about;
+            // the exact argument list is asserted in `llvm_param_abi_execution_test.rs`
+            // against the same production `build_module`.
+            llvm_ir.contains("define void @naso_entry("),
             "expected a single naso_entry function, got:\n{}",
             llvm_ir
         );
@@ -1028,7 +1084,7 @@ mod llvm_codegen_tests {
             .emit_llvm(&pir)
             .expect("LLVM codegen failed");
         assert!(
-            llvm_ir.contains("define void @naso_entry()"),
+            llvm_ir.contains("define void @naso_entry("),
             "expected a single naso_entry function, got:\n{}",
             llvm_ir
         );
@@ -1050,7 +1106,7 @@ mod llvm_codegen_tests {
         // parsed schedule for this fixture is a `Sequence` of two `Domain` nodes and a
         // `Sequence` adds no control flow of its own.
         assert!(
-            llvm_ir.contains("define void @naso_entry()"),
+            llvm_ir.contains("define void @naso_entry("),
             "missing naso_entry:\n{}",
             llvm_ir
         );

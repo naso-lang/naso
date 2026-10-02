@@ -12,6 +12,8 @@
 
 use crate::codegen::context::CodegenContext;
 use crate::codegen::error::{CodegenError, CodegenResult};
+use crate::codegen::llvm::module_builder::build_entry_signature;
+use crate::codegen::llvm::value_builder::TensorBinding;
 use crate::codegen::llvm::{
     access_emission::AccessEmitter,
     expr_lowering::PirExprLowerer,
@@ -21,6 +23,7 @@ use crate::codegen::llvm::{
     type_lowering::LlvmTypeLowering,
     value_builder::LlvmValueBuilder,
 };
+use crate::ir::pir_types::ParamKind;
 use crate::ir::{
     access_relation::AccessRelations,
     affine_domain::AffineDomain,
@@ -29,6 +32,7 @@ use crate::ir::{
     schedule_tree::{ScheduleNode, ScheduleTree, StmtId},
 };
 use inkwell::basic_block::BasicBlock;
+use inkwell::types::BasicTypeEnum;
 use inkwell::values::{AnyValue, BasicValueEnum, FunctionValue};
 
 /// Main entry point for lowering a ScheduleTree to LLVM IR
@@ -111,20 +115,75 @@ pub fn lower_schedule_tree_into<'ctx>(
     let entry = llvm_context.append_basic_block(function, "entry");
     value_builder.builder().position_at_end(entry);
 
-    // Bind the function's symbolic-constant arguments to their names BEFORE the
-    // schedule is lowered, because a symbolic loop bound reads them.
+    // Bind the function's arguments to their names BEFORE the schedule is lowered,
+    // because a symbolic loop bound and every tensor subscript read them.
     //
-    // `naso_entry`'s signature is built by `LLVMModuleBuilder::build_module` from
-    // `schedule_parameters(&pir_module.schedule)`, so argument `j` is exactly the
-    // name of the schedule's `j`-th symbolic constant. A function with FEWER
-    // arguments than names is accepted (a hand-built module may declare names it
-    // does not carry) but a bound that actually needs one is refused by
-    // `load_parameter_value` rather than being given a substitute value.
-    for (index, name) in schedule_parameters(&pir_module.schedule).iter().enumerate() {
+    // The list comes from `build_entry_signature`, the SAME function that built the
+    // signature in `LLVMModuleBuilder::build_module`, so argument `j` is exactly the
+    // `j`-th entry there. Deriving the two independently is how they drift apart and
+    // produce a function whose first argument is silently read as the second.
+    //
+    // A tensor binds to the argument POINTER ITSELF, with no alloca and no store: the
+    // pointer is the caller's buffer. Allocating a local and storing the pointer into it
+    // would still work for reading, but it re-introduces the "tensor is a slot holding a
+    // value" model that makes `input[i]` ambiguous between a load of the pointer and a
+    // load of the element.
+    let abi = build_entry_signature(&mut LlvmTypeLowering::new(llvm_context), pir_module)?;
+    for (index, entry) in abi.iter().enumerate() {
         let Some(arg) = function.get_nth_param(index as u32) else {
+            // Fewer arguments than the ABI names. A hand-built module may legitimately
+            // do this; a body that actually reads the missing name is refused by the
+            // `Var` arm rather than given a substitute value.
             break;
         };
-        value_builder.bind_argument(name, arg)?;
+        match entry.kind {
+            ParamKind::Tensor { elem, ref shape } => {
+                let elem_ty = scalar_slot_type(value_builder, &elem);
+                value_builder.bind_tensor(
+                    &entry.name,
+                    TensorBinding {
+                        base: arg.into_pointer_value(),
+                        elem: elem_ty,
+                        shape: shape.clone(),
+                    },
+                );
+            }
+            // A quantum register binds as a pointer like a tensor, but with no element
+            // type, because nothing here indexes one. A read stays a diagnostic.
+            ParamKind::QRegister => {
+                value_builder.bind_tensor(
+                    &entry.name,
+                    TensorBinding {
+                        base: arg.into_pointer_value(),
+                        // The element type is recorded but never used for indexing: a
+                        // `QRegister` subscript has no lowering and reports that. Using
+                        // `i8` is a placeholder that must never be mistaken for a
+                        // working one.
+                        elem: value_builder
+                            .type_lowering()
+                            .int_type(crate::codegen::abi::IntWidth::I8)
+                            .into(),
+                        shape: None,
+                    },
+                );
+            }
+            // A scalar is stored into an alloca so the body reads it through the same
+            // name-resolution path as every other binding; a loop bound lowers as a
+            // load of exactly this slot.
+            // `Unsupported` has no slot to bind to. `build_entry_signature` refuses
+            // that kind before this loop runs, so reaching it would mean the signature
+            // and this loop disagree; it is reported rather than given a substitute
+            // value, which is exactly the substitution this work refuses to make.
+            ParamKind::Unsupported(ref reason) => {
+                return Err(CodegenError::UnsupportedFeature(format!(
+                    "parameter `{}` has no bindable ABI slot: {reason}",
+                    entry.name
+                )));
+            }
+            ParamKind::Scalar(_) => {
+                value_builder.bind_argument(&entry.name, arg)?;
+            }
+        }
     }
 
     // Create schedule lowering context
@@ -164,6 +223,28 @@ pub fn lower_schedule_tree_into<'ctx>(
     }
 
     Ok(())
+}
+
+/// The LLVM type a scalar element type occupies in a tensor buffer.
+///
+/// One function, because the signature builder and the argument binder must agree: a
+/// tensor whose slot says `f64` but whose binding loads `f32` is a load of the wrong
+/// width, and nothing about the emitted IR makes that obvious.
+fn scalar_slot_type<'ctx>(
+    value_builder: &LlvmValueBuilder<'ctx>,
+    elem: &crate::ir::pir_types::ElemType,
+) -> BasicTypeEnum<'ctx> {
+    use crate::codegen::abi::{FloatWidth, IntWidth};
+    use crate::ir::pir_types::ElemType;
+    let tl = value_builder.type_lowering();
+    match elem {
+        ElemType::F64 => tl.float_type(FloatWidth::F64).into(),
+        ElemType::I8 => tl.int_type(IntWidth::I8).into(),
+        ElemType::I16 => tl.int_type(IntWidth::I16).into(),
+        ElemType::I32 => tl.int_type(IntWidth::I32).into(),
+        ElemType::I64 => tl.int_type(IntWidth::I64).into(),
+        ElemType::Bool => tl.int_type(IntWidth::I1).into(),
+    }
 }
 
 /// Every `Domain` statement id in a schedule subtree, in tree order.

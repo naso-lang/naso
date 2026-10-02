@@ -10,7 +10,7 @@ use crate::codegen::llvm::schedule_lowering::{
 };
 use crate::codegen::llvm::type_lowering::LlvmTypeLowering;
 use crate::codegen::llvm::value_builder::LlvmValueBuilder;
-use crate::ir::pir_types::PirModule;
+use crate::ir::pir_types::{ParamKind, PirModule};
 use crate::ir::schedule_tree::StmtId;
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder as LlvmBuilder;
@@ -41,6 +41,153 @@ pub struct LLVMModuleBuilder<'ctx> {
     current_function: Option<FunctionValue<'ctx>>,
     // Current basic block
     current_block: Option<BasicBlock<'ctx>>,
+}
+
+/// One slot of the entry function's signature.
+pub struct EntryParam<'ctx> {
+    /// The name the body reads this value by.
+    pub name: String,
+    /// The LLVM type of the slot. A tensor parameter's slot is `ptr`; a scalar's is
+    /// its own type.
+    pub ty: BasicTypeEnum<'ctx>,
+    /// What the slot holds, for the binding step.
+    ///
+    /// A tensor's `elem` is the ELEMENT type, not `ptr`: it is what a `getelementptr`
+    /// steps by and what a load returns. Storing `ptr` here would make `input[i]` a
+    /// load of a pointer -- the exact confusion this ABI removed.
+    pub kind: ParamKind,
+}
+
+/// Build the entry function's signature from `pir_module`.
+///
+/// The order is `PirModule::function_params` (declared parameters, source order)
+/// followed by any schedule symbolic constant not among them. `lower_schedule_tree_into`
+/// binds arguments by INDEX into this same list, so both sides must compute it
+/// identically -- hence one function, exported, rather than two traversals.
+///
+/// Each entry is `(name, slot type, kind)`. The slot type and the kind are computed
+/// together because a tensor's slot is a pointer while its kind carries the element
+/// type; deriving one from the other separately is how they drift apart.
+pub fn build_entry_signature<'ctx>(
+    type_lowering: &mut LlvmTypeLowering<'ctx>,
+    pir_module: &PirModule,
+) -> CodegenResult<Vec<EntryParam<'ctx>>> {
+    let mut out: Vec<EntryParam<'ctx>> = Vec::new();
+    for param in &pir_module.function_params {
+        let (ty, kind) = param_slot(type_lowering, param)?;
+        out.push(EntryParam {
+            name: param.name.clone(),
+            ty,
+            kind,
+        });
+    }
+    // A symbolic constant the schedule names but no function declared. It is an i64
+    // because loop bounds are computed in i64 throughout this backend, and it is a real
+    // argument rather than an invented constant: a trip count that came from anywhere
+    // else would iterate a different number of times than the source says.
+    let i64_type = type_lowering.int_type(crate::codegen::abi::IntWidth::I64);
+    for name in schedule_parameters(&pir_module.schedule) {
+        if out.iter().any(|p| p.name == name) {
+            continue;
+        }
+        out.push(EntryParam {
+            name,
+            ty: i64_type.into(),
+            kind: ParamKind::Scalar(crate::ir::pir_types::ElemType::I64),
+        });
+    }
+    Ok(out)
+}
+
+/// The LLVM slot type and binding kind for one declared parameter.
+fn param_slot<'ctx>(
+    type_lowering: &mut LlvmTypeLowering<'ctx>,
+    param: &crate::ir::pir_types::FunctionParam,
+) -> CodegenResult<(BasicTypeEnum<'ctx>, ParamKind)> {
+    use crate::ir::pir_types::ElemType;
+    let ptr_ty = type_lowering
+        .ptr_type(i64_placeholder(type_lowering).into(), 0)?
+        .into();
+    Ok(match &param.kind {
+        // A tensor is a POINTER to the caller's buffer. It is never an alloca and never
+        // zero-filled: a callee-allocated tensor is one the caller cannot supply, and a
+        // function that reads it computes on data nobody provided -- building clean and
+        // silently wrong.
+        ParamKind::Tensor { elem, shape } => {
+            let Some(shape) = shape else {
+                return Err(CodegenError::UnsupportedFeature(format!(
+                    "parameter `{}` has a symbolic tensor extent. The entry signature \
+                     needs the shape to linearise a subscript (`t[i][j]` is \
+                     `i * cols + j`), and a symbolic extent needs monomorphisation, \
+                     which is not implemented. Give the tensor literal extents.",
+                    param.name
+                )));
+            };
+            // The shape is recorded but not used to size anything: the caller owns the
+            // allocation and knows its length. It is validated here only so a
+            // zero-element dimension is refused rather than producing a stride of zero
+            // that would alias every index onto one element.
+            if shape.is_empty() || shape.contains(&0) {
+                return Err(CodegenError::UnsupportedFeature(format!(
+                    "parameter `{}` is a tensor with shape {shape:?}, which has no \
+                     elements to index or write",
+                    param.name
+                )));
+            }
+            (
+                ptr_ty,
+                ParamKind::Tensor {
+                    elem: *elem,
+                    shape: Some(shape.clone()),
+                },
+            )
+        }
+        // A scalar is passed BY VALUE. LLVM functions have no such restriction as WGSL
+        // compute entry points do, so there is no reason to route it through memory.
+        ParamKind::Scalar(elem) => {
+            let ty: BasicTypeEnum<'ctx> = match elem {
+                ElemType::F64 => type_lowering
+                    .float_type(crate::codegen::abi::FloatWidth::F64)
+                    .into(),
+                ElemType::I8 => type_lowering
+                    .int_type(crate::codegen::abi::IntWidth::I8)
+                    .into(),
+                ElemType::I16 => type_lowering
+                    .int_type(crate::codegen::abi::IntWidth::I16)
+                    .into(),
+                ElemType::I32 => type_lowering
+                    .int_type(crate::codegen::abi::IntWidth::I32)
+                    .into(),
+                ElemType::I64 => type_lowering
+                    .int_type(crate::codegen::abi::IntWidth::I64)
+                    .into(),
+                ElemType::Bool => type_lowering
+                    .int_type(crate::codegen::abi::IntWidth::I1)
+                    .into(),
+            };
+            (ty, ParamKind::Scalar(*elem))
+        }
+        // A quantum register is a caller-owned pointer, but nothing in this backend
+        // indexes one, so the binding exists while every read of it stays a diagnostic.
+        ParamKind::QRegister => (ptr_ty, ParamKind::QRegister),
+        ParamKind::Unsupported(ty) => {
+            return Err(CodegenError::UnsupportedFeature(format!(
+                "parameter `{}` has type `{ty}`, which has no slot in the LLVM function \
+                 ABI. Nothing is substituted for it: an invented slot would let the \
+                 body read a value the caller never passed.",
+                param.name
+            )));
+        }
+    })
+}
+
+/// A throwaway integer type used only to build an opaque pointer.
+///
+/// LLVM 17 pointers are opaque, so the pointee is erased in the resulting type and the
+/// argument does not affect the pointer's identity. `LlvmTypeLowering::ptr_type` takes
+/// one anyway to keep the caller's intent visible, so a real type has to be supplied.
+fn i64_placeholder<'ctx>(type_lowering: &LlvmTypeLowering<'ctx>) -> inkwell::types::IntType<'ctx> {
+    type_lowering.int_type(crate::codegen::abi::IntWidth::I64)
 }
 
 impl<'ctx> LLVMModuleBuilder<'ctx> {
@@ -180,19 +327,26 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
             //
             // A module with no symbolic bounds gets the previous `void()` signature,
             // so nothing about a constant-bounded program changes.
-            let param_names = schedule_parameters(&pir_module.schedule);
-            let i64_type = self
-                .type_lowering
-                .int_type(crate::codegen::abi::IntWidth::I64);
+            // THE ABI. The entry function takes one real argument per parameter the
+            // SOURCE declared -- a tensor by pointer, a scalar by value -- and then one
+            // `i64` per symbolic constant the schedule names but no function declared.
+            //
+            // The symbolic constants come second and only for names not already bound,
+            // because `extract_parameters` only ever recorded `main`'s. That ordering is
+            // what keeps `fn sum_to(n: i64)`'s `n` an ordinary declared parameter while
+            // a `forall i in 0..n` naming something undeclared still gets a slot.
+            // A borrow of `self.type_lowering` ends before `self.module` is used, so
+            // the two disjoint fields can be held at once.
+            let abi = build_entry_signature(&mut self.type_lowering, pir_module)?;
             let param_types: Vec<inkwell::types::BasicTypeEnum<'ctx>> =
-                param_names.iter().map(|_| i64_type.into()).collect();
+                abi.iter().map(|e| e.ty).collect();
             let fn_type = self.type_lowering.fn_type(None, &param_types, false); // `None` is void
             let function = self.module.add_function(ENTRY_NAME, fn_type, None);
-            // Name the arguments in the IR so the printed module says where each
-            // symbolic value came from.
-            for (i, name) in param_names.iter().enumerate() {
+            // Name the arguments in the IR so the printed module says where each value
+            // came from -- which argument is a caller's buffer and which is a trip count.
+            for (i, entry) in abi.iter().enumerate() {
                 if let Some(arg) = function.get_nth_param(i as u32) {
-                    arg.set_name(name);
+                    arg.set_name(&entry.name);
                 }
             }
             self.set_current_function(function);

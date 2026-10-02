@@ -68,6 +68,58 @@ pub struct LoweringContext {
     accesses: AccessRelations,
     schedule_nodes: Vec<ScheduleNode>,
     param_names: Vec<String>,
+    /// The typed ABI parameter list, the union over every function's parameters.
+    function_params: Vec<crate::ir::pir_types::FunctionParam>,
+}
+
+/// The `ElemType` a scalar or tensor-element AST type lowers to.
+///
+/// `None` means "no LLVM spelling in this ABI", which the caller turns into a
+/// refusal naming the type. Notably a float is ALWAYS `F64`: the AST records
+/// `int_width` but has no float width, so `f32` and `f64` are the same type in
+/// the IR already and inventing a distinction here would be a guess.
+fn elem_kind(ty: &crate::ast::Type) -> Option<crate::ir::pir_types::ElemType> {
+    use crate::ir::pir_types::ElemType;
+    Some(match ty.kind {
+        // `TypeKind::Float` covers both `f32` and `f64` with nothing to tell
+        // them apart; see `ElemType`'s doc comment.
+        crate::ast::ty::TypeKind::Float => ElemType::F64,
+        crate::ast::ty::TypeKind::Bool => ElemType::Bool,
+        // `int_width` is `None` for a bare `int`. Choosing a width here would be
+        // inventing one, and loop bounds are i64 throughout this backend, so a
+        // widthless `int` parameter has no exact slot.
+        crate::ast::ty::TypeKind::Int
+        | crate::ast::ty::TypeKind::UInt
+        | crate::ast::ty::TypeKind::Nat => match ty.int_width {
+            Some(8) => ElemType::I8,
+            Some(16) => ElemType::I16,
+            Some(32) => ElemType::I32,
+            Some(64) => ElemType::I64,
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
+/// A `ParamKind` as text, for a diagnostic that names the type it could not give
+/// a slot to.
+fn describe_param_kind(kind: &crate::ir::pir_types::ParamKind) -> String {
+    use crate::ir::pir_types::ParamKind;
+    match kind {
+        ParamKind::Tensor { elem, shape } => match shape {
+            // Spelled the way the source spells it: element type first, then one
+            // extent per dimension, so a two-dimensional matrix reads as
+            // `Tensor[F64, 64, 64]` rather than as a shape the author never wrote.
+            Some(shape) => {
+                let dims: Vec<String> = shape.iter().map(|n| n.to_string()).collect();
+                format!("Tensor[{elem:?}, {}]", dims.join(", "))
+            }
+            None => format!("Tensor[{elem:?}, <symbolic extent>]"),
+        },
+        ParamKind::Scalar(elem) => format!("{elem:?}"),
+        ParamKind::QRegister => "QRegister".to_string(),
+        ParamKind::Unsupported(ty) => ty.clone(),
+    }
 }
 
 impl LoweringContext {
@@ -80,6 +132,7 @@ impl LoweringContext {
             accesses: AccessRelations::new(),
             schedule_nodes: Vec::new(),
             param_names: Vec::new(),
+            function_params: Vec::new(),
         }
     }
 
@@ -93,6 +146,14 @@ impl LoweringContext {
         // Extract parameters from main function
         self.extract_parameters(program);
 
+        // The typed ABI list, over EVERY function. This is a separate pass from
+        // `extract_parameters` because the two answer different questions: that
+        // one asks "which names does the schedule need a value for?", this one
+        // asks "what ABI does the generated function need?". It runs first so a
+        // parameter declared with two conflicting types is reported before any
+        // body is lowered against a signature that cannot represent it.
+        self.extract_function_params(program)?;
+
         // Lower all items
         for item in &program.items {
             self.lower_item(item)?;
@@ -102,13 +163,14 @@ impl LoweringContext {
         let schedule = self.build_schedule_tree()?;
 
         // Build PIR module
-        let pir = PirModule::new(
+        let mut pir = PirModule::new(
             std::mem::take(&mut self.statements),
             schedule,
             std::mem::take(&mut self.accesses),
             std::mem::take(&mut self.quantities),
             self.param_names.clone(),
         );
+        pir.function_params = std::mem::take(&mut self.function_params);
 
         // Validate the generated PIR
         validate_pir(&pir).map_err(|e| LoweringError::ValidationError(format!("{:?}", e)))?;
@@ -118,6 +180,11 @@ impl LoweringContext {
 
     fn extract_parameters(&mut self, program: &Program) {
         // Extract parameters from main function signature
+        //
+        // `param_names` stays the module-level SYMBOLIC-CONSTANT list, which is a
+        // different thing from the ABI: it carries names only and exists so a
+        // schedule band naming `n` has a slot for its value. The typed ABI that a
+        // backend builds a function signature from is `function_params`.
         for item in &program.items {
             if let crate::ast::Item::Function(func) = item {
                 if func.name.name == "main" {
@@ -129,6 +196,110 @@ impl LoweringContext {
                     break;
                 }
             }
+        }
+    }
+
+    /// Lower every function's parameters into the typed ABI list.
+    ///
+    /// This runs for EVERY function, not just `main`. Restricting it to `main`
+    /// was why a body reading `input` in `kernels/scale_f32.naso` had no
+    /// allocation: the file's functions are `scale_clamp_f32` and `scale_one`,
+    /// so no parameter was ever recorded and the read was refused.
+    ///
+    /// The list is the UNION over all functions because a `PirModule` holds one
+    /// statement list with no function structure and the backend emits one entry
+    /// function. A name bound by two functions with DIFFERENT types is recorded
+    /// and the backend refuses it naming both, rather than one of them silently
+    /// winning.
+    fn extract_function_params(&mut self, program: &Program) -> Result<(), LoweringError> {
+        for item in &program.items {
+            let crate::ast::Item::Function(func) = item else {
+                continue;
+            };
+            for param in &func.params {
+                let kind = self.param_kind(&param.ty);
+                let entry = crate::ir::pir_types::FunctionParam {
+                    name: param.name.name.clone(),
+                    kind,
+                    quantity: param.quantity,
+                    mutability: param.mutability,
+                };
+                if let Some(existing) = self.function_params.iter().find(|p| p.name == entry.name) {
+                    if existing.kind != entry.kind {
+                        return Err(LoweringError::Unsupported(format!(
+                            "parameter `{}` is declared with two different types \
+                             ({} and {}). A PIR module is one flat statement list \
+                             with no function structure, so the generated entry \
+                             function has ONE slot per name and cannot give this \
+                             name both types.",
+                            entry.name,
+                            describe_param_kind(&existing.kind),
+                            describe_param_kind(&entry.kind),
+                        )));
+                    }
+                    continue;
+                }
+                self.function_params.push(entry);
+            }
+        }
+        Ok(())
+    }
+
+    /// The ABI shape of one AST parameter type.
+    ///
+    /// Anything not covered becomes `ParamKind::Unsupported` carrying the type's
+    /// own `Display`, so the backend's refusal names what it could not lower.
+    /// Returning `Unsupported` rather than `Err` keeps the diagnostic at the
+    /// backend, which is the layer that knows what it can emit; the lowering pass
+    /// has no LLVM types to reason about.
+    fn param_kind(&self, ty: &crate::ast::Type) -> crate::ir::pir_types::ParamKind {
+        use crate::ir::pir_types::ParamKind;
+        match &ty.kind {
+            crate::ast::ty::TypeKind::Tensor(dims) => {
+                // `Tensor[Elem, N]`: the first type argument is the ELEMENT and
+                // the rest are extents. Counting type arguments as dimensions
+                // would make every real 1-D tensor look 2-D, which is the mistake
+                // `wgsl_compute::tensor_parts` documents.
+                let Some((elem, rest)) = dims.split_first() else {
+                    return ParamKind::Unsupported("Tensor with no element type".to_string());
+                };
+                let Some(elem_ty) = elem_kind(elem) else {
+                    // The common case here is a tensor OF tensors, `Tensor[Tensor[f32, 4], 8]`.
+                    // Naming it as nesting rather than as an opaque element type is what
+                    // tells the author the ABI would need a second stride, not a wider
+                    // element: `Tensor[Tensor[f32, 4], 8]` cannot be one `ptr` because
+                    // `rows[i]` yields four elements, not one.
+                    return ParamKind::Unsupported(format!(
+                        "a tensor whose element type is itself `{}`, i.e. a nested tensor. The \
+                         LLVM ABI passes one `ptr` per tensor, which has a single stride; \
+                         indexing `u[i][j]` needs a second stride that no argument supplies",
+                        elem.kind
+                    ));
+                };
+                // Every remaining type argument is an extent, so `Tensor[f32, 64]`
+                // is shape `[64]` and `Tensor[f32, 64, 64]` is `[64, 64]`. A shape
+                // rather than a single extent is what lets `C[i][j]` linearise.
+                let shape: Option<Vec<u64>> = rest.iter().map(|d| d.nat_const()).collect();
+                if let Some(ref s) = shape {
+                    if s.contains(&0) {
+                        return ParamKind::Unsupported(format!(
+                            "tensor `{ty}` has a zero extent, so it has no elements to index \
+                             or write"
+                        ));
+                    }
+                }
+                ParamKind::Tensor {
+                    elem: elem_ty,
+                    // A symbolic extent is carried as `None`, not resolved: a backend
+                    // that needs a constant must refuse it rather than invent a bound.
+                    shape,
+                }
+            }
+            crate::ast::ty::TypeKind::QRegister(_) => ParamKind::QRegister,
+            _ => match elem_kind(ty) {
+                Some(elem) => ParamKind::Scalar(elem),
+                None => ParamKind::Unsupported(format!("{ty}")),
+            },
         }
     }
 
@@ -945,12 +1116,60 @@ mod lowering_tests {
     /// an empty module with no error.
     #[test]
     fn test_non_main_functions_are_lowered() {
+        // Distinct parameter names, deliberately: both functions declaring `t` at
+        // different extents is now a refusal rather than two lowered statements,
+        // because the generated entry has one slot per NAME. Pinned by
+        // `test_two_functions_may_not_reuse_a_name_at_two_types` below. What this
+        // test asserts is that a non-`main` function lowers at all, which needs two
+        // names to say.
         let m = lower(
             "fn helper(t: Tensor[f32,8]) { forall i in 0..8 { t[i] = 1.0; } }
-             fn other(t: Tensor[f32,4]) { forall i in 0..4 { t[i] = 2.0; } }",
+             fn other(u: Tensor[f32,4]) { forall i in 0..4 { u[i] = 2.0; } }",
         );
         assert_eq!(m.statements.len(), 2, "both functions must lower");
         assert!(first_band(&m).is_some());
+    }
+
+    /// Two functions may NOT reuse one parameter name at two different types.
+    ///
+    /// A `PirModule` is one flat statement list with no function structure, so the
+    /// generated entry function has ONE slot per name. Deduplicating on name alone
+    /// would hand the second function the first one's buffer -- the caller fills
+    /// `Tensor[f32,8]` elements and the second function reads them as
+    /// `Tensor[f32,4]` or as `i8`, which is a silent wrong answer with no
+    /// diagnostic. So it is refused, naming both types.
+    ///
+    /// The SAME name at the SAME type is fine, and must stay fine: that is the
+    /// ordinary "two kernels with the same signature" case.
+    #[test]
+    fn test_two_functions_may_not_reuse_a_name_at_two_types() {
+        let program = parse_program(
+            "fn a(t: Tensor[f32,8]) { forall i in 0..8 { t[i] = 1.0; } }
+             fn b(t: Tensor[f32,4]) { forall i in 0..4 { t[i] = 2.0; } }",
+        )
+        .expect("parse");
+        let err = lower_program(&program).expect_err("must refuse the collision");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("`t`") && msg.contains("two different types"),
+            "the refusal must name the parameter and the conflict: {msg}"
+        );
+
+        // The same name at the same type is ONE slot, not a refusal.
+        let same = lower(
+            "fn a(t: Tensor[f32,8]) { forall i in 0..8 { t[i] = 1.0; } }
+             fn b(t: Tensor[f32,8]) { forall i in 0..8 { t[i] = 2.0; } }",
+        );
+        assert_eq!(
+            same.statements.len(),
+            2,
+            "identical signatures must still lower, one slot shared by name"
+        );
+        assert_eq!(
+            same.function_params.len(),
+            1,
+            "`t` is one entry slot, deduplicated because the types agree"
+        );
     }
 
     /// A proof block is erased, not lowered and not an error. This is why

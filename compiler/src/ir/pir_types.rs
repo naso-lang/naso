@@ -142,6 +142,84 @@ pub enum UnaryOp {
     Not,
 }
 
+/// The element type of a tensor or scalar, as the LLVM ABI needs it.
+///
+/// This is deliberately coarser than `ast::Type`. It carries only the
+/// distinctions a backend cannot recover on its own, and it derives `Eq` so
+/// `PirExpr` (and therefore `PirModule`) keeps deriving it.
+///
+/// # Why floats have no width
+///
+/// `ast::Type` records `int_width` but has no float counterpart: the parser
+/// turns BOTH `f32` and `f64` into `TypeKind::Float` with nothing to tell them
+/// apart, and `PirExpr::FloatLit` lowers to LLVM `double`. So `ElemType::F64`
+/// is the only spelling available for a Naso float. Emitting `float` for a
+/// tensor while literals are `double` would require an `fptrunc` at every
+/// store, and inserting that conversion silently is exactly what this IR
+/// exists to prevent. `TypeKind::Float` is therefore `double` throughout, and
+/// a program needing genuine single-precision storage is not representable
+/// yet -- that gap belongs in the AST, not in a guess here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ElemType {
+    F64,
+    I8,
+    I16,
+    I32,
+    I64,
+    Bool,
+}
+
+/// How a function parameter reaches the generated function.
+///
+/// A parameter used to produce NO PIR at all: `PirModule::parameters` carried
+/// only the NAMES of `main`'s parameters, and only as module-level symbolic
+/// constants. A body that read a tensor parameter therefore had no allocation
+/// for it. This enum is what a backend needs to give each parameter a real ABI
+/// slot, and it is carried from the AST rather than re-derived.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ParamKind {
+    /// A caller-owned buffer of `elem`, of `extent` elements.
+    ///
+    /// Becomes an LLVM POINTER, never an alloca. Allocating and zero-filling a
+    /// tensor parameter would produce a function that computes on data the
+    /// caller cannot supply -- it builds clean and is silently wrong, which is
+    /// the specific failure this whole change exists to remove.
+    ///
+    /// `shape` is the extent of each dimension, outermost first. It is `None`
+    /// for a symbolic extent (`Tensor[f32, N]`), which no backend here can
+    /// monomorphise; such a parameter is refused with that reason rather than
+    /// given a guessed bound.
+    ///
+    /// A shape rather than one extent, because `C[i][j]` needs both: a single
+    /// pointer has one stride, so a 2-D subscript can only be linearised
+    /// (`i * cols + j`) when the column count is known. Carrying the whole
+    /// shape is what makes that a GEP instead of a refusal, and it is why a
+    /// matrix kernel and a vector kernel share one ABI.
+    Tensor {
+        elem: ElemType,
+        shape: Option<Vec<u64>>,
+    },
+    /// A scalar, passed BY VALUE.
+    Scalar(ElemType),
+    /// A quantum register: a caller-owned pointer, like a tensor but with no
+    /// element type the LLVM backend indexes.
+    QRegister,
+    /// A parameter whose type no ABI rule covers.
+    ///
+    /// Recorded rather than dropped, so a backend refuses it naming the type
+    /// instead of inventing a slot for it.
+    Unsupported(String),
+}
+
+/// One function parameter, with everything an ABI needs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FunctionParam {
+    pub name: String,
+    pub kind: ParamKind,
+    pub quantity: Quantity,
+    pub mutability: Mutability,
+}
+
 /// PIR Statement: a computational unit with iteration domain
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PirStatement {
@@ -174,6 +252,20 @@ pub struct PirModule {
     pub quantities: QuantityMap,
     /// Module-level parameters (symbolic constants)
     pub parameters: Vec<String>,
+    /// Every function parameter in the program, with its ABI shape.
+    ///
+    /// `parameters` above is a NAME list for module-level symbolic constants
+    /// (`n` in `forall i in 0..n`) and cannot express a type, an extent, or a
+    /// parameter of any function other than `main`. This field is the one a
+    /// backend reads to build a function signature, so it carries every
+    /// parameter of every function in the program, in source order.
+    ///
+    /// Parameters from DIFFERENT functions are merged into one list because a
+    /// `PirModule` is one statement list with no function structure: the
+    /// backend emits one entry function containing every function's body. Two
+    /// functions binding the same name with different types is refused by the
+    /// backend rather than silently given one of the two types.
+    pub function_params: Vec<FunctionParam>,
     /// Function signatures for external calls
     pub extern_functions: Vec<ExternFunction>,
 }
@@ -190,6 +282,7 @@ impl Default for PirModule {
             accesses: AccessRelations::new(),
             quantities: QuantityMap::new(),
             parameters: Vec::new(),
+            function_params: Vec::new(),
             extern_functions: Vec::new(),
         }
     }
@@ -225,6 +318,9 @@ impl PirModule {
             accesses,
             quantities,
             parameters,
+            // Filled in by the lowering pass from the AST signatures; a
+            // hand-constructed module genuinely has no function parameters.
+            function_params: Vec::new(),
             extern_functions: Vec::new(),
         }
     }

@@ -35,6 +35,17 @@
 //   element and drop the `as i8` narrowing below, producing a shader that
 //   VALIDATES and is still WRONG. So the backend refuses, naming the reason.
 //
+//   FOR LLVM (`--target llvm`) this file is refused for a DIFFERENT reason, which
+//   this file previously did not document at all. LLVM does have exact `i8`
+//   storage and `as i8` narrows correctly, so width is NOT the obstacle. The
+//   obstacle is that its three functions each declare `input`/`output`/`scale`
+//   at a DIFFERENT type -- `Tensor[f32, 1024]` in one, `Tensor[i8, 1024]` in
+//   another -- and a PIR module is one flat statement list with no function
+//   structure, so the generated entry function has ONE slot per name and cannot
+//   give one name two types. The lowering refuses, naming both types. Giving each
+//   function its own LLVM symbol would remove the name clash but not the
+//   flattening, so that is a larger change than it looks.
+//
 //   The width is now carried in the AST (Type::int_width) so that decision can
 //   be made rather than guessed; previously i8 and i32 were indistinguishable
 //   and the compiler widened silently. A narrower-than-i32 storage layout --

@@ -39,6 +39,46 @@ use inkwell::types::BasicTypeEnum;
 use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue};
 use std::collections::HashMap;
 
+/// How a subscript or assignment target reads as SOURCE, for a diagnostic.
+///
+/// `PirExpr`'s `Debug` is the AST's debug output, so an error message built from it
+/// shows Rust enum syntax (`Var("input")`, `Index { .. }`) rather than the `input` and
+/// `output[i]` the reader wrote. This is what names the construct instead.
+/// Split a subscript chain into its root tensor and ALL its subscripts.
+///
+/// `C[i][j]` is parsed as `Index { base: Index { base: Var(C), indices: [i] },
+/// indices: [j] }`. Both halves need the whole list, so the inner indices are
+/// prepended until the base is a bare name.
+///
+/// Collapsing only the outer level would be the plausible wrong answer: `t[0]` for
+/// every row, which reads like a matrix and is not one.
+fn flatten_subscript<'e>(
+    mut base: &'e PirExpr,
+    indices: &[PirExpr],
+) -> (&'e PirExpr, Vec<PirExpr>) {
+    let mut all = indices.to_vec();
+    while let PirExpr::Index {
+        base: inner,
+        indices: inner_indices,
+    } = base
+    {
+        let mut merged = inner_indices.clone();
+        merged.append(&mut all);
+        all = merged;
+        base = inner;
+    }
+    (base, all)
+}
+
+fn describe_index_base(expr: &PirExpr) -> String {
+    match expr {
+        PirExpr::Var(name) => format!("`{name}`"),
+        PirExpr::Index { base, .. } => format!("`{}[..]`", describe_index_base(base)),
+        PirExpr::Field { base, field } => format!("`{}.{field}`", describe_index_base(base)),
+        other => format!("{other:?}"),
+    }
+}
+
 /// Lowers `PirExpr` into LLVM instructions.
 ///
 /// Holds no builder of its own: it borrows the one `LlvmValueBuilder` owns, so there
@@ -152,6 +192,15 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                     .map(|a| self.build_expr(a, quantities))
                     .collect();
                 let arg_values = arg_values?;
+
+                // The PRELUD math intrinsics are compiler intrinsics, declared in the
+                // typechecker's environment with an EMPTY body because "codegen emits them
+                // directly". Until now nothing did: `clamp` fell through to the module
+                // lookup below and failed with "Function 'clamp' not found", so every
+                // shipped kernel -- all of which clamp -- could not be built at all.
+                if let Some(v) = self.build_prelude_math(name, &arg_values)? {
+                    return Ok(v);
+                }
 
                 let func = self.module.get_function(name).ok_or_else(|| {
                     CodegenError::FunctionBuildError(format!("Function '{}' not found", name))
@@ -284,16 +333,23 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 let _ = inverse;
                 self.build_expr(body, quantities)
             }
+            // `base[indices...]`: a real load out of a caller-owned tensor buffer.
+            //
+            // This used to evaluate the base, throw the indices away, and return the
+            // base itself -- so `input[i]` handed the body a POINTER where an element
+            // belonged, and the multiply that followed was `mul double, ptr %input,
+            // double %scale`, which LLVM rejects. It is now a GEP against the buffer's
+            // element type followed by a load, which is what the source asks for.
+            //
+            // Two subscripts (`u[i][j]`) would need a row type and a row stride the IR
+            // does not carry, so it is refused naming the construct rather than silently
+            // indexing the flat base as if it were one dimension.
             PirExpr::Index { base, indices } => {
-                let base_ptr = self.build_expr(base, quantities)?;
-                let index_vals: CodegenResult<Vec<_>> = indices
-                    .iter()
-                    .map(|i| self.build_expr(i, quantities))
-                    .collect();
-                let _ = index_vals;
-
-                // Simplified: just return base pointer for now
-                Ok(base_ptr)
+                let (root, all) = flatten_subscript(base, indices);
+                let tensor = self.tensor_base(root)?;
+                let idx: CodegenResult<Vec<BasicValueEnum<'ctx>>> =
+                    all.iter().map(|i| self.build_expr(i, quantities)).collect();
+                self.load_tensor_element(&tensor, &idx?)
             }
             PirExpr::Field { base, field } => {
                 let base_val = self.build_expr(base, quantities)?;
@@ -388,38 +444,57 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
             // answer and stores nothing -- the class of bug this backend previously had
             // with the whole loop body.
             PirExpr::Assign { target, value } => {
-                let target = target.as_ref();
+                // An INDEXED target (`output[i]`) is a GEP into a caller-owned buffer, which is
+                // how a kernel body writes its result. This used to refuse every indexed
+                // target -- "only a named variable is addressable" -- with the reason
+                // that an indexed lvalue "needs a GEP with an element type this path does
+                // not carry". That element type is exactly what the tensor binding records,
+                // so the refusal described a gap that had since been filled and blocked
+                // every kernel body in the repository.
                 let value = self.build_expr(value, quantities)?;
 
-                // Only a plain named variable is addressable today. An indexed target
-                // (`output[i]`) needs a GEP, which requires an element type the IR
-                // carries only for allocas -- see AccessEmitter.
-                let name = match target {
-                    PirExpr::Var(n) => n,
-                    other => {
-                        return Err(CodegenError::UnsupportedFeature(format!(
-                            "assignment to {:?}: only a named variable is addressable by \
-                             the LLVM backend; an indexed or computed lvalue needs a \
-                             GEP with an element type this path does not carry",
-                            other
-                        )));
-                    }
-                };
+                // Two addressable shapes: a named variable's slot, and one subscript of
+                // a bound tensor. Anything else is refused by name. An indexed target
+                // resolves to an element ADDRESS rather than the value currently stored
+                // there, which is what makes `output[i] = ...` a real store.
+                let store_target: (inkwell::values::PointerValue<'ctx>, BasicTypeEnum<'ctx>) =
+                    match target.as_ref() {
+                        PirExpr::Var(name) => self.value_builder.variable(name).ok_or_else(|| {
+                            CodegenError::UnsupportedFeature(format!(
+                                "assignment to `{name}`: no allocation is known for it, so there \
+                                 is nowhere to store. Declared names in scope: {:?}",
+                                self.value_builder.variable_names()
+                            ))
+                        })?,
+                        PirExpr::Index { base, indices } => {
+                            let (root, all) = flatten_subscript(base, indices);
+                            let tensor = self.tensor_base(root)?;
+                            let idx: CodegenResult<Vec<BasicValueEnum<'ctx>>> = all
+                                .iter()
+                                .map(|i| self.build_expr(i, quantities))
+                                .collect();
+                            let gep = self.tensor_gep(&tensor, &idx?, "elem")?;
+                            (gep, tensor.elem)
+                        }
+                        other => {
+                            return Err(CodegenError::UnsupportedFeature(format!(
+                                "assignment to {}: only a named variable or a single \
+                                 subscript of a tensor parameter is addressable by the \
+                                 LLVM backend",
+                                describe_index_base(other)
+                            )));
+                        }
+                    };
 
-                let (ptr, pointee) = self.value_builder.variable(name).ok_or_else(|| {
-                    CodegenError::UnsupportedFeature(format!(
-                        "assignment to `{name}`: no allocation is known for it, so there \
-                         is nowhere to store. Declared names in scope: {:?}",
-                        self.value_builder.variable_names()
-                    ))
-                })?;
+                let (ptr, pointee) = store_target;
 
                 let value_ty = value.get_type();
                 if value_ty != pointee {
                     return Err(CodegenError::UnsupportedFeature(format!(
-                        "assignment to `{name}`: storing {value_ty:?} into a slot of type \
+                        "assignment through `{}`: storing {value_ty:?} into a slot of type \
                          {pointee:?}. Widening or narrowing here would be a silent \
-                         wrong-answer bug, so it is refused."
+                         wrong-answer bug, so it is refused.",
+                        describe_index_base(target)
                     )));
                 }
 
@@ -509,6 +584,398 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
         }
     }
 
+    /// The tensor binding an index or assign target names.
+    ///
+    /// Only a bare name can be a base. Anything else -- an index of an index, a field
+    /// access -- has no binding and is refused here rather than evaluated, because
+    /// evaluating it and discarding the result is the failure mode this module exists
+    /// to prevent.
+    fn tensor_base(
+        &self,
+        base: &PirExpr,
+    ) -> CodegenResult<crate::codegen::llvm::value_builder::TensorBinding<'ctx>> {
+        let name = match base {
+            PirExpr::Var(n) => n,
+            other => {
+                return Err(CodegenError::UnsupportedFeature(format!(
+                    "subscripting {}: a tensor subscript must name a bound tensor \
+                     parameter, because the LLVM ABI looks the buffer up by name",
+                    describe_index_base(other)
+                )));
+            }
+        };
+        self.value_builder.tensor(name).ok_or_else(|| {
+            CodegenError::UnsupportedFeature(format!(
+                "subscripting `{name}`, which is not a bound tensor: there is no \
+                 caller-supplied buffer to index into. Tensor parameters are bound to \
+                 the function's pointer arguments; declared names in scope: {:?}",
+                self.value_builder.variable_names()
+            ))
+        })
+    }
+
+    /// GEP to one element of a tensor: `getelementptr <elem>, ptr %base, i64 %index`.
+    ///
+    /// The index is EXTENDED, never truncated or reinterpreted. The induction variable
+    /// this backend emits for a loop bound is i64, but an index that is already an
+    /// integer of another width is sign-extended to GEP's i64 index type -- widening a
+    /// value for indexing is exact, whereas narrowing would silently address the wrong
+    /// element, and reinterpreting (zext of a negative) would address far out of bounds.
+    fn tensor_gep(
+        &mut self,
+        tensor: &crate::codegen::llvm::value_builder::TensorBinding<'ctx>,
+        indices: &[BasicValueEnum<'ctx>],
+        name: &str,
+    ) -> CodegenResult<inkwell::values::PointerValue<'ctx>> {
+        let flat = self.linearize_index(tensor, indices, name)?;
+        self.value_builder
+            .build_gep(tensor.elem, tensor.base, &[flat.into()], name)
+    }
+
+    /// Collapse a subscript list to ONE i64 element offset: `i * cols + j`.
+    ///
+    /// A `ptr` has a single stride, so `C[i][j]` has to be computed before the GEP.
+    /// Doing this is not an optimisation: indexing only the first dimension would
+    /// return column 0 for every row, which is a plausible-looking wrong answer.
+    ///
+    /// The row-major strides come from the DECLARED shape, not from the caller's
+    /// buffer length. If the caller allocated a differently-shaped buffer the
+    /// arithmetic is wrong, and that is exactly where QTT's guarantees end -- see the
+    /// limitations note in `TensorBinding::shape`.
+    fn linearize_index(
+        &mut self,
+        tensor: &crate::codegen::llvm::value_builder::TensorBinding<'ctx>,
+        indices: &[BasicValueEnum<'ctx>],
+        name: &str,
+    ) -> CodegenResult<inkwell::values::IntValue<'ctx>> {
+        let i64_ty = self
+            .value_builder
+            .type_lowering()
+            .int_type(crate::codegen::abi::IntWidth::I64);
+
+        let shape = tensor.shape.as_deref().unwrap_or(&[]);
+        if indices.len() > shape.len() {
+            return Err(CodegenError::UnsupportedFeature(format!(
+                "subscripting with {} indices into a tensor of {} dimension(s): there is \
+                 no stride for the extra index, and treating it as another element would \
+                 address memory past what the caller supplied",
+                indices.len(),
+                shape.len()
+            )));
+        }
+        // Leading dimensions the source did NOT subscript are multiplied out as zero,
+        // which is the identity on the offset. That keeps a 1-D tensor's `t[i]` on the
+        // fast path with no arithmetic at all.
+        // `sum over d of index[d] * stride(d)`, skipping any LEADING dimension the
+        // source did not subscript: its contribution is 0 * stride = 0, so the term
+        // can be dropped entirely rather than emitted as a multiply by zero.
+        //
+        // A 1-D tensor with one subscript therefore does NO arithmetic at all, and a
+        // `t[i]` still lowers to a single `getelementptr`.
+        let mut offset: Option<inkwell::values::IntValue<'ctx>> = None;
+        for (dim, idx_val) in indices.iter().enumerate() {
+            // The row-major stride of dimension `dim` is the product of every extent
+            // to its right. `dim < shape.len()` is guaranteed by the check above.
+            let stride: u64 = shape[dim + 1..].iter().product();
+            let raw = idx_val.into_int_value();
+            let idx = if raw.get_type() == i64_ty {
+                raw
+            } else {
+                self.value_builder
+                    .builder()
+                    .build_int_cast_sign_flag(raw, i64_ty, true, "index")
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+            };
+            let scaled = if stride == 1 {
+                idx
+            } else {
+                let stride_val = self
+                    .value_builder
+                    .build_int_constant(i64_ty, stride, "stride");
+                self.value_builder
+                    .builder()
+                    .build_int_mul(idx, stride_val, name)
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+            };
+            offset = Some(match offset {
+                None => scaled,
+                Some(prev) => self
+                    .value_builder
+                    .builder()
+                    .build_int_add(prev, scaled, name)
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?,
+            });
+        }
+        // No subscript at all is offset 0, the first element. That is reachable from a
+        // fixture body that names a tensor without indexing it.
+        Ok(offset.unwrap_or_else(|| self.value_builder.build_int_constant(i64_ty, 0, name)))
+    }
+
+    /// Load one element out of a tensor. The read half of `t[i]`.
+    fn load_tensor_element(
+        &mut self,
+        tensor: &crate::codegen::llvm::value_builder::TensorBinding<'ctx>,
+        indices: &[BasicValueEnum<'ctx>],
+    ) -> CodegenResult<BasicValueEnum<'ctx>> {
+        let gep = self.tensor_gep(tensor, indices, "elem_addr")?;
+        self.value_builder
+            .builder()
+            .build_load(tensor.elem, gep, "elem")
+            .map_err(|e| CodegenError::InstructionError(e.to_string()))
+    }
+
+    /// Emit a prelude math intrinsic, or return `None` if `name` is not one.
+    ///
+    /// The typechecker declares these with an empty body on the understanding that
+    /// codegen emits them directly, so they are compiler intrinsics rather than calls.
+    /// `None` means "not an intrinsic, carry on to the module lookup" -- it is NOT an
+    /// error, because a program may legitimately call a function it declares itself.
+    ///
+    /// # Why `round` is not `llvm.round`
+    ///
+    /// `llvm.round.f64(double, i32)` does not verify on LLVM 17 without an `immarg`
+    /// operand, and the two alternatives are both WRONG for Naso's `round`:
+    /// `llvm.rint` rounds half-to-EVEN, while Naso (and WGSL, whose backend this
+    /// mirrors) round half-AWAY-FROM-ZERO. `round(0.5)` must be `1`, and `rint` gives
+    /// `0`. So `round` is spelled out of `floor`/`ceil` on the sign of the operand,
+    /// which is half-away-from-zero by construction and verifiable by running it.
+    ///
+    /// # NaN behaviour
+    ///
+    /// `clamp` is `select` on ORDERED comparisons, so a NaN input falls through both
+    /// tests and is returned unchanged. That is deliberate: the WGSL backend's `clamp`
+    /// is the language's semantics, and an unordered comparison would instead return a
+    /// bound, inventing a value the program never computed.
+    fn build_prelude_math(
+        &mut self,
+        name: &str,
+        args: &[BasicValueEnum<'ctx>],
+    ) -> CodegenResult<Option<BasicValueEnum<'ctx>>> {
+        // Arity is checked against the intrinsic, not assumed: `clamp` takes three
+        // arguments and the unary intrinsics take one, and calling one with the wrong
+        // count must be a diagnostic rather than an index panic or a silently
+        // ignored extra operand.
+        let want_arity = match name {
+            "clamp" => 3,
+            "round" | "abs" | "floor" | "ceil" | "sqrt" | "exp" => 1,
+            _ => return Ok(None),
+        };
+        if args.len() != want_arity {
+            return Err(CodegenError::UnsupportedFeature(format!(
+                "prelude intrinsic `{name}` takes {want_arity} argument(s) but was \
+                 called with {}",
+                args.len()
+            )));
+        }
+        // Every one of these is a FLOAT intrinsic in the prelude's own signature
+        // (`TypeKind::Float`), so an integer argument is a typechecker gap. It is
+        // refused rather than converted.
+        let float_arg =
+            |v: &BasicValueEnum<'ctx>| -> CodegenResult<inkwell::values::FloatValue<'ctx>> {
+                match v.get_type() {
+                    BasicTypeEnum::FloatType(_) => Ok((*v).into_float_value()),
+                    other => Err(CodegenError::UnsupportedFeature(format!(
+                        "prelude intrinsic `{name}` is declared on floats but got {other:?}. \
+                     Converting it here would be an implicit conversion."
+                    ))),
+                }
+            };
+
+        match name {
+            "clamp" => {
+                let x = float_arg(&args[0])?;
+                let lo = float_arg(&args[1])?;
+                let hi = float_arg(&args[2])?;
+                // min then max, as two ordered selects. Doing it in this order rather
+                // than as a single select is what makes a reversed range (`lo > hi`)
+                // return `hi`, matching WGSL's `clamp(x, lo, hi) = min(max(x, lo), hi)`.
+                let builder = self.value_builder.builder();
+                let above_lo = builder
+                    .build_float_compare(inkwell::FloatPredicate::OLT, x, lo, "clamp_below_lo")
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                // `build_select` needs a concrete `BasicValue`, and both arms must be the
+                // same one: an `x` of one type against a bound of another would be a
+                // select LLVM rejects, and one that "worked" would be storing a value the
+                // program never computed.
+                let raised: inkwell::values::FloatValue<'ctx> = builder
+                    .build_select(
+                        above_lo,
+                        BasicValueEnum::FloatValue(lo),
+                        BasicValueEnum::FloatValue(x),
+                        "clamp_raised",
+                    )
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                    .into_float_value();
+                let above_hi = builder
+                    .build_float_compare(inkwell::FloatPredicate::OGT, raised, hi, "clamp_above_hi")
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                let clamped = builder
+                    .build_select(
+                        above_hi,
+                        BasicValueEnum::FloatValue(hi),
+                        BasicValueEnum::FloatValue(raised),
+                        "clamp",
+                    )
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                Ok(Some(clamped))
+            }
+            "round" => {
+                let x = float_arg(&args[0])?;
+                let ty = self
+                    .value_builder
+                    .type_lowering()
+                    .float_type(crate::codegen::abi::FloatWidth::F64);
+                let half = ty.const_float(0.5);
+                // `x < 0 ? ceil(x - 0.5) : floor(x + 0.5)` is round-half-away-from-zero,
+                // which is what Naso's `round` means and what `llvm.rint` does NOT mean.
+                // The two branches are named for the direction they apply to: the
+                // non-negative operand rounds UP by half and then takes the FLOOR, and
+                // the negative operand rounds DOWN by half and then takes the CEILING.
+                // Swapping floor and ceil between the two branches silently turns
+                // round(-2.5) into -2, which no IR-text assertion would catch.
+                //
+                // Each step takes its own short borrow of the builder. `call_f64_intrinsic`
+                // needs `&mut self`, so a single `builder` binding held across the whole
+                // sequence would not borrow-check; the three scopes below keep every
+                // borrow dead before the next one starts.
+                let (is_neg, up, down) = {
+                    let builder = self.value_builder.builder();
+                    let is_neg = builder
+                        .build_float_compare(
+                            inkwell::FloatPredicate::OLT,
+                            x,
+                            ty.const_zero(),
+                            "round_is_neg",
+                        )
+                        .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                    let up = builder
+                        .build_float_add(x, half, "round_up")
+                        .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                    let down = builder
+                        .build_float_sub(x, half, "round_down")
+                        .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                    (is_neg, up, down)
+                };
+                // `floor`/`ceil` are the `llvm.floor.f64` / `llvm.ceil.f64` intrinsics:
+                // inkwell 0.10 exposes no `build_float_to_int_floor`, and truncating
+                // instead would make `round(2.7)` = 2 rather than 3.
+                let (floor_up, ceil_down) = {
+                    let floor_up = self
+                        .call_f64_intrinsic("llvm.floor.f64", up, "floor")?
+                        .into_float_value();
+                    let ceil_down = self
+                        .call_f64_intrinsic("llvm.ceil.f64", down, "ceil")?
+                        .into_float_value();
+                    (floor_up, ceil_down)
+                };
+                let rounded = self
+                    .value_builder
+                    .builder()
+                    .build_select(
+                        is_neg,
+                        BasicValueEnum::FloatValue(ceil_down),
+                        BasicValueEnum::FloatValue(floor_up),
+                        "round",
+                    )
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                Ok(Some(rounded))
+            }
+            "floor" | "ceil" => {
+                let x = float_arg(&args[0])?;
+                let intrinsic = if name == "floor" {
+                    "llvm.floor.f64"
+                } else {
+                    "llvm.ceil.f64"
+                };
+                Ok(Some(self.call_f64_intrinsic(intrinsic, x, name)?))
+            }
+            // `abs` on a float CLEARS THE SIGN BIT. It must not truncate: `abs(-0.5)`
+            // is `0.5`, and an integer `abs` of the truncated value would be `0`. That
+            // is a wrong answer rather than a rounding choice, so `build_float_abs` is
+            // the only correct spelling and it is what is emitted.
+            "abs" => {
+                let x = float_arg(&args[0])?;
+                Ok(Some(self.call_f64_intrinsic("llvm.fabs.f64", x, "abs")?))
+            }
+            // `sqrt` and `exp` are LLVM intrinsics and must be DECLARED with their exact
+            // signature. The argument passed is `x` itself -- an earlier draft passed
+            // `const_zero()`, which computed `sqrt(0.0)` and discarded `x` while
+            // appearing to work.
+            "sqrt" | "exp" => {
+                let x = float_arg(&args[0])?;
+                let ty = self
+                    .value_builder
+                    .type_lowering()
+                    .float_type(crate::codegen::abi::FloatWidth::F64);
+                let intrinsic = if name == "sqrt" {
+                    "llvm.sqrt.f64"
+                } else {
+                    "llvm.exp.f64"
+                };
+                // The `double` type is what `call_f64_intrinsic` declares the intrinsic
+                // for; `ty` is read here only to name the expectation.
+                let _ = ty;
+                Ok(Some(self.call_f64_intrinsic(intrinsic, x, name)?))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Call a `double -> double` LLVM intrinsic, declaring it on first use.
+    ///
+    /// A small helper because the declaration, the argument and the result all have to
+    /// agree on the exact `double` signature; inlining that three times is how one of
+    /// them ends up passing a `float` to a function declared for `double`, which LLVM
+    /// rejects only at verification.
+    fn call_f64_intrinsic(
+        &mut self,
+        intrinsic: &str,
+        arg: inkwell::values::FloatValue<'ctx>,
+        name: &str,
+    ) -> CodegenResult<BasicValueEnum<'ctx>> {
+        let ty = self
+            .value_builder
+            .type_lowering()
+            .float_type(crate::codegen::abi::FloatWidth::F64);
+        // The signature is taken from `arg` rather than assumed, so an intrinsic
+        // declared for a different width is a type error here instead of invalid IR.
+        debug_assert_eq!(
+            arg.get_type(),
+            ty,
+            "f64 intrinsic `{intrinsic}` must take the type it is declared for"
+        );
+        let func = self.declare_or_get_intrinsic(intrinsic, &[ty.into()], ty.into())?;
+        let call = self
+            .value_builder
+            .builder()
+            .build_call(func, &[BasicMetadataValueEnum::from(arg)], name)
+            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+        call.try_as_basic_value().basic().ok_or_else(|| {
+            CodegenError::UnsupportedFeature(format!("intrinsic `{intrinsic}` returned void"))
+        })
+    }
+
+    /// Declare an LLVM intrinsic on first use, or return the existing declaration.
+    ///
+    /// LLVM requires `llvm.*` functions to be DECLARED, not defined, and requires the
+    /// declaration to carry the exact signature -- so the types come from the call site
+    /// that needs them rather than from a table that could drift out of step with it.
+    fn declare_or_get_intrinsic(
+        &mut self,
+        intrinsic: &str,
+        param_types: &[BasicTypeEnum<'ctx>],
+        ret_type: BasicTypeEnum<'ctx>,
+    ) -> CodegenResult<FunctionValue<'ctx>> {
+        if let Some(f) = self.module.get_function(intrinsic) {
+            return Ok(f);
+        }
+        let fn_type =
+            self.value_builder
+                .type_lowering()
+                .fn_type(Some(ret_type), param_types, false);
+        Ok(self.module.add_function(intrinsic, fn_type, None))
+    }
+
     /// Placeholder value for expressions that produce no LLVM value (a void call).
     /// An `i64` zero.
     fn void_placeholder(&self) -> BasicValueEnum<'ctx> {
@@ -526,6 +993,33 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
         right: BasicValueEnum<'ctx>,
     ) -> CodegenResult<BasicValueEnum<'ctx>> {
         use inkwell::IntPredicate;
+
+        // A FLOAT operand routes to the float arm. This dispatch is new and load-bearing:
+        // `into_int_value` on a `double` PANICS, so `input[i] * scale` in a kernel body
+        // used to abort the compiler rather than fail gracefully -- the int-only arm
+        // below could not have produced the multiply even had it been reached.
+        //
+        // Mixing the two is refused rather than converted. `f64 * i64` has no single
+        // correct answer: it differs on whether the integer is exactly representable, and
+        // picking a conversion here is precisely the implicit widening this backend
+        // must not insert.
+        match (left.get_type(), right.get_type()) {
+            (BasicTypeEnum::FloatType(_), BasicTypeEnum::FloatType(_)) => {
+                return self.build_float_binary_op(
+                    op,
+                    left.into_float_value(),
+                    right.into_float_value(),
+                );
+            }
+            (BasicTypeEnum::IntType(_), BasicTypeEnum::IntType(_)) => {}
+            (l, r) => {
+                return Err(CodegenError::UnsupportedFeature(format!(
+                    "binary operation on operands of different types ({l:?} and {r:?}). \
+                     Converting one to the other would be an implicit widening or \
+                     narrowing, so it is refused."
+                )));
+            }
+        }
 
         let left_int: IntValue<'ctx> = left.into_int_value();
         let right_int: IntValue<'ctx> = right.into_int_value();
@@ -613,11 +1107,110 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
         Ok(result.into())
     }
 
+    /// Float arithmetic and comparison.
+    ///
+    /// Comparisons use the FLOAT predicates, and this is not a detail: `slt` on an
+    /// integer is a signed comparison, while a float has no sign bit, so `clamp(v, lo,
+    /// hi)` implemented with the integer predicate would be meaningless. `Eq`/`Ne` use
+    /// `oeq`/`one`, the ordered predicates, so a NaN compares unequal rather than
+    /// unordered-equal.
+    ///
+    /// `Mod` has no float spelling in Naso and is refused: `frem` is defined but the
+    /// language has no `%` on floats, so reaching here means the typechecker let
+    /// something through and the honest answer is a diagnostic.
+    fn build_float_binary_op(
+        &mut self,
+        op: BinaryOp,
+        left: inkwell::values::FloatValue<'ctx>,
+        right: inkwell::values::FloatValue<'ctx>,
+    ) -> CodegenResult<BasicValueEnum<'ctx>> {
+        use inkwell::FloatPredicate;
+
+        // Arithmetic yields a `double` and a comparison yields an `i1`, so the two groups
+        // return separately rather than through one `?`-chained `Result`: a single arm
+        // for both would have to convert the comparisons to a float, which is exactly
+        // the implicit conversion this backend must not insert.
+        let arithmetic: Option<inkwell::values::FloatValue<'ctx>> = match op {
+            BinaryOp::Add => Some(
+                self.value_builder
+                    .builder()
+                    .build_float_add(left, right, "fadd")
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?,
+            ),
+            BinaryOp::Sub => Some(
+                self.value_builder
+                    .builder()
+                    .build_float_sub(left, right, "fsub")
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?,
+            ),
+            BinaryOp::Mul => Some(
+                self.value_builder
+                    .builder()
+                    .build_float_mul(left, right, "fmul")
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?,
+            ),
+            BinaryOp::Div => Some(
+                self.value_builder
+                    .builder()
+                    .build_float_div(left, right, "fdiv")
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?,
+            ),
+            _ => None,
+        };
+        if let Some(v) = arithmetic {
+            return Ok(v.into());
+        }
+
+        // A float has no sign bit, so the ORDERED predicates are the only meaningful
+        // ones: `olt` is "strictly less", not "signed less than", and `oeq`/`one` make
+        // a NaN compare unequal rather than unordered-equal.
+        let predicate = match op {
+            BinaryOp::Eq => FloatPredicate::OEQ,
+            BinaryOp::Ne => FloatPredicate::ONE,
+            BinaryOp::Lt => FloatPredicate::OLT,
+            BinaryOp::Le => FloatPredicate::OLE,
+            BinaryOp::Gt => FloatPredicate::OGT,
+            BinaryOp::Ge => FloatPredicate::OGE,
+            other => {
+                return Err(CodegenError::UnsupportedFeature(format!(
+                    "{other:?} is not defined on floating-point operands by the LLVM \
+                     backend. A float has no bitwise or shift operators, and Naso has \
+                     no `%` on floats."
+                )));
+            }
+        };
+        Ok(self
+            .value_builder
+            .builder()
+            .build_float_compare(predicate, left, right, "fcmp")
+            .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+            .into())
+    }
+
+    /// Float negation, and the integer arm below.
+    ///
+    /// `into_int_value` panics on a `double`, so `-v` on a float had to route here
+    /// first for the same reason binary multiplication does.
     fn build_unary_op(
         &mut self,
         op: UnaryOp,
         expr: BasicValueEnum<'ctx>,
     ) -> CodegenResult<BasicValueEnum<'ctx>> {
+        if let BasicTypeEnum::FloatType(_) = expr.get_type() {
+            return match op {
+                UnaryOp::Neg => Ok(self
+                    .value_builder
+                    .builder()
+                    .build_float_neg(expr.into_float_value(), "fneg")
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                    .into()),
+                UnaryOp::Not => Err(CodegenError::UnsupportedFeature(
+                    "`!` (logical not) on a floating-point operand has no LLVM \
+                     spelling; the typechecker should have rejected it."
+                        .to_string(),
+                )),
+            };
+        }
         let int_val = expr.into_int_value();
         let result = match op {
             UnaryOp::Neg => self.value_builder.builder().build_int_neg(int_val, "neg"),

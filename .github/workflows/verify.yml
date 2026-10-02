@@ -157,10 +157,14 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # `llvm-sys` links LLVM's static component libraries, which includes Polly.
+      # `llvm-17-dev` alone does not ship `libPolly.a`, so without `libpolly-17-dev`
+      # the build dies with "could not find native static library `Polly`". llvm-sys's
+      # own CI installs the same package.
       - name: Install LLVM 17
         run: |
           sudo apt-get update
-          sudo apt-get install -y llvm-17-dev clang-17
+          sudo apt-get install -y llvm-17-dev libpolly-17-dev clang-17
           # `llvm-config-17` finds its own prefix; llvm-sys looks for `llvm-config`.
           echo "/usr/lib/llvm-17/bin" >> "$GITHUB_PATH"
           echo "LLVM_SYS_170_PREFIX=/usr/lib/llvm-17" >> "$GITHUB_ENV"
@@ -169,6 +173,9 @@ jobs:
         run: |
           llvm-config-17 --version
           clang-17 --version | head -1
+          # Fail early and legibly if the static archive llvm-sys needs is missing,
+          # rather than several minutes later inside a link error.
+          test -f /usr/lib/llvm-17/lib/libPolly.a && echo "found libPolly.a"
 
       - name: Build with the llvm feature
         run: cargo build --features llvm --all-targets

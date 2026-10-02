@@ -483,9 +483,67 @@ impl LoweringContext {
                 // without this a `void` function with a `return` would leave the id
                 // behind for the NEXT value-returning function to claim.
                 self.pending_return_stmt = None;
+                // Set when the function's LAST statement is a control-flow
+                // expression that is also its return value; see below.
+                let mut tail_value_override: Option<crate::ir::schedule_tree::StmtId> = None;
 
-                for stmt in &func.body.stmts {
-                    self.lower_stmt(stmt)?;
+                // A function body that ENDS with a control-flow expression --
+                // `fn f() -> f32 { if c { 1.0 } else { 2.0 } }` -- has its `if` in
+                // `body.stmts`, not `body.expr`, because the parser classifies
+                // `if`/`match`/`for`/`while` as self-delimiting statements that need
+                // no trailing semicolon.
+                //
+                // That is a statement POSITION, but the construct is an EXPRESSION
+                // whose value is the function's return value, and its arms are blocks
+                // whose tails are that value. Lowering it as an ordinary statement --
+                // evaluated for its side effects, value discarded -- is how this ended
+                // up refused as "no return statement" while the value sat in the
+                // source. Worse, it would have computed the `if` and thrown the answer
+                // away, which is the silent-wrong-answer shape.
+                //
+                // So the LAST statement, when it is control flow and there is no
+                // `body.expr` after it, is lowered as the return value. `lower_stmt`
+                // cannot do this: it discards an expression's value by contract.
+                let stmts_len = func.body.stmts.len();
+                //
+                // `forall` is EXCLUDED. `is_control_flow_stmt` includes it, because a
+                // `forall` statement also needs no trailing semicolon, but a `forall` is
+                // a LOOP: `lower_expr_stmt` lowers it into a schedule band, and routing
+                // it through `lower_expr` instead hit the `Unsupported` fallback with a
+                // bare `Forall(...)` debug dump. That broke 15 lowering and
+                // schedule-consumer tests. So the condition here is `if`/`match` only --
+                // the constructs that are EXPRESSIONS whose value is the block's tail.
+                let last_is_control_flow = func.body.expr.is_none()
+                    && stmts_len > 0
+                    && matches!(&func.body.stmts[stmts_len - 1].kind, crate::ast::StmtKind::Expr(e)
+                        if matches!(e.kind, crate::ast::expr::ExprKind::If(..)));
+                if last_is_control_flow {
+                    // Statements before it run normally.
+                    for stmt in &func.body.stmts[..stmts_len - 1] {
+                        self.lower_stmt(stmt)?;
+                    }
+                    let expr = match &func.body.stmts[stmts_len - 1].kind {
+                        crate::ast::StmtKind::Expr(e) => e.clone(),
+                        _ => unreachable!("checked by last_is_control_flow"),
+                    };
+                    let lowered = self.lower_expr(&expr)?;
+                    let stmt_id = self.next_stmt_id();
+                    let domain = AffineDomain::universe(0, 0);
+                    self.statements.push(PirStatement {
+                        id: stmt_id,
+                        domain: domain.clone(),
+                        body: lowered,
+                        quantity: crate::ast::Quantity::Many,
+                        mutability: crate::ast::Mutability::Immutable,
+                        span: None,
+                    });
+                    self.schedule_nodes
+                        .push(ScheduleNode::domain(stmt_id, domain));
+                    tail_value_override = Some(stmt_id);
+                } else {
+                    for stmt in &func.body.stmts {
+                        self.lower_stmt(stmt)?;
+                    }
                 }
                 // The body's trailing expression, and whether its VALUE is this
                 // function's return value.
@@ -535,31 +593,35 @@ impl LoweringContext {
                             .expr
                             .as_ref()
                             .is_some_and(|t| Self::tail_yields_value(&t.kind));
-                let tail_value = match &func.body.expr {
-                    Some(tail) if tail_is_the_return => {
-                        let lowered = self.lower_expr(tail)?;
-                        let stmt_id = self.next_stmt_id();
-                        let domain = AffineDomain::universe(0, 0);
-                        self.statements.push(PirStatement {
-                            id: stmt_id,
-                            domain: domain.clone(),
-                            body: lowered,
-                            quantity: crate::ast::Quantity::Many,
-                            mutability: crate::ast::Mutability::Immutable,
-                            span: None,
-                        });
-                        self.schedule_nodes
-                            .push(ScheduleNode::domain(stmt_id, domain));
-                        Some(stmt_id)
+                let tail_value = if let Some(id) = tail_value_override {
+                    Some(id)
+                } else {
+                    match &func.body.expr {
+                        Some(tail) if tail_is_the_return => {
+                            let lowered = self.lower_expr(tail)?;
+                            let stmt_id = self.next_stmt_id();
+                            let domain = AffineDomain::universe(0, 0);
+                            self.statements.push(PirStatement {
+                                id: stmt_id,
+                                domain: domain.clone(),
+                                body: lowered,
+                                quantity: crate::ast::Quantity::Many,
+                                mutability: crate::ast::Mutability::Immutable,
+                                span: None,
+                            });
+                            self.schedule_nodes
+                                .push(ScheduleNode::domain(stmt_id, domain));
+                            Some(stmt_id)
+                        }
+                        // Not the return value, so it is evaluated for what it DOES rather
+                        // than for what it is: an ordinary scheduled expression statement,
+                        // exactly the lowering a `;` after it would have produced.
+                        Some(tail) => {
+                            self.lower_expr_stmt(tail)?;
+                            None
+                        }
+                        None => None,
                     }
-                    // Not the return value, so it is evaluated for what it DOES rather
-                    // than for what it is: an ordinary scheduled expression statement,
-                    // exactly the lowering a `;` after it would have produced.
-                    Some(tail) => {
-                        self.lower_expr_stmt(tail)?;
-                        None
-                    }
-                    None => None,
                 };
 
                 // Lift this function's slice out of the flat lists.
@@ -1250,6 +1312,81 @@ impl LoweringContext {
                     mutability,
                     value: Box::new(v),
                     body: Box::new(PirExpr::IntLit(0)),
+                })
+            }
+            // A BLOCK used as an expression -- in practice the body of an `if` or
+            // `else` arm, which the parser produces as `{ .. }`.
+            //
+            // This arm did not exist, so an `if` in a function body failed to lower
+            // with `Unsupported construct: Block(...)`. That is why `if` could not be
+            // compiled at all even though the parser built a perfectly good
+            // `ExprKind::If` and `PirExpr::If` already existed all the way down to
+            // the backends.
+            //
+            // It lowers EXACTLY the way a loop body does: each statement becomes a
+            // PIR statement, those statements are lifted out of the flat list into a
+            // `Stmts` node, and the block's tail expression is appended as the
+            // block's value. Reusing that shape keeps a branch body and a loop body
+            // semantically identical, which is what the backends already handle.
+            //
+            // The tail matters: `{ let a = 2.0; a * 5.0 }` must evaluate to `10.0`,
+            // not to the last statement it happened to run.
+            ExprKind::Block(b) => {
+                let first_new = self.statements.len();
+                let first_sched = self.schedule_nodes.len();
+                for st in &b.stmts {
+                    self.lower_stmt(st)?;
+                }
+                let mut parts: Vec<crate::ir::PirExpr> = self.statements[first_new..]
+                    .iter()
+                    .map(|s| s.body.clone())
+                    .collect();
+
+                // A `return` inside this block is REFUSED, not hoisted.
+                //
+                // I hit exactly this while making `if` compile. `if x > 0.0 { return
+                // 1.0; } return -1.0;` lowered to an EMPTY `then` block, a discarded
+                // phi, and a function that ALWAYS returned -1.0: the condition was
+                // computed correctly and controlled nothing. The cause is that the
+                // return statement is one of the statements this arm lifts out of the
+                // enclosing list, so hoisting it by name is the only way to keep it --
+                // and hoisting is wrong whenever the block is not the function's final
+                // expression, because the statements after it would be skipped.
+                //
+                // Rather than hoist and silently mis-compile the general case, the
+                // backend refuses it and names the construct. `if` as a VALUE
+                // expression works and is covered; early-return control flow inside an
+                // `if` needs real multi-exit lowering, which is a larger change than
+                // it looks and is not something to fake.
+                if self.pending_return_stmt.is_some() {
+                    return Err(LoweringError::Unsupported(
+                        "a `return` inside an `if` or `else` block is not lowered. \
+                         Hoisting it would skip whatever follows the `if`, so it is \
+                         refused rather than compiled to the wrong value. `if` whose \
+                         branches produce a value works. For an early return, rewrite \
+                         the condition so one branch falls through, or move the `if` \
+                         into a separate function."
+                            .to_string(),
+                    ));
+                }
+
+                // The inner statements belong to this block, not to the enclosing
+                // function's top level. Leaving them in `self.statements` would make
+                // the enclosing function's schedule run them unconditionally -- so
+                // both arms of an `if` would execute, and the condition would only
+                // pick a VALUE. That is the classic "condition that does not
+                // control" bug, and it is silent: the code builds and returns a
+                // plausible number.
+                self.statements.truncate(first_new);
+                self.schedule_nodes.truncate(first_sched);
+
+                if let Some(tail) = &b.expr {
+                    parts.push(self.lower_expr(tail)?);
+                }
+                Ok(match parts.len() {
+                    0 => crate::ir::PirExpr::Stmts(Vec::new()),
+                    1 => parts.pop().expect("len checked"),
+                    _ => crate::ir::PirExpr::Stmts(parts),
                 })
             }
             ExprKind::If(cond, then_branch, else_branch) => {

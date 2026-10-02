@@ -152,6 +152,56 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
     // parameter is kept because it is part of the signature both callers already have,
     // and dropping it would mean every call site changed for no behavioural gain.
     #[allow(clippy::only_used_in_recursion)]
+    /// Convert `value` to `target`, or REFUSE naming both the value and the goal.
+    ///
+    /// Used where a value must line up with another branch's type at a join point. It
+    /// handles only the conversions that are meaningful for such a value:
+    ///
+    /// - int -> float: `sitofp` (a signed placeholder is the honest reading)
+    /// - float -> int: `fptosi`, which SATURATES rather than trapping, so a
+    ///   placeholder can never become poison
+    /// - int -> int: sext/zext/trunc chosen from the widths, sign-extending when the
+    ///   source is narrower
+    /// - float -> float: `fptrunc`/`fpext`
+    ///
+    /// Anything else -- pointers, aggregates, i1 -- is refused. A wrong-but-plausible
+    /// value here would be worse than an error: it would flow into a phi node and
+    /// become indistinguishable from a real computation.
+    fn coerce_to(
+        &mut self,
+        value: BasicValueEnum<'ctx>,
+        target: BasicTypeEnum<'ctx>,
+        context_desc: &str,
+    ) -> CodegenResult<BasicValueEnum<'ctx>> {
+        if value.get_type() == target {
+            return Ok(value);
+        }
+        let builder = self.value_builder.builder();
+        match (value, target) {
+            (BasicValueEnum::IntValue(i), BasicTypeEnum::FloatType(f)) => builder
+                .build_signed_int_to_float(i, f, "coerce_to_float")
+                .map(BasicValueEnum::FloatValue)
+                .map_err(|e| CodegenError::InstructionError(e.to_string())),
+            (BasicValueEnum::FloatValue(f), BasicTypeEnum::IntType(i)) => builder
+                .build_float_to_signed_int(f, i, "coerce_to_int")
+                .map(BasicValueEnum::IntValue)
+                .map_err(|e| CodegenError::InstructionError(e.to_string())),
+            (BasicValueEnum::IntValue(i), BasicTypeEnum::IntType(t)) => builder
+                .build_int_cast_sign_flag(i, t, true, "coerce_to_int_width")
+                .map(BasicValueEnum::IntValue)
+                .map_err(|e| CodegenError::InstructionError(e.to_string())),
+            (BasicValueEnum::FloatValue(f), BasicTypeEnum::FloatType(t)) => builder
+                .build_float_cast(f, t, "coerce_float_width")
+                .map(BasicValueEnum::FloatValue)
+                .map_err(|e| CodegenError::InstructionError(e.to_string())),
+            (other, want) => Err(CodegenError::UnsupportedFeature(format!(
+                "cannot coerce {other} to {want} for {context_desc}. Only numeric \
+                 conversions are supported at a join point: coercing a pointer or an \
+                 aggregate would produce a value that looks computed but is not.",
+            ))),
+        }
+    }
+
     pub fn build_expr(
         &mut self,
         expr: &PirExpr,
@@ -401,9 +451,29 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                     .build_unconditional_branch(merge_block)
                     .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
 
-                // Else branch
+                // Else branch.
+                //
+                // When the source has NO `else`, lowering substitutes `IntLit(0)`. That
+                // used to be phi'd straight against the then-value, and for a `double`
+                // function LLVM rejected the module:
+                //
+                //   PHI node operands are not the same type as the result!
+                //     %if_phi = phi double [ 1.000000e+00, %then ], [ 0, %else ]
+                //
+                // so `if x > 0.0 { return 1.0; }` did not compile at all. The
+                // substituted literal is a standing-in for "no value", and forcing it to
+                // match the then-type by reinterpreting the bits is the kind of fix that
+                // produces a plausible wrong answer, so the zero is CONVERTED to the
+                // then-branch's type instead. `sitofp` on zero is exactly zero in
+                // double, and `fptrunc`/`zext` on zero is zero of the narrower width --
+                // so the value is right for every type, not just the ones that happen
+                // to work.
+                let then_type = then_val.get_type();
                 self.value_builder.builder().position_at_end(else_block);
-                let else_val = self.build_expr(else_branch, quantities)?;
+                let mut else_val = self.build_expr(else_branch, quantities)?;
+                if else_val.get_type() != then_type {
+                    else_val = self.coerce_to(else_val, then_type, "the missing `else` branch")?;
+                }
                 self.value_builder
                     .builder()
                     .build_unconditional_branch(merge_block)
@@ -414,7 +484,7 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 let phi = self
                     .value_builder
                     .builder()
-                    .build_phi(then_val.get_type(), "if_phi")
+                    .build_phi(then_type, "if_phi")
                     .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
                 phi.add_incoming(&[(&then_val, then_block), (&else_val, else_block)]);
                 Ok(phi.as_basic_value())

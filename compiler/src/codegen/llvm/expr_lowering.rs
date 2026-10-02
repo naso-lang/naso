@@ -127,14 +127,14 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                     // is now refused rather than silently reading zero. See
                     // `llvm_forall_execution_test::
                     // a_band_with_no_declared_iterator_does_not_bind_the_wrong_one`.
-                    return Err(CodegenError::UnsupportedFeature(format!(
+                    Err(CodegenError::UnsupportedFeature(format!(
                         "read of `{name}`: no allocation is known for it, so there is \
                          nothing to load. Returning zero would be a silent wrong answer, \
                          and an uninitialised LLVM value is also zero, so the result \
                          would be indistinguishable from a real computation. Declared \
                          names in scope: {:?}",
                         self.value_builder.variable_names()
-                    )));
+                    )))
                 }
             }
             PirExpr::Binary { op, left, right } => {

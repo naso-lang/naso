@@ -254,10 +254,10 @@ impl<'ctx> AccessEmitter<'ctx> {
         // Parameters.
         for param in function.get_params() {
             let name = param.get_name().to_string_lossy().into_owned();
-            if name == dim_name || name == iv_name {
-                if let Ok(int_val) = IntValue::try_from(param) {
-                    return Ok(int_val.into());
-                }
+            if (name == dim_name || name == iv_name)
+                && let Ok(int_val) = IntValue::try_from(param)
+            {
+                return Ok(int_val.into());
             }
         }
 

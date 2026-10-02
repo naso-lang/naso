@@ -1,9 +1,9 @@
 // @generated
-#[cfg(feature = "llvm")]
 
 /// LLVM Type Lowering
 ///
 /// Maps Naso PIR types (with quantities) to LLVM types using inkwell.
+#[cfg(feature = "llvm")]
 use crate::codegen::abi::{
     FloatWidth, IntWidth, LlvmAggregateType, LlvmPointerType, QuantityAwareType,
 };
@@ -25,8 +25,6 @@ pub struct LlvmTypeLowering<'ctx> {
     qubit_type: PointerType<'ctx>,
     /// Result type (i1)
     result_type: IntType<'ctx>,
-    /// Address space for quantum types
-    quantum_address_space: u32,
 }
 
 impl<'ctx> LlvmTypeLowering<'ctx> {
@@ -40,7 +38,6 @@ impl<'ctx> LlvmTypeLowering<'ctx> {
             struct_cache: HashMap::new(),
             qubit_type,
             result_type,
-            quantum_address_space: 0,
         }
     }
 

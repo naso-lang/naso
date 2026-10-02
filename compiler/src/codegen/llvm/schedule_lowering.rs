@@ -30,7 +30,6 @@ use crate::ir::{
 };
 use inkwell::basic_block::BasicBlock;
 use inkwell::values::{AnyValue, BasicValueEnum, FunctionValue};
-use std::collections::HashMap;
 
 /// Main entry point for lowering a ScheduleTree to LLVM IR
 ///
@@ -242,15 +241,6 @@ pub struct ScheduleLowering<'ctx, 'a> {
     quantities: &'a QuantityMap,
     access_relations: &'a AccessRelations,
 
-    /// Current basic block
-    current_block: Option<BasicBlock<'ctx>>,
-    /// Statement -> block mapping
-    stmt_blocks: HashMap<StmtId, BasicBlock<'ctx>>,
-    /// Induction variable phi nodes
-    induction_vars: HashMap<String, inkwell::values::PhiValue<'ctx>>,
-    /// Loop metadata
-    loop_metadata: HashMap<String, inkwell::values::MetadataValue<'ctx>>,
-
     // Sub-emitters
     loop_emitter: LoopEmitter<'ctx>,
     access_emitter: AccessEmitter<'ctx>,
@@ -279,10 +269,6 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
             pir_module,
             quantities,
             access_relations,
-            current_block: None,
-            stmt_blocks: HashMap::new(),
-            induction_vars: HashMap::new(),
-            loop_metadata: HashMap::new(),
             loop_emitter,
             access_emitter,
             optimizer,
@@ -291,12 +277,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
     }
 
     fn set_current_block(&mut self, block: BasicBlock<'ctx>) {
-        self.current_block = Some(block);
         self.value_builder.builder().position_at_end(block);
-    }
-
-    fn current_block(&self) -> BasicBlock<'ctx> {
-        self.current_block.expect("No current block set")
     }
 
     /// Lower a schedule node recursively
@@ -402,7 +383,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
                 })
                 .collect();
             self.parallel_emitter.emit_parallel_band(
-                &mut self.value_builder,
+                self.value_builder,
                 &par_bounds,
                 members,
                 child,
@@ -430,7 +411,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
                 })
                 .collect();
             self.loop_emitter.emit_sequential_band(
-                &mut self.value_builder,
+                self.value_builder,
                 &seq_bounds,
                 members,
                 child,
@@ -777,10 +758,10 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
         // Emit access instructions (loads/stores/GEPs)
         for access in accesses {
             self.access_emitter.emit_access(
-                &mut self.value_builder,
+                self.value_builder,
                 access,
                 &stmt.body,
-                &self.quantities,
+                self.quantities,
             )?;
         }
 

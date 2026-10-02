@@ -1,12 +1,20 @@
-use crate::ast::Quantity;
-/// OpenQASM 3.0 Exporter
-///
-/// Lowers QIR operations into OpenQASM 3.0 string specifications including:
-/// - Gate definitions
-/// - qubit[n] registers
-/// - bit[n] classical results
-/// - Inverse gate uncomputation blocks for [0] and [1] quantities
+//! OpenQASM 3.0 Exporter
+//!
+//! Lowers QIR operations into OpenQASM 3.0 string specifications including:
+//! - Gate definitions
+//! - qubit[n] registers
+//! - bit[n] classical results
+//! - `reset` / `barrier` blocks for [0] and [1] quantities
+//!
+//! `generate_adjoint` holds the adjoint table the uncomputation path will need. It
+//! has no caller yet, because the [0] path emits `reset` -- which discards rather
+//! than inverts -- so no exported circuit consults it. It is retained because it is
+//! quantum knowledge encoded once and correctly (`s`/`sdg` and `t`/`tdg` swap, every
+//! self-inverse gate maps to itself, a rotation negates its angle), and losing it
+//! means re-deriving the table. It is covered by tests rather than merely allowed,
+//! so it cannot rot while it waits.
 
+use crate::ast::Quantity;
 #[cfg(feature = "llvm")]
 use crate::codegen::qir::{QIRModule, QIROperation};
 use crate::runtime::exporter::{
@@ -18,8 +26,6 @@ use std::collections::HashMap;
 pub struct OpenQASMExporter {
     /// Include gate definitions in output
     include_definitions: bool,
-    /// Target gate set for decomposition
-    target_gates: Vec<String>,
     /// Enable automatic barrier insertion for [0]/[1] quantities
     auto_barriers: bool,
 }
@@ -35,37 +41,6 @@ impl OpenQASMExporter {
     pub fn new() -> Self {
         Self {
             include_definitions: true,
-            target_gates: vec![
-                "h".to_string(),
-                "x".to_string(),
-                "y".to_string(),
-                "z".to_string(),
-                "s".to_string(),
-                "sdg".to_string(),
-                "t".to_string(),
-                "tdg".to_string(),
-                "rx".to_string(),
-                "ry".to_string(),
-                "rz".to_string(),
-                "cx".to_string(),
-                "cy".to_string(),
-                "cz".to_string(),
-                "swap".to_string(),
-                "iswap".to_string(),
-                "ccx".to_string(),
-                "cphase".to_string(),
-                "measure".to_string(),
-                "reset".to_string(),
-            ],
-            auto_barriers: true,
-        }
-    }
-
-    /// Create exporter with custom target gate set
-    pub fn with_target_gates(target_gates: Vec<String>) -> Self {
-        Self {
-            include_definitions: true,
-            target_gates,
             auto_barriers: true,
         }
     }
@@ -266,6 +241,14 @@ impl OpenQASMExporter {
     }
 
     /// Generate inverse (adjoint) of a gate for uncomputation
+    ///
+    /// Retained for the uncomputation path, which does not call it yet. The allow is
+    /// narrow and deliberate: clippy lints the library without `cfg(test)`, so the
+    /// unit tests that pin this table do not count as a use, and without the allow
+    /// clippy would demand the method be deleted. Deleting it would throw away the
+    /// adjoint relation for every gate -- the part of a quantum compiler that is
+    /// easiest to get subtly wrong and cheapest to get right once.
+    #[allow(dead_code)]
     fn generate_adjoint(&self, name: &str, qubits: &[usize], params: &[f64]) -> String {
         let adjoint_name = match name {
             "h" => "h",
@@ -494,5 +477,61 @@ mod tests {
         // X basis measurement should have H before measure
         assert!(result.output.contains("h q[0];"));
         assert!(result.output.contains("c[0] = measure q[0];"));
+    }
+}
+
+#[cfg(test)]
+mod adjoint_tests {
+    use super::OpenQASMExporter;
+
+    /// The adjoint table encodes which gate is its own inverse and which rotates the
+    /// other way. Getting it wrong silently emits a circuit computing the wrong
+    /// function, and no shape assertion catches that, so the entries that differ are
+    /// pinned here rather than the method merely being allowed to be unused.
+    #[test]
+    fn a_self_inverse_gate_is_its_own_adjoint() {
+        let e = OpenQASMExporter::new();
+        for g in ["h", "x", "y", "z", "cx", "ccx", "swap"] {
+            assert_eq!(
+                e.generate_adjoint(g, &[0], &[]),
+                format!("{g} q[0];"),
+                "{g} is self-inverse"
+            );
+        }
+    }
+
+    /// `s` and `t` are NOT self-inverse; their adjoints are the dagger variants, and
+    /// the mapping has to go both ways.
+    #[test]
+    fn a_phase_gate_adjoint_is_its_dagger() {
+        let e = OpenQASMExporter::new();
+        assert_eq!(e.generate_adjoint("s", &[1], &[]), "sdg q[1];");
+        assert_eq!(e.generate_adjoint("sdg", &[1], &[]), "s q[1];");
+        assert_eq!(e.generate_adjoint("t", &[0], &[]), "tdg q[0];");
+        assert_eq!(e.generate_adjoint("tdg", &[0], &[]), "t q[0];");
+    }
+
+    /// A rotation's adjoint negates its angle. Dropping the negation makes `rx(theta)`
+    /// come out as its own inverse, i.e. the identity rather than the inverse.
+    #[test]
+    fn a_parameterised_rotation_negates_its_angle() {
+        let e = OpenQASMExporter::new();
+        assert_eq!(
+            e.generate_adjoint("rx", &[0], &[0.25]),
+            "rx(-0.2500000000) q[0];"
+        );
+    }
+
+    /// Every operand of a two-qubit gate is kept, and an unrecognised gate passes
+    /// through unchanged rather than being dropped from the circuit.
+    #[test]
+    fn a_multi_qubit_gate_keeps_every_operand() {
+        let e = OpenQASMExporter::new();
+        assert_eq!(e.generate_adjoint("cz", &[0, 1], &[]), "cz q[0], q[1];");
+        assert_eq!(
+            e.generate_adjoint("rz", &[2, 3], &[1.5]),
+            "rz(-1.5000000000) q[2], q[3];"
+        );
+        assert_eq!(e.generate_adjoint("unknown", &[0], &[]), "unknown q[0];");
     }
 }

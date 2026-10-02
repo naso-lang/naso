@@ -57,3 +57,10 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# The wasm cdylib wants a size-tuned release build rather than the workspace's
+# speed-tuned `opt-level = 3`. Its own `[profile.release]` lived in the member's
+# Cargo.toml, where cargo ignores it (with a warning), so the intent never took
+# effect; per-package overrides belong here at the workspace root instead.
+[profile.release.package.nasoc-wasm]
+opt-level = "s"

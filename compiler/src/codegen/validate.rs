@@ -12,6 +12,12 @@ use inkwell::values::{AnyValue, AsValueRef, CallSiteValue, InstructionOpcode, Op
 /// Bitcode validation and structural verification for generated LLVM IR
 #[cfg(feature = "llvm")]
 pub struct BitcodeValidator<'ctx> {
+    // The validator is constructed from the owning `LlvmContext` by every caller
+    // (`BitcodeValidator::new(&context)`) and is expected to need it as soon as a
+    // check has to materialise a type or constant to compare against. No current
+    // check does, so the field is held but unread rather than dropped from the
+    // public constructor's signature.
+    #[allow(dead_code)]
     context: &'ctx LlvmContext,
 }
 
@@ -144,7 +150,7 @@ impl<'ctx> BitcodeValidator<'ctx> {
             }
 
             // Verify instructions in block
-            self.verify_instructions(&bb, report)?;
+            self.verify_instructions(bb, report)?;
         }
 
         if !has_entry && block_count > 0 {

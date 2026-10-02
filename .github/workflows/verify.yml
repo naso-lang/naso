@@ -134,3 +134,60 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
         working-directory: .
+
+  # The LLVM backend is behind a feature flag, so every default-profile job in this
+  # workflow skips it. That left the entire native backend -- loop lowering, the
+  # schedule tree, casts, and the CPU execution harness -- unverified on every push.
+  # This job runs it, including the tests that compile generated IR with `llc` and
+  # execute it, so a regression in the backend cannot land green.
+  llvm-backend:
+    name: LLVM Backend (build, test, execute on CPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    env:
+      # `llvm-sys 170` is satisfied by any LLVM 17.x; this pins the minor series so a
+      # runner image update cannot silently move us onto LLVM 18 and fail the build.
+      LLVM_SYS_170_PREFIX: /usr/lib/llvm-17
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install LLVM 17
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-17-dev clang-17
+          # `llvm-config-17` finds its own prefix; llvm-sys looks for `llvm-config`.
+          echo "/usr/lib/llvm-17/bin" >> "$GITHUB_PATH"
+          echo "LLVM_SYS_170_PREFIX=/usr/lib/llvm-17" >> "$GITHUB_ENV"
+
+      - name: Report toolchain versions
+        run: |
+          llvm-config-17 --version
+          clang-17 --version | head -1
+
+      - name: Build with the llvm feature
+        run: cargo build --features llvm --all-targets
+
+      - name: Test with the llvm feature
+        run: cargo test --features llvm --workspace --no-fail-fast
+
+      # The execution tests shell out to `llc` and `clang`, which are on PATH as
+      # `llc-17`/`clang-17` on the runner. Symlink the unversioned names the tests
+      # invoke, so they do not silently fall back to a different major version.
+      - name: Expose unversioned llc/clang for the execution harness
+        run: |
+          sudo ln -sf /usr/lib/llvm-17/bin/llc /usr/local/bin/llc
+          sudo ln -sf /usr/bin/clang-17 /usr/local/bin/clang
+          llc --version | head -2
+          clang --version | head -1
+
+      - name: Re-run the CPU execution tests with llc/clang on PATH
+        run: cargo test --features llvm --test llvm_execution_test --test llvm_forall_execution_test
+
+      - name: Clippy with the llvm feature
+        run: cargo clippy --features llvm --all-targets -- -D warnings

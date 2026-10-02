@@ -24,14 +24,38 @@ impl QirProfileKind {
             QirProfileKind::Full => "full",
         }
     }
+}
 
-    /// Parse from string
-    pub fn from_str(s: &str) -> Option<Self> {
+/// Error returned when a string does not name a known QIR profile kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseQirProfileKindError {
+    /// The rejected input, kept verbatim.
+    pub input: String,
+}
+
+impl std::fmt::Display for ParseQirProfileKindError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unknown QIR profile `{}`: expected base, adaptive or full",
+            self.input
+        )
+    }
+}
+
+impl std::error::Error for ParseQirProfileKindError {}
+
+impl std::str::FromStr for QirProfileKind {
+    type Err = ParseQirProfileKindError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "base" => Some(QirProfileKind::Base),
-            "adaptive" => Some(QirProfileKind::Adaptive),
-            "full" => Some(QirProfileKind::Full),
-            _ => None,
+            "base" => Ok(QirProfileKind::Base),
+            "adaptive" => Ok(QirProfileKind::Adaptive),
+            "full" => Ok(QirProfileKind::Full),
+            _ => Err(ParseQirProfileKindError {
+                input: s.to_string(),
+            }),
         }
     }
 }
@@ -239,21 +263,17 @@ impl QirProfile {
         }
 
         // Check for dynamic control flow in base profile
-        if !self.allows_dynamic_control_flow {
-            if module_ir.contains("qir.if") || module_ir.contains("qir.while") {
-                errors.push(
-                    "Dynamic control flow (qir.if/qir.while) not allowed in base profile"
-                        .to_string(),
-                );
-            }
+        if !self.allows_dynamic_control_flow
+            && (module_ir.contains("qir.if") || module_ir.contains("qir.while"))
+        {
+            errors.push(
+                "Dynamic control flow (qir.if/qir.while) not allowed in base profile".to_string(),
+            );
         }
 
         // Check for qubit reuse in base profile
-        if !self.allows_qubit_reuse {
-            if module_ir.contains("qir.qubit_reset") {
-                errors
-                    .push("Qubit reuse (qir.qubit_reset) not allowed in base profile".to_string());
-            }
+        if !self.allows_qubit_reuse && module_ir.contains("qir.qubit_reset") {
+            errors.push("Qubit reuse (qir.qubit_reset) not allowed in base profile".to_string());
         }
 
         if errors.is_empty() {

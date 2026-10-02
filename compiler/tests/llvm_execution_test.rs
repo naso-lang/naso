@@ -202,12 +202,6 @@ fn build_storing_ir_at(value: PirExpr, width: naso_compiler::codegen::abi::IntWi
     builder.module_to_string()
 }
 
-/// Build, compile, run, and return `(value, ir)` for a store of `value` into an i64
-/// destination.
-fn build_storing_ir(value: PirExpr) -> String {
-    build_storing_ir_at(value, naso_compiler::codegen::abi::IntWidth::I64)
-}
-
 /// Compile `ir` to x86-64, link it with the C harness, run it, and return the printed
 /// value. This is a genuine native execution, not an inspection of the IR.
 ///

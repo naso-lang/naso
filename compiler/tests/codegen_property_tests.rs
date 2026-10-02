@@ -22,8 +22,8 @@ mod llvm_property_tests {
     use inkwell::types::BasicMetadataTypeEnum;
     use proptest::prelude::*;
 
-    /// Property: A module built to be well-formed passes LLVM verification
-    /// and produces no validator errors.
+    // Property: A module built to be well-formed passes LLVM verification
+    // and produces no validator errors.
     proptest! {
         #[test]
         fn prop_valid_module_passes_validation(
@@ -53,8 +53,8 @@ mod llvm_property_tests {
         }
     }
 
-    /// Property: a block without a terminator is reported as a
-    /// "Block terminator" error; a properly chained one is not.
+    // Property: a block without a terminator is reported as a
+    // "Block terminator" error; a properly chained one is not.
     proptest! {
         #[test]
         fn prop_function_body_structure(
@@ -93,27 +93,27 @@ mod llvm_property_tests {
         }
     }
 
-    /// Property: LLVM's own verifier is the authority on call well-formedness,
-    /// and the call instruction the builder emits carries exactly the argument
-    /// types the callee declares.
-    ///
-    /// CORRECTED / NOTE: this was originally `prop_call_signature_matching`,
-    /// which asserted that `validate.rs::verify_types` reports no
-    /// "Call signature"/"Call arity" error when the arguments match. That is
-    /// not true on this LLVM build, and it is a production bug rather than a
-    /// test bug:
-    ///
-    ///   * `verify_types` (compiler/src/codegen/validate.rs:299) assumes
-    ///     "operand 0 of a call is the callee; the rest are the arguments".
-    ///   * On LLVM 17 with opaque pointers the callee is the LAST operand:
-    ///     `call void @callee(i32 3)` has operand 0 = `i32` and operand 1 =
-    ///     `ptr`. (Verified by dumping the operands.)
-    ///   * So `arg_types` ends up as `[ptr]` and is compared against the
-    ///     declared `[i32]`, producing a spurious
-    ///     "Call signature: callee" error for every well-typed call.
-    ///
-    /// The property below therefore asserts what is actually verifiable, and
-    /// the bug is reported rather than papered over by a weakened assertion.
+    // Property: LLVM's own verifier is the authority on call well-formedness,
+    // and the call instruction the builder emits carries exactly the argument
+    // types the callee declares.
+    //
+    // CORRECTED / NOTE: this was originally `prop_call_signature_matching`,
+    // which asserted that `validate.rs::verify_types` reports no
+    // "Call signature"/"Call arity" error when the arguments match. That is
+    // not true on this LLVM build, and it is a production bug rather than a
+    // test bug:
+    //
+    //   * `verify_types` (compiler/src/codegen/validate.rs:299) assumes
+    //     "operand 0 of a call is the callee; the rest are the arguments".
+    //   * On LLVM 17 with opaque pointers the callee is the LAST operand:
+    //     `call void @callee(i32 3)` has operand 0 = `i32` and operand 1 =
+    //     `ptr`. (Verified by dumping the operands.)
+    //   * So `arg_types` ends up as `[ptr]` and is compared against the
+    //     declared `[i32]`, producing a spurious
+    //     "Call signature: callee" error for every well-typed call.
+    //
+    // The property below therefore asserts what is actually verifiable, and
+    // the bug is reported rather than papered over by a weakened assertion.
     proptest! {
         #[test]
         fn prop_call_wellformedness_matches_llvm_verifier(
@@ -151,13 +151,13 @@ mod llvm_property_tests {
         }
     }
 
-    /// Property: global classification matches LLVM's real state.
-    ///
-    /// CORRECTED: this was originally `prop_global_variable_types`, which tried
-    /// to build a `void` global. `void` is not a `BasicTypeEnum` in inkwell and
-    /// LLVM forbids void-typed globals outright, so that branch could never
-    /// exist -- the test was fiction. The real, reachable classification is the
-    /// constant / externally-declared / initialized one below.
+    // Property: global classification matches LLVM's real state.
+    //
+    // CORRECTED: this was originally `prop_global_variable_types`, which tried
+    // to build a `void` global. `void` is not a `BasicTypeEnum` in inkwell and
+    // LLVM forbids void-typed globals outright, so that branch could never
+    // exist -- the test was fiction. The real, reachable classification is the
+    // constant / externally-declared / initialized one below.
     proptest! {
         #[test]
         fn prop_global_variable_report(
@@ -205,8 +205,8 @@ mod llvm_property_tests {
         }
     }
 
-    /// Property: report bookkeeping matches what was pushed into it, and
-    /// `summary()` agrees with the vector lengths.
+    // Property: report bookkeeping matches what was pushed into it, and
+    // `summary()` agrees with the vector lengths.
     proptest! {
         #[test]
         fn prop_validation_report_consistency(
@@ -250,8 +250,8 @@ mod llvm_property_tests {
         }
     }
 
-    /// Property: every PIR statement parsed out of the source maps to a
-    /// corresponding function definition in the emitted LLVM IR.
+    // Property: every PIR statement parsed out of the source maps to a
+    // corresponding function definition in the emitted LLVM IR.
     proptest! {
         #[test]
         fn prop_structural_verification_basic(
@@ -449,7 +449,7 @@ mod llvm_property_tests {
 
         for i in 0..num_statements {
             pir.push_str(&format!("S{} = {{\n", i));
-            pir.push_str(&format!("  domain = test_domain\n"));
+            pir.push_str("  domain = test_domain\n");
             pir.push_str(&format!("  body = \"stmt_{}\"\n", i));
             pir.push_str("}\n\n");
         }
@@ -495,9 +495,9 @@ mod qir_property_tests {
     use inkwell::context::Context;
     use proptest::prelude::*;
 
-    /// Property: the QIR validator's checks track the actual IR text --
-    /// target triple presence drives the module-declaration check, and the
-    /// presence of `__quantum__` intrinsics drives the intrinsics check.
+    // Property: the QIR validator's checks track the actual IR text --
+    // target triple presence drives the module-declaration check, and the
+    // presence of `__quantum__` intrinsics drives the intrinsics check.
     proptest! {
         #[test]
         fn prop_qir_declaration_and_intrinsic_checks(
@@ -526,8 +526,8 @@ mod qir_property_tests {
         }
     }
 
-    /// Property: qubit allocation and measurement are detected iff the QIR
-    /// text actually contains the corresponding runtime intrinsics.
+    // Property: qubit allocation and measurement are detected iff the QIR
+    // text actually contains the corresponding runtime intrinsics.
     proptest! {
         #[test]
         fn prop_qir_quantum_ops_detection(
@@ -549,7 +549,7 @@ mod qir_property_tests {
         }
     }
 
-    /// Property: QIR report bookkeeping is consistent.
+    // Property: QIR report bookkeeping is consistent.
     proptest! {
         #[test]
         fn prop_qir_validation_report_consistency(

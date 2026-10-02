@@ -2,8 +2,9 @@
 //!
 //! LLVM-specific lowering of quantity-aware types to inkwell types.
 
-#[cfg(feature = "llvm")]
-use crate::codegen::abi::abi_core::{LlvmAggregateType, LlvmPointerType, QuantityAwareType};
+// `LlvmAggregateType`, `LlvmPointerType` and `QuantityAwareType` come in via the
+// `pub use ...::*` glob at the bottom of this file; importing them privately here
+// as well would shadow that public re-export.
 #[cfg(feature = "llvm")]
 use crate::codegen::error::{CodegenError, CodegenResult};
 #[cfg(feature = "llvm")]

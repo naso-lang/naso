@@ -1,8 +1,9 @@
+//! Hardware Backend Exporter
+//!
+//! Provides a unified trait for exporting QIR modules to various hardware backends
+//! including OpenQASM 3.0, Amazon Braket, and other quantum hardware targets.
+
 use crate::ast::Quantity;
-/// Hardware Backend Exporter
-///
-/// Provides a unified trait for exporting QIR modules to various hardware backends
-/// including OpenQASM 3.0, Amazon Braket, and other quantum hardware targets.
 
 #[cfg(feature = "llvm")]
 mod braket;

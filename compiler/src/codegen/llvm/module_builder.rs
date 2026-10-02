@@ -41,8 +41,6 @@ pub struct LLVMModuleBuilder<'ctx> {
     current_function: Option<FunctionValue<'ctx>>,
     // Current basic block
     current_block: Option<BasicBlock<'ctx>>,
-    // Named struct types
-    struct_types: HashMap<String, inkwell::types::StructType<'ctx>>,
 }
 
 impl<'ctx> LLVMModuleBuilder<'ctx> {
@@ -65,8 +63,6 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
             value_builder: Some(value_builder),
             current_function: None,
             current_block: None,
-
-            struct_types: HashMap::new(),
         })
     }
 

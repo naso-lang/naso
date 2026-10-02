@@ -1,6 +1,6 @@
 //! QIR (Quantum Intermediate Representation) Backend
-///
-/// Generates QIR-compatible LLVM IR for quantum programs following the Microsoft QIR spec.
+//!
+//! Generates QIR-compatible LLVM IR for quantum programs following the Microsoft QIR spec.
 
 #[cfg(feature = "llvm")]
 pub mod module_builder;

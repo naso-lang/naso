@@ -1,8 +1,9 @@
+//! Amazon Braket Hardware Backend Exporter
+//!
+//! Lowers QIR modules to Amazon Braket JSON AST structure for execution
+//! on AWS quantum hardware (superconducting, ion trap, photonic).
+
 use crate::ast::Quantity;
-/// Amazon Braket Hardware Backend Exporter
-///
-/// Lowers QIR modules to Amazon Braket JSON AST structure for execution
-/// on AWS quantum hardware (superconducting, ion trap, photonic).
 
 #[cfg(feature = "llvm")]
 use crate::codegen::qir::{QIRModule, QIROperation};
@@ -10,7 +11,7 @@ use crate::runtime::exporter::{
     DecompositionRule, ExportMetadata, ExportResult, ExporterError, HardwareExporter, TargetBackend,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::HashMap;
 
 /// Braket IR (Intermediate Representation) types
@@ -130,41 +131,22 @@ pub enum BraketResult {
 }
 
 /// Amazon Braket exporter
-pub struct BraketExporter {
-    /// Target device ARN (optional)
-    device_arn: Option<String>,
-    /// Include device parameters
-    include_device_params: bool,
-    /// Default shots for sampling
-    default_shots: usize,
-}
-
-impl Default for BraketExporter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+///
+/// Currently stateless. It used to carry an optional `device_arn` written only by a
+/// `with_device_arn` builder setter that nothing called, so `device_parameters` was
+/// always emitted as `null` and the ARN never appeared in any output. A field that
+/// can never be `Some` is worse than no field: `deviceArn` looks like a supported
+/// feature in the emitted IR and is not. The field, its setter, and the
+/// `device_parameters` entry it fed have all been removed; re-adding them means
+/// threading a real device selection through `ExporterFactory`, not restoring a
+/// builder that nothing drives.
+#[derive(Default)]
+pub struct BraketExporter;
 
 impl BraketExporter {
     /// Create a new Braket exporter
     pub fn new() -> Self {
-        Self {
-            device_arn: None,
-            include_device_params: false,
-            default_shots: 1000,
-        }
-    }
-
-    /// Set target device ARN
-    pub fn with_device_arn(mut self, arn: String) -> Self {
-        self.device_arn = Some(arn);
-        self
-    }
-
-    /// Set default shots
-    pub fn with_shots(mut self, shots: usize) -> Self {
-        self.default_shots = shots;
-        self
+        Self
     }
 
     /// Export a QIR module to Braket IR
@@ -271,10 +253,8 @@ impl BraketExporter {
                 instructions,
                 results,
             },
-            device_parameters: self
-                .device_arn
-                .as_ref()
-                .map(|arn| json!({ "deviceArn": arn })),
+            // No device selection exists in this path yet; see the type-level note.
+            device_parameters: None,
         };
 
         // Serialize to JSON
@@ -282,8 +262,10 @@ impl BraketExporter {
             ExporterError::ExportFailed(format!("JSON serialization failed: {}", e))
         })?;
 
-        let mut metadata = ExportMetadata::default();
-        metadata.qubit_count = module.qubit_count;
+        let mut metadata = ExportMetadata {
+            qubit_count: module.qubit_count,
+            ..Default::default()
+        };
         // `gate_count` counts GATES ONLY. Summing every entry in `operation_counts`
         // also counted `measure`, `reset` and `barrier`, so a 2-gate circuit with 2
         // measurements reported 4 gates -- double-counting the measurements that

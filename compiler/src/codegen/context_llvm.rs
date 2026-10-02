@@ -18,7 +18,7 @@ use inkwell::targets::{
 #[cfg(feature = "llvm")]
 use std::path::Path;
 #[cfg(feature = "llvm")]
-use target_lexicon::{Architecture, BinaryFormat, Environment, OperatingSystem, Triple, Vendor};
+use target_lexicon::{Architecture, OperatingSystem, Triple};
 
 #[cfg(feature = "llvm")]
 /// LLVM-specific code generation context
@@ -207,30 +207,6 @@ fn inkwell_opt_level(opt_level: OptLevel) -> OptimizationLevel {
         OptLevel::Default => OptimizationLevel::Default,
         OptLevel::Aggressive => OptimizationLevel::Aggressive,
     }
-}
-
-#[cfg(feature = "llvm")]
-/// Helper to convert target_lexicon Triple to inkwell TargetTriple
-fn to_inkwell_triple(triple: &Triple) -> TargetTriple {
-    // target-lexicon 0.12 represents absent components as `Unknown` enum
-    // variants rather than `Option`s, so they are filtered out by comparison.
-    let mut s = String::new();
-    s.push_str(triple.architecture.to_string().as_str());
-    if triple.vendor != Vendor::Unknown {
-        s.push('-');
-        s.push_str(triple.vendor.to_string().as_str());
-    }
-    s.push('-');
-    s.push_str(triple.operating_system.to_string().as_str());
-    if triple.environment != Environment::Unknown {
-        s.push('-');
-        s.push_str(triple.environment.to_string().as_str());
-    }
-    if triple.binary_format != BinaryFormat::Unknown {
-        s.push('-');
-        s.push_str(triple.binary_format.to_string().as_str());
-    }
-    TargetTriple::create(&s)
 }
 
 // Stub implementation when llvm feature is not enabled

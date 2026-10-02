@@ -1402,6 +1402,135 @@ impl LoweringContext {
             // leaving them in the top-level statement list would run them ONCE, before
             // the loop, unconditionally.
             //
+            // `for i in N { body }` is a COUNTED loop -- `iter` is a count, not an
+            // iterable, since `for i in 0..n` does not parse and `for i in n` does.
+            //
+            // It lowers to the `While` this file already emits, not to a band. A
+            // counted loop's trip count IS statically affine, so it could become a
+            // band; but desugaring it here means one loop CFG in the backend instead
+            // of two, and the desugaring is exact:
+            //
+            //     for i in N { B }   ==   let mut i = 0; while i < N { B; i = i + 1; }
+            //
+            // The increment is APPENDED after the body, so a `continue` in the body
+            // would skip it and loop forever -- which is exactly why `continue` is
+            // currently refused rather than emitted. Nothing here can make that worse,
+            // and the desugaring is the standard one.
+            //
+            // The counter is a fresh PIR binding, not a source name, so a source
+            // variable called `i` cannot be captured by it. It is still added to the
+            // function's quantity map, because `[1]` markings are recorded there and a
+            // synthesised binding must not appear unaccounted for.
+            crate::ast::ExprKind::For(fl) => {
+                let count = self.lower_expr(&fl.iter)?;
+                let mut parts: Vec<crate::ir::PirExpr> = Vec::new();
+
+                //
+                // The counter's name is derived from the source variable so two `for`
+                // loops in one function do not collide, and it is NOT the source name
+                // itself, so a source variable called `i` cannot be captured by it.
+                let counter = format!("__for_counter_{}", fl.var.name);
+
+                // `let mut __for_counter_N = 0;`
+                //
+                // Emitted as a PIR `Let` directly rather than by building an AST
+                // `LetStmt` and running it through `lower_let_stmt`. The AST route
+                // needs a synthesised `Ident`, a type, and a fresh `NodeId` for a
+                // binding the compiler invents, and all three would be fabricated
+                // source. The `Let` node carries the same information without any.
+                self.quantities
+                    .insert(counter.clone(), crate::ast::Quantity::Many);
+                parts.push(crate::ir::PirExpr::Let {
+                    name: counter.clone(),
+                    qty: crate::ast::Quantity::Many,
+                    mutability: crate::ast::Mutability::Mut,
+                    value: Box::new(crate::ir::PirExpr::IntLit(0)),
+                    body: Box::new(crate::ir::PirExpr::IntLit(0)),
+                });
+
+                // Body statements, then the increment, then the block's tail.
+                let first_new = self.statements.len();
+                let first_sched = self.schedule_nodes.len();
+                for st in &fl.body.stmts {
+                    self.lower_stmt(st)?;
+                }
+                if self.pending_return_stmt.is_some() {
+                    return Err(LoweringError::Unsupported(
+                        "a `return` inside a `for` body is not lowered, for the same \
+                         reason as inside a `if` or `while`: hoisting it would skip the \
+                         rest of the body and the counter increment, so the loop would \
+                         never advance."
+                            .to_string(),
+                    ));
+                }
+                let mut body_parts: Vec<crate::ir::PirExpr> = self.statements[first_new..]
+                    .iter()
+                    .map(|s| s.body.clone())
+                    .collect();
+                self.statements.truncate(first_new);
+                self.schedule_nodes.truncate(first_sched);
+
+                // `i = i + 1` -- appended so it runs after the body.
+                body_parts.push(crate::ir::PirExpr::Assign {
+                    target: Box::new(crate::ir::PirExpr::Var(counter.clone())),
+                    value: Box::new(crate::ir::PirExpr::Binary {
+                        op: crate::ir::BinaryOp::Add,
+                        left: Box::new(crate::ir::PirExpr::Var(counter.clone())),
+                        right: Box::new(crate::ir::PirExpr::IntLit(1)),
+                    }),
+                });
+                if let Some(tail) = &fl.body.expr {
+                    body_parts.push(self.lower_expr(tail)?);
+                }
+
+                // Bind the loop variable the body actually reads, BEFORE the body.
+                //
+                // The counter and the loop variable are different things: the counter
+                // is the compiler's induction state, and `i` in `for i in n { ... i
+                // ... }` is the name the source wrote. A body reading `i` must see the
+                // CURRENT iteration's value, so `i` is assigned from the counter at
+                // the top of every iteration -- not once before the loop, which would
+                // freeze it at 0 and make every iteration contribute the same amount.
+                //
+                // Omitting this was the first version of this change, and it failed
+                // with "read of `i`: no allocation is known for it" -- the strict
+                // unbound-read refusal doing its job again rather than returning zero.
+                body_parts.insert(
+                    0,
+                    crate::ir::PirExpr::Assign {
+                        target: Box::new(crate::ir::PirExpr::Var(fl.var.name.clone())),
+                        value: Box::new(crate::ir::PirExpr::Var(counter.clone())),
+                    },
+                );
+                // The loop variable is a slot the body writes, so give it one up front
+                // by evaluating it as part of the loop's binding sequence.
+                parts.insert(
+                    1,
+                    crate::ir::PirExpr::Let {
+                        name: fl.var.name.clone(),
+                        qty: crate::ast::Quantity::Many,
+                        mutability: crate::ast::Mutability::Mut,
+                        value: Box::new(crate::ir::PirExpr::IntLit(0)),
+                        body: Box::new(crate::ir::PirExpr::IntLit(0)),
+                    },
+                );
+                self.quantities
+                    .insert(fl.var.name.clone(), crate::ast::Quantity::Many);
+
+                // The guard `i < N` is evaluated every iteration, which is what a
+                // counted loop means: the bound is re-read rather than frozen.
+                parts.push(crate::ir::PirExpr::While {
+                    cond: Box::new(crate::ir::PirExpr::Binary {
+                        op: crate::ir::BinaryOp::Lt,
+                        left: Box::new(crate::ir::PirExpr::Var(counter)),
+                        right: Box::new(count),
+                    }),
+                    body: Box::new(crate::ir::PirExpr::Stmts(body_parts)),
+                });
+
+                Ok(crate::ir::PirExpr::Stmts(parts))
+            }
+            //
             // `break`/`continue` become their own PIR nodes rather than being resolved
             // to a target HERE.
             //

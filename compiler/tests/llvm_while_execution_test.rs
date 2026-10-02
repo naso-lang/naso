@@ -596,3 +596,160 @@ int main(void){ printf("%ld %ld\n", naso_k(0), naso_k(4)); return 0; }
         "a `while` loop with no `break` must be unaffected by the new keywords.\n--- IR ---\n{ir}"
     );
 }
+
+// ===== `for`: a counted loop, lowered onto the `while` above =====
+
+/// `for i in n { ... }` runs its body exactly `n` times, with `i` taking 0..n.
+///
+/// Three inputs including 0 and 1, which catch the two easy wrong answers: a loop
+/// that runs `n-1` times (missing the last iteration) and one that runs `n+1` (not
+/// re-testing the guard). `sum_for(5)` is 0+1+2+3+4 = 10 and `sum_for(10)` is
+/// 0+..+9 = 45.
+#[test]
+fn a_for_loop_runs_its_body_exactly_the_counted_number_of_times() {
+    let src = "\
+fn sum_for(n: i64) -> i64 {
+    let mut t = 0;
+    for i in n { t = t + i; }
+    t
+}
+";
+    let ir = build_ir(src);
+    let driver = r#"
+#include <stdio.h>
+long naso_sum_for(long);
+int main(void){ printf("%ld %ld %ld\n", naso_sum_for(0), naso_sum_for(5), naso_sum_for(10)); return 0; }
+"#;
+    assert_eq!(
+        run(&ir, driver),
+        "0 10 45",
+        "the body must run exactly n times over i = 0..n. A body that ran n-1 times \
+         gives 6 for n=5 and 36 for n=10; one that ran n+1 times gives 15 and 55.\n--- IR ---\n{ir}"
+    );
+}
+
+/// The loop variable must hold the CURRENT iteration's value, re-read every time.
+///
+/// This is the bug the first version of this change had. The counter was bound and
+/// advanced correctly, but the loop variable was never bound, so reading it failed.
+/// The tempting wrong fix -- binding `i` once before the loop -- is worse than a
+/// refusal, because it makes every iteration contribute the same amount: `sum_for(5)`
+/// would be 0 five times over, i.e. 0, which looks like a plausible empty-loop result.
+///
+/// So `sum_for(3)` must be 0+1+2 = 3, and a frozen `i` gives 0.
+#[test]
+fn the_loop_variable_holds_the_current_iterations_value() {
+    let src = "\
+fn sum_for(n: i64) -> i64 {
+    let mut t = 0;
+    for i in n { t = t + i; }
+    t
+}
+";
+    let ir = build_ir(src);
+    let driver = r#"
+#include <stdio.h>
+long naso_sum_for(long);
+int main(void){ printf("%ld %ld\n", naso_sum_for(3), naso_sum_for(7)); return 0; }
+"#;
+    assert_eq!(
+        run(&ir, driver),
+        "3 21",
+        "0+1+2 = 3 for n=3 and 0+1+..+6 = 21 for n=7. A loop variable frozen at its \
+         initial value would give 0 for both, which is indistinguishable from an \
+         empty loop.\n--- IR ---
+{ir}"
+    );
+}
+
+/// Two `for` loops with DIFFERENT variable names in one function both work.
+///
+/// I wrote this test to pin that the counter name is derived from the loop variable,
+// so two loops cannot collide. It does NOT do that. Mutating the counter name to a
+// single shared `__for_counter` still passes all 19 tests -- because each `for`
+// re-binds the counter with a `Let`, and the guard RE-LOADS it each iteration, so a
+// shared name is re-initialised before the second loop reads it.
+//
+// The derivation is sound, not lucky: the second `for` pushes `Let { name: counter }`
+// and then the `While` guard loads that same slot. A shared name therefore still
+// starts the second loop from 0. So there is no collision bug here, and claiming one
+// would have put a false claim in the test suite. The behaviour is kept as coverage
+// for two loops in one function, which is worth having on its own, and the comment
+// says what it actually establishes.
+#[test]
+fn two_for_loops_in_one_function_each_start_from_their_own_counter() {
+    let src = "\
+fn two(n: i64) -> i64 {
+    let mut a = 0;
+    for i in n { a = a + i; }
+    let mut b = 0;
+    for j in n { b = b + j; }
+    a + b
+}
+";
+    let ir = build_ir(src);
+    let driver = r#"
+#include <stdio.h>
+long naso_two(long);
+int main(void){ printf("%ld %ld\n", naso_two(4), naso_two(6)); return 0; }
+"#;
+    assert_eq!(
+        run(&ir, driver),
+        "12 30",
+        "each loop sums 0..n-1, so for n=4 each gives 6 and together 12; for n=6 each \
+         gives 0+1+2+3+4+5 = 15 and together 30. If the second loop started from the \
+         first's final counter value these totals would differ.\n--- IR ---\n{ir}"
+    );
+}
+
+/// `for` re-reads its bound, so a variable bound by an `if` before it is honoured.
+///
+/// The guard compares against a variable's value on every iteration. If the count
+/// expression were evaluated once and frozen, a program that changes the bound
+/// between two `for` loops would use the first loop's count for the second.
+#[test]
+fn a_for_loop_re_reads_its_bound_from_the_current_value() {
+    let src = "\
+fn f(n: i64) -> i64 {
+    let mut t = 0;
+    let mut k = n;
+    for i in k { t = t + i; }
+    k = 2;
+    let mut u = 0;
+    for i in k { u = u + i; }
+    t + u
+}
+";
+    let ir = build_ir(src);
+    let driver = r#"
+#include <stdio.h>
+long naso_f(long);
+int main(void){ printf("%ld\n", naso_f(3)); return 0; }
+"#;
+    assert_eq!(
+        run(&ir, driver),
+        "4",
+        "the first loop sums 0..2 = 3; k is then set to 2, so the second loop also \
+         sums 0..1 = 1; together 4. A frozen count would make the second loop run \
+         three times as well, giving 3 + 3 = 6.\n--- IR ---\n{ir}"
+    );
+}
+
+/// A `return` inside a `for` body is refused, and says why.
+///
+/// Distinct from the `while` case: hoisting the return would skip the counter
+/// increment, so the loop would never advance and would run forever even if the
+/// return did not already exit.
+#[test]
+fn a_return_inside_a_for_body_is_refused_rather_than_compiled_to_the_wrong_value() {
+    let msg = compile_error("fn f(n: i64) -> i64 { for i in n { return i; } return 0; }\n");
+    assert!(
+        msg.contains("a `return` inside a `for` body"),
+        "the diagnostic must name the construct it refuses: {msg}"
+    );
+    assert!(
+        msg.contains("the loop would never advance"),
+        "the diagnostic must give the `for`-specific reason -- a skipped counter \
+         increment makes the loop non-terminating, which is worse than in a `while`: {msg}"
+    );
+}

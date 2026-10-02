@@ -69,10 +69,10 @@ impl Drop for CaseDir {
 /// prefix works in both places, so the test tests the COMPILER rather than the
 /// layout of one machine.
 fn tool(name: &str) -> String {
-    if let Ok(found) = Command::new(name).arg("--version").output() {
-        if found.status.success() {
-            return name.to_string();
-        }
+    if let Ok(found) = Command::new(name).arg("--version").output()
+        && found.status.success()
+    {
+        return name.to_string();
     }
     let brew = "/home/linuxbrew/.linuxbrew/opt/llvm@17/bin";
     if std::path::Path::new(brew).join(name).exists() {

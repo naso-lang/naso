@@ -713,9 +713,52 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
             // whose effects were emitted.
             PirExpr::Stmts(parts) => {
                 let mut last: Option<BasicValueEnum<'ctx>> = None;
+                //
+                // Each part of a `Stmts` list IS a statement, so set the flag while
+                // building them. Without this a `let` in an `if` arm was scoped to its
+                // own expression: `if x > 0.0 { let a = 10.0; a + 1.0 }` freed `a` as
+                // soon as its placeholder body finished, so reading it next was
+                // refused with "no allocation is known for it". The function's own
+                // statements already got this via the caller; a block's statements did
+                // not, because this arm is reached from `build_expr`.
+                let outer_statement_position = self.in_statement_position;
+                self.in_statement_position = true;
+                // A BLOCK introduces a scope, so anything it binds leaves with it.
+                //
+                // Without this, a binding made in an `if` arm stayed in scope after the
+                // join and produced INVALID LLVM: `if x > 0.0 { let a = 10.0; a } else
+                // { -1.0 } a` emitted `load double, ptr %a` in `if_merge`, where `%a`
+                // had only ever been allocated inside `%then`. LLVM correctly rejected
+                // it -- the alloca is not in that block's scope -- but the diagnostic
+                // arrives as a verifier failure quoting the whole function rather than
+                // as "that name is out of scope here". Tracking the names this block
+                // added and removing them on the way out turns that into the strict
+                // unbound-read refusal that already names the variable.
+                let names_before: Vec<String> = self.value_builder.variable_names();
+                let mut build_result = Ok(());
                 for part in parts {
-                    last = Some(self.build_expr(part, quantities)?);
+                    match self.build_expr(part, quantities) {
+                        Ok(v) => last = Some(v),
+                        Err(e) => {
+                            build_result = Err(e);
+                            break;
+                        }
+                    }
                 }
+                self.in_statement_position = outer_statement_position;
+                // Remove only what THIS block introduced, and do it even on the error
+                // path so a failed build does not leave names behind for the next arm.
+                let names_after = self.value_builder.variable_names();
+                let introduced: Vec<String> = names_after
+                    .iter()
+                    .filter(|n| !names_before.contains(n))
+                    .cloned()
+                    .collect();
+                for name in introduced {
+                    self.value_builder.remove_variable(&name);
+                }
+                build_result?;
+
                 match last {
                     Some(v) => Ok(v),
                     None => Ok(self

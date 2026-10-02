@@ -225,25 +225,89 @@ fn pick(x: f32) -> f32 {
     );
 }
 
-/// A `let` INSIDE an `if` arm is refused, because the arm has no scope.
+/// A `let` INSIDE an `if` arm is bound in that arm and readable in it.
 ///
-/// This is a real limitation and it is stated rather than worked around. The
-/// binding is recorded in the PIR with no allocation, so reading it would be an
-/// unbound read -- and an unbound read in this backend is refused deliberately
-/// rather than returning zero, because an uninitialised LLVM value is also zero
-/// and the result would be indistinguishable from a real computation.
+/// This is the case a statement-position `let` gets wrong in a way that looks
+/// correct: the binding is created, then freed as soon as its own (placeholder)
+/// body finishes, so the very next statement reads an unbound name. The read is
+/// REFUSED rather than answered with zero -- an uninitialised LLVM value is also
+/// zero, so a lenient read would produce a plausible number that was never
+/// computed.
 ///
-/// The refusal names the variable, so the diagnostic is actionable rather than
-/// "unsupported".
+/// Each arm binds its own value, so the two arms must produce DIFFERENT answers.
+/// If a binding leaked out of the first arm, the second would see `a` and not its
+/// own `b`.
 #[test]
-fn a_let_inside_an_if_arm_has_no_scope_and_is_refused() {
-    let msg = compile_error(
-        "fn pick(x: f32) -> f32 { if x > 0.0 { let a = 10.0; a + 1.0 } else { -1.0 } }\n",
+fn a_let_inside_an_if_arm_is_bound_and_readable_within_that_arm() {
+    let src = "\
+fn pick(x: f32) -> f32 {
+    if x > 0.0 { let a = 10.0; a + 1.0 } else { let b = 20.0; b + 2.0 }
+}
+";
+    let ir = build_ir(src);
+    let got = run(&ir, &pick_driver());
+    assert_eq!(
+        got, "11.0 22.0 22.0 11.0",
+        "each arm must read ITS OWN binding: the then-arm computes 10.0 + 1.0 = 11.0 \
+         and the else-arm computes 20.0 + 2.0 = 22.0. Note 22.0 is POSITIVE -- the \
+         `else` arm is not negated, it is simply the other arm. If the binding were \
+         freed early the read would be refused outright; if it leaked between arms the \
+         second arm would compute 10.0 + 2.0 = 12.0 instead of 22.0, so this also \
+         pins that the two arms do not share a slot.\n--- IR ---\n{ir}"
     );
+}
+
+/// A `let` inside an arm does NOT leak out of the `if`.
+///
+/// The shadowing test above would pass even if bindings leaked, as long as each
+/// arm re-bound before reading. This one reads an arm-local name AFTER the `if`,
+/// which must be refused -- a name that is in scope in one arm is not in scope
+/// after the join, and treating it as such is how a stale value becomes a result.
+#[test]
+fn a_binding_from_inside_an_if_arm_is_not_in_scope_after_the_if() {
+    let msg =
+        compile_error("fn f(x: f32) -> f32 { if x > 0.0 { let a = 10.0; a } else { -1.0 } a }\n");
     assert!(
         msg.contains("`a`") && msg.contains("no allocation is known for it"),
-        "the refusal must name the unbound binding, so the message points at the \
-         actual construct: {msg}"
+        "an arm-local name must be out of scope after the `if`, and the refusal must \
+         name it: {msg}"
+    );
+}
+
+/// A `let` inside an arm inside a loop, accumulating across iterations.
+///
+/// Each iteration re-binds and re-reads. If the binding were freed at the end of
+/// the first iteration, iteration 2 would be refused; if it were hoisted out of
+/// the loop, the sum would start from a stale value rather than 0.
+///
+/// The trip count is chosen so a wrong answer is arithmetically distinct:
+/// `i * 2` for i in 0..5 is 0 + 2 + 4 + 6 + 8 = 20.
+#[test]
+fn a_let_inside_an_if_arm_inside_a_loop_rebinds_on_every_iteration() {
+    let src = "\
+fn sum(n: i64) -> i64 {
+    let mut total = 0;
+    forall i in 0..n {
+        if i > 1 { let d = i * 2; total = total + d; }
+    }
+    total
+}
+";
+    let ir = build_ir(src);
+    let driver = r#"
+#include <stdio.h>
+long naso_sum(long);
+int main(void){ printf("%ld %ld\n", naso_sum(5), naso_sum(3)); return 0; }
+"#;
+    assert_eq!(
+        run(&ir, driver),
+        "18 4",
+        "`i > 1` means n=5 takes the then-arm only for i=2,3,4, and d = i*2 is 4, \
+         6, 8, summing to 18. For n=3 only i=2 qualifies, contributing 4. Three \
+         separate opportunities to be wrong: if the binding leaked out of the loop \
+         the first iteration would start from a stale d, if it were freed early \
+         iteration 2 would be refused, and if `i*2` were hoisted d would always be \
+         the same value.\n--- IR ---\n{ir}"
     );
 }
 

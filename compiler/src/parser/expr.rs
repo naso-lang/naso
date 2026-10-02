@@ -213,6 +213,8 @@ impl<'a> Parser<'a> {
             Some(TK::For) => self.parse_for(),
             Some(TK::Forall) => self.parse_quantified(),
             Some(TK::While) => self.parse_while(),
+            Some(TK::Break) => self.parse_break(),
+            Some(TK::Continue) => self.parse_continue(),
             Some(TK::Return) => self.parse_return(),
             Some(TK::Reversible) => self.parse_reversible_expr(),
             Some(TK::Measure) => self.parse_measure(),
@@ -553,6 +555,38 @@ impl<'a> Parser<'a> {
             span,
             next_id(),
         )
+    }
+
+    /// `break [value]` and `continue`.
+    ///
+    /// Both are optional-value control flow: `break;` leaves the innermost loop,
+    /// `break v;` leaves it with a value, and `continue` restarts the next
+    /// iteration. `continue` takes no value because there is nowhere for it to go.
+    ///
+    /// Parsing `break` at all was the missing piece. As an IDENTIFIER it parsed
+    /// cleanly into `ExprKind::Var("break")`, so a program using it reached lowering
+    /// and only failed at codegen with an unbound-read message about a variable the
+    /// author never declared. Building the dedicated node here is what makes the
+    /// construct visible to every later pass instead of silently mis-parsed.
+    fn parse_break(&mut self) -> Expr {
+        let start = self.pos;
+        self.expect(TK::Break);
+        // Same shape `parse_return` uses: a value is present unless the next token
+        // terminates the expression. `break;` and `break}` must not be read as
+        // `break <something>`, and guessing the other way would consume the `}`.
+        let value = match self.peek() {
+            Some(TK::Semicolon) | Some(TK::RBrace) | Some(TK::RParen) | None => None,
+            _ => Some(Box::new(self.parse_expr())),
+        };
+        let span = self.span_from(start);
+        Expr::new(ExprKind::Break(value), span, next_id())
+    }
+
+    fn parse_continue(&mut self) -> Expr {
+        let start = self.pos;
+        self.expect(TK::Continue);
+        let span = self.span_from(start);
+        Expr::new(ExprKind::Continue, span, next_id())
     }
 
     fn parse_while(&mut self) -> Expr {

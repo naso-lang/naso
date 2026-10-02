@@ -1401,6 +1401,33 @@ impl LoweringContext {
             // body's statements belong to the loop, not to the enclosing function, and
             // leaving them in the top-level statement list would run them ONCE, before
             // the loop, unconditionally.
+            //
+            // `break`/`continue` become their own PIR nodes rather than being resolved
+            // to a target HERE.
+            //
+            // The tempting design is for lowering to record "the loop I am currently
+            // lowering", so `break` lowers straight to a jump. It is wrong: a `break`
+            // inside an `if` inside a loop must bind to the LOOP, and a lowering pass
+            // that tracks one current loop while descending into an `if` arm has no
+            // way to say which loop that arm's `break` means. Binding it eagerly is how
+            // a `break` ends up jumping to the wrong exit -- silently, because the
+            // resulting program is still well formed.
+            //
+            // So the nodes carry no target. The backend owns the CFG and knows which
+            // exit a `break` at any point belongs to.
+            //
+            // Before this, `break` had NO representation at all: it lexed as an
+            // identifier, so it reached here as `Var("break")`, lowered to a read of a
+            // variable nobody declared, and failed at codegen with an unbound-read
+            // message about a variable the author never wrote.
+            ExprKind::Break(value) => {
+                let v = match value {
+                    Some(inner) => Some(Box::new(self.lower_expr(inner)?)),
+                    None => None,
+                };
+                Ok(crate::ir::PirExpr::Break { value: v })
+            }
+            ExprKind::Continue => Ok(crate::ir::PirExpr::Continue),
             ExprKind::While(cond, body) => {
                 let c = self.lower_expr(cond)?;
                 let first_new = self.statements.len();

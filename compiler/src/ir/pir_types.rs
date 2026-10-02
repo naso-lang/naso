@@ -132,6 +132,26 @@ pub enum PirExpr {
     /// Order matters and is preserved: this is a sequence, not a set.
     Stmts(Vec<PirExpr>),
 
+    /// Leave the innermost enclosing loop.
+    ///
+    /// `value` is the loop's result, so `break v;` is a way to produce one. A loop
+    /// whose break carries a value must produce that value at its exit, which is why
+    /// `value` is carried rather than discarded.
+    ///
+    /// The innermost loop is resolved by the BACKEND from the CFG it is building, not
+    /// recorded here. A PIR-level "current loop" pointer would be wrong the moment a
+    /// loop is nested inside an `if` inside another loop, and would silently bind a
+    /// `break` to the wrong target.
+    Break {
+        /// Optional result of the loop being left.
+        value: Option<Box<PirExpr>>,
+    },
+
+    /// Restart the innermost enclosing loop.
+    ///
+    /// No value: there is nowhere for a value to go, since the loop has not finished.
+    Continue,
+
     /// A `while` loop: evaluate `cond`, and while it is true run `body`.
     ///
     /// This is NOT sugar for `Forall`. A `forall` has a statically known,
@@ -617,6 +637,13 @@ impl PirModule {
             PirExpr::While { cond, body } => {
                 self.expr_contains_var(cond, var) || self.expr_contains_var(body, var)
             }
+            // A `break` with a value CONSUMES that value on the path it exits, so it
+            // must be counted. `continue` has nothing to count.
+            PirExpr::Break { value } => match value {
+                Some(v) => self.expr_contains_var(v, var),
+                None => false,
+            },
+            PirExpr::Continue => false,
             PirExpr::Binary { left, right, .. } => {
                 self.expr_contains_var(left, var) || self.expr_contains_var(right, var)
             }
@@ -857,6 +884,11 @@ fn pir_expr_to_string(expr: &PirExpr, _indent: usize) -> String {
         // The `Stmts` arm flattens the body into the same expression, because a
         // `while` produces no value and dropping the body here would make a printed
         // program claim a loop that it does not contain.
+        PirExpr::Break { value } => match value {
+            Some(v) => format!("break {}", pir_expr_to_string(v, 0)),
+            None => "break".to_string(),
+        },
+        PirExpr::Continue => "continue".to_string(),
         PirExpr::While { cond, body } => format!(
             "while {} {{ {} }}",
             pir_expr_to_string(cond, 0),

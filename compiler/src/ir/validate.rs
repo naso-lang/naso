@@ -207,6 +207,12 @@ fn expr_contains_var(expr: &PirExpr, var: &str) -> bool {
         PirExpr::While { cond, body } => {
             expr_contains_var(cond, var) || expr_contains_var(body, var)
         }
+        // A `break v` consumes `v` on the path where it fires.
+        PirExpr::Break { value } => match value {
+            Some(v) => expr_contains_var(v, var),
+            None => false,
+        },
+        PirExpr::Continue => false,
         // BOTH sides are uses: the target is bound to a location, the value is consumed.
         PirExpr::Assign { target, value } => {
             expr_contains_var(target, var) || expr_contains_var(value, var)

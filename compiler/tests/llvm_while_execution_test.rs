@@ -394,3 +394,205 @@ fn count(n: i64) -> i64 {
          induction variable, so it runs forever instead of failing.\n--- IR ---\n{ir}"
     );
 }
+
+// ===== `break` / `continue`: parsed, lowered, and refused =====
+//
+// Before this, `break` had NO representation anywhere in the pipeline. It lexed as a
+// plain IDENTIFIER, so `if c { break; }` parsed into `ExprKind::Var("break")` -- no
+// syntax error, no missing-keyword error, and an AST indistinguishable from a
+// program that legitimately reads a variable named `break`.
+//
+// The only thing standing between that and a silent wrong answer was the strict
+// unbound-read refusal in the LLVM backend, which failed the program with "read of
+// `break`: no allocation is known for it". That names a VARIABLE the author never
+// wrote, which sends a reader looking for a missing declaration instead of a missing
+// language feature. So the diagnostic was accurate about the compiler's state and
+// misleading about the program.
+
+/// The lexer must produce a `break` KEYWORD, not an identifier.
+///
+/// This is the root of the whole problem, so it is asserted first and on its own. A
+/// test that only checked the eventual diagnostic would pass if `break` were still
+/// an identifier that happened to be refused later -- which is the state this suite
+/// was written to end.
+#[test]
+fn break_and_continue_lex_as_keywords_and_not_as_identifiers() {
+    use naso_compiler::lexer::token::TokenKind;
+
+    let toks = naso_compiler::lexer::Lexer::tokenize("break continue");
+    assert_eq!(
+        toks.len(),
+        2,
+        "`break continue` must lex as exactly two tokens, got {toks:?}"
+    );
+    assert!(
+        matches!(toks[0], TokenKind::Break),
+        "`break` must lex as the keyword, not an identifier. Got {:?}. As an identifier \
+         it produced Var(\"break\") and reached codegen as an unbound read of a \
+         variable the author never wrote.",
+        toks[0]
+    );
+    assert!(
+        matches!(toks[1], TokenKind::Continue),
+        "`continue` must lex as the keyword, not an identifier. Got {:?}",
+        toks[1]
+    );
+}
+
+/// The parser must build `ExprKind::Break`, not `ExprKind::Var("break")`.
+///
+/// A distinct check from the lexer one: the tokens can be right and the parser still
+/// route them to the identifier path.
+#[test]
+fn the_parser_builds_a_break_node_rather_than_a_variable_read() {
+    let src = "fn f(n: i64) -> i64 {\n  while n > 0 { break; }\n  n\n}\n";
+    let program = naso_compiler::parser::parse_program(src).expect("parses");
+    let json = serde_json::to_string(&program).expect("serialises");
+    assert!(
+        json.contains("\"Break\""),
+        "the AST must contain a Break node.\n{json}"
+    );
+    assert!(
+        !json.contains("\"Var\":{\"name\":\"break\""),
+        "`break` must not become a variable read. This is the exact shape that made the \
+         construct invisible: a program mentioning `break` typechecked and lowered, \
+         then failed with a message about an undeclared VARIABLE.\n{json}"
+    );
+}
+
+/// `break;` with no value, `break v;` with one, and `continue` must all lower to
+/// their own PIR nodes rather than to a variable read.
+#[test]
+fn break_and_continue_lower_to_their_own_pir_nodes() {
+    for (tag, src, needle, forbidden) in [
+        (
+            "bare break",
+            "fn f() -> i64 { let mut i = 0; while true { i = i + 1; if i > 3 { break; } } i }\n",
+            "Break",
+            "Var(\"break\")",
+        ),
+        (
+            "break with a value",
+            "fn f() -> i64 { let mut i = 0; while true { i = i + 1; if i > 3 { break i; } } i }\n",
+            "Break",
+            "Var(\"break\")",
+        ),
+        (
+            "continue",
+            "fn f() -> i64 { let mut i = 0; while i < 9 { i = i + 1; if i > 2 { continue; } } i }\n",
+            "Continue",
+            "Var(\"continue\")",
+        ),
+    ] {
+        let program = naso_compiler::parser::parse_program(src)
+            .unwrap_or_else(|e| panic!("{tag}: must parse: {e:?}"));
+        let pir = naso_compiler::lowering::lower_program(&program)
+            .unwrap_or_else(|e| panic!("{tag}: must lower: {e}"));
+        let dump = format!("{pir:?}");
+        assert!(
+            dump.contains(needle),
+            "{tag}: expected a {needle} node in the PIR.\n{dump}"
+        );
+        assert!(
+            !dump.contains(forbidden),
+            "{tag}: {forbidden} must not appear -- that is the mis-parse this work \
+             removed.\n{dump}"
+        );
+    }
+}
+
+/// The backend refuses `break`, and says what is missing rather than what is wrong.
+///
+/// Paired with `a_while_loop_runs_its_body_until_the_condition_becomes_false`, which
+/// proves `while` itself works. Without that pairing, a backend refusing everything
+/// would pass this suite.
+#[test]
+fn break_is_refused_by_the_backend_with_a_message_that_names_the_construct() {
+    let msg = compile_error(
+        "fn f(n: i64) -> i64 { let mut i = 0; while i < n { i = i + 1; if i > 3 { break; } } i }\n",
+    );
+    assert!(
+        msg.contains("`break` is parsed and lowered, but this backend does not yet emit it"),
+        "the diagnostic must name `break` and say the backend does not emit it, rather \
+         than describing a missing variable: {msg}"
+    );
+    assert!(
+        msg.contains("no loop stack is threaded"),
+        "the diagnostic must name the actual missing mechanism, so a reader knows this \
+         is a backend gap and not a bad program: {msg}"
+    );
+    assert!(
+        msg.contains("Refused rather than compiled to a no-op")
+            || msg.contains("rather than compiled to a no-op"),
+        "the diagnostic must say why it refuses instead of approximating, since a \
+         no-op `break` inside an `if` would exit no loop at all: {msg}"
+    );
+    assert!(
+        !msg.contains("no allocation is known for it"),
+        "the OLD failure named an undeclared variable, which sent readers looking for a \
+         missing declaration. That wording must be gone: {msg}"
+    );
+}
+
+/// The same for `continue`, whose wrong implementation is an infinite loop.
+#[test]
+fn continue_is_refused_by_the_backend_with_a_message_that_names_the_construct() {
+    let msg = compile_error(
+        "fn f(n: i64) -> i64 { let mut i = 0; while i < n { i = i + 1; if i > 2 { continue; } } i }\n",
+    );
+    assert!(
+        msg.contains("`continue` is parsed and lowered, but this backend does not yet emit it"),
+        "the diagnostic must name `continue` and the gap: {msg}"
+    );
+    assert!(
+        msg.contains("would be an infinite loop"),
+        "the diagnostic must say what the wrong implementation would do: {msg}"
+    );
+}
+
+/// `break v;` is refused too, and specifically for carrying a value.
+///
+/// A `break` with a value is a strictly bigger job than a bare one: the loop has to
+/// produce that value at its exit, so the loop's own type is constrained by it. That
+/// is worth stating rather than folding into the bare-`break` message.
+#[test]
+fn a_break_carrying_a_value_is_also_refused_and_is_a_distinct_case() {
+    let bare = compile_error(
+        "fn f(n: i64) -> i64 { let mut i = 0; while i < n { i = i + 1; if i > 3 { break; } } i }\n",
+    );
+    let with_value = compile_error(
+        "fn f(n: i64) -> i64 { let mut i = 0; while i < n { i = i + 1; if i > 3 { break i; } } i }\n",
+    );
+    assert!(
+        !with_value.is_empty() && !bare.is_empty(),
+        "both forms must be refused rather than one silently accepted"
+    );
+    // Both must be refused by the SAME mechanism, since neither is emitted. What must
+    // not happen is `break i;` compiling while `break;` is refused -- that would mean
+    // the value-carrying form silently dropped `i`, computing a different answer.
+    assert!(
+        with_value.contains("`break`") && bare.contains("`break`"),
+        "both forms must be refused as `break`\n--- bare ---\n{bare}\n--- with value ---\n{with_value}"
+    );
+}
+
+/// A plain `while` still compiles after the lexer gained two new keywords.
+///
+/// `break` and `continue` were added to the lexer at priority 3 alongside `while` and
+/// `forall`. A new keyword is a new way to break every program that used the
+/// identifier, so "the other things still work" is its own risk.
+#[test]
+fn adding_the_break_and_continue_keywords_did_not_disturb_plain_while_loops() {
+    let src = "fn k(n: i64) -> i64 { let mut i = 0; while i < n { i = i + 1; } i }\n";
+    let ir = build_ir(src);
+    let driver = r#"
+#include <stdio.h>
+long naso_k(long);
+int main(void){ printf("%ld %ld\n", naso_k(0), naso_k(4)); return 0; }
+"#;
+    assert_eq!(
+        run(&ir, driver),
+        "0 4",
+        "a `while` loop with no `break` must be unaffected by the new keywords.\n--- IR ---\n{ir}"
+    );
+}

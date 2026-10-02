@@ -73,6 +73,11 @@ fn pir_expr_to_string(expr: &PirExpr, _indent: usize) -> String {
         PirExpr::FloatLit(v) => format!("{}", v),
         PirExpr::BoolLit(v) => format!("{}", v),
         PirExpr::Var(v) => v.clone(),
+        PirExpr::Break { value } => match value {
+            Some(v) => format!("break {}", pir_expr_to_string(v, 0)),
+            None => "break".to_string(),
+        },
+        PirExpr::Continue => "continue".to_string(),
         PirExpr::While { cond, body } => format!(
             "while {} {{ {} }}",
             pir_expr_to_string(cond, 0),

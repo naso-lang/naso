@@ -373,6 +373,12 @@ fn count_in_expr(expr: &PirExpr, var: &str) -> usize {
         PirExpr::While { cond, body } => {
             (count_in_expr(cond, var) + count_in_expr(body, var)).max(1)
         }
+        // A `break v` CONSUMES `v` on the path where it fires, so it counts like any
+        // other use. `continue` has no value, so it counts nothing -- reporting a use
+        // there would invent a violation, and reporting none for `break v` would let a
+        // linear value escape through the exit edge.
+        PirExpr::Break { value: Some(v), .. } => count_in_expr(v, var),
+        PirExpr::Break { value: None, .. } | PirExpr::Continue => 0,
         PirExpr::Assign { target, value } => count_in_expr(target, var) + count_in_expr(value, var),
         PirExpr::Cast { expr, .. } => count_in_expr(expr, var),
         _ => 0,
@@ -423,6 +429,11 @@ fn expr_contains_var(expr: &PirExpr, var: &str) -> bool {
         PirExpr::While { cond, body } => {
             expr_contains_var(cond, var) || expr_contains_var(body, var)
         }
+        PirExpr::Break { value } => match value {
+            Some(v) => expr_contains_var(v, var),
+            None => false,
+        },
+        PirExpr::Continue => false,
         PirExpr::Assign { target, value } => {
             expr_contains_var(target, var) || expr_contains_var(value, var)
         }

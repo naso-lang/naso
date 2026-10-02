@@ -105,6 +105,22 @@ pub enum TokenKind {
     While,
     #[regex("[fF][oO][rR][aA][lL][lL]", priority = 3)]
     Forall,
+    //
+    // `break`/`continue` needed their own tokens, and until they had them they were
+    // lexed as plain IDENTIFIERS. So `if c { break; }` parsed as `if c { <a read of
+    // a variable named "break"> }`: no syntax error, no missing-keyword error, and
+    // an AST indistinguishable from a program that legitimately reads a variable
+    // called `break`.
+    //
+    // That is the worst failure shape for a keyword: a program containing `break`
+    // typechecked and lowered, and only failed later at codegen with "read of
+    // `break`: no allocation is known for it" -- naming the variable rather than the
+    // construct the author wrote. The strict read refusal is what stopped it from
+    // being silently zero, and the fix belongs here.
+    #[regex("[bB][rR][eE][aA][kK]", priority = 3)]
+    Break,
+    #[regex("[cC][oO][nN][tT][iI][nN][uU][eE]", priority = 3)]
+    Continue,
     #[regex("[iI][nN]", priority = 3)]
     In,
     #[regex("[sS][tT][rR][uU][cC][tT]", priority = 3)]
@@ -310,6 +326,8 @@ impl TokenKind {
             TokenKind::For => "'for'",
             TokenKind::While => "'while'",
             TokenKind::Forall => "'forall'",
+            TokenKind::Break => "'break'",
+            TokenKind::Continue => "'continue'",
             TokenKind::In => "'in'",
             TokenKind::Struct => "'struct'",
             TokenKind::Enum => "'enum'",

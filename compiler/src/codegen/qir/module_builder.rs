@@ -431,6 +431,41 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
             // the loop's result depend on whether it ran at all, so this synthesises a
             // fresh zero of the RESULT type -- the same convention as a statement in an
             // expression position, and the reason the PIR documents the value as unit.
+            //
+            // REFUSED, not approximated.
+            //
+            // `break`/`continue` are lowered to nodes without a target on purpose: the
+            // enclosing loop is known only from the CFG the backend is building. That
+            // is the right design, and it means emitting them needs the backend to
+            // thread a loop stack through `build_expr` -- a real change, not a
+            // two-line branch.
+            //
+            // What matters here is that the alternative was rejected rather than
+            // reached for. Treating `break` as "skip to the end of the loop" without a
+            // loop stack, or as a no-op, produces a program that builds clean and
+            // computes the wrong thing -- for `break` inside an `if`, skipping nothing
+            // at all. So the backend says what is missing and what does work.
+            PirExpr::Break { value } => {
+                let _ = value;
+                Err(CodegenError::UnsupportedFeature(
+                    "`break` is parsed and lowered, but this backend does not yet emit \
+                     it: the enclosing loop is known only from the control-flow graph \
+                     being built, and no loop stack is threaded through expression \
+                     lowering. It is refused rather than compiled to a no-op, because a \
+                     `break` inside an `if` that did nothing would exit no loop at all \
+                     and still build. `while` loops themselves work; see \
+                     `llvm_while_execution_test`."
+                        .to_string(),
+                ))
+            }
+            PirExpr::Continue => Err(CodegenError::UnsupportedFeature(
+                "`continue` is parsed and lowered, but this backend does not yet emit \
+                 it, for the same reason as `break`: restarting the innermost loop \
+                 requires the loop the control-flow graph is inside, which expression \
+                 lowering is not currently given. Refused rather than compiled to a \
+                 no-op, which would be an infinite loop."
+                    .to_string(),
+            )),
             PirExpr::While { cond, body } => {
                 let func = self.current_function().unwrap();
                 let header = self.llvm_context.append_basic_block(func, "while_cond");

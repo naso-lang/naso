@@ -60,8 +60,28 @@ impl Drop for CaseDir {
     }
 }
 
+/// Locate `llc`/`clang`.
+///
+/// NOT a hardcoded path. An earlier version of this file used
+/// `/home/linuxbrew/.linuxbrew/opt/llvm@17/bin/{name}` and passed locally on this
+/// container while failing on every CI run, because CI installs LLVM system-wide
+/// and puts it on `PATH`. Preferring `PATH` and falling back to the Homebrew
+/// prefix works in both places, so the test tests the COMPILER rather than the
+/// layout of one machine.
 fn tool(name: &str) -> String {
-    format!("/home/linuxbrew/.linuxbrew/opt/llvm@17/bin/{name}")
+    if let Ok(found) = Command::new(name).arg("--version").output() {
+        if found.status.success() {
+            return name.to_string();
+        }
+    }
+    let brew = "/home/linuxbrew/.linuxbrew/opt/llvm@17/bin";
+    if std::path::Path::new(brew).join(name).exists() {
+        return format!("{brew}/{name}");
+    }
+    panic!(
+        "`{name}` not found on PATH and not in {brew}; these tests execute generated \
+             code, so they cannot be skipped."
+    );
 }
 
 fn lower_source(src: &str) -> naso_compiler::ir::PirModule {

@@ -381,13 +381,24 @@ fn synthetic_single_function(pir_module: &PirModule) -> crate::ir::pir_types::Pi
         quantities: pir_module.quantities.clone(),
         return_type: crate::ir::pir_types::FnReturn::Void,
         return_stmt: None,
+        // A hand-built module has no `Block::expr`: it was written as a statement
+        // list, so there is no trailing expression that could be an implicit return.
+        // Fabricating one here would let a fixture return something its source never
+        // wrote.
+        tail_return_stmt: None,
         span: None,
     }
 }
 
 /// The expression a function RETURNS, taken from the statement lowering named.
 ///
-/// Refused rather than substituted if the id names no statement: a `return_stmt` that
+/// `id` is [`crate::ir::pir_types::PirFunction::return_stmt`] for an explicit
+/// `return e` and [`crate::ir::pir_types::PirFunction::tail_return_stmt`] for an
+/// implicit tail. Both name a statement in the same list, so this lookup is shared;
+/// WHICH one is being resolved is the caller's business, and it is decided in
+/// `emit_one_function` by a rule that names both fields explicitly.
+///
+/// Refused rather than substituted if the id names no statement: a return id that
 /// does not resolve means lowering and codegen disagree about the function's body, and
 /// emitting `undef` there would return an arbitrary value that still passes every check
 /// downstream.
@@ -408,6 +419,30 @@ fn return_expression(
                 func.name, id.0
             ))
         })
+}
+
+/// Which source construct supplies a function's return value.
+///
+/// Recorded rather than collapsed to a bare `Option<&PirExpr>` because the two are
+/// NOT interchangeable downstream: the diagnostic for a type mismatch says "`return`
+/// expression" for one and "trailing expression" for the other, and a caller reading
+/// only the value could not tell which of the two programs it is looking at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturnSource {
+    /// `return e` written in the source.
+    Explicit,
+    /// The block's trailing expression, with no `return` in the body.
+    ImplicitTail,
+}
+
+impl ReturnSource {
+    /// How this source construct is named in a diagnostic.
+    pub fn describe(self) -> &'static str {
+        match self {
+            ReturnSource::Explicit => "`return` expression",
+            ReturnSource::ImplicitTail => "trailing expression",
+        }
+    }
 }
 
 /// A throwaway integer type used only to build an opaque pointer.
@@ -652,10 +687,13 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
             // `lower_domain`, which is erasure rather than a coverage gap.
             let scheduled: Vec<StmtId> = statements_under(&func.schedule.root);
             for stmt in &func.statements {
-                // The RETURN statement is deliberately not in the tree: it is evaluated
-                // in the function's exit block, not as a scheduled statement. It is
-                // covered by construction, so it is not reported here.
-                if func.return_stmt == Some(stmt.id) {
+                // The RETURN statement -- explicit or implicit tail -- is deliberately
+                // not in the tree: it is evaluated in the function's exit block, not as
+                // a scheduled statement. It is covered by construction, so it is not
+                // reported here. BOTH ids are skipped, because a function can return a
+                // value through either and a tail-only return would otherwise be
+                // reported as an unreachable statement.
+                if func.return_stmt == Some(stmt.id) || func.tail_return_stmt == Some(stmt.id) {
                     continue;
                 }
                 if !scheduled.contains(&stmt.id) {
@@ -711,37 +749,70 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
         self.set_current_function(function);
         // The RETURN VALUE, evaluated in the function's exit block.
         //
-        // Read out of the function's own statements by `return_stmt`, which lowering
-        // recorded and removed from the schedule. It cannot be a scheduled statement:
-        // that would compute it in the middle of the body and return whatever the last
-        // statement happened to leave behind.
-        let return_value = match (func.return_stmt, func.return_type.clone()) {
-            (None, crate::ir::pir_types::FnReturn::Void) => None,
-            (Some(id), _) => Some(return_expression(func, id)?),
-            // No `return` statement but the function DECLARES a return type.
-            //
-            // This used to fall through to returning zero, which is the one answer
-            // that can never be right: `fn f(x: f32) -> f32 { let mut y = x * 3.0; }`
-            // compiled cleanly, printed `0.0`, and was wrong. A caller gets no signal
-            // that the function computed nothing.
-            //
-            // Returning the trailing expression instead would be a guess too -- the
-            // parser folds a function's last expression into `Block::expr`, so for
-            // `fn f() -> f32 { x * 3.0 }` the value IS there, while for the example
-            // above it is a `let` whose binding is discarded. Distinguishing those is a
-            // real design question, and until it is answered the honest answer is to
-            // refuse and name the function.
-            (None, crate::ir::pir_types::FnReturn::Scalar(_)) => {
+        // Read out of the function's own statements by one of TWO ids, both recorded
+        // by lowering and both removed from the schedule. Neither can be a scheduled
+        // statement: that would compute the value in the middle of the body and return
+        // whatever the last statement happened to leave behind.
+        //
+        // # The two sources, and why they are not one
+        //
+        // `return_stmt` is an explicit `return e` in the source. `tail_return_stmt` is
+        // the block's trailing expression in a function that declares a return type and
+        // contains no `return` at all -- `fn f() -> f32 { 3.0 * 4.0 }`, whose value is
+        // 12.0. They are separate PIR fields so neither can be mistaken for the other:
+        // a real `return` and an implicit tail are different source programs, and a
+        // diagnostic or a test that cannot tell them apart cannot check either.
+        //
+        // # Why this was not always the answer
+        //
+        // `tail_return_stmt` did not exist before, and `fn f() -> f32 { 3.0 * 4.0 }`
+        // lowered its tail into PIR and DISCARDED it while this arm refused the
+        // function. The refusal was right, and is still right, for `fn f(x: f32) -> f32
+        // { let mut y = x * 3.0; }` -- but wrong for a body whose last thing is an
+        // expression whose value the programmer plainly means to return.
+        //
+        // Returning zero instead, which is what this backend did before `64ebf59`, is
+        // the one answer that can never be right: `f(5.0)` evaluated to `0.0` and the
+        // caller had no way to distinguish a missing computation from a genuine zero.
+        //
+        // # When BOTH ids are absent, there is genuinely no value
+        //
+        // The remaining refusal is not the tail case. It is a declared return type with
+        // no `return` AND no trailing expression -- a body ending in `let`, or in
+        // nothing at all. The parser folds a trailing *expression* into `Block::expr`
+        // but routes every `let` to `Block::stmts`, so such a body lowers a statement
+        // for the binding and has no expression to return. `f(5.0)` must not quietly
+        // yield `0.0`, and it must not yield `y` either.
+        let (return_value, return_source) = match (
+            func.return_stmt,
+            func.tail_return_stmt,
+            func.return_type.clone(),
+        ) {
+            (None, None, crate::ir::pir_types::FnReturn::Void) => (None, None),
+            (Some(id), _, _) => (
+                Some(return_expression(func, id)?),
+                Some(ReturnSource::Explicit),
+            ),
+            (None, Some(id), _) => (
+                Some(return_expression(func, id)?),
+                Some(ReturnSource::ImplicitTail),
+            ),
+            (None, None, crate::ir::pir_types::FnReturn::Scalar(_)) => {
                 return Err(CodegenError::UnsupportedFeature(format!(
-                    "function `{}` declares a return type but has no `return` statement, \
-                     so there is no value to return. Returning zero would be silently \
-                     wrong: the caller cannot distinguish it from a computed zero. Add \
-                     an explicit `return`, or drop the return type to make the function \
-                     `void`.",
+                    "function `{}` declares a return type but has no `return` statement \
+                     and no trailing expression whose value could be returned, so there \
+                     is no value to return. Returning zero would be silently wrong: the \
+                     caller cannot distinguish it from a computed zero. Add an explicit \
+                     `return`, or end the body with the expression to return, or drop \
+                     the return type to make the function `void`.",
                     func.name
                 )));
             }
-            (None, _) => None,
+            // `FnReturn::Unsupported` is REFUSED just below, with a message naming the
+            // type. Reaching this arm means the declared return type has no slot in
+            // this ABI, so there is nothing to return in that slot either; the refusal
+            // below is the one that says why.
+            (None, None, _) => (None, None),
         };
         // `FnReturn::Unsupported` is checked here rather than in the declaration pass so
         // the refusal names the function whose return type could not be lowered.
@@ -773,6 +844,7 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
             &view.accesses,
             abi,
             return_value,
+            return_source,
             self.callee_params.as_ref(),
         )?;
         Ok(())

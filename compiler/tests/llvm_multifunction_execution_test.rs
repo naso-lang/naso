@@ -1152,20 +1152,43 @@ fn try_build(src: &str) -> Result<String, String> {
     }
 }
 
-/// A function that DECLARES a return type but never returns is refused.
+/// A function that DECLARES a return type, has no `return`, AND no trailing
+/// expression, is refused.
 ///
 /// It used to compile and return zero. For `fn f(x: f32) -> f32 { let mut y = x * 3.0; }`
 /// that meant `f(5.0)` evaluated to `0.0` where `15.0` was correct, and the caller had
 /// no way to tell a missing computation from a genuine zero. Zero is the one answer
 /// that can never be right here, so the backend names the function instead.
+///
+/// # Why this program is still refused now that the tail IS the return
+///
+/// `fn f() -> f32 { 3.0 * 4.0 }` has a trailing expression and returns 12.0. This one
+/// does not, and the difference is the PARSER's, not a judgement call: `parse_stmt_list`
+/// routes every `let` to `Block::stmts`, and only a trailing EXPRESSION without a
+/// semicolon lands in `Block::expr`. So this body has no tail expression at all --
+/// lowering emits a statement for the binding and there is no value anywhere to
+/// return. Returning `y` would be inventing a value the source never wrote; returning
+/// zero is the silent wrong answer. Refusal is the only honest answer left.
+///
+/// The diagnostic is also asserted on its WORDING, because it now has to distinguish
+/// this case from the tail case it used to be the only example of. It says "no `return`
+/// statement AND no trailing expression", not just "no `return` statement" -- the
+/// latter would send a reader to look for a missing `return` in a program whose tail
+/// return already works.
 #[test]
-fn a_declared_return_type_with_no_return_is_refused_rather_than_returning_zero() {
+fn a_declared_return_type_with_neither_a_return_nor_a_tail_is_refused() {
     let msg = compile_error_for(
         "fn f(x: f32) -> f32 {\n    let mut y = x * 3.0;\n}\nfn main() -> f32 { return f(5.0); }\n",
     );
     assert!(
         msg.contains("`f`") && msg.contains("no `return` statement"),
         "the diagnostic must name the function and the missing `return`: {msg}"
+    );
+    assert!(
+        msg.contains("no trailing expression"),
+        "the diagnostic must distinguish this from the tail-return case, which IS \
+         supported: a reader told only \"no `return` statement\" would go looking for \
+         a missing `return` in a program whose tail return already works. Got: {msg}"
     );
     assert!(
         msg.contains("Returning zero would be silently wrong"),
@@ -1183,5 +1206,351 @@ fn the_same_function_compiles_once_it_is_honestly_void() {
     assert!(
         ir.contains("define void @naso_f"),
         "dropping the return type must give a void `f`:\n{ir}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7. The IMPLICIT tail-expression return.
+//
+// `fn f() -> f32 { 3.0 * 4.0 }` must return 12.0. It used to return nothing at all
+// (the backend refused it), and before that it returned ZERO -- the one answer a
+// caller cannot distinguish from a computed zero.
+//
+// Every test here is an EXECUTION test for the reason in this file's module doc: LLVM
+// constant-folds `3.0 * 4.0` into the following `ret`, so the IR text is identical
+// whether the tail was returned, returned as zero, or not returned at all and the
+// value invented. Only running it can tell.
+// ---------------------------------------------------------------------------
+
+/// Compile a scalar-returning module and read the value `naso_entry` returns.
+///
+/// `naso_entry` is the forwarding shim, so calling it also exercises the shim's
+/// forwarding of the return value: a shim that dropped the value would print
+/// something other than the number the source computes.
+fn run_scalar(src: &str) -> (f64, String) {
+    run_scalar_arg(src, "", "")
+}
+
+/// As [`run_scalar`], for a module whose entry takes arguments.
+///
+/// `sig` is the argument list of the `naso_entry` declaration and `call` the argument
+/// list of the call, as C text. They are separate because a default argument is not C:
+/// `naso_entry(double a = 5)` is a declaration, and `naso_entry(5)` is the call.
+fn run_scalar_arg(src: &str, sig: &str, call: &str) -> (f64, String) {
+    let ir = build_ir(src);
+    let driver = format!(
+        r#"#include <stdint.h>
+#include <stdio.h>
+extern double naso_entry({sig});
+int main(void) {{
+    printf("%.17g\n", naso_entry({call}));
+    return 0;
+}}
+"#
+    );
+    let stdout = run_ok(&ir, &driver);
+    let got = stdout.trim().parse::<f64>().unwrap_or_else(|e| {
+        panic!("driver printed {stdout:?}, expected a number: {e}\n--- IR ---\n{ir}")
+    });
+    (got, ir)
+}
+
+/// `fn f() -> f32 { 3.0 * 4.0 }` called from `main` must return 12.0.
+///
+/// This is the whole point of the feature, and 12.0 is the only correct answer: 0.0
+/// is what the pre-`64ebf59` zero fallback produced, and a shim or call that dropped
+/// the value would produce garbage or 0.0 instead.
+///
+/// MUTATION CAUGHT: making `tail_return_stmt` unused, so the backend falls back to
+/// `build_zero`. That SURVIVED before this test existed, because the only test
+/// touching a declared-return function asserted that the module was REFUSED -- and
+/// the mutant refuses it too, for a different reason. A refusal test cannot tell two
+/// implementations apart when both refuse; only a value can.
+#[test]
+fn a_trailing_expression_is_the_return_value_of_a_function_that_declares_a_return_type() {
+    let (got, ir) = run_scalar("fn f() -> f32 { 3.0 * 4.0 }\nfn main() -> f32 { return f(); }\n");
+    assert_eq!(
+        got, 12.0,
+        "`fn f() -> f32 {{ 3.0 * 4.0 }}` must return 12.0, not zero and not a refusal. \
+         Got {got}.\n--- IR ---\n{ir}"
+    );
+}
+
+/// The same value reached WITHOUT an explicit `return` in `main`, so the tail path is
+/// pinned on the entry function as well as on a callee.
+///
+/// `naso_entry` is `naso_main`'s shim, and `main` itself returns by tail. If the tail
+/// path only worked for non-entry functions, or if the shim dropped the value, this
+/// would print something other than 7.0.
+#[test]
+fn the_tail_return_works_for_the_entry_function_and_through_the_entry_shim() {
+    let (got, ir) = run_scalar("fn main() -> f32 { 2.0 + 5.0 }\n");
+    assert_eq!(
+        got, 7.0,
+        "an entry function whose body is a trailing expression must return its value \
+         through `naso_entry`. Got {got}.\n--- IR ---\n{ir}"
+    );
+}
+
+/// A tail that follows a `let` must return the tail, not the let.
+///
+/// `fn k() -> f32 { let a = 2.0; a * 5.0 }` is the most valuable case in this
+/// group, and it is here for a specific reason. The parser gives this body
+/// `stmts = 1` (the `let`) AND `tail = Some` (the `a * 5.0`), whereas the
+/// bare `fn f() -> f32 { 3.0 * 4.0 }` above has `stmts = 0`. An implementation
+/// that returns "whatever the last thing lowered to" would pass the bare case
+/// and fail this one -- or worse, pass both by accident and be wrong for a
+/// program where the `let` is the last thing. Pinning `stmts = 1, tail = Some`
+/// is what forces the implementation to read the tail slot specifically.
+///
+/// 10.0 is derived from the source: `a` is 2.0 and `2.0 * 5.0` is 10.0. The
+/// wrong answers this must separate from are 0.0 (the let binding, or the
+/// pre-`64ebf59` zero fallback) and 2.0 (the `let`'s own value, which an
+/// implementation returning the last STATEMENT rather than the tail would give).
+///
+/// MUTATION CAUGHT: keying the return on the last PIR statement instead of
+/// `tail_return_stmt`. This test is the only one that catches it, because in
+/// every other tail program here the last statement and the tail coincide.
+#[test]
+fn a_trailing_expression_after_a_let_returns_the_tail_not_the_binding() {
+    let (got, ir) =
+        run_scalar("fn k() -> f32 { let a = 2.0; a * 5.0 }\nfn main() -> f32 { return k(); }\n");
+    assert_eq!(
+        got, 10.0,
+        "`fn k() -> f32 {{ let a = 2.0; a * 5.0 }}` must return 10.0. 2.0 means the \
+         last STATEMENT was returned instead of the trailing EXPRESSION; 0.0 means \
+         the zero fallback. This body has one `let` AND a tail, which is what makes \
+         it the discriminating case.\n--- IR ---\n{ir}"
+    );
+}
+
+/// A trailing ASSIGNMENT is a STORE, not a return value, and is REFUSED.
+///
+/// `fn f(x: f32) -> f32 { x = 1.0 }` -- the assignment has no semicolon, so the
+/// parser makes it the block's trailing expression and the AST really does hand
+/// lowering a tail. It is still not a value: what the source wrote is a store,
+/// and reading the target back to manufacture a return value would be inventing
+/// one. The allow-list in `tail_yields_value` is what refuses it, and the
+/// function is correctly refused as having no return value at all.
+///
+/// MUTATION CAUGHT: adding `E::Assign(..)` to the allow-list. This is a REAL
+/// silent wrong answer, not a theoretical one -- I ran it. With `Assign`
+/// allowed, the same program compiles and emits
+///
+///     define double @naso_f(double %x) {
+///     entry:
+///       %x1 = alloca double, align 8
+///       store double %x, ptr %x1, align 8
+///       store double 1.000000e+00, ptr %x1, align 8
+///       ret double 1.000000e+00     <-- a value the source never returned
+///     }
+///
+/// It compiles, it verifies, and the caller receives a number. Nothing in the IR
+/// says the function stored rather than computed. That is precisely the class of
+/// bug this project exists to prevent, and it is why the check is an ALLOW-list
+/// (a new `ExprKind` defaults to "not a value") rather than a deny-list.
+#[test]
+fn a_trailing_assignment_is_a_store_and_is_not_a_return_value() {
+    let msg =
+        compile_error_for("fn f(x: f32) -> f32 { x = 1.0 }\nfn main() -> f32 { return f(2.0); }\n");
+    assert!(
+        msg.contains("`f`"),
+        "a trailing assignment must not be treated as the return value; the \
+         function must still be refused: {msg}"
+    );
+}
+
+/// An explicit `return` WINS over a trailing expression, and the trailing
+/// expression still runs.
+///
+/// The parser produces `fn f() -> f32 { let a = 1.0; return 2.0; 3.0 }` as
+/// `stmts = 2` (the `let` and the `return`) with `tail = Some(3.0)`. So this
+/// body has BOTH an explicit return and a trailing value, and the rule is that
+/// the explicit one names the function's result: it returns 2.0, not 3.0.
+///
+/// The trailing `3.0` is unreachable code after a `return`, so it is dropped --
+/// which is correct, and is the same thing LLVM's own `ret` does.
+///
+/// # What this test is really pinning
+///
+/// The two return fields must never both be populated for one function. This
+/// is the case that says so at the level of the VALUE rather than of the PIR
+/// bookkeeping: lowering records the explicit return in `return_stmt`, and the
+/// backend's match resolves `Some(return_stmt)` first, so the trailing `3.0`
+/// cannot take over even if lowering were to record it as well.
+///
+/// MUTATION CAUGHT (indirectly): removing the `pending_return_stmt.is_none()`
+/// guard from the tail decision. That guard is DEFENSE IN DEPTH rather than the
+/// load-bearing check -- the backend's match ordering is what actually resolves
+/// the conflict, which is why bypassing the guard alone produced byte-identical
+/// IR. I verified that: baseline and mutated both emit `ret double
+/// 2.000000e+00`. This test pins the observable behaviour so the redundancy
+/// cannot be mistaken for permission to drop either half.
+#[test]
+fn an_explicit_return_wins_over_a_trailing_expression() {
+    let (got, ir) = run_scalar(
+        "fn f() -> f32 { let a = 1.0; return 2.0; 3.0 }\nfn main() -> f32 { return f(); }\n",
+    );
+    assert_eq!(
+        got, 2.0,
+        "the explicit `return 2.0` names the result; the unreachable trailing \
+         `3.0` must not replace it. 3.0 means both return fields were consulted \
+         and the tail won.\n--- IR ---\n{ir}"
+    );
+}
+
+/// A tail that is a CALL must return the CALLEE's value, not a stale or invented one.
+///
+/// `fn h(x: f32) -> f32 { double_it(x) }` returns `double_it`'s result, so the implicit
+/// return has to work through the whole call path: emit `naso_double_it`, marshal the
+/// argument, and return what comes back.
+///
+/// The value is read through `main` rather than by calling `naso_h` directly, so the
+/// assertion also covers the tail-returned value surviving ANOTHER function's return.
+/// Called twice with different arguments so a stale value cannot pass: 5.0 -> 10.0 and
+/// 1.25 -> 2.5, and neither is the other's answer.
+///
+/// MUTATION CAUGHT: returning the tail's zero/default instead of the call's result.
+/// It compiles -- the call is still emitted for its side effects if any -- and only
+/// execution separates it.
+#[test]
+fn a_trailing_expression_that_is_a_call_returns_the_callees_value() {
+    let src = "\
+fn double_it(x: f32) -> f32 {
+    return x * 2.0;
+}
+fn h(x: f32) -> f32 { double_it(x) }
+fn pick(a: f32) -> f32 { return a; }
+fn main(x: f32) -> f32 { return pick(h(x)); }
+";
+    for (arg, want) in [(5.0f64, 10.0f64), (1.25, 2.5)] {
+        let (got, ir) = run_scalar_arg(src, "double a", &format!("{arg}"));
+        assert_eq!(
+            got, want,
+            "h({arg}) must return double_it({arg}) = {want} through the tail. \
+             A stale or invented value would pass one of these two cases by \
+             coincidence, which is why both are checked.\n--- IR ---\n{ir}"
+        );
+    }
+}
+
+/// A loop that accumulates into a local, followed by that local as the tail.
+///
+/// `fn k() -> f32 { let mut s = 0.0; forall i in 0..3 { s = s + 1.0; } s }` must return
+/// 3.0 -- the value AFTER the loop, not the 0.0 the local held before it.
+///
+/// This is the case where keying the tail on "the last statement in PIR" instead of
+/// "the trailing EXPRESSION" would go wrong, and the case where a backend that emitted
+/// the tail BEFORE the loop would return the pre-loop value. 3.0 distinguishes both:
+/// 0.0 is what a pre-loop read or a dropped tail gives, and 1.0 is a single iteration.
+///
+/// MUTATION CAUGHT: evaluating the tail expression in the function's ENTRY block rather
+/// than its exit block. That is a real mutant here -- the tail's `Var` read would load
+/// the alloca before the loop's stores, which is exactly the pre-loop value, and the
+/// program would compile and verify.
+#[test]
+fn a_trailing_local_read_after_a_loop_returns_the_post_loop_value() {
+    let (got, ir) = run_scalar(
+        "fn k() -> f32 { let mut s = 0.0; forall i in 0..3 { s = s + 1.0; } s }\n\
+         fn main() -> f32 { return k(); }\n",
+    );
+    assert_eq!(
+        got, 3.0,
+        "three iterations of `s = s + 1.0` must leave s = 3.0, and the tail must return \
+         the POST-loop value. 0.0 means the tail was read before the loop or dropped; \
+         1.0 means the loop ran once.\n--- IR ---\n{ir}"
+    );
+}
+
+/// A tail whose TYPE does not match the declared return type is refused, and the
+/// message says which construct produced the value.
+///
+/// `fn f() -> f32 { true }` declares `f32` and the tail is a `bool`. Nothing is
+/// converted: an `i1` widened to a float would be a value the source never wrote, and
+/// a zero would be a value it never wrote even more plainly.
+///
+/// The assertion checks that the diagnostic says "trailing expression" and not
+/// "`return` expression". Those name DIFFERENT source programs -- `fn f() -> f32 {
+/// return true; }` versus `fn f() -> f32 { true }` -- and a diagnostic that calls a
+/// tail a `return` sends the reader looking for a keyword that is not there.
+#[test]
+fn a_tail_whose_type_does_not_match_the_declared_return_type_is_refused_naming_the_construct() {
+    let msg = compile_error_for("fn f() -> f32 { true }\nfn main() -> f32 { return f(); }\n");
+    assert!(
+        msg.contains("trailing expression"),
+        "the diagnostic must name the TAIL as the source of the value, not a \
+         `return` -- there is no `return` in this program: {msg}"
+    );
+    assert!(
+        !msg.contains("`return` expression"),
+        "calling the tail a `return` expression would send the reader looking for a \
+         keyword this program does not contain: {msg}"
+    );
+    assert!(
+        msg.contains("Nothing is converted"),
+        "the diagnostic must say that no coercion was applied: {msg}"
+    );
+}
+
+/// The explicit-`return` form must still be diagnosed as an explicit `return`.
+///
+/// The counterpart to the test above, and the reason the two are separate PIR fields:
+/// `fn f() -> f32 { return true; }` is a DIFFERENT program whose diagnostic must say
+/// "`return` expression". If one field held both, this assertion and the previous one
+/// could not both hold.
+#[test]
+fn an_explicit_return_of_the_wrong_type_is_still_named_as_a_return_expression() {
+    let msg =
+        compile_error_for("fn f() -> f32 { return true; }\nfn main() -> f32 { return f(); }\n");
+    assert!(
+        msg.contains("`return` expression"),
+        "an explicit `return` must be diagnosed as a `return` expression: {msg}"
+    );
+    assert!(
+        !msg.contains("trailing expression"),
+        "an explicit `return` must not be diagnosed as a trailing expression: {msg}"
+    );
+}
+
+/// A `void` function's tail expression still RUNS; it is discarded, not skipped.
+///
+/// `fn side(out: inout [1] Tensor[f32, 1]) { out[0] = 42.0 }` -- a store with NO
+/// semicolon, so the parser makes it the block's trailing expression. There is nothing
+/// to return, so the store's value is discarded; the STORE must still happen.
+///
+/// It used not to. The tail was lowered through `lower_expr` and its result thrown
+/// away, so the function body emitted no store at all -- the identical program with a
+/// `;` stored correctly and this one silently did nothing. A tail is not dead code
+/// because its value is unused.
+///
+/// MUTATION CAUGHT: routing the non-return tail back through `lower_expr` and
+/// discarding it. This test is the only thing that catches it, because every other
+/// void-tail program in the suite either has no side effect or already ends in `;`.
+#[test]
+fn a_void_functions_trailing_expression_is_evaluated_and_not_dropped() {
+    let src = "\
+fn side(out: inout [1] Tensor[f32, 1]) { out[0] = 42.0 }
+fn main(out: inout [1] Tensor[f32, 1]) { side(out) }
+";
+    let ir = build_ir(src);
+    let driver = r#"#include <stdint.h>
+#include <stdio.h>
+extern void naso_entry(double *out, int64_t out_len);
+static double out[1];
+int main(void) {
+    out[0] = -1.0;
+    naso_entry(out, 1);
+    printf("%.17g\n", out[0]);
+    return 0;
+}
+"#
+    .to_string();
+    let stdout = run_ok(&ir, &driver);
+    let got: f64 = stdout.trim().parse().expect("driver prints a number");
+    assert_eq!(
+        got, 42.0,
+        "a void function's trailing `out[0] = 42.0` is a STORE, and it must happen. \
+         -1.0 means it was compiled away. A trailing expression is not dead code \
+         because its value is unused.\n--- IR ---\n{ir}"
     );
 }

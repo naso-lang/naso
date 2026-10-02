@@ -360,6 +360,44 @@ pub struct PirFunction {
     /// statement is not the function's last statement -- which is REFUSED at lowering
     /// rather than lowered to a silently zero return.
     pub return_stmt: Option<crate::ir::schedule_tree::StmtId>,
+    /// The statement holding this function's IMPLICIT return value: the value of the
+    /// block's trailing expression, for a function that declares a return type and
+    /// contains no `return` at all.
+    ///
+    /// # This is NOT the explicit return
+    ///
+    /// [`Self::return_stmt`] is `Some` only when the source contains `return e`. A
+    /// backend must not conclude "this function returns a value" from that field
+    /// alone: a function can return a value with `return_stmt == None`, and conflating
+    /// the two is how a tail return gets re-emitted as a scheduled statement, or
+    /// refused as a missing return.
+    ///
+    /// # Why a second field rather than a synthetic `return_stmt`
+    ///
+    /// Recording the tail as if the programmer had written `return <tail>` makes the
+    /// two indistinguishable everywhere downstream: `return_stmt == None` stops meaning
+    /// "no return statement", a diagnostic cannot say which form the source used, and a
+    /// test cannot assert that a real `return` took a different path from a tail. Two
+    /// fields keep the source's own distinction. They are never both `Some`: lowering
+    /// fills this one only when `return_stmt` is `None`.
+    ///
+    /// # Which AST shape sets it
+    ///
+    /// `Block::expr` -- the trailing expression the PARSER folded off the end of the
+    /// body -- and only when its kind yields a value. `let mut y = x * 3.0;` is NOT a
+    /// trailing expression: the parser routes every `let` to `Block::stmts`, so that
+    /// program has no `Block::expr` at all and therefore no tail value, even though
+    /// lowering does emit a statement for the binding. "A statement exists in PIR" and
+    /// "the body ends in an expression whose value is the function's result" are
+    /// different facts, and only the second one may be returned. Lowering checks the
+    /// AST kind against an explicit allow-list for exactly that reason.
+    ///
+    /// # Scheduled?
+    ///
+    /// No. As with `return_stmt`, the `Domain` node naming this statement is removed
+    /// from `schedule`, so the value is evaluated once in the function's exit block
+    /// rather than also as a statement in the middle of the body.
+    pub tail_return_stmt: Option<crate::ir::schedule_tree::StmtId>,
     /// Source location, for a diagnostic that can point at the function.
     pub span: Option<crate::ast::Span>,
 }

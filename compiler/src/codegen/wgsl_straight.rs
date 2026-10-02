@@ -612,19 +612,197 @@ fn emit_function(out: &mut String, func: &Function) -> CodegenResult<()> {
     for stmt in &func.body.stmts {
         emit_stmt(out, stmt, 1)?;
     }
-    if let Some(tail) = &func.body.expr {
+    match &func.body.expr {
         // A block ending in `return ...` needs no extra return after it.
-        if matches!(tail.kind, ExprKind::Return(_)) {
+        Some(tail) if matches!(tail.kind, ExprKind::Return(_)) => {
             emit_expr_inline(out, tail);
             out.push_str(";\n");
-        } else {
+        }
+        // A VOID function's trailing expression is evaluated for its effect and
+        // discarded, so the emitted `return;` is the right terminator.
+        Some(tail) if func.ret_ty.is_none() => {
             emit_expr_inline(out, tail);
             out.push_str(";\n    return;\n");
         }
+        // A function that DECLARES a return type and ends in a value expression
+        // returns that expression. This is the implicit return, and it is the
+        // same rule the LLVM backend applies: the parser folds a trailing
+        // EXPRESSION into `Block::expr`, so `fn f() -> float { 3.0 * 4.0 }` has
+        // its 12.0 right there.
+        //
+        // It used to emit `return;` here, which is invalid WGSL in a function
+        // declared `-> f32` -- a shader that fails naga's validator with an
+        // error about a return type the programmer never wrote.
+        Some(tail) if tail_yields_value(&tail.kind) => {
+            out.push_str("    return ");
+            emit_expr_inline(out, tail);
+            out.push_str(";\n");
+        }
+        // A declared return type with a trailing expression that is not a value
+        // -- an assignment, a loop, a binding. Refused rather than guessed at.
+        Some(tail) => {
+            return Err(CodegenError::UnsupportedFeature(format!(
+                "function `{}` declares a return type but ends in an expression that \
+                 does not produce a value, at line {}. There is nothing this backend \
+                 can return. Add an explicit `return` of the value to return, or drop \
+                 the return type to make the function `void`.",
+                func.name.name, tail.span.line
+            )));
+        }
+        // A declared return type with NO trailing expression at all.
+        //
+        // An explicit `return e;` is a STATEMENT, so `fn f() -> float { return
+        // 1.0; }` has `body.expr == None` too and must NOT be refused here -- it
+        // already emits its own `return` above. Only a body with neither an
+        // explicit return nor a trailing value is genuinely missing one.
+        //
+        // The parser routes every `let` to `Block::stmts`, so `fn f(x: float) ->
+        // float { let mut y = x * 3.0; }` lands here.
+        //
+        // It used to emit the function with NO return statement whatsoever, which
+        // is invalid WGSL -- and the failure mode is exactly the one this backend
+        // refuses elsewhere: nothing in the shader says the value is missing.
+        // There is no honest value to return. Returning zero would be silently
+        // wrong, because a caller cannot distinguish it from a computed zero, and
+        // returning the discarded binding `y` would be inventing a value the source
+        // never wrote. So it is refused, and the diagnostic names the function.
+        None if func.ret_ty.is_some() && !has_explicit_return(func) => {
+            return Err(CodegenError::UnsupportedFeature(format!(
+                "function `{}` declares a return type but has no `return` statement \
+                 and no trailing expression whose value could be returned, so there \
+                 is no value to return. Returning zero would be silently wrong: the \
+                 caller cannot distinguish it from a computed zero. Add an explicit \
+                 `return`, or end the body with the expression to return, or drop the \
+                 return type to make the function `void`.",
+                func.name.name
+            )));
+        }
+        // A void function with no trailing expression: WGSL needs no terminator.
+        None => {}
     }
 
     out.push_str("}\n\n");
     Ok(())
+}
+
+/// Does this function body contain an explicit `return`?
+///
+/// # Why this is needed
+///
+/// An explicit `return e;` with a semicolon is a `StmtKind::Return` in
+/// `Block::stmts`, so such a body has `body.expr == None` -- the SAME shape as
+/// `fn f(x: float) -> float { let mut y = x * 3.0; }`, which has no return at
+/// all. "No trailing expression" therefore does not imply "no return", and
+/// refusing on it alone would reject a function that returns perfectly well.
+///
+/// (The parser also folds a `return` with no semicolon into the tail slot, so
+/// both shapes occur in real source. This scan covers the statement form; the
+/// tail form is handled by the `ExprKind::Return` arm in `emit_function`.)
+///
+/// # Why a full recursive scan, not just `body.stmts`
+///
+/// A `return` nested inside an `if` or a loop is still a return: the function's
+/// value comes from there. A function whose only `return` is nested has no
+/// trailing value, but it is NOT missing one, and refusing it would be a false
+/// positive. The scan looks through the block forms this backend can emit. A
+/// construct it cannot emit is refused by `check_supported` before this runs, so
+/// an unrecognised nesting is unreachable here rather than silently missed.
+fn has_explicit_return(func: &Function) -> bool {
+    func.body.stmts.iter().any(stmt_has_return)
+}
+
+fn stmt_has_return(stmt: &Stmt) -> bool {
+    match &stmt.kind {
+        StmtKind::Return(_) => true,
+        StmtKind::Let(s) => expr_has_return(&s.value),
+        StmtKind::LetInOut(s) => expr_has_return(&s.value),
+        StmtKind::LetConsume(s) => expr_has_return(&s.value),
+        StmtKind::Expr(e) => expr_has_return(e),
+        _ => false,
+    }
+}
+
+fn expr_has_return(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Return(_) => true,
+        ExprKind::Binary(_, l, r) => expr_has_return(l) || expr_has_return(r),
+        ExprKind::Unary(_, i) | ExprKind::Ascribe(i, _) | ExprKind::Index(i, _) => {
+            expr_has_return(i)
+        }
+        ExprKind::Call(callee, args) => expr_has_return(callee) || args.iter().any(expr_has_return),
+        ExprKind::MethodCall(recv, _, args) => {
+            expr_has_return(recv) || args.iter().any(expr_has_return)
+        }
+        ExprKind::Field(base, _) => expr_has_return(base),
+        ExprKind::Assign(l, r) => expr_has_return(l) || expr_has_return(r),
+        ExprKind::Block(b) => {
+            b.stmts.iter().any(stmt_has_return) || b.expr.as_deref().is_some_and(expr_has_return)
+        }
+        // Loops are EXPRESSIONS in this AST, so a `return` inside one is reached
+        // through the expression tree, not through `Block::stmts`.
+        ExprKind::For(l) => {
+            l.body.stmts.iter().any(stmt_has_return)
+                || l.body.expr.as_deref().is_some_and(expr_has_return)
+        }
+        ExprKind::Forall(l) => {
+            l.body.stmts.iter().any(stmt_has_return)
+                || l.body.expr.as_deref().is_some_and(expr_has_return)
+        }
+        ExprKind::While(c, b) => expr_has_return(c) || block_or_expr_has_return(b),
+        ExprKind::If(cond, then, els) => {
+            expr_has_return(cond)
+                || block_or_expr_has_return(then)
+                || els.as_deref().is_some_and(block_or_expr_has_return)
+        }
+        _ => false,
+    }
+}
+
+fn block_or_expr_has_return(expr: &Expr) -> bool {
+    if let ExprKind::Block(b) = &expr.kind {
+        b.stmts.iter().any(stmt_has_return) || b.expr.as_deref().is_some_and(expr_has_return)
+    } else {
+        expr_has_return(expr)
+    }
+}
+
+/// Does this trailing-expression kind produce a VALUE, and so can supply a
+/// function's return value?
+///
+/// # Why an allow-list and not a deny-list
+///
+/// Because the question is not "is this a statement" but "does evaluating it give
+/// the caller a value". A deny-list would have to enumerate every form that does
+/// NOT, and `ExprKind` grows: the next variant added would default to "this is a
+/// value", which is exactly the silent wrong answer this backend exists to
+/// prevent. An allow-list defaults to "not a value", so a new expression kind is
+/// refused until someone decides it yields one.
+///
+/// Deliberately NOT here: the bindings (`Let`/`LetInOut`/`LetConsume` -- a
+/// binding's value is its bound NAME, and a function body ending in one has no
+/// expression at all), `Assign` (a store, whose "value" the source does not mean
+/// by the result), the control-flow forms, the loops, and the proof-only
+/// constructs.
+fn tail_yields_value(kind: &ExprKind) -> bool {
+    matches!(
+        kind,
+        ExprKind::Literal(_)
+            | ExprKind::Var(_)
+            | ExprKind::Binary(..)
+            | ExprKind::Unary(..)
+            | ExprKind::Call(..)
+            | ExprKind::MethodCall(..)
+            | ExprKind::Field(..)
+            | ExprKind::Index(..)
+            | ExprKind::Struct(..)
+            | ExprKind::Variant(..)
+            | ExprKind::Tuple(_)
+            | ExprKind::Array(_)
+            | ExprKind::Block(_)
+            | ExprKind::If(..)
+            | ExprKind::Match(..)
+            | ExprKind::Ascribe(..)
+    )
 }
 
 fn emit_stmt(out: &mut String, stmt: &Stmt, depth: usize) -> CodegenResult<()> {
@@ -1390,5 +1568,123 @@ mod tests {
             !w.contains("return clamp("),
             "returning the inner expression would mean the cast was dropped:\n{w}"
         );
+    }
+
+    /// A function that DECLARES a return type and ends in a value expression must
+    /// emit `return <expr>;` in WGSL.
+    ///
+    /// It used to emit the expression as a bare statement followed by `return;`,
+    /// which is invalid WGSL in a function declared `-> f32`: `return;` with no
+    /// value in a non-void function fails naga's validator. So the shader never
+    /// worked at all, rather than working wrongly -- but "never worked" is not a
+    /// property this project is willing to leave to chance either.
+    #[test]
+    fn a_trailing_expression_is_emitted_as_a_wgsl_return_of_its_value() {
+        let w = lower("fn f() -> float { 3.0 * 4.0 }").unwrap();
+        assert!(
+            w.contains("return (3.0 * 4.0);"),
+            "the tail must be the returned value:\n{w}"
+        );
+        assert!(
+            !w.contains("return;"),
+            "a bare `return;` in a `-> f32` function is invalid WGSL:\n{w}"
+        );
+    }
+
+    /// A tail AFTER a `let`, which is the discriminating case: the body's `stmts`
+    /// is non-empty AND `Block::expr` is `Some`.
+    ///
+    /// `stmts = 0` (a bare tail) would let an implementation that returns "the last
+    /// thing emitted" pass by coincidence. Here the `let` is the last STATEMENT and
+    /// `a * 5.0` is the TAIL, so only an implementation that reads the tail slot
+    /// emits `return (a * 5.0);`.
+    #[test]
+    fn a_trailing_expression_after_a_let_returns_the_tail_not_the_binding() {
+        let w = lower("fn f(x: float) -> float { let a = 2.0; a * 5.0 }").unwrap();
+        assert!(
+            w.contains("let a = 2.0;") && w.contains("return (a * 5.0);"),
+            "the tail, not the `let`, must be returned:\n{w}"
+        );
+    }
+
+    /// A declared return type with NO value anywhere is refused, naming the function.
+    ///
+    /// The parser routes every `let` to `Block::stmts`, so this body has no trailing
+    /// expression. It used to emit `fn f(x: f32) -> f32 { let y = (x * 3.0); }` -- a
+    /// function with a return type and NO return statement, which is invalid WGSL and
+    /// says nothing about the value being missing.
+    #[test]
+    fn a_declared_return_type_with_no_value_is_refused_by_the_wgsl_backend_too() {
+        let err = lower("fn f(x: float) -> float { let mut y = x * 3.0; }")
+            .expect_err("a value-returning function with no value must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`f`"),
+            "the diagnostic must name the function: {msg}"
+        );
+        assert!(
+            msg.contains("Returning zero would be silently wrong"),
+            "the diagnostic must say why zero is refused: {msg}"
+        );
+    }
+
+    /// An explicit `return e;` is a STATEMENT, so it leaves `Block::expr` empty --
+    /// the same shape as the refusal case above. It must NOT be refused.
+    ///
+    /// This is the counterweight to the previous test: "no trailing expression" does
+    /// not imply "no return", and a backend that confuses the two refuses programs
+    /// that return perfectly well.
+    #[test]
+    fn an_explicit_return_is_not_mistaken_for_a_missing_one() {
+        let w = lower("fn f() -> float { return 3.0 * 4.0; }")
+            .expect("an explicit return must still compile");
+        assert!(w.contains("return (3.0 * 4.0);"), "{w}");
+    }
+
+    /// A `return` NESTED inside a loop is still a return, so the function is not
+    /// missing one.
+    ///
+    /// This body has `Block::expr == None` -- the `forall` is a statement, not a
+    /// trailing expression -- so without the recursive scan it would be refused,
+    /// even though it returns perfectly well from inside the loop. It is the case
+    /// that says the scan has to look through the block forms rather than only at
+    /// `body.stmts`' top level.
+    ///
+    /// (`if` is not used here because this backend refuses it outright, so the
+    /// refusal would come from `check_supported` and the test would pass for the
+    /// wrong reason.)
+    #[test]
+    fn a_return_nested_in_a_loop_counts_as_a_return() {
+        let w = lower("fn f(x: float) -> float { forall i in 0..2 { return x; } }")
+            .expect("a body whose return is nested in a loop must not be refused");
+        assert!(
+            w.contains("return x;"),
+            "the nested return must be emitted: {w}"
+        );
+    }
+
+    /// A declared return type whose tail is an ASSIGNMENT is refused, not guessed at.
+    ///
+    /// An assignment is a store. Its "value" is not what the source means by the
+    /// function's result, and reading the target back would invent one.
+    #[test]
+    fn a_declared_return_type_ending_in_an_assignment_is_refused() {
+        let err = lower("fn f(x: float) -> float { x = 1.0 }")
+            .expect_err("an assignment is not a return value");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not produce a value"),
+            "the diagnostic must say the tail is not a value: {msg}"
+        );
+    }
+
+    /// A VOID function's tail still runs; it is evaluated and discarded.
+    ///
+    /// The `return;` is correct here -- a WGSL void function may return with no value
+    /// -- which is exactly why the same emission was wrong in the `-> f32` case.
+    #[test]
+    fn a_void_functions_trailing_expression_still_terminates_the_function() {
+        let w = lower("fn f(x: float) { x = 1.0 }").expect("void tail");
+        assert!(w.contains("return;"), "{w}");
     }
 }

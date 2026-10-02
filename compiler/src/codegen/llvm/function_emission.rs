@@ -327,6 +327,10 @@ mod tests {
             quantities: HashMap::new(),
             return_type: FnReturn::Void,
             return_stmt: None,
+            // Hand-built for the emission-order tests, which are about naming and
+            // recursion rather than returns. A body written as a bare statement list
+            // has no trailing expression, so there is no implicit return to record.
+            tail_return_stmt: None,
             span: Some(Span::default()),
         }
     }

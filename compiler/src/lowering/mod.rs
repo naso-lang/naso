@@ -487,17 +487,80 @@ impl LoweringContext {
                 for stmt in &func.body.stmts {
                     self.lower_stmt(stmt)?;
                 }
-                // A trailing expression is held on the block, NOT in `stmts`.
+                // The body's trailing expression, and whether its VALUE is this
+                // function's return value.
                 //
-                // The parser folds the last statement of a function body into
-                // `Block::expr` when it is an expression, so
-                // `fn f() { .. return true; }` puts that `return` in the tail
-                // slot. Only iterating `stmts` skipped it, and because the tail
-                // was simply never visited its `return` was never reported
-                // either -- the function body lowered as if it ended earlier.
-                if let Some(tail) = &func.body.expr {
-                    self.lower_expr(tail)?;
-                }
+                // The parser folds the last expression of a function body into
+                // `Block::expr`, so it is NOT in `stmts`. Only iterating `stmts`
+                // skipped it, and the function body then lowered as if it ended
+                // earlier.
+                //
+                // `tail_value` is `Some` only for a function that DECLARES a return
+                // type, contains no `return`, and ends in an expression that produces
+                // a value. Each of those three conditions is load-bearing:
+                //
+                //  * no explicit `return` -- an explicit return is the programmer
+                //    naming the value, and it wins. `pending_return_stmt` is checked
+                //    BEFORE the tail is lowered precisely so a `return` in tail
+                //    position cannot be double-counted as both.
+                //  * a value-producing kind -- see `tail_yields_value`. This is the
+                //    condition that keeps `fn f(x: f32) -> f32 { let mut y = x * 3.0;
+                //    }` refused: the parser routes every `let` to `Block::stmts`, so
+                //    that body has no `Block::expr` and no tail value at all, even
+                //    though lowering does emit a statement for the binding. A tail
+                //    that is not a value -- an assignment, a loop, a control-flow
+                //    form -- is equally refused rather than guessed at.
+                //
+                // # A tail that is NOT the return still has to RUN
+                //
+                // Only the return-value case above takes the expression's VALUE. Every
+                // other tail -- a `void` function's, or one a `return` already claimed --
+                // goes through `lower_expr_stmt`, which makes it an ordinary SCHEDULED
+                // statement.
+                //
+                // It used to go through `lower_expr` and have its result thrown away,
+                // which silently dropped the tail's SIDE EFFECTS: `fn side(out: inout
+                // [1] Tensor[f32, 1]) { out[0] = 7.0 }` -- a store, with no semicolon,
+                // so the parser made it the tail -- lowered to a function whose body
+                // emitted no store at all. The identical body with a `;` stored
+                // correctly. A tail is not dead code because its value is unused, and a
+                // compiler that compiles a store away is the silent wrong answer this
+                // compiler exists to prevent.
+                let declared_return = self.return_type(func);
+                let tail_is_the_return =
+                    !matches!(declared_return, crate::ir::pir_types::FnReturn::Void)
+                        && self.pending_return_stmt.is_none()
+                        && func
+                            .body
+                            .expr
+                            .as_ref()
+                            .is_some_and(|t| Self::tail_yields_value(&t.kind));
+                let tail_value = match &func.body.expr {
+                    Some(tail) if tail_is_the_return => {
+                        let lowered = self.lower_expr(tail)?;
+                        let stmt_id = self.next_stmt_id();
+                        let domain = AffineDomain::universe(0, 0);
+                        self.statements.push(PirStatement {
+                            id: stmt_id,
+                            domain: domain.clone(),
+                            body: lowered,
+                            quantity: crate::ast::Quantity::Many,
+                            mutability: crate::ast::Mutability::Immutable,
+                            span: None,
+                        });
+                        self.schedule_nodes
+                            .push(ScheduleNode::domain(stmt_id, domain));
+                        Some(stmt_id)
+                    }
+                    // Not the return value, so it is evaluated for what it DOES rather
+                    // than for what it is: an ordinary scheduled expression statement,
+                    // exactly the lowering a `;` after it would have produced.
+                    Some(tail) => {
+                        self.lower_expr_stmt(tail)?;
+                        None
+                    }
+                    None => None,
+                };
 
                 // Lift this function's slice out of the flat lists.
                 //
@@ -519,7 +582,7 @@ impl LoweringContext {
                 let quantities = self.per_function_quantities(func);
 
                 let params = self.declared_params(func)?;
-                let return_type = self.return_type(func);
+                let return_type = declared_return;
 
                 // The RETURN VALUE, if this function returns one.
                 //
@@ -533,24 +596,41 @@ impl LoweringContext {
                 //
                 // `pending_return_stmt` is drained here so one function's `return`
                 // cannot be attributed to the next.
+                //
+                // # `None` here no longer means "returns zero"
+                //
+                // It used to. `-> i64` with no `return e` was accepted and the backend
+                // read `None` as zero, which is the one answer a caller cannot
+                // distinguish from a computed zero -- so the backend now refuses. The
+                // other way a value-returning function can have `return_stmt == None`
+                // is the implicit tail, recorded separately in `tail_return_stmt`
+                // above. A backend that sees `None` must consult `tail_return_stmt`
+                // next, and refuse only when BOTH are `None`.
                 let return_stmt = match return_type {
                     crate::ir::pir_types::FnReturn::Void => None,
-                    // No `return` statement in the body leaves `return_stmt` as
-                    // `None`, which the backend reads as "this function returns zero".
-                    // That is a KNOWN LIMITATION, not a correctness claim: `-> i64` with
-                    // no `return` is accepted by the typechecker and several existing
-                    // tests declare one while reading a global instead. Making it an
-                    // error, or making the tail expression the return value, would change
-                    // what those programs compile to.
                     _ => self.pending_return_stmt.take(),
                 };
+                // An explicit `return` and an implicit tail are never both recorded:
+                // `tail_is_the_return` required `pending_return_stmt.is_none()`, and a
+                // tail `return` sets it during `lower_expr` above. Asserting it here
+                // rather than trusting the ordering is what keeps the two fields from
+                // silently disagreeing if the tail-lowering order ever changes.
+                debug_assert!(
+                    return_stmt.is_none() || tail_value.is_none(),
+                    "function `{}` recorded both an explicit `return` and an implicit \
+                     tail return; exactly one is the source's shape",
+                    func.name.name
+                );
+                // Both the explicit return and the implicit tail are evaluated in the
+                // exit block, so neither may ALSO be a scheduled statement.
                 let schedule_nodes: Vec<ScheduleNode> = schedule_nodes
                     .into_iter()
                     .filter(|n| {
-                        !matches!(
-                            (n, return_stmt),
-                            (ScheduleNode::Domain { stmt_id, .. }, Some(r)) if *stmt_id == r
-                        )
+                        let ScheduleNode::Domain { stmt_id, .. } = n else {
+                            return true;
+                        };
+                        *stmt_id != return_stmt.unwrap_or(StmtId(usize::MAX))
+                            && *stmt_id != tail_value.unwrap_or(StmtId(usize::MAX))
                     })
                     .collect();
 
@@ -563,6 +643,7 @@ impl LoweringContext {
                     quantities,
                     return_type,
                     return_stmt,
+                    tail_return_stmt: tail_value,
                     span: Some(func.span),
                 });
             }
@@ -632,6 +713,69 @@ impl LoweringContext {
             Some(elem) => FnReturn::Scalar(elem),
             None => FnReturn::Unsupported(format!("{ty}")),
         }
+    }
+
+    /// Does this trailing-expression kind produce a VALUE, and so can be a
+    /// function's implicit return?
+    ///
+    /// # Why an allow-list and not a deny-list
+    ///
+    /// Because the question is not "is this a statement" but "does evaluating it
+    /// produce a value the caller can receive". A deny-list would have to enumerate
+    /// every form that does NOT, and `ExprKind` grows: the next variant added would
+    /// default to "this is a value", which is exactly the silent wrong answer this
+    /// compiler exists to prevent. An allow-list defaults to "not a value", so a new
+    /// expression kind is refused until someone decides it yields one.
+    ///
+    /// # What is deliberately NOT here
+    ///
+    ///  * `Let`/`LetInOut`/`LetConsume` -- a binding's value is its bound NAME, and a
+    ///    function body that ends in one has no expression at all. The parser routes
+    ///    every `let` to `Block::stmts`, so this case is reached only through a block
+    ///    expression; it is listed as refused so the reason is stated rather than
+    ///    reached by accident.
+    ///  * `Assign` -- an assignment is a store. Its "value" is not what the source
+    ///    means by the function's result, and reading the target back would invent one.
+    ///  * `Return`/`Break`/`Continue` -- control flow, not values. A `return` here is
+    ///    handled by `pending_return_stmt`, so reaching this arm means something else.
+    ///  * `For`/`Forall`/`While`/`Quantified` -- loops. A loop's result is a statement
+    ///    list, not an expression, and a `forall` band in tail position has no value
+    ///    this backend can name.
+    ///  * `Reversible`, `Lambda`, `Projection`, `Error` -- none lowers to a value this
+    ///    ABI can return; `lower_expr` refuses the unsupported ones itself.
+    ///
+    /// # What IS here
+    ///
+    /// The forms whose lowering is a `PirExpr` the backend evaluates to a value:
+    /// literals, variables, operators, calls, subscripts, field access, the
+    /// constructors, the control-flow-valued `if`/`match`, a type ascription, and a
+    /// block expression (whose value is its own trailing expression).
+    ///
+    /// Note that this says nothing about the TYPE. Whether the value matches the
+    /// declared return type is decided by the backend, which refuses a mismatch rather
+    /// than converting -- see `lower_schedule_tree_into`.
+    fn tail_yields_value(kind: &crate::ast::expr::ExprKind) -> bool {
+        use crate::ast::expr::ExprKind as E;
+        matches!(
+            kind,
+            E::Literal(_)
+                | E::Var(_)
+                | E::Binary(..)
+                | E::Unary(..)
+                | E::Call(..)
+                | E::MethodCall(..)
+                | E::Field(..)
+                | E::Index(..)
+                | E::Struct(..)
+                | E::Variant(..)
+                | E::Tuple(_)
+                | E::Array(_)
+                | E::Block(_)
+                | E::If(..)
+                | E::Match(..)
+                | E::Ascribe(..)
+                | E::QuantumOp(_)
+        )
     }
 
     /// The quantity annotations in scope for `func`: its parameters, plus every name

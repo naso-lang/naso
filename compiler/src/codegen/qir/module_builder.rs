@@ -196,7 +196,40 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
     }
 
     // Build the entire PIR module as QIR
+    //
+    // # This backend has no notion of a Naso FUNCTION
+    //
+    // It walks `pir_module.statements` -- the flat compatibility list -- and emits
+    // one `void @qir_stmt_N()` per statement. `pir_module.functions` is never
+    // consulted, so a declared return type has nowhere to go: no typed function is
+    // emitted at all, and the caller's value simply does not exist.
+    //
+    // That is the silent wrong answer, not a harmless omission. A caller asking for
+    // `f`'s result gets no `f` in the module and no diagnostic saying why, and
+    // emitting `ret 0` instead would be worse still -- zero is the one value a
+    // caller cannot distinguish from a computed zero. So a module containing a
+    // value-returning function is REFUSED here, naming the function.
+    //
+    // This is not a regression: the same module already failed to compile the
+    // moment its body used a float, because `build_expr` unwraps every operand as
+    // an `IntValue`. QIR is currently usable only for qubit/gate statement bodies,
+    // which return nothing. Saying so is strictly more useful than emitting a
+    // module whose functions are missing.
     pub fn build_module(&mut self, pir_module: &PirModule) -> CodegenResult<()> {
+        for func in &pir_module.functions {
+            if func.return_type != crate::ir::pir_types::FnReturn::Void {
+                return Err(CodegenError::QirError(format!(
+                    "function `{}` declares a return type, and the QIR backend emits one \
+                     `void` function per PIR statement rather than a typed function per \
+                     Naso function, so this value has nowhere to go. Nothing is returned \
+                     in its place: zero would be silently wrong, because a caller cannot \
+                     distinguish it from a computed zero. Use the LLVM or WGSL backend \
+                     for a function that returns a value.",
+                    func.name
+                )));
+            }
+        }
+
         // Build quantum operations from statements
         for stmt in &pir_module.statements {
             self.build_statement(stmt)?;
@@ -629,5 +662,76 @@ mod tests {
             .module()
             .verify()
             .unwrap_or_else(|e| panic!("LLVM rejected the module: {e}\n{ir}"));
+    }
+
+    /// A module whose function DECLARES a return type is refused, naming it.
+    ///
+    /// This backend emits one `void @qir_stmt_N()` per PIR statement and never reads
+    /// `pir_module.functions`, so a declared return type has nowhere to go: no typed
+    /// function is emitted and the caller's value simply does not exist. That is the
+    /// silent wrong answer -- worse than a zero, because there is not even a zero to
+    /// mistake for a computed one. Refusing says which function and why.
+    #[test]
+    fn a_value_returning_function_is_refused_rather_than_silently_dropped() {
+        let context = CodegenContext::new(CodegenTarget::Host, OptLevel::None).unwrap();
+        let mut builder = QIRModuleBuilder::new(&context).unwrap();
+
+        let mut module = PirModule::default();
+        module.functions.push(crate::ir::pir_types::PirFunction {
+            name: "score".to_string(),
+            params: Vec::new(),
+            statements: Vec::new(),
+            schedule: crate::ir::schedule_tree::ScheduleTree::new(
+                crate::ir::schedule_tree::ScheduleNode::Empty,
+                vec![],
+            ),
+            accesses: crate::ir::AccessRelations::default(),
+            quantities: HashMap::new(),
+            return_type: crate::ir::pir_types::FnReturn::Scalar(
+                crate::ir::pir_types::ElemType::F64,
+            ),
+            return_stmt: None,
+            tail_return_stmt: None,
+            span: None,
+        });
+
+        let err = builder
+            .build_module(&module)
+            .expect_err("a value-returning function must be refused, not dropped");
+        let msg = err.to_string();
+        assert!(msg.contains("`score`"), "must name the function: {msg}");
+        assert!(
+            msg.contains("zero would be silently wrong"),
+            "must say why no value is invented: {msg}"
+        );
+    }
+
+    /// A module of VOID functions is unaffected by that refusal.
+    ///
+    /// QIR's actual use -- qubit allocation and gate application -- returns nothing,
+    /// so the refusal above must not have made the backend unusable.
+    #[test]
+    fn a_void_function_still_builds() {
+        let context = CodegenContext::new(CodegenTarget::Host, OptLevel::None).unwrap();
+        let mut builder = QIRModuleBuilder::new(&context).unwrap();
+        let mut module = PirModule::default();
+        module.functions.push(crate::ir::pir_types::PirFunction {
+            name: "apply_h".to_string(),
+            params: Vec::new(),
+            statements: Vec::new(),
+            schedule: crate::ir::schedule_tree::ScheduleTree::new(
+                crate::ir::schedule_tree::ScheduleNode::Empty,
+                vec![],
+            ),
+            accesses: crate::ir::AccessRelations::default(),
+            quantities: HashMap::new(),
+            return_type: crate::ir::pir_types::FnReturn::Void,
+            return_stmt: None,
+            tail_return_stmt: None,
+            span: None,
+        });
+        builder
+            .build_module(&module)
+            .expect("a void function must still build: QIR's real programs are void");
     }
 }

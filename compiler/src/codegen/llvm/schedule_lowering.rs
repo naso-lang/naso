@@ -12,7 +12,7 @@
 
 use crate::codegen::context::CodegenContext;
 use crate::codegen::error::{CodegenError, CodegenResult};
-use crate::codegen::llvm::module_builder::{EntryParam, build_entry_signature};
+use crate::codegen::llvm::module_builder::{EntryParam, ReturnSource, build_entry_signature};
 use crate::codegen::llvm::value_builder::TensorBinding;
 use crate::codegen::llvm::{
     access_emission::AccessEmitter,
@@ -73,6 +73,7 @@ pub fn lower_schedule_tree<'ctx>(
         abi.as_slice(),
         None,
         None,
+        None,
     )
 }
 
@@ -109,6 +110,7 @@ pub fn lower_schedule_tree_into<'ctx>(
     access_relations: &AccessRelations,
     abi: &[EntryParam<'ctx>],
     return_value: Option<&PirExpr>,
+    return_source: Option<ReturnSource>,
     callee_params: Option<&HashMap<String, Vec<ParamKind>>>,
 ) -> CodegenResult<()> {
     let llvm_context = ctx.llvm_context();
@@ -264,24 +266,24 @@ pub fn lower_schedule_tree_into<'ctx>(
     // function whose return value is never read, and it is a silent wrong answer for
     // every other one: a caller would receive 0 for `fn f(x) { x + 1 }` and nothing in
     // the IR would say the value was invented. So `return_value` -- the expression the
-    // function's `return` statement lowered to, evaluated HERE, in the exit block --
-    // is what is returned.
+    // function's `return` statement OR its trailing expression lowered to, evaluated
+    // HERE, in the exit block -- is what is returned. Which of the two it was is
+    // `return_source`, and nothing downstream may tell them apart by value alone.
     //
-    // # A function with a return TYPE but no `return` statement
+    // # A function with a return TYPE and no value at all
     //
-    // Returns ZERO, which is a KNOWN LIMITATION and not a claim of correctness.
+    // Unreachable from `emit_one_function`, which REFUSES a value-returning function
+    // whose `return_stmt` and `tail_return_stmt` are both `None` before calling here.
+    // That refusal is the fix the comment above used to call for: the zero fallback
+    // below used to be the ONLY answer such a function got, and it was the one answer
+    // a caller cannot distinguish from a computed zero.
     //
-    // `-> i64` with no `return e` is accepted by the typechecker, and several existing
-    // tests rely on that: they declare a return type, end the body with an assignment
-    // to a global, and read the GLOBAL rather than the return value. Refusing here
-    // would break seven passing tests over a case none of them is testing.
-    //
-    // What is NOT true is that such a function returns zero -- it returns an
-    // unspecified value that happens to be spelled `zero`. The distinction matters and
-    // is recorded rather than papered over: `PirFunction::return_stmt` is `None` here,
-    // so this is distinguishable from a function that genuinely computed zero. Making
-    // it an error, or making the tail expression the return value, is the right fix and
-    // is NOT done here, because both change what existing programs compile to.
+    // The arm survives because this function is `pub` and is also called by
+    // `lower_schedule_tree` -- the flat single-function entry point that has no
+    // `PirFunction` and therefore no return bookkeeping at all. Rather than delete the
+    // arm and leave that caller to emit an unterminated function, the fallback stays
+    // and says what it is. It is a compatibility path, NOT a claim that a Naso
+    // function may return zero.
     let return_type = function.get_type().get_return_type();
     let returned = match (return_type, return_value) {
         (None, _) => None,
@@ -298,11 +300,18 @@ pub fn lower_schedule_tree_into<'ctx>(
             // came from the function's declaration and the value from its body, and if
             // they disagree the source does not say what the function returns. Casting
             // one to the other would invent an answer.
+            //
+            // `return_source` names WHICH source construct produced this expression, so
+            // the diagnostic says "trailing expression" for `fn f() -> f32 { 3.0 * 4.0 }`
+            // and "`return` expression" for `fn f() -> f32 { return 3.0 * 4.0; }`. The
+            // two are different programs and a reader chasing the bug needs to know
+            // which one they are looking at.
             if value.get_type() != ty {
+                let source = return_source.map_or("return", ReturnSource::describe);
                 return Err(CodegenError::UnsupportedFeature(format!(
-                    "function `{}` declares it returns `{}` but its `return` expression \
-                     evaluates to `{}`. Nothing is converted between them: a cast here \
-                     would be a value the source never wrote.",
+                    "function `{}` declares it returns `{}` but its {source} evaluates \
+                     to `{}`. Nothing is converted between them: a cast here would be \
+                     a value the source never wrote.",
                     function.get_name().to_string_lossy(),
                     ty,
                     value.get_type(),
@@ -310,9 +319,9 @@ pub fn lower_schedule_tree_into<'ctx>(
             }
             Some(value)
         }
-        // No `return` was lowered for this function. See the comment above: zero is a
-        // documented limitation, preserved so a program that declares a return type and
-        // never returns one still compiles as it always has.
+        // No value was supplied at all. Reached only through the flat
+        // `lower_schedule_tree` entry point -- see the comment above. A `PirFunction`
+        // path cannot get here: `emit_one_function` refuses first.
         (Some(ty), None) => Some(lowering.value_builder.build_zero(ty)),
     };
     lowering.value_builder.build_return(returned)?;

@@ -365,6 +365,14 @@ fn count_in_expr(expr: &PirExpr, var: &str) -> usize {
         // here would make these counters under-report, so the test would pass on a
         // program that actually uses the variable.
         PirExpr::Stmts(parts) => parts.iter().map(|p| count_in_expr(p, var)).sum::<usize>(),
+        // A `while` body may run any number of times, so its uses are counted as
+        // "present" rather than added: the point of the check is that a `[1]` value
+        // used only inside a loop is SEEN. Returning 0 here -- the obvious thing when
+        // a trip count is unknown -- would make the loop a hole through which a
+        // linear value escapes validation entirely.
+        PirExpr::While { cond, body } => {
+            (count_in_expr(cond, var) + count_in_expr(body, var)).max(1)
+        }
         PirExpr::Assign { target, value } => count_in_expr(target, var) + count_in_expr(value, var),
         PirExpr::Cast { expr, .. } => count_in_expr(expr, var),
         _ => 0,
@@ -410,6 +418,11 @@ fn expr_contains_var(expr: &PirExpr, var: &str) -> bool {
         // sides of an assignment. Returning false for these would under-report
         // usages and let a double-use slip through this test.
         PirExpr::Stmts(parts) => parts.iter().any(|p| expr_contains_var(p, var)),
+        // BOTH halves: the condition is evaluated every iteration, so a value used
+        // only there is still used by the loop.
+        PirExpr::While { cond, body } => {
+            expr_contains_var(cond, var) || expr_contains_var(body, var)
+        }
         PirExpr::Assign { target, value } => {
             expr_contains_var(target, var) || expr_contains_var(value, var)
         }

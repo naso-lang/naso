@@ -1389,6 +1389,71 @@ impl LoweringContext {
                     _ => crate::ir::PirExpr::Stmts(parts),
                 })
             }
+            //
+            // A `while` lowers to a PIR loop, NOT to a schedule band. The distinction is
+            // the whole point: a `forall`'s trip count is statically affine and becomes
+            // a polyhedral band that Polly can transform, while a `while`'s trip count
+            // depends on values computed inside its own body. There is no affine
+            // domain to extract, so treating it as a band would mean inventing bounds.
+            //
+            // The body is lowered exactly the way a loop body already is, and the
+            // `truncate` matters for the same reason it does in `ExprKind::Block`: the
+            // body's statements belong to the loop, not to the enclosing function, and
+            // leaving them in the top-level statement list would run them ONCE, before
+            // the loop, unconditionally.
+            ExprKind::While(cond, body) => {
+                let c = self.lower_expr(cond)?;
+                let first_new = self.statements.len();
+                let first_sched = self.schedule_nodes.len();
+                //
+                // The body may or may not be a braced `Block`. `while c { ... }` gives a
+                // `Block`; `while c x = x + 1;` gives a bare expression. Handling both
+                // matters because the braced form is a STATEMENT list, and those
+                // statements must be lowered as statements -- a `let` in a `while` body
+                // has to become a binding, not an evaluated-and-discarded value.
+                let mut tail: Option<&crate::ast::expr::Expr> = None;
+                #[allow(clippy::needless_late_init)]
+                match &body.kind {
+                    crate::ast::expr::ExprKind::Block(blk) => {
+                        for st in &blk.stmts {
+                            self.lower_stmt(st)?;
+                        }
+                        tail = blk.expr.as_deref();
+                    }
+                    other => {
+                        // A bare body is evaluated for its effects here.
+                        let _ = other;
+                        self.lower_expr(body)?;
+                    }
+                }
+                let mut parts: Vec<crate::ir::PirExpr> = self.statements[first_new..]
+                    .iter()
+                    .map(|s| s.body.clone())
+                    .collect();
+                if self.pending_return_stmt.is_some() {
+                    return Err(LoweringError::Unsupported(
+                        "a `return` inside a `while` body is not lowered, for the same \
+                         reason as inside an `if`: hoisting it would skip the rest of the \
+                         body and every later iteration. Return the value from after the \
+                         loop instead."
+                            .to_string(),
+                    ));
+                }
+                self.statements.truncate(first_new);
+                self.schedule_nodes.truncate(first_sched);
+                if let Some(t) = tail {
+                    parts.push(self.lower_expr(t)?);
+                }
+                let body_value = match parts.len() {
+                    0 => crate::ir::PirExpr::Stmts(Vec::new()),
+                    1 => parts.pop().expect("len checked"),
+                    _ => crate::ir::PirExpr::Stmts(parts),
+                };
+                Ok(crate::ir::PirExpr::While {
+                    cond: Box::new(c),
+                    body: Box::new(body_value),
+                })
+            }
             ExprKind::If(cond, then_branch, else_branch) => {
                 let c = self.lower_expr(cond)?;
                 let t = self.lower_expr(then_branch)?;

@@ -195,6 +195,18 @@ fn expr_contains_var(expr: &PirExpr, var: &str) -> bool {
         // every statement in a loop body from linearity validation, so a linear
         // value consumed only inside a loop would never be seen.
         PirExpr::Stmts(parts) => parts.iter().any(|p| expr_contains_var(p, var)),
+        //
+        // BOTH halves, and the reason is linearity. A `[1]` value consumed only inside
+        // a `while` body must still be SEEN as consumed -- otherwise the loop is a hole
+        // through which a linear value could escape validation, and the whole point of
+        // the quantity annotation is that consumption is checked. The condition counts
+        // too: a value consumed by the guard is consumed by the loop.
+        //
+        // Skipping the BODY would be exactly the `Stmts` bug documented above, one
+        // level down: the body of a loop body still contains statements.
+        PirExpr::While { cond, body } => {
+            expr_contains_var(cond, var) || expr_contains_var(body, var)
+        }
         // BOTH sides are uses: the target is bound to a location, the value is consumed.
         PirExpr::Assign { target, value } => {
             expr_contains_var(target, var) || expr_contains_var(value, var)

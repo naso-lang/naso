@@ -131,6 +131,29 @@ pub enum PirExpr {
     ///
     /// Order matters and is preserved: this is a sequence, not a set.
     Stmts(Vec<PirExpr>),
+
+    /// A `while` loop: evaluate `cond`, and while it is true run `body`.
+    ///
+    /// This is NOT sugar for `Forall`. A `forall` has a statically known,
+    /// affine iteration domain and lowers to a schedule band that Polly can
+    /// transform. A `while` has no such domain: the trip count depends on values
+    /// computed inside the body, so there is no polyhedral form to build.
+    /// Pretending otherwise would give a loop nest whose bounds are a guess.
+    ///
+    /// The body is carried rather than discarded, because a loop body that
+    /// vanishes is precisely the `IntLit(0)` bug documented on `Stmts`. It is a
+    /// sequence for the same reason `Stmts` is.
+    ///
+    /// The value of a `while` is unit. It exists for its effects, and a backend
+    /// that needs a value at this position must synthesise one of the right type
+    /// -- never reuse a value from inside the body, which would make the loop's
+    /// result depend on whether it ran at all.
+    While {
+        /// Re-evaluated before every iteration, including the first.
+        cond: Box<PirExpr>,
+        /// Run while `cond` holds.
+        body: Box<PirExpr>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -587,6 +610,13 @@ impl PirModule {
     fn expr_contains_var(&self, expr: &PirExpr, var: &str) -> bool {
         match expr {
             PirExpr::Var(v) => v == var,
+            // BOTH halves, including the condition. A loop that only increments
+            // its induction variable would otherwise look like it does not depend
+            // on it, and a rewrite keyed on that would drop the update -- turning a
+            // terminating loop into an infinite one.
+            PirExpr::While { cond, body } => {
+                self.expr_contains_var(cond, var) || self.expr_contains_var(body, var)
+            }
             PirExpr::Binary { left, right, .. } => {
                 self.expr_contains_var(left, var) || self.expr_contains_var(right, var)
             }
@@ -824,6 +854,14 @@ fn pir_expr_to_string(expr: &PirExpr, _indent: usize) -> String {
         PirExpr::FloatLit(v) => format!("{}", v),
         PirExpr::BoolLit(v) => format!("{}", v),
         PirExpr::Var(v) => v.clone(),
+        // The `Stmts` arm flattens the body into the same expression, because a
+        // `while` produces no value and dropping the body here would make a printed
+        // program claim a loop that it does not contain.
+        PirExpr::While { cond, body } => format!(
+            "while {} {{ {} }}",
+            pir_expr_to_string(cond, 0),
+            pir_expr_to_string(body, 0)
+        ),
         PirExpr::Assign { target, value } => {
             format!(
                 "{} = {}",

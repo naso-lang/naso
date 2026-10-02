@@ -411,6 +411,97 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
 
                 Ok(result)
             }
+            //
+            // A `while` is a real loop, NOT a band. A `forall` lowers to a schedule
+            // band because its trip count is statically affine; a `while` has no such
+            // domain, so it lowers to a header/body/exit CFG cycle with the condition
+            // re-evaluated in the header before EVERY iteration, including the first.
+            //
+            // The condition must be a re-loaded value, not a cached SSA one: it reads
+            // variables the body mutates, and hoisting the compare out of the header
+            // would make the loop run forever or not at all.
+            //
+            // The loop yields no value. Returning the body's last value would make the
+            // result depend on whether the loop ran at all -- `while false {}` would
+            // then differ from the same program without the loop -- so a fresh zero of
+            // the RIGHT TYPE is synthesised. Taking the type from the body's value
+            // would be wrong for the same reason, plus it is unavailable for an empty
+            // body.
+            PirExpr::While { cond, body } => {
+                let func = self.current_function;
+                let context = self.value_builder.type_lowering().context();
+                let header = context.append_basic_block(func, "while_cond");
+                let body_block = context.append_basic_block(func, "while_body");
+                let exit_block = context.append_basic_block(func, "while_exit");
+
+                let bool_type = self
+                    .value_builder
+                    .type_lowering()
+                    .int_type(crate::codegen::abi::IntWidth::I1);
+
+                // Emit the condition test in the HEADER, and end the incoming block by
+                // branching on it. The block the caller was building is the block that
+                // jumps INTO the header, so its terminator is written before position
+                // moves.
+                let entry_cond_val = self.build_expr(cond, quantities)?;
+                let entry_bool = self
+                    .value_builder
+                    .builder()
+                    .build_int_compare(
+                        inkwell::IntPredicate::NE,
+                        entry_cond_val.into_int_value(),
+                        bool_type.const_zero(),
+                        "while_entry_test",
+                    )
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                self.value_builder
+                    .builder()
+                    .build_conditional_branch(entry_bool, header, exit_block)
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+
+                // Header: re-test each iteration.
+                self.value_builder.builder().position_at_end(header);
+                let header_cond_val = self.build_expr(cond, quantities)?;
+                let header_bool = self
+                    .value_builder
+                    .builder()
+                    .build_int_compare(
+                        inkwell::IntPredicate::NE,
+                        header_cond_val.into_int_value(),
+                        bool_type.const_zero(),
+                        "while_cond_val",
+                    )
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                self.value_builder
+                    .builder()
+                    .build_conditional_branch(header_bool, body_block, exit_block)
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+
+                // Body, then jump back to the header.
+                self.value_builder.builder().position_at_end(body_block);
+                self.build_expr(body, quantities)?;
+                self.value_builder
+                    .builder()
+                    .build_unconditional_branch(header)
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+
+                self.value_builder.builder().position_at_end(exit_block);
+                // A `while` yields unit, so any value here is a placeholder for a
+                // caller that needs one. `i1 false` zero-extended to `i64` is 0
+                // without inventing a wider computation.
+                Ok(self
+                    .value_builder
+                    .builder()
+                    .build_int_cast(
+                        bool_type.const_zero(),
+                        self.value_builder
+                            .type_lowering()
+                            .int_type(crate::codegen::abi::IntWidth::I64),
+                        "while_result",
+                    )
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                    .into())
+            }
             PirExpr::If {
                 cond,
                 then_branch,
@@ -443,13 +534,34 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                     .build_conditional_branch(cond_bool, then_block, else_block)
                     .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
 
-                // Then branch
+                // Then branch.
+                //
+                // The branch to the merge must be emitted in the block the ARM ENDS in,
+                // not in whatever block the builder happens to be pointing at.
+                //
+                // This is a real bug that only a nested loop exposes. An arm containing
+                // a `while` ends in `while_exit`, not in `then`, because the loop moved
+                // the insertion point. Branching from wherever the builder sat produced
+                // `then` with no terminator, an `if_merge` with only a phi, and a
+                // function LLVM rejected as malformed -- so
+                // `if x > 0 { while ... }` failed to compile at all.
+                //
+                // So the arm's final block is read back from the builder after building
+                // it. For an arm with no loop that is the arm's own block, which is the
+                // previous behaviour.
                 self.value_builder.builder().position_at_end(then_block);
                 let then_val = self.build_expr(then_branch, quantities)?;
+                let then_end = self.value_builder.builder().get_insert_block();
+                self.value_builder
+                    .builder()
+                    .position_at_end(then_end.unwrap_or(then_block));
                 self.value_builder
                     .builder()
                     .build_unconditional_branch(merge_block)
                     .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                // The PHI's incoming block must be the block that actually jumps to the
+                // merge, not the arm's first block.
+                let then_incoming = then_end.unwrap_or(then_block);
 
                 // Else branch.
                 //
@@ -471,13 +583,18 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 let then_type = then_val.get_type();
                 self.value_builder.builder().position_at_end(else_block);
                 let mut else_val = self.build_expr(else_branch, quantities)?;
+                let else_end = self.value_builder.builder().get_insert_block();
                 if else_val.get_type() != then_type {
                     else_val = self.coerce_to(else_val, then_type, "the missing `else` branch")?;
                 }
                 self.value_builder
                     .builder()
+                    .position_at_end(else_end.unwrap_or(else_block));
+                self.value_builder
+                    .builder()
                     .build_unconditional_branch(merge_block)
                     .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                let else_incoming = else_end.unwrap_or(else_block);
 
                 // Merge block
                 self.value_builder.builder().position_at_end(merge_block);
@@ -486,7 +603,7 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                     .builder()
                     .build_phi(then_type, "if_phi")
                     .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
-                phi.add_incoming(&[(&then_val, then_block), (&else_val, else_block)]);
+                phi.add_incoming(&[(&then_val, then_incoming), (&else_val, else_incoming)]);
                 Ok(phi.as_basic_value())
             }
             PirExpr::Reversible { body, inverse } => {

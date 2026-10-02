@@ -426,6 +426,44 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
                 phi.add_incoming(&[(&then_val, then_block_end), (&else_val, else_block_end)]);
                 Ok(phi.as_basic_value())
             }
+            //
+            // A `while` produces no value. Returning the body's last value would make
+            // the loop's result depend on whether it ran at all, so this synthesises a
+            // fresh zero of the RESULT type -- the same convention as a statement in an
+            // expression position, and the reason the PIR documents the value as unit.
+            PirExpr::While { cond, body } => {
+                let func = self.current_function().unwrap();
+                let header = self.llvm_context.append_basic_block(func, "while_cond");
+                let body_block = self.llvm_context.append_basic_block(func, "while_body");
+                let exit_block = self.llvm_context.append_basic_block(func, "while_exit");
+
+                self.current_block = Some(header);
+                self.builder.position_at_end(header);
+                let cond_val = self.build_expr(cond)?;
+                let cond_bool = self
+                    .builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::NE,
+                        cond_val.into_int_value(),
+                        self.result_type.const_zero(),
+                        "while_cond_val",
+                    )
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                self.builder
+                    .build_conditional_branch(cond_bool, body_block, exit_block)
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+
+                self.current_block = Some(body_block);
+                self.builder.position_at_end(body_block);
+                self.build_expr(body)?;
+                self.builder
+                    .build_unconditional_branch(header)
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+
+                self.current_block = Some(exit_block);
+                self.builder.position_at_end(exit_block);
+                Ok(self.result_type.const_zero().into())
+            }
             PirExpr::Reversible { body, inverse: _ } => {
                 // For QIR, we just build the body
                 // The inverse would be handled by quantum compiler

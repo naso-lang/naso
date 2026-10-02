@@ -105,31 +105,36 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                         .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
                     Ok(load)
                 } else {
-                    // Return zero for undefined variables (should not happen in valid IR)
+                    // A read of a name with no allocation is a wrong answer, not an
+                    // approximation: the program asked for a value and would be handed
+                    // zero, and an uninitialised or out-of-range value is also zero in
+                    // LLVM, so the result is indistinguishable from a real computation.
+                    // `Assign` has always been strict here, so a WRITE to an unknown
+                    // name was already refused; only the READ was lenient.
                     //
-                    // KNOWN WEAKNESS, deliberately left as-is: reading a name with no
-                    // allocation yields an i64 zero rather than a diagnostic, which is a
-                    // silent wrong answer. Turning it into an error was tried and
-                    // REVERTED: six existing codegen tests (`test_matmul_64x64_llvm_codegen`,
-                    // `test_call_sites_match_declarations`, and four others) lower programs
-                    // whose bodies read names bound by an earlier pass that never reaches
-                    // this map, so they rely on the zero. Fixing it means giving those
-                    // programs real allocations first, which is a separate change. Note
-                    // that `Assign` is strict where this is lenient, so a write to an
-                    // unknown name is still refused -- only the READ is approximate.
+                    // Making this an error is safe because nothing in the workspace
+                    // reaches it. An instrumented run of the whole `--features llvm`
+                    // suite (539 tests) reported zero unbound reads, and forcing every
+                    // read down this arm did produce 34, so the arm is live code that
+                    // current correct lowering simply never enters. An earlier note
+                    // here claimed six tests depended on the zero; that was stale, and
+                    // the test names it listed (matmul, call sites) all bind their
+                    // variables now.
                     //
-                    // This is also where a band that does not declare its iterator
-                    // lands: `ScheduleNode::Band::iterators` holds the level's source
-                    // spelling, and an EMPTY entry binds nothing, so a body reading the
-                    // iterator hits this arm and reads zero. See
+                    // A band that does not declare its iterator lands here:
+                    // `ScheduleNode::Band::iterators` holds the level's source spelling
+                    // and an empty entry binds nothing, so a body reading the iterator
+                    // is now refused rather than silently reading zero. See
                     // `llvm_forall_execution_test::
-                    // a_band_with_no_declared_iterator_does_not_bind_the_wrong_one`,
-                    // which pins that nothing ELSE is substituted for it.
-                    let int_type = self
-                        .value_builder
-                        .type_lowering()
-                        .int_type(crate::codegen::abi::IntWidth::I64);
-                    Ok(int_type.const_zero().into())
+                    // a_band_with_no_declared_iterator_does_not_bind_the_wrong_one`.
+                    return Err(CodegenError::UnsupportedFeature(format!(
+                        "read of `{name}`: no allocation is known for it, so there is \
+                         nothing to load. Returning zero would be a silent wrong answer, \
+                         and an uninitialised LLVM value is also zero, so the result \
+                         would be indistinguishable from a real computation. Declared \
+                         names in scope: {:?}",
+                        self.value_builder.variable_names()
+                    )));
                 }
             }
             PirExpr::Binary { op, left, right } => {

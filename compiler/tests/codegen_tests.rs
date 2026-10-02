@@ -763,6 +763,57 @@ fn parse_pir(content: &str) -> Result<PirModule, String> {
         });
     }
 
+    // Every array a body reads must be a real binding, or the backend is asked to
+    // load a name it has no allocation for. A fixture declares its arrays in
+    // `[accesses]` as `array_name = "A"`, and the body string reads `A[i][k]`, so
+    // `[accesses]` is the only place the two can be connected.
+    //
+    // This was not done, and the missing binding was invisible because an unbound
+    // READ returned an i64 zero instead of a diagnostic. So `C[i][j] += A[i][k] * B[k][j]`
+    // compiled to `add i64 0, 0` and the six tests that load this fixture passed on
+    // IR shape alone -- they never checked that a matmul read anything. The backend
+    // read arm is now strict, and these bindings are what make it honest.
+    let mut arrays: Vec<String> = Vec::new();
+    for (hdr, lines) in &secs {
+        // `sections()` strips the brackets, so the header is the bare section name.
+        if hdr != "accesses" {
+            continue;
+        }
+        for line in lines {
+            if let Some(rest) = line.trim().strip_prefix("array_name") {
+                let name = rest.trim_start().trim_start_matches('=').trim();
+                let name = name.trim_matches('"');
+                if !name.is_empty() && !arrays.iter().any(|a| a == name) {
+                    arrays.push(name.to_string());
+                }
+            }
+        }
+    }
+    if !arrays.is_empty() {
+        // Wrap EACH statement's body in the array bindings rather than adding a
+        // statement of its own. A synthetic leading statement would change
+        // `statements.len()`, which several tests assert against the fixture's real
+        // count (`assert_eq!(pir.statements.len(), 1, "matmul fixture has one
+        // statement")`), so the fixture would stop describing itself.
+        //
+        // The bindings are prepended to each body, so a name the body reads resolves
+        // for that body, and `Let` keeps the binding for the rest of the statement
+        // because statement position does not scope it away.
+        for stmt in &mut statements {
+            let mut body = stmt.body.clone();
+            for name in arrays.iter().rev() {
+                body = PirExpr::Let {
+                    name: name.clone(),
+                    qty: Quantity::Zero,
+                    mutability: Mutability::Immutable,
+                    value: Box::new(PirExpr::IntLit(0)),
+                    body: Box::new(body),
+                };
+            }
+            stmt.body = body;
+        }
+    }
+
     // Neither module builder reads the schedule tree or the access relations,
     // so they are left empty rather than guessed at; the statement domains
     // above are what codegen actually consumes.
@@ -1102,12 +1153,28 @@ mod llvm_codegen_tests {
         }
         // Arrays A and B are read by the kernel; the builder does not yet emit
         // per-array globals.
-        assert!(
-            report
-                .mismatched_elements
-                .iter()
-                .any(|m| m == "Missing allocation for array: A")
-        );
+        // Arrays A, B and C now match as `Array -> Global/Value`, because the
+        // fixture parser binds every array named in `[accesses]` before the body
+        // runs. This assertion used to require the OPPOSITE -- that `A` be reported
+        // as a MISSING allocation -- which encoded the bug: the body read `A[i][k]`
+        // with no allocation behind it, and that mismatch was the only signal the
+        // fixture did not describe a matmul at all.
+        //
+        // Asserting the match is the stronger claim, and it is what lets this test
+        // fail again: drop the bindings in the parser and all three go back to
+        // `Missing allocation`.
+        for array in ["A", "B", "C"] {
+            assert!(
+                report
+                    .matched_elements
+                    .iter()
+                    .any(|m| m == &format!("Array -> Global/Value: {}", array)),
+                "expected array {} to be bound; matched: {:?}, mismatched: {:?}",
+                array,
+                report.matched_elements,
+                report.mismatched_elements
+            );
+        }
     }
 
     #[test]

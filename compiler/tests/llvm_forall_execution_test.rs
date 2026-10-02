@@ -837,38 +837,42 @@ fn a_two_level_band_binds_each_level_its_own_iterator() {
 ///
 /// The `no declaration` case is what the OLD code did for a hand-built band whose
 /// domain label did not parse, so this is the pre-existing behaviour held to not have
-/// silently changed into "binds whatever was lying around".
+/// A band that does not declare the iterator its body reads must be REFUSED.
+///
+/// This used to assert that such a band still built and that the body read the same
+/// value whether the band declared `j` or nothing -- i.e. it asserted the answer was
+/// consistently wrong. Reading a name with no allocation returned an i64 zero, and
+/// an uninitialised LLVM value is also zero, so "consistently zero" was
+/// indistinguishable from a real computation and the test passed on a wrong answer.
+///
+/// Refusing is the correct behaviour and a stronger claim: the body asks for `i`,
+/// nothing binds `i`, and the backend says so. Declaring the right name must also
+/// change the outcome, so the refusal is not just "this input is always refused".
 #[test]
-fn a_band_with_no_declared_iterator_does_not_bind_the_wrong_one() {
-    // Declares `j`; the body reads `i`. Nothing here may resolve `i` to `j`.
-    let wrong_name = run_band_with_iterator(vec!["j".to_string()])
-        .expect("a band naming a variable the body never reads must still build");
-    // Declares nothing at all.
-    let no_name =
-        run_band_with_iterator(vec![String::new()]).expect("a band with no iterator must build");
-
-    assert_eq!(
-        wrong_name.0, no_name.0,
-        "a body reading `i` must get the same answer whether the band declares `j` or \
-         nothing. They disagree if some other name is being substituted for `i`. \
-         `j` gave {}, no name gave {}.\n--- IR (declares j) ---\n{}",
-        wrong_name.0, no_name.0, wrong_name.1
-    );
-    // The wrong name must not appear as a binding the body could have read.
+fn a_band_with_no_declared_iterator_is_refused_rather_than_reading_zero() {
+    // Declares `j`; the body reads `i`. Nothing may resolve `i` to `j`.
+    let wrong = run_band_with_iterator(vec!["j".to_string()])
+        .expect_err("a band whose declared iterator is not the one the body reads must be refused");
     assert!(
-        !wrong_name.1.contains("\"j\""),
-        "`j` was never read by the body, so it must not have been bound to the \
-         induction variable.\n--- IR ---\n{}",
-        wrong_name.1
+        wrong.contains("read of `i`"),
+        "the diagnostic must name the variable the body actually read, got: {wrong}"
     );
-    // And declaring the right name must actually change the answer, so the agreement
-    // above is a real observation rather than both cases being equally broken.
-    let right_name = run_band_with_iterator(vec!["i".to_string()])
-        .expect("a band declaring the read iterator must build");
+
+    // Declares nothing at all: same refusal, for the same reason.
+    let none = run_band_with_iterator(vec![String::new()])
+        .expect_err("a band with no iterator must be refused when the body reads one");
+    assert!(
+        none.contains("read of `i`"),
+        "the diagnostic must name `i` rather than report an empty iterator, got: {none}"
+    );
+
+    // Declaring the right name must build and compute. This is what makes the two
+    // refusals above a real observation rather than the input being always refused.
+    let right = run_band_with_iterator(vec!["i".to_string()])
+        .expect("a band declaring the iterator the body reads must build and run");
     assert_ne!(
-        right_name.0, no_name.0,
-        "declaring `i` must change what the body computes, otherwise the iterator \
-         field is not reaching codegen at all"
+        right.0, 0,
+        "declaring `i` must let the body read the induction variable, not a zero"
     );
 }
 

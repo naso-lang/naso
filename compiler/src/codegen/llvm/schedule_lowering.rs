@@ -513,25 +513,23 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
 
             // The bound for THIS level, which is the member's own index. Iterating the
             // full `n_iter` would repeat earlier levels once per member.
-            for iter_dim in [level] {
-                if let Some((lower, upper)) = domain.iterator_bounds(iter_dim) {
-                    // The band's own iterator list is where the source spelling of
-                    // this level's induction variable lives. An empty or absent entry
-                    // means the band does not declare one, and the induction variable
-                    // is then left unbound -- a body that reads it is a diagnostic,
-                    // never a silent zero.
-                    let iterator_name = match iterators.get(level) {
-                        Some(name) if !name.is_empty() => Some(name.clone()),
-                        _ => None,
-                    };
-                    bounds.push(LoopBounds {
-                        iterator_dim: iter_dim,
-                        lower: self.lower_affine_expr(&domain.parameter_names, &lower)?,
-                        iterator_name,
-                        upper: self.lower_affine_expr(&domain.parameter_names, &upper)?,
-                        step: 1, // Default step of 1
-                    });
-                }
+            let iter_dim = level;
+            if let Some((lower, upper)) = domain.iterator_bounds(iter_dim) {
+                // The band's own iterator list is where the source spelling of this
+                // level's induction variable lives. An empty or absent entry means the
+                // band does not declare one, and the induction variable is then left
+                // unbound -- a body that reads it is a diagnostic, never a silent zero.
+                let iterator_name = match iterators.get(level) {
+                    Some(name) if !name.is_empty() => Some(name.clone()),
+                    _ => None,
+                };
+                bounds.push(LoopBounds {
+                    iterator_dim: iter_dim,
+                    lower: self.lower_affine_expr(&domain.parameter_names, &lower)?,
+                    iterator_name,
+                    upper: self.lower_affine_expr(&domain.parameter_names, &upper)?,
+                    step: 1, // Default step of 1
+                });
             }
         }
 

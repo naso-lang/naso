@@ -1,0 +1,14 @@
+# Pinned so the CI gates are reproducible.
+#
+# The workflow used `dtolnay/rust-toolchain@stable`, which floats. New clippy lints
+# therefore appear on the runner without any change here: the LLVM job failed twice
+# on lints (`for loop over a single element`) that the locally-installed clippy
+# 1.98 does not emit, so a green local run and a red CI run disagreed about the
+# same commit.
+#
+# 1.98 is the toolchain the LLVM backend, the execution harness and the clippy gate
+# were all verified against. Move this deliberately, and re-run the full suite when
+# you do, rather than discovering the change as a red build.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]

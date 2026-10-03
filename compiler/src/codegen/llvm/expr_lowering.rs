@@ -174,6 +174,19 @@ pub struct LoopTargets<'ctx> {
     pub continue_target: inkwell::basic_block::BasicBlock<'ctx>,
     /// Leave here: the block after the loop.
     pub break_target: inkwell::basic_block::BasicBlock<'ctx>,
+    /// This frame is an AFFINE schedule band, not a runtime CFG loop.
+    ///
+    /// A band's trip count is statically known, so its body is emitted as
+    /// straight-line code inside a known iteration space. There is no runtime exit to
+    /// branch to, and creating one would defeat the polyhedral form the whole pass
+    /// exists to produce.
+    ///
+    /// This flag exists so the REFUSAL can be accurate. A `break` inside a `forall`
+    /// used to be reported as "`break` outside a loop: no enclosing loop is being
+    /// built" -- which is false, the program has a loop, and it sends the reader
+    /// looking in the wrong place entirely. The two targets on an affine frame are
+    /// never branched to; the flag is checked first.
+    pub affine_band: bool,
 }
 
 impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
@@ -527,6 +540,20 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                             .to_string(),
                     )
                 })?;
+                if targets.affine_band {
+                    return Err(CodegenError::UnsupportedFeature(
+                        "`break` inside an affine `forall` loop. This is NOT the same as \
+                         being outside a loop -- there IS a loop here, but its trip count \
+                         is statically known and its body is emitted as straight-line \
+                         code inside that iteration space, so there is no runtime exit to \
+                         branch to. Leaving early would also break the polyhedral form \
+                         the schedule pass exists to produce: the dependence analysis \
+                         that chose this band assumes every iteration runs. Use a \
+                         `while` or a counted `for` when the number of iterations is \
+                         not known in advance."
+                            .to_string(),
+                    ));
+                }
                 self.value_builder
                     .builder()
                     .build_unconditional_branch(targets.break_target)
@@ -549,6 +576,18 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                             .to_string(),
                     )
                 })?;
+                if targets.affine_band {
+                    return Err(CodegenError::UnsupportedFeature(
+                        "`continue` inside an affine `forall` loop. This is NOT the same \
+                         as being outside a loop -- there IS a loop here, but every \
+                         iteration belongs to its statically known iteration space, and \
+                         the dependence analysis that scheduled the band assumes the \
+                         body runs on all of them. Skipping iterations would invalidate \
+                         that schedule. Use a `while` or a counted `for` when some \
+                         iterations may be skipped."
+                            .to_string(),
+                    ));
+                }
                 self.value_builder
                     .builder()
                     .build_unconditional_branch(targets.continue_target)
@@ -627,6 +666,9 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 self.loop_stack.push(LoopTargets {
                     continue_target: step_block,
                     break_target: exit_block,
+                    // A runtime CFG loop has real exit edges, so `break` and `continue`
+                    // have somewhere real to go.
+                    affine_band: false,
                 });
                 let body_result = self.build_expr(body, quantities);
                 self.loop_stack.pop();

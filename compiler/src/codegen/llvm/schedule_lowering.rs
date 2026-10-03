@@ -452,6 +452,15 @@ pub struct ScheduleLowering<'ctx, 'a> {
     access_emitter: AccessEmitter<'ctx>,
     optimizer: PolyhedralOptimizer,
     parallel_emitter: ParallelEmitter<'ctx>,
+    /// How many loop bands are currently being emitted around this statement.
+    ///
+    /// This is what decides whether a statement's body is inside an affine loop.
+    /// It cannot be inferred from "is there a band above me", because EVERY statement
+    /// sits under a Domain node, including a function's top-level statements -- so a
+    /// top-level `break` was reported as "`break` inside an affine `forall` loop",
+    /// which is worse than the original wrong message: the program has no loop at all
+    /// and now claims to have one.
+    band_depth: usize,
 }
 
 impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
@@ -481,6 +490,9 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
             access_emitter,
             optimizer,
             parallel_emitter,
+            // No band is being emitted for a statement that has not been reached
+            // through `lower_band`.
+            band_depth: 0,
         })
     }
 
@@ -606,6 +618,11 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
                         access_relations,
                         callee_params,
                     )?;
+                    // Statements lowered from here ARE inside the loop nest this band
+                    // emits, so their bodies carry the affine frame. Without this,
+                    // `emit_statement_body` cannot tell a band body from a top-level
+                    // statement -- both sit under a Domain node.
+                    inner.band_depth = self.band_depth + 1;
                     inner.lower_node(child)
                 },
             )?;
@@ -635,6 +652,11 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
                         access_relations,
                         callee_params,
                     )?;
+                    // Statements lowered from here ARE inside the loop nest this band
+                    // emits, so their bodies carry the affine frame. Without this,
+                    // `emit_statement_body` cannot tell a band body from a top-level
+                    // statement -- both sit under a Domain node.
+                    inner.band_depth = self.band_depth + 1;
                     inner.lower_node(child)
                 },
             )?;
@@ -998,13 +1020,46 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
     /// it must outlive its own expression.
     fn emit_statement_body(&mut self, stmt: &PirStatement) -> CodegenResult<()> {
         let quantities = self.quantities;
+        //
+        // An AFFINE frame, not an empty stack.
+        //
+        // This used to be `Vec::new()` with a comment saying no loop was being lowered
+        // -- which was wrong. The body IS inside a band: `forall i in 0..4 { ... }`
+        // emits straight-line code for each point of a known iteration space, and this
+        // function builds that code. With an empty stack, a `break` in the body was
+        // reported as being "outside a loop", telling the author their program had no
+        // loop when it plainly has one.
+        //
+        // The two targets are never branched to -- `affine_band` is checked before
+        // either is read -- but they must be real block values.
+        //
+        // The entry block stands in for both targets. They are never branched to --
+        // `affine_band` is checked first and refuses -- but `LoopTargets` holds real
+        // block values, and the function's entry block is one that certainly exists.
+        // A `for` is chosen over inventing two unreachable blocks so that a future
+        // refactor which DID branch here would produce a visible wrong answer rather
+        // than a dangling block reference.
+        let band_exit = self
+            .function
+            .get_first_basic_block()
+            .expect("a function under construction always has an entry block");
         let mut lowerer = PirExprLowerer {
             value_builder: self.value_builder,
             module: self.module,
             current_function: self.function,
             callee_params: self.callee_params,
             in_statement_position: true,
-            loop_stack: Vec::new(),
+            loop_stack: if self.band_depth > 0 {
+                vec![crate::codegen::llvm::expr_lowering::LoopTargets {
+                    continue_target: band_exit,
+                    break_target: band_exit,
+                    affine_band: true,
+                }]
+            } else {
+                // Not inside a loop. An empty stack is correct HERE and only here, and
+                // it makes `break` say "outside a loop", which is the truth.
+                Vec::new()
+            },
         };
         // The value is discarded because a statement body's result is not the point --
         // its SIDE EFFECTS are. Every arm of `build_expr` that has a side effect emits

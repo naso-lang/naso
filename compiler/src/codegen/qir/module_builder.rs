@@ -509,6 +509,8 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
                     .push(crate::codegen::llvm::expr_lowering::LoopTargets {
                         continue_target: step_block,
                         break_target: exit_block,
+                        // A runtime CFG loop has real exit edges.
+                        affine_band: false,
                     });
                 if self
                     .builder

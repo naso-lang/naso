@@ -568,6 +568,32 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
                  being reversible."
                     .to_string(),
             )),
+            //
+            // REFUSED, not ignored.
+            //
+            // A `return` in the middle of a QIR function needs the function's result
+            // type threaded into `build_expr`, which only the function emitter knows.
+            // Guessing it would coerce the returned value to something the signature
+            // does not say, which is a wrong answer wearing a valid signature.
+            //
+            // The LLVM backend emits it. This one refuses until it can do the same
+            // without inventing a type.
+            PirExpr::Return { value } => Err(CodegenError::UnsupportedFeature(
+                match value {
+                    Some(_) => {
+                        "a `return` with a value inside a nested block is not \
+                                emitted by the QIR backend yet. Emitting it would mean \
+                                inventing the function's result type here, which only \
+                                the function emitter knows, and coercing the returned \
+                                value to a type the signature does not state."
+                    }
+                    None => {
+                        "a bare `return` inside a nested block is not emitted by \
+                             the QIR backend yet."
+                    }
+                }
+                .to_string(),
+            )),
             PirExpr::Index { base, indices: _ } => {
                 let base_val = self.build_expr(base)?;
                 Ok(base_val)

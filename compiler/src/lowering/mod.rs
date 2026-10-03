@@ -1334,13 +1334,70 @@ impl LoweringContext {
             ExprKind::Block(b) => {
                 let first_new = self.statements.len();
                 let first_sched = self.schedule_nodes.len();
+                let mut parts: Vec<crate::ir::PirExpr> = Vec::new();
                 for st in &b.stmts {
+                    //
+                    // A `return` in this block becomes a `PirExpr::Return` PART, not a
+                    // hoisted function-scope statement.
+                    //
+                    // `lower_stmt` is the wrong entry point here. It turns `return e`
+                    // into a PIR statement and records it in `pending_return_stmt`, and
+                    // this arm then lifts the block's statements back out of the
+                    // enclosing list -- so the return would escape its branch entirely
+                    // and the statements after the `if` would be skipped. That is how
+                    // `if x > 0 { return 1; } return -1;` came to return 1
+                    // unconditionally.
+                    //
+                    // Intercepting it keeps the return inside the branch, so the branch
+                    // that fires is the branch that leaves.
+                    //
+                    // BOTH spellings. `return` reaches this block as an EXPRESSION
+                    // statement (`StmtKind::Expr` holding `ExprKind::Return`) when it
+                    // is written with a semicolon inside a block, which is how
+                    // `if c { return 7; }` parses. Only intercepting
+                    // `StmtKind::Return` therefore missed the entire case this change
+                    // exists for: the arm lowered to `IntLit(7)`, the `if` picked 7 or
+                    // 0 as a VALUE, and `return -1` after the `if` returned -1
+                    // unconditionally. It compiled, verified, and was wrong.
+                    //
+                    // The tell is that the emitted `then` block was EMPTY while the
+                    // merge phi still held 7 -- a return that returns nothing.
+                    let as_return: Option<Option<&crate::ast::expr::Expr>> = match &st.kind {
+                        crate::ast::StmtKind::Return(v) => Some(v.as_ref()),
+                        crate::ast::StmtKind::Expr(e) if matches!(e.kind, ExprKind::Return(_)) => {
+                            match &e.kind {
+                                ExprKind::Return(v) => Some(v.as_deref()),
+                                _ => unreachable!("guarded by the matches! above"),
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(value) = as_return {
+                        let lowered = match value {
+                            Some(v) => Some(Box::new(self.lower_expr(v)?)),
+                            None => None,
+                        };
+                        parts.push(crate::ir::PirExpr::Return { value: lowered });
+                        continue;
+                    }
+                    //
+                    // Drain whatever `lower_stmt` just added, IMMEDIATELY.
+                    //
+                    // Appending them all after the loop was a silent reordering. A
+                    // nested `if` inside this block is itself lowered through
+                    // `ExprKind::Block`, which pushes its parts onto
+                    // `self.statements` -- so `if n > 5 { return 1; }` inside
+                    // `{ ...; return 2; }` landed in `statements`, while the `return 2`
+                    // went straight into `parts`. Extending at the end put `return 2`
+                    // FIRST, made the inner `return 1` unreachable, and turned
+                    // `n = 9` into 2 instead of 1.
+                    //
+                    // Draining per statement keeps every part in the order it was
+                    // written, which is the only order that can be right.
                     self.lower_stmt(st)?;
+                    parts.extend(self.statements[first_new..].iter().map(|s| s.body.clone()));
+                    self.statements.truncate(first_new);
                 }
-                let mut parts: Vec<crate::ir::PirExpr> = self.statements[first_new..]
-                    .iter()
-                    .map(|s| s.body.clone())
-                    .collect();
 
                 // A `return` inside this block is REFUSED, not hoisted.
                 //
@@ -1358,16 +1415,57 @@ impl LoweringContext {
                 // expression works and is covered; early-return control flow inside an
                 // `if` needs real multi-exit lowering, which is a larger change than
                 // it looks and is not something to fake.
-                if self.pending_return_stmt.is_some() {
-                    return Err(LoweringError::Unsupported(
-                        "a `return` inside an `if` or `else` block is not lowered. \
-                         Hoisting it would skip whatever follows the `if`, so it is \
-                         refused rather than compiled to the wrong value. `if` whose \
-                         branches produce a value works. For an early return, rewrite \
-                         the condition so one branch falls through, or move the `if` \
-                         into a separate function."
-                            .to_string(),
-                    ));
+                //
+                // A `return` in this block is now lowered IN PLACE, as `PirExpr::Return`.
+                //
+                // It used to be refused, and the refusal was right about the mechanism:
+                // a `return` lowers to a PIR statement plus a flag naming it, and this
+                // arm LIFTS its block's statements back out of the enclosing list. The
+                // only way to keep an arm's `return` was to hoist it to function scope,
+                // and hoisting is wrong -- the statements after the `if` would be
+                // skipped. `if x > 0 { return 1; } return -1;` hoisted returned 1
+                // unconditionally: the condition was computed and controlled nothing.
+                //
+                // Keeping it in the branch instead means the branch that actually fires
+                // is the branch that leaves, which is what the source says.
+                //
+                // The statements that FOLLOW the return inside the same arm are still
+                // refused, and that is a real limit rather than a shortcut: they are
+                // unreachable, and emitting them would produce code differing from
+                // correct only by an answer nobody can see.
+                //
+                // A `return` in this block must be the block's LAST effect, because
+                // nothing after it can run.
+                //
+                // This checks the SOURCE order, not whether a return happened: a
+                // `return` as the block's final statement is the normal case and is
+                // exactly what this whole change exists to support. Only a return
+                // with statements after it is the problem, because those statements
+                // are unreachable -- and emitting them would produce code that differs
+                // from the correct program by an answer nobody can see.
+                //
+                // BOTH spellings again -- a `return` written with a semicolon inside a
+                // block arrives as `StmtKind::Expr` holding `ExprKind::Return`. A guard
+                // that matched only `StmtKind::Return` passed `if n > 0 { return 1;
+                // n = 5; }` straight through, because the return it was looking for was
+                // never in that shape.
+                if let Some(idx) = b.stmts.iter().position(|s| {
+                    matches!(s.kind, crate::ast::StmtKind::Return(_))
+                        || matches!(
+                            &s.kind,
+                            crate::ast::StmtKind::Expr(e)
+                                if matches!(e.kind, ExprKind::Return(_))
+                        )
+                }) && idx + 1 < b.stmts.len()
+                {
+                    return Err(LoweringError::Unsupported(format!(
+                        "a `return` is followed by {} more statement(s) in the same \
+                         `if` or `else` block. Those statements cannot run, and emitting \
+                         them anyway would compile to a different program rather than a \
+                         visibly wrong one. Move the `return` last, or restructure so \
+                         the branch falls through.",
+                        b.stmts.len() - idx - 1
+                    )));
                 }
 
                 // The inner statements belong to this block, not to the enclosing

@@ -729,6 +729,68 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                     .map_err(|e| CodegenError::InstructionError(e.to_string()))?
                     .into())
             }
+            //
+            // `return` inside a nested block: build the value, emit `ret` HERE.
+            //
+            // This is what makes `if c { return 1; } return -1;` mean what it says.
+            // Emitting the return where it is written is the whole point -- the branch
+            // that fires is the branch that leaves.
+            //
+            // The value is coerced to the enclosing function's REAL return type, read
+            // from `current_function`. Guessing it would be the failure mode this arm
+            // exists to avoid: an `i64` returned from an `f32` function would be
+            // reinterpreted, and the wrong number would leave through a valid-looking
+            // signature.
+            //
+            // After the `ret` the block is terminated. Callers that branch to a merge
+            // must notice that -- the `if` arm already does, via `get_terminator()`,
+            // for `break` and `continue`, and a `return` is the same case: the arm does
+            // not flow into the merge.
+            PirExpr::Return { value } => {
+                let func = self.current_function;
+                let ret_type = func.get_type().get_return_type();
+                let emitted = match value {
+                    None => {
+                        // A bare `return` in a function that declares a result is a type
+                        // error, and inventing a zero would be a wrong answer. Say so.
+                        if !ret_type.is_none() {
+                            return Err(CodegenError::UnsupportedFeature(
+                                "a bare `return` in a function whose signature declares a \
+                                 result type. The source does not say what to return, and \
+                                 returning zero here would be an invented answer."
+                                    .to_string(),
+                            ));
+                        }
+                        self.value_builder
+                            .builder()
+                            .build_return(None)
+                            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                        self.zero_placeholder()?.into()
+                    }
+                    Some(v) => {
+                        let lowered = self.build_expr(v, quantities)?;
+                        let want = ret_type.ok_or_else(|| {
+                            CodegenError::UnsupportedFeature(
+                                "a `return` with a value inside a nested block, in a \
+                                 function whose signature returns nothing. There is no \
+                                 value to return it from."
+                                    .to_string(),
+                            )
+                        })?;
+                        let coerced = if lowered.get_type() == want {
+                            lowered
+                        } else {
+                            self.coerce_to(lowered, want, "a returned value")?
+                        };
+                        self.value_builder
+                            .builder()
+                            .build_return(Some(&coerced))
+                            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                        coerced
+                    }
+                };
+                Ok(emitted)
+            }
             PirExpr::If {
                 cond,
                 then_branch,

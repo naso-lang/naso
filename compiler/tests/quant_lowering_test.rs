@@ -388,6 +388,8 @@ fn count_in_expr(expr: &PirExpr, var: &str) -> usize {
         PirExpr::Break { value: None, .. } | PirExpr::Continue => 0,
         PirExpr::Assign { target, value } => count_in_expr(target, var) + count_in_expr(value, var),
         PirExpr::Cast { expr, .. } => count_in_expr(expr, var),
+        // A returned value is consumed by leaving, so it is a reference like any other.
+        PirExpr::Return { value } => value.as_deref().map_or(0, |v| count_in_expr(v, var)),
         _ => 0,
     }
 }
@@ -419,6 +421,8 @@ fn expr_contains_var(expr: &PirExpr, var: &str) -> bool {
         PirExpr::Reversible { body, inverse } => {
             expr_contains_var(body, var) || expr_contains_var(inverse, var)
         }
+        // A returned value is CONSUMED by leaving the function, so it is a use.
+        PirExpr::Return { value } => value.as_deref().is_some_and(|v| expr_contains_var(v, var)),
         PirExpr::QuantumOp {
             op: _,
             args,

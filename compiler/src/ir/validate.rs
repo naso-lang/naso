@@ -179,6 +179,11 @@ pub fn validate_pir(module: &PirModule) -> Result<(), Vec<ValidationError>> {
 fn expr_contains_var(expr: &PirExpr, var: &str) -> bool {
     match expr {
         PirExpr::Var(v) => v == var,
+        // A returned value is CONSUMED by leaving the function, so it is a use.
+        // Excluding it would let a `[1]` value returned from inside a branch pass
+        // linearity as unused -- the resource escapes through the return edge and
+        // nothing in the analysis ever looks there.
+        PirExpr::Return { value } => value.as_deref().is_some_and(|v| expr_contains_var(v, var)),
         PirExpr::Binary { left, right, .. } => {
             expr_contains_var(left, var) || expr_contains_var(right, var)
         }

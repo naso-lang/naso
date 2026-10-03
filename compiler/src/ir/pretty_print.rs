@@ -69,6 +69,12 @@ pub fn format_pir_expr(expr: &PirExpr) -> String {
 
 fn pir_expr_to_string(expr: &PirExpr, _indent: usize) -> String {
     match expr {
+        // A return is CONTROL FLOW, not a value. Printing it as one is what lets it be
+        // seen leaving the branch that fires rather than hoisted to the function tail.
+        PirExpr::Return { value } => match value {
+            Some(v) => format!("return {};", pir_expr_to_string(v, 0)),
+            None => "return;".to_string(),
+        },
         PirExpr::IntLit(v) => format!("{}", v),
         PirExpr::FloatLit(v) => format!("{}", v),
         PirExpr::BoolLit(v) => format!("{}", v),

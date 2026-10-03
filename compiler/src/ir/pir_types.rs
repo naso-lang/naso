@@ -132,6 +132,29 @@ pub enum PirExpr {
     /// Order matters and is preserved: this is a sequence, not a set.
     Stmts(Vec<PirExpr>),
 
+    /// Return from the enclosing FUNCTION, with `value`, or with nothing.
+    ///
+    /// This exists for a `return` in a position where the function's tail cannot carry
+    /// it -- inside an `if` or `else` arm, inside a loop body. Those used to be
+    /// REFUSED.
+    ///
+    /// The refusal was correct about the mechanism and wrong about the fix. A `return`
+    /// lowers to a PIR *statement* plus a flag naming it, and an `if` arm is built by
+    /// lifting its statements back out of the enclosing list. So the only way to keep
+    /// an arm's `return` was to hoist it to function scope -- and hoisting is wrong,
+    /// because the statements after the `if` would then be skipped. `if x > 0 { return
+    /// 1; } return -1;` hoisted returns 1 unconditionally: the condition was computed
+    /// correctly and controlled nothing.
+    ///
+    /// A return is therefore an EXPRESSION here, evaluated where it is written, so the
+    /// branch that actually fires is the branch that leaves. Statements after it in
+    /// the same arm are unreachable and are refused, since silently emitting them
+    /// would produce code whose only difference from correct code is a wrong answer
+    /// nobody can see.
+    ///
+    /// `None` is a bare `return` in a function with no result type.
+    Return { value: Option<Box<PirExpr>> },
+
     /// Leave the innermost enclosing loop.
     ///
     /// `value` is the loop's result, so `break v;` is a way to produce one. A loop
@@ -680,6 +703,12 @@ impl PirModule {
             // make every statement inside a loop body invisible to linearity
             // checking, so a linear value used only inside a loop would pass -- a
             // soundness hole, not a cosmetic one.
+            // A `return` carries a value that is CONSUMED by leaving, so it counts as a
+            // use. Ignoring it would make a `[1]` value returned from inside a branch
+            // look unused, and linearity would pass a program that leaks the resource.
+            PirExpr::Return { value } => value
+                .as_deref()
+                .is_some_and(|v| self.expr_contains_var(v, var)),
             PirExpr::Stmts(parts) => parts.iter().any(|p| self.expr_contains_var(p, var)),
             // BOTH sides: a linear value appearing in the target is being bound to a
             // location, and one in the value is being consumed. Both are uses.
@@ -896,6 +925,12 @@ impl std::error::Error for ValidationError {}
 
 fn pir_expr_to_string(expr: &PirExpr, _indent: usize) -> String {
     match expr {
+        // A return is CONTROL FLOW, not a value. Printing it as one is what lets it be
+        // seen leaving the branch that fires rather than hoisted to the function tail.
+        PirExpr::Return { value } => match value {
+            Some(v) => format!("return {};", pir_expr_to_string(v, 0)),
+            None => "return;".to_string(),
+        },
         PirExpr::IntLit(v) => format!("{}", v),
         PirExpr::FloatLit(v) => format!("{}", v),
         PirExpr::BoolLit(v) => format!("{}", v),

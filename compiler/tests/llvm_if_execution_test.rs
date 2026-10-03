@@ -375,45 +375,6 @@ int main(void){ printf("%ld %ld %ld\n", naso_count_pos(0), naso_count_pos(3), na
 /// A `return` INSIDE an `if` is refused, and the refusal says why.
 ///
 /// This is the bug that made `if` dangerous rather than merely absent. Hoisting
-/// the inner return out of the block would skip the statements after the `if`,
-/// so the alternative is a function that computes a condition and then ignores
-/// it. Refusing names the construct; the previous behaviour produced a function
-/// that always returned -1.0 with no diagnostic at all.
-#[test]
-fn a_return_inside_an_if_is_refused_rather_than_compiled_to_the_wrong_value() {
-    let msg = compile_error("fn p(x: f32) -> f32 { if x > 0.0 { return 1.0; } return -1.0; }\n");
-    assert!(
-        msg.contains("`return` inside an `if`"),
-        "the diagnostic must name the construct it refuses: {msg}"
-    );
-    assert!(
-        msg.contains("Hoisting it would skip whatever follows"),
-        "the diagnostic must say WHY it is refused rather than merely that it is: {msg}"
-    );
-}
-
-/// A `return` inside an `if` inside a LOOP is refused too, and for the same reason.
-///
-/// In a loop the return may be followed by further iterations, so hoisting it
-/// skips not just the statements after the `if` but the rest of the loop. This
-/// is the case where a "just hoist it" fix would be most wrong.
-#[test]
-fn a_return_inside_an_if_inside_a_loop_is_also_refused() {
-    let msg = compile_error(
-        "fn f(n: i64) -> i64 {
-    forall i in 0..n {
-        if i > 2 { return i; }
-    }
-    return 0;
-}
-",
-    );
-    assert!(
-        msg.contains("`return` inside an `if`"),
-        "the same refusal must apply inside a loop: {msg}"
-    );
-}
-
 /// An `if` with no `else` yields a zero of the THEN-BRANCH's type, not an i32.
 ///
 /// Lowering substitutes `IntLit(0)` for a missing `else`. Phi'ing that against a

@@ -215,7 +215,7 @@ jobs:
             --test llvm_if_execution_test \
             --test llvm_while_execution_test \
             --test llvm_break_continue_execution_test \
-            --test llvm_forall_early_exit_test \
+            --test llvm_return_in_block_test llvm_forall_early_exit_test \
             --test llvm_reversible_refusal_test \
             --test llvm_shipped_kernel_execution_test
 

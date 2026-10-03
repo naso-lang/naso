@@ -23,6 +23,24 @@ pub(crate) fn is_control_flow_stmt(kind: &ExprKind) -> bool {
             | ExprKind::For(..)
             | ExprKind::While(..)
             | ExprKind::Forall(..)
+            // `return` is control flow, not a value.
+            //
+            // Without this, a trailing `return 2;` inside a block -- written without
+            // the semicolon acting as a terminator, or with it swallowed -- was
+            // classified as the block's TAIL EXPRESSION and appended AFTER the block's
+            // statements instead of staying where it was written.
+            //
+            // The observable effect was a reordering that changed the answer:
+            // `if n > 0 { if n > 5 { return 1; } return 2; }` put `return 2` BEFORE
+            // the inner `if`, so the inner `return 1` became unreachable and `n = 9`
+            // returned 2 instead of 1. It compiled, verified, and was wrong --
+            // a silent wrong answer from a single missing match arm.
+            //
+            // `break` and `continue` are in the same category and are listed for the
+            // same reason: neither produces a value, so neither can be a tail.
+            | ExprKind::Return(..)
+            | ExprKind::Break(..)
+            | ExprKind::Continue
     )
 }
 

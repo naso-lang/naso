@@ -638,7 +638,7 @@ int main(void){ printf("%ld %ld %ld\n", naso_f(3, 4), naso_f(-3, 4), naso_f(0, 0
 /// enough that `double` represents it exactly (so the expected value is exact and the test
 /// is not comparing rounded output).
 #[test]
-fn a_large_negative_integer_promotes_as_a_SIGNED_value() {
+fn a_large_negative_integer_promotes_as_a_signed_value() {
     let ir = build_ir("fn f(a: i64, b: f32) -> f64 { a + b }\n");
     let driver = r#"
 #include <stdio.h>
@@ -656,7 +656,7 @@ int main(void){ printf("%.1f\n", naso_f(-(1L << 40), 0.5)); return 0; }
 /// The same for the integer-on-the-left of a comparison, where the value is consumed by a
 /// predicate rather than summed.
 #[test]
-fn a_large_negative_integer_compares_as_a_SIGNED_value() {
+fn a_large_negative_integer_compares_as_a_signed_value() {
     let ir = build_ir("fn f(a: i64, b: f32) -> i64 { if a < b { 1 } else { 0 } }\n");
     let driver = r#"
 #include <stdio.h>

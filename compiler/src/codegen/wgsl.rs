@@ -254,8 +254,30 @@ impl WgslContext {
             PirExpr::Var(v) => {
                 wgsl.push_str(&format!("{}{}\n", indent_str, v));
             }
+            //
+            // REFUSED, not commented out.
+            //
+            // Writing `// Unsupported expr: ...` into the output and returning `Ok`
+            // produces a WGSL module that naga validates and that computes the wrong
+            // thing, because the operation it was supposed to emit is simply absent.
+            // A missing statement is not a visible error -- it is a program that runs.
+            //
+            // This is the same defect as the `Reversible` inverse drop in the LLVM and
+            // QIR backends: an unimplemented operation reported as success.
+            //
+            // In particular `return` must land here rather than being special-cased.
+            // WGSL has no expression-level `return`, and a conditional return inside a
+            // compute kernel needs the whole entry point's control flow, which this
+            // emitter does not model. Silently dropping it would drop the branch that
+            // selects it.
             _ => {
-                wgsl.push_str(&format!("{}// Unsupported expr: {:?}\n", indent_str, expr));
+                return Err(CodegenError::UnsupportedFeature(format!(
+                    "the WGSL backend cannot emit {:?}. It previously wrote a \
+                     `// Unsupported expr` comment into the output and reported \
+                     success, which yields a module that validates and computes the \
+                     wrong result.",
+                    expr
+                )));
             }
         }
         Ok(())
@@ -381,6 +403,21 @@ fn count_in_expr(expr: &PirExpr, var: &str) -> usize {
         PirExpr::Reversible { body, inverse } => {
             count_in_expr(body, var) + count_in_expr(inverse, var)
         }
+        //
+        // A BLOCK is where control flow now lives. `Stmts` had no arm here, so it
+        // fell through to `_ => 0` and every occurrence inside a block counted as
+        // NOTHING.
+        //
+        // `if c { return 7; }` lowers to exactly that, which made the whole
+        // linearity check blind to the common case: a `[1]` value returned from a
+        // branch was invisible, and so was one read twice inside a loop body. The
+        // check still ran, still passed programs, and reported "used 0 times" on the
+        // programs it did catch -- a diagnostic that described its own blindness
+        // rather than the user's error.
+        PirExpr::Stmts(parts) => parts.iter().map(|p| count_in_expr(p, var)).sum(),
+        // A `return`'s value is CONSUMED by leaving the function, so it is a use.
+        // Omitting it would let a linear resource escape through the return edge.
+        PirExpr::Return { value } => value.as_deref().map_or(0, |v| count_in_expr(v, var)),
         PirExpr::QuantumOp {
             op: _,
             args,

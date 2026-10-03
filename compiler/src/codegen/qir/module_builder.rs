@@ -12,7 +12,113 @@ use inkwell::context::Context as LlvmContext;
 use inkwell::module::Module as LlvmModule;
 use inkwell::types::{BasicTypeEnum, IntType, PointerType};
 use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, FunctionValue, PointerValue};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+/// The operation name if `expr` is a quantum operation, otherwise `""`.
+///
+/// Used at the point a `let` binds a value, to decide whether the name being bound is a
+/// qubit. Only a direct quantum operation is recognised: anything else -- a computation, a
+/// scalar read, a call -- binds a name that is not a qubit, and an unrecognised shape is left
+/// on the classical path so it is not refused as a quantum operand.
+fn value_op(expr: &PirExpr) -> &str {
+    match expr {
+        PirExpr::QuantumOp { op, .. } => op.as_str(),
+        _ => "",
+    }
+}
+
+/// Whether a lowered quantum operation PRODUCES a qubit rather than acting on one.
+///
+/// `qalloc` allocates. Every other quantum operation either acts on existing qubits or
+/// returns a classical result, so claiming a pointer for those would be wrong in the other
+/// direction.
+///
+/// This is what distinguishes `ptr null` from `i64 0` as the value of `let [1] q = qalloc(1)`.
+/// QIR models a qubit as a pointer while the builder's generic placeholder is an integer, and
+/// an integer passed to `qir.h(ptr)` is rejected by the LLVM verifier. Deciding this from the
+/// operation is the only place that knows both facts.
+fn qir_intrinsic_returns_qubit(op: &str) -> bool {
+    op.eq_ignore_ascii_case("qalloc")
+}
+
+/// The QIR intrinsic name a lowered quantum operation name refers to, if one exists.
+///
+/// # Why the mapping is explicit
+///
+/// Lowering names operations the way `GateKind`'s `Display` spells them -- `"H"`, `"CX"`,
+/// `"reset"` -- and names allocation `"qalloc"`. The intrinsic table declares `qir.h`,
+/// `qir.cx` and `qir.qubit_alloc`. Concatenating `qir.{op}` therefore looked up names that do
+/// not exist, and the backend refused every gate and every allocation. This was the second of
+/// the two defects that stopped the QIR backend emitting any circuit.
+///
+/// # Why `None` rather than a guess
+///
+/// An unmapped operation returns `None`, which the caller turns into a refusal. Falling back
+/// to `qir.h` -- which the QIR classifier once did -- would turn a mis-spelled or
+/// not-yet-supported operation into a Hadamard: working code applying the wrong unitary.
+fn qir_intrinsic_for(op: &str) -> Option<&'static str> {
+    // Lowering names a gate the way `GateKind`'s `Display` spells it -- "H", "CX" -- while
+    // hand-built PIR, the QIR classifier and the hardware exporters use the lowercase
+    // intrinsic-style name -- "h", "cx". Both spellings name the same operation, so both are
+    // accepted here. Normalising on case rather than duplicating every arm keeps the mapping
+    // to one line per operation, so a gate cannot be added to one spelling and forgotten in
+    // the other.
+    let op = op.to_ascii_lowercase();
+    Some(match op.as_str() {
+        // Allocation and release. Not gates, but quantum operations with no `GateKind`.
+        "qalloc" => "qir.qubit_alloc",
+        "qfree" => "qir.qubit_release",
+
+        // Single-qubit unitaries.
+        "h" | "hadamard" => "qir.h",
+        "x" | "pauli_x" => "qir.x",
+        "y" | "pauli_y" => "qir.y",
+        "z" | "pauli_z" => "qir.z",
+        "s" => "qir.s",
+        "t" => "qir.t",
+        "rx" => "qir.rx",
+        "ry" => "qir.ry",
+        "rz" => "qir.rz",
+
+        // Two-qubit gates.
+        "cx" | "cnot" => "qir.cx",
+        "cy" => "qir.cy",
+        "cz" => "qir.cz",
+
+        // Measurement. The base profile declares `qir.mz`/`qir.mx`/`qir.my` for a per-basis
+        // read and a `qir.measure` that writes through a result pointer. Naso measures in the
+        // computational basis, so `mz` is the read that matches.
+        "measure" | "mz" => "qir.mz",
+        "mx" => "qir.mx",
+        "my" => "qir.my",
+
+        // `phase(theta, q)` is a Z rotation by `theta`.
+        "phase" => "qir.rz",
+
+        // Two-qubit exchange, and the three-qubit Toffoli.
+        "swap" => "qir.swap",
+        "iswap" => "qir.iswap",
+        "ccx" | "toffoli" => "qir.ccx",
+
+        // The dynamic family: a call whose arity is chosen at runtime. QIR takes these
+        // through `qir.controlled`, with `qir.adjoint` for a reversed circuit.
+        "controlled" => "qir.controlled",
+        "adjoint" => "qir.adjoint",
+
+        // `reset(q)` returns the qubit to |0> IN PLACE. The base profile declares no reset
+        // intrinsic, so it is REFUSED rather than approximated by a release -- a release
+        // hands the qubit away, which is not what `reset` means.
+        "reset" => return None,
+
+        // `entangle(q...)` has no single-intinsic implementation, and approximating it by a
+        // CNOT would silently compute something else. Refused; see the module note.
+        "entangle" => return None,
+
+        // Anything else: an operation with no declared intrinsic. See above on why this is
+        // not a guess.
+        _ => return None,
+    })
+}
 
 // QIR Module Builder for generating quantum IR
 pub struct QIRModuleBuilder<'ctx> {
@@ -32,6 +138,18 @@ pub struct QIRModuleBuilder<'ctx> {
     // Variable allocations: pointer plus the pointee type (required by
     // opaque-pointer `build_load` in inkwell 0.10)
     variables: HashMap<String, (PointerValue<'ctx>, BasicTypeEnum<'ctx>)>,
+
+    /// Names this module bound to a QUBIT, as opposed to a scalar.
+    ///
+    /// The backend emits one `void` function per PIR statement, so a qubit bound by
+    /// `qalloc` in an earlier statement is genuinely not in scope when a later statement uses
+    /// it. That must be refused -- applying the gate to a placeholder integer would emit valid
+    /// QIR that is not the source program -- but a CLASSICAL binding that crosses statements
+    /// is ordinary and must keep working.
+    ///
+    /// This set is what tells the two apart, and it is populated at the point of allocation,
+    /// where the backend knows the value is a qubit.
+    quantum_var: HashSet<String>,
     // Declared intrinsics
     declared_intrinsics: HashMap<String, FunctionValue<'ctx>>,
     /// Enclosing loops, outermost first, so `break`/`continue` take the LAST.
@@ -66,6 +184,7 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
             current_function: None,
             current_block: None,
             variables: HashMap::new(),
+            quantum_var: HashSet::new(),
             declared_intrinsics: HashMap::new(),
             loop_stack: Vec::new(),
         };
@@ -98,6 +217,7 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
             current_function: None,
             current_block: None,
             variables: HashMap::new(),
+            quantum_var: HashSet::new(),
             declared_intrinsics: HashMap::new(),
             loop_stack: Vec::new(),
         };
@@ -274,6 +394,12 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
 
         self.current_function = None;
         self.current_block = None;
+        // `variables` is cleared: each statement is its own function, so its locals are gone.
+        //
+        // `quantum_var` deliberately PERSISTS. It records that a NAME denotes a qubit, which
+        // is precisely the fact that survives the scope reset and is needed to tell "a qubit
+        // that went out of scope" apart from "a scalar that was never defined". Clearing it
+        // here would restore the old silent `i64 0`.
         self.variables.clear();
 
         Ok(())
@@ -298,8 +424,38 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
                         .builder
                         .build_load(*pointee_ty, *ptr, name)
                         .map_err(|e| CodegenError::InstructionError(e.to_string()))?)
+                } else if self.quantum_var.contains(name) {
+                    //
+                    // REFUSED, not zero -- but ONLY for a quantum operand.
+                    //
+                    // A `[1]` qubit bound in an EARLIER `PirStatement` is unbound here,
+                    // because every statement is emitted as its own `void` function with its
+                    // own `variables` map (see `build_statement`). So a two-statement circuit
+                    //
+                    //     let [1] a: Qubit = qalloc(1);  // statement 0
+                    //     hadamard(a);                    // statement 1
+                    //
+                    // found `a` unbound and used the integer 0, which LLVM's verifier then
+                    // rejected. Returning zero also hides the real problem: the qubit exists,
+                    // it is just not reachable from here.
+                    //
+                    // The scope of this refusal is deliberately narrow. A CLASSICAL binding
+                    // that crosses statements is legal and must keep working -- the module's
+                    // statements are the Naso program's statements, and a scalar computed in
+                    // one and used in the next is ordinary. Refusing those would reject
+                    // correct programs to fix a quantum-specific problem. So the check applies
+                    // only to names the quantum binder introduced.
+                    Err(CodegenError::QirError(format!(
+                        "quantum operand `{name}` is not bound in this statement. The QIR \
+                         backend emits one void function per PIR statement, so a qubit \
+                         allocated in an earlier statement is not in scope here. Emitting a \
+                         placeholder instead would apply the gate to something other than \
+                         that qubit."
+                    )))
                 } else {
-                    // Return zero for undefined
+                    // A classical name that is genuinely unbound. The zero keeps the previous
+                    // behaviour for this path; it is not a quantum operand, so it cannot
+                    // misidentify a qubit.
                     Ok(self.llvm_context.i64_type().const_int(0, false).into())
                 }
             }
@@ -348,9 +504,23 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
                 self.variables
                     .insert(name.clone(), (alloca, val.get_type()));
 
+                // If the bound value is a qubit, remember that. `build_statement` clears
+                // `variables` between statements, so this set is what lets a later
+                // statement distinguish "a qubit that went out of scope" from "a scalar that
+                // was never defined".
+                if qir_intrinsic_returns_qubit(value_op(value)) {
+                    self.quantum_var.insert(name.clone());
+                }
+
                 let result = self.build_expr(body)?;
 
                 self.variables.remove(name);
+                // `quantum_var` is deliberately NOT popped here. Its whole purpose is to
+                // outlive this `let`'s scope so that a LATER statement can tell "this name is a
+                // qubit" from "this name is a scalar". Popping it would make the set empty
+                // again by the time the gate is emitted, which is exactly the silent `i64 0`
+                // this exists to prevent. The set is per-MODULE, and a name is never rebound to
+                // a different kind of value inside one module, so not popping is correct.
                 Ok(result)
             }
             // QIR models qubits and their measurement, not integer arithmetic.
@@ -594,10 +764,30 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
                 }
                 .to_string(),
             )),
-            PirExpr::Index { base, indices: _ } => {
-                let base_val = self.build_expr(base)?;
-                Ok(base_val)
-            }
+            //
+            // REFUSED, not passed through.
+            //
+            // `Index` used to discard the subscript and return the base, so `q[1]` and `q[2]`
+            // -- two DIFFERENT qubits -- emitted as the same operand. Combined with the
+            // per-statement function split below, that made the emitted QIR a valid LLVM
+            // module that was NOT the source program: a fixture saying
+            //
+            //     H q[1]; CNOT q[1], q[2]
+            //
+            // emitted `h` on one allocation and `cx` on two others, i.e. a circuit applying
+            // gates to unrelated qubits. It passed validation, and the tests asserted only
+            // that the text `call void @qir.h(` appeared -- which it did.
+            //
+            // That is the worst class of failure here: valid output, wrong quantum program.
+            // Selecting a qubit out of a register array needs a `getelementptr` and a load
+            // from a real allocation, which this backend does not build. Refused until it
+            // does.
+            PirExpr::Index { base, .. } => Err(CodegenError::UnsupportedFeature(format!(
+                "indexing `{base:?}` is not emitted by the QIR backend. Selecting a qubit \
+                 out of a register array needs a real allocation to index into, and \
+                 discarding the subscript would apply gates to the wrong qubits -- emitting \
+                 valid QIR that does not compute the source program."
+            ))),
             PirExpr::Field { base, field: _ } => {
                 let base_val = self.build_expr(base)?;
                 Ok(base_val)
@@ -615,8 +805,18 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
                 // Lower to the corresponding QIR intrinsic call, e.g. "h" ->
                 // "qir.h". Value arguments come first, then the qubits they
                 // act on.
-                let intrinsic_name = format!("qir.{}", op);
-                let func = self.get_intrinsic(&intrinsic_name).ok_or_else(|| {
+                // Map the lowering's operation name to a QIR intrinsic.
+                //
+                // Lowering emits `GateKind`'s Display spelling -- "H", "CX", "reset" -- plus
+                // `qalloc` for allocation. Those are NOT QIR intrinsic names: the intrinsic
+                // table declares `qir.h`, `qir.cx` and `qir.qubit_alloc`. Building the name
+                // as `qir.{op}` therefore looked up `qir.H` and `qir.qalloc`, neither of
+                // which exists, so every gate AND every allocation was refused. This was the
+                // second of the two defects that stopped the QIR backend emitting any circuit.
+                let intrinsic_name = qir_intrinsic_for(op).ok_or_else(|| {
+                    CodegenError::QirError(format!("no QIR intrinsic for quantum operation `{op}`"))
+                })?;
+                let func = self.get_intrinsic(intrinsic_name).ok_or_else(|| {
                     CodegenError::QirError(format!(
                         "Unknown QIR intrinsic '{}' for quantum op '{}'",
                         intrinsic_name, op
@@ -639,11 +839,24 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
                     .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
 
                 // Void-returning intrinsics (gates, releases) produce no value;
-                // build_expr must return one, so yield the QIR result zero.
-                Ok(call
-                    .try_as_basic_value()
-                    .basic()
-                    .unwrap_or_else(|| self.result_type.const_zero().into()))
+                // build_expr must return one.
+                if let Some(value) = call.try_as_basic_value().basic() {
+                    return Ok(value);
+                }
+
+                // `qir.qubit_alloc` returns a Qubit, which QIR models as a POINTER. The
+                // generic placeholder below is an integer, so returning it here typed the
+                // binding as `i64`, and every later use of that qubit passed an `i64` where a
+                // gate wants a `ptr` -- which the LLVM verifier rejects. A qubit-producing
+                // operation therefore yields a null pointer of the right type.
+                if qir_intrinsic_returns_qubit(op) {
+                    return Ok(self
+                        .llvm_context
+                        .ptr_type(AddressSpace::default())
+                        .const_null()
+                        .into());
+                }
+                Ok(self.result_type.const_zero().into())
             }
         }
     }

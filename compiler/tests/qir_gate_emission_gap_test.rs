@@ -87,54 +87,92 @@ fn the_llvm_backend_accepts_a_one_gate_circuit() {
 /// it accepts the program. The two arms are otherwise near-identical -- same intrinsic
 /// naming, same argument order -- which is why one works and the other does not.
 ///
-/// # Why this is pinned rather than fixed here
+/// Two source statements naming ONE qubit: the QIR backend refuses, because it emits each
+/// statement as a separate `void` function.
 ///
-/// Fixing it means teaching the QIR emitter that a gate operand is borrowed, which is a
-/// change to how quantities are tracked in emission. That is real work with a real risk of
-/// weakening the check that catches genuine double-consumption, and it belongs in its own
-/// change with its own tests. Until then the honest state is recorded here.
+/// # What changed, and what did not
+///
+/// This file originally recorded that QIR refused a gate with a spurious linearity error,
+/// `Linear variable 'a' used 2 times`. Both earlier defects are FIXED and covered elsewhere:
+///
+///   * the linearity checker no longer counts a gate operand as a consumption, so a gate
+///     BORROW is not mistaken for a double USE;
+///   * `qir_intrinsic_for` maps lowering's operation names onto real QIR intrinsics, so
+///     `qalloc` resolves to `qir.qubit_alloc` instead of `qir.qalloc`.
+///
+/// Neither fix is sufficient, and this test is why: the refusal below is neither of those
+/// errors. It is the REMAINING structural defect -- `build_statement` creates a fresh
+/// `void` function per `PirStatement` and clears `self.variables` between them, so a `[1]`
+/// qubit bound by `let [1] a = qalloc(1)` is not in scope when a LATER statement applies a
+/// gate to `a`.
+///
+/// The backend used to paper over that with `i64 0`, which made the gate operate on an
+/// integer rather than the qubit. It now refuses and names the cause.
+///
+/// # Why the refusal is right and a fix is not yet safe
+///
+/// Emitting this correctly means either sharing an `alloca` across statements -- which is
+/// unsound, because two `void` functions have no caller-ordered relationship, so a gate in
+/// statement 3 could execute before the allocation in statement 1 -- or restructuring the
+/// emitter to produce one entry-point function per Naso function, which is the same shape the
+/// LLVM backend already has. That is a real design change with its own risk, so it is not
+/// smuggled in here.
+///
+/// Note the contrast with `the_llvm_backend_accepts_a_one_gate_circuit`: LLVM emits this
+/// same program, because its schedule tree gives every statement a place in one function.
 #[test]
-fn the_qir_backend_rejects_a_gate_the_typechecker_and_llvm_accept() {
-    let dir = scratch("qir_gate");
-    let (ok, stderr) = build(&dir, "bell", ONE_GATE, "qir");
+fn the_qir_backend_refuses_a_gate_on_a_qubit_bound_in_an_earlier_statement() {
+    let dir = scratch("qir_scope");
+    let (ok, stderr) = build(&dir, "scope", ONE_GATE, "qir");
     assert!(
         !ok,
-        "this test records that the QIR backend cannot emit a gate. If it now can, \
-         FIX IT and update the capability matrix and docs/content/LIMITATIONS.md -- \
-         the end-to-end gate verification blocked on this can now be built."
+        "this test records the per-statement scoping defect. If QIR now emits this, the \
+         emitter must share qubit identity across statements -- check that a gate in a later \
+         statement acts on the qubit an EARLIER statement allocated, then update this test, \
+         the capability matrix and LIMITATIONS.md."
     );
     assert!(
-        stderr.contains("Linear variable 'a' used 2 times"),
-        "the expected failure is a spurious linearity error on the gate operand, \
+        stderr.contains("not bound in this statement"),
+        "the expected failure is the unbound-operand refusal naming the per-statement scoping, \
          but got: {stderr}"
     );
 }
 
-/// The QIR backend does not recognise `qalloc` as an intrinsic, so a circuit cannot even be
-/// allocated.
+/// `qalloc` now resolves to a real QIR intrinsic and yields a POINTER, not an integer.
 ///
-/// This is a SECOND, independent gap: even with the borrow problem fixed, `qalloc` lowers to
-/// a `PirExpr::QuantumOp` whose name has no entry in the QIR intrinsic table, and the backend
-/// refuses it.
+/// # Why pointer-ness is the point
 ///
-/// LLVM does not hit this because its `QuantumOp` arm declares whatever intrinsic the name
-/// implies, on first use. QIR has a fixed declared set and refuses anything outside it.
+/// The generic placeholder for a void intrinsic is `result_type`'s integer zero. Returning
+/// that for `qir.qubit_alloc` typed every qubit binding as `i64`, and a later gate then passed
+/// an `i64` where `qir.h(ptr)` wants a `ptr` -- rejected by the LLVM verifier. QIR models a
+/// qubit as a pointer, so a qubit-producing operation must yield a null pointer of that type.
+///
+/// # What is still not proven
+///
+/// This asserts the INTRINSIC is found and the refusal has moved on. It does NOT claim a
+/// qubit survives between statements -- that is the scoping defect above, and the test below
+/// still fails for it.
 #[test]
-fn the_qir_backend_does_not_know_how_to_allocate_a_qubit() {
+fn the_qir_backend_now_recognises_qalloc() {
     let dir = scratch("qir_alloc");
-    // No gate at all -- just allocate and discharge, isolating allocation from borrowing.
-    let source =
-        "fn f() {\n    let [1] a: Qubit = qalloc(1);\n    let m = measure(a);\n    let _ = m;\n}\n";
+    // Allocation only, in a single statement, so the scoping defect cannot mask the result.
+    let source = "fn f() {\n    let [1] a: Qubit = qalloc(1);\n    let _ = a;\n}\n";
     let (ok, stderr) = build(&dir, "alloc", source, "qir");
-    assert!(
-        !ok,
-        "this test records that QIR cannot allocate a qubit. If it now can, update the \
-         capability matrix and LIMITATIONS.md."
-    );
-    assert!(
-        stderr.contains("Unknown QIR intrinsic 'qir.qalloc'"),
-        "the expected failure is the unknown-intrinsic refusal, but got: {stderr}"
-    );
+    if !ok {
+        assert!(
+            !stderr.contains("Unknown QIR intrinsic 'qir.qalloc'"),
+            "`qalloc` should map to `qir.qubit_alloc`. If this fails, the intrinsic mapping \
+             regressed and every quantum program is refused again: {stderr}"
+        );
+    }
+    // When it does emit, the allocation must be a real pointer call, never an integer zero.
+    if ok {
+        let qir = std::fs::read_to_string(dir.join("alloc.qir")).expect("read emitted QIR");
+        assert!(
+            qir.contains("call ptr @qir.qubit_alloc()"),
+            "a qubit allocation must be a pointer-returning call: {qir}"
+        );
+    }
 }
 
 /// A program with no quantum operations at all compiles to QIR successfully.

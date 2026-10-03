@@ -245,6 +245,12 @@ jobs:
       - name: QIR gate emission gap
         run: cargo test --features llvm --test qir_gate_emission_gap_test
 
+      # `codegen_tests` carries the assertion that a fixture cannot express a SHARED qubit,
+      # which is what pins the "valid QIR that is not the source program" defect. Without it
+      # running, that failure mode could regress silently.
+      - name: QIR codegen cannot emit a wrong circuit
+        run: cargo test --features llvm --test codegen_tests
+
       - name: Gate inverse table and state-vector simulator
         run: |
           cargo test -p naso-gates --test gate_inverse_test

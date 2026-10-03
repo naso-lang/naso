@@ -335,15 +335,23 @@ fn target_matrix() -> Vec<TargetRow> {
         },
         // -- quantum operations: refused, and the reason is specific --------------
         //
-        // These are recorded because the QIR backend's refusal here is NOT the same
-        // refusal as its scalar rows. It refuses scalar arithmetic by design -- it emits
-        // one `void` quantum operation. It refuses GATES because it cannot emit them: a
-        // gate operand is BORROWN, and the gate arm re-checks quantity on each operand, so
-        // `hadamard(a)` followed by `measure(a)` is reported as using the linear qubit
-        // twice. Separately, `qalloc` has no entry in the QIR intrinsic table.
+        // These are recorded because the QIR backend's refusal here is NOT the same refusal
+        // as its scalar rows. It refuses scalar arithmetic by design -- it emits one `void`
+        // function per quantum operation and has no arithmetic.
         //
-        // LLVM accepts both of these programs, so the source language and one backend
-        // support them -- the gap is specific to QIR emission.
+        // Two EARLIER defects are fixed and no longer the cause. A gate operand is BORROWED,
+        // and the linearity checker no longer mistakes a borrow for a double USE;
+        // `qalloc` now maps to `qir.qubit_alloc` rather than the nonexistent `qir.qalloc`.
+        //
+        // The refusal that remains is structural: the emitter builds one `void` function per
+        // PIR statement and clears its locals between them, so a `[1]` qubit bound by
+        // `qalloc` in one statement is not in scope when a later statement gates it. The
+        // backend refuses rather than substituting a placeholder, because a placeholder would
+        // emit valid QIR applying gates to something other than the qubit.
+        //
+        // LLVM accepts both programs -- its schedule tree gives every statement a place in one
+        // function -- so the source language and one backend support them. The gap is
+        // specific to QIR emission.
         TargetRow {
             construct: "qubit allocation and measurement",
             src: "fn f() { let [1] a: Qubit = qalloc(1); let m = measure(a); let _ = m; }",
@@ -351,7 +359,7 @@ fn target_matrix() -> Vec<TargetRow> {
             qir: Outcome::Refused,
             wgsl_straight: Outcome::Refused,
             wgsl_compute: Outcome::Refused,
-            note: "`qalloc` has no entry in the QIR intrinsic table",
+            note: "the measurement is in a second statement, where the qubit allocated in the first is out of scope",
         },
         TargetRow {
             construct: "a single gate",
@@ -360,7 +368,7 @@ fn target_matrix() -> Vec<TargetRow> {
             qir: Outcome::Refused,
             wgsl_straight: Outcome::Refused,
             wgsl_compute: Outcome::Refused,
-            note: "a gate BORROWS a qubit, but the QIR gate arm re-checks quantity per operand and reports a double use",
+            note: "the gate is in a second statement, where the qubit allocated in the first is out of scope",
         },
         TargetRow {
             construct: "scalar float multiply",

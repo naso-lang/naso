@@ -111,8 +111,8 @@ compiled output into that check.
 | Construct | QIR | WGSL straight-line | WGSL compute | Note |
 |---|---|---|---|---|
 | empty function | **emits** | **emits** | **refused** | a compute kernel with no tensor parameter has nothing to bind <!-- construct:empty function --> |
-| qubit allocation and measurement | **refused** | **refused** | **refused** | `qalloc` has no entry in the QIR intrinsic table <!-- construct:qubit allocation and measurement --> |
-| a single gate | **refused** | **refused** | **refused** | a gate BORROWS a qubit, but the QIR gate arm re-checks quantity per operand and reports a double use <!-- construct:a single gate --> |
+| qubit allocation and measurement | **refused** | **refused** | **refused** | the measurement is in a second statement, where the qubit allocated in the first is out of scope <!-- construct:qubit allocation and measurement --> |
+| a single gate | **refused** | **refused** | **refused** | the gate is in a second statement, where the qubit allocated in the first is out of scope <!-- construct:a single gate --> |
 | scalar float multiply | **refused** | **emits** | **refused** | QIR has no scalar arithmetic; it emits one void quantum operation <!-- construct:scalar float multiply --> |
 | scalar integer add | **refused** | **emits** | **refused** | <!-- construct:scalar integer add --> |
 | function call | **refused** | **emits** | **refused** | <!-- construct:function call --> |
@@ -155,3 +155,46 @@ Kept deliberately, and refused rather than approximated:
   the shortened band yet, and a guard on runtime data has no affine form. A `while` loop
   exit.
 - Cranelift, entirely.
+
+## QIR emits valid modules that are not the source program
+
+The QIR backend has, at times, produced LLVM modules that pass every structural and
+verification check while computing a different quantum program than the source. This is
+recorded because it is the failure mode most likely to be mistaken for success.
+
+Three separate mechanisms contributed, all now addressed:
+
+1. **A gate operand was counted as a consumption.** A `[1]` qubit is linear, so it may be
+   *borrowed* any number of times; only being consumed spends it. The linearity checker
+   counted every operand occurrence, so `hadamard(a)` followed by `measure(a)` was reported
+   as using the qubit twice — a spurious refusal on correct code.
+
+2. **`qalloc` was looked up as `qir.qalloc`.** Lowering names operations the way
+   `GateKind` displays them (`H`, `CX`, `reset`) plus `qalloc`; the QIR intrinsic table
+   declares `qir.h`, `qir.cx` and `qir.qubit_alloc`. No circuit could be allocated, let alone
+   gated. An unrecognised operation is now refused rather than guessed at.
+
+3. **Operand identity was not preserved.** This is the serious one, and it is a property of
+   the test fixtures rather than of a single function. `compiler/tests/codegen_tests.rs`
+   lowers every quantum operand in a fixture body to a *fresh* `qir.qubit_alloc()`, so
+   `teleport.pir` — which says `H q[1]; CNOT q[1], q[2]` and requires `q[1]` to be one qubit in
+   both places — emitted an `h` on one allocation and a `cx` on two different ones. The
+   emitted module validated. It was not teleportation: no Bell pair was ever created.
+
+The tests passed throughout, because they asserted that the emitted text contained
+`call void @qir.h(` and `call void @qir.ccx(`. That text was present. **A test that checks a
+gate is present cannot detect a gate being applied to the wrong qubit.**
+
+Two consequences are now enforced:
+
+- `assert_fixture_cannot_share_qubits` asserts the allocation-to-gate ratio. A circuit that
+  reuses qubits allocates fewer of them than it applies gates to; the current fixtures emit
+  *more*, and that is now a recorded failure mode rather than an invisible one.
+- `test_teleport_golden_fixture` asserts that the measurement statement is still reported as
+  missing. The builder emits `h`, `cx`, `x` and `z` but drops `S_alice_measure` entirely, so
+  Bob's conditional corrections never appear.
+
+**Teleportation is not emitted by the QIR backend today.** It emits some of the right gate
+names, on qubits that are not the ones the fixture names, and omits the measurement and
+correction steps. QIR output from this backend is structural text; it has never been executed
+against a QPU or a simulator.

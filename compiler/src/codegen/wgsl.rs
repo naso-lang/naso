@@ -390,6 +390,47 @@ pub fn generate_wgsl(module: &PirModule, target: WgslTarget) -> CodegenResult<St
 }
 
 /// Verify WGSL codegen preserves QTT invariants
+/// Whether a quantum operation CONSUMES its qubit operands, as opposed to borrowing them.
+///
+/// # The distinction
+///
+/// A GATE borrows. `hadamard(a)` applies a unitary to `a` and `a` is still live afterwards,
+/// so applying two gates to one qubit is correct and must not be a double use. A
+/// MEASUREMENT consumes. `measure(a)` collapses `a` into a classical bit, so using `a` again
+/// afterwards is a genuine violation. `GateKind::Reset` is a borrow for the same reason `H`
+/// is -- the qubit still exists afterwards -- which is why the enum documents it as "Not
+/// consuming: like `hadamard`".
+///
+/// # Why the default is to CONSUME
+///
+/// The classification must not be read optimistically. An unrecognised operation is treated
+/// as a consumption, so an unknown quantum op is still counted and a real double-use through
+/// it is still caught.
+///
+/// The reason is the direction of the possible failure. If an unknown name were assumed to
+/// borrow, then any genuine double-consumption expressed through an unrecognised operation
+/// would stop being reported -- and this check exists precisely to catch a `[1]` value used
+/// twice. That converts a spurious refusal on correct code into a silent acceptance of
+/// incorrect code, which is strictly worse: the first is a diagnostic the user can act on,
+/// the second is a quantum program that reuses destroyed state.
+///
+/// So the check is weakened ONLY for names on the explicit list below, and for those,
+/// treating an occurrence as a use is the bug being fixed. Adding a name to this list is a
+/// decision that it BORROWS, and must be made by knowing what the operation does.
+fn quantum_op_consumes_qubits(op: &str) -> bool {
+    match op {
+        // Borrow: a unitary gate. The qubit is transformed in place and remains live.
+        "H" | "X" | "Y" | "Z" | "S" | "T" | "CX" | "CY" | "CZ" | "RX" | "RY" | "RZ" => false,
+        // Borrow: reset returns the qubit to |0> IN PLACE; the binding stays usable.
+        "reset" => false,
+        // Consume: these read the qubit out into a classical value or hand it away.
+        "measure" | "qfree" | "qalloc" => true,
+        // Consume by default. See the doc comment: an unknown operation is not evidence of
+        // a borrow, and assuming one would weaken the check that catches double use.
+        _ => true,
+    }
+}
+
 pub fn verify_wgsl_linearity(module: &PirModule) -> CodegenResult<()> {
     // Check that [1] quantity variables are not duplicated
     for (var, qty) in &module.quantities {
@@ -452,14 +493,20 @@ fn count_in_expr(expr: &PirExpr, var: &str) -> usize {
         // A `return`'s value is CONSUMED by leaving the function, so it is a use.
         // Omitting it would let a linear resource escape through the return edge.
         PirExpr::Return { value } => value.as_deref().map_or(0, |v| count_in_expr(v, var)),
-        PirExpr::QuantumOp {
-            op: _,
-            args,
-            qubits,
-        } => {
+        //
+        // A GATE BORROWS its qubits. A measurement CONSUMES them. Counting both as a use
+        // made every correct circuit a linearity violation: `hadamard(a)` followed by
+        // `measure(a)` uses the linear qubit once in each of two different senses and was
+        // reported as using it twice, so the QIR backend could not emit a single gate.
+        //
+        // See `quantum_op_consumes_qubits` for the classification and, more importantly,
+        // for why the DEFAULT is to consume.
+        PirExpr::QuantumOp { op, args, qubits } if quantum_op_consumes_qubits(op) => {
             args.iter().map(|a| count_in_expr(a, var)).sum::<usize>()
                 + qubits.iter().map(|q| count_in_expr(q, var)).sum::<usize>()
         }
+        // A gate BORROWS: the qubit is still live afterwards, so this is not a use.
+        PirExpr::QuantumOp { .. } => 0,
         _ => 0,
     }
 }

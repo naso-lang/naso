@@ -14,7 +14,7 @@
 //! MATRICES on the CPU. It is not a QPU, nothing here runs on hardware, and passing says
 //! nothing about one.
 
-use naso_verify::statevector::{Complex, Gate, StateVector};
+use naso_gates::statevector::{Complex, Gate, StateVector};
 
 /// Tolerance for identities built from repeated `1/sqrt(2)` divisions.
 ///

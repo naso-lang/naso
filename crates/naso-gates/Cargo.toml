@@ -1,0 +1,19 @@
+[package]
+name = "naso-gates"
+version = "0.1.0"
+edition = "2024"
+description = "Quantum gate matrices, the adjoint relation, and CPU state-vector simulation for Naso"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/naso-lang/naso"
+
+# No dependencies, deliberately.
+#
+# This crate exists because the dependency arrow pointed the wrong way: `naso-verify`
+# depends on `naso-compiler`, so the compiler could not reach a gate table that lived in
+# the verifier. A leaf crate that BOTH depend on breaks the cycle without inverting it.
+#
+# It also exists to prevent a second failure: a gate table copied into both crates would
+# drift, and drift in an ADJOINT table silently computes wrong inverses rather than
+# failing. One definition, reachable from every layer.
+
+[dependencies]

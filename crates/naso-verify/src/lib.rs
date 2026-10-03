@@ -15,7 +15,6 @@ pub mod cache;
 pub mod cli;
 pub mod config;
 pub mod error;
-pub mod gate_inverse;
 #[cfg(feature = "z3")]
 pub mod lower;
 pub mod model;
@@ -32,7 +31,6 @@ pub mod quantum;
 pub mod smtlib;
 #[cfg(feature = "z3")]
 pub mod solver;
-pub mod statevector;
 
 #[cfg(feature = "z3")]
 use crate::config::SolverConfig;
@@ -59,6 +57,16 @@ pub fn verify_default(program: &Program) -> Result<VerifyResult, VerifyError> {
 /// Re-export CLI types for compiler integration
 #[cfg(feature = "z3")]
 pub use cli::{VerifyCliConfig, VerifyMode, parse_verify_args};
+
+// The gate matrices, the adjoint relation, and the CPU state-vector simulator live in
+// `naso-gates`, a leaf crate with no dependencies.
+//
+// They were moved there rather than reimplemented because the dependency arrow pointed the
+// wrong way: this crate depends on `naso-compiler`, so the compiler could not reach a gate
+// table that lived here. A shared leaf breaks the cycle without inverting it, and it keeps a
+// single definition -- a table duplicated into two crates would drift, and drift in an
+// adjoint table computes wrong inverses instead of failing.
+pub use naso_gates::{gate_inverse, statevector};
 
 #[cfg(test)]
 mod tests {

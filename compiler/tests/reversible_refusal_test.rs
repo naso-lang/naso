@@ -304,10 +304,41 @@ fn the_documented_blockers_to_wiring_reversible_are_still_real() {
 /// exactly the drop-the-inverse defect that was fixed earlier.
 #[test]
 fn the_gate_inverse_table_has_a_verified_entry_for_every_gate_but_no_producer() {
-    let table = include_str!("../../crates/naso-verify/src/gate_inverse.rs");
+    let table = include_str!("../../crates/naso-gates/src/gate_inverse.rs");
     assert!(
         table.contains("pub fn inverse_of"),
-        "the gate-inverse table is missing from naso-verify"
+        "the gate-inverse table is missing from naso-gates"
+    );
+
+    // The table must exist in EXACTLY ONE place.
+    //
+    // It was moved out of naso-verify and into the leaf crate naso-gates, because
+    // naso-verify depends on naso-compiler and so the compiler could not reach a table that
+    // lived there. The tempting alternative -- keeping a copy in each crate -- is what this
+    // assertion forbids: a copy of an adjoint table does not fail to build when the two
+    // disagree, it silently computes wrong inverses. One definition, reachable from every
+    // layer, is the only arrangement that makes that impossible.
+    for (label, path) in [
+        ("compiler", include_str!("../src/lib.rs")),
+        (
+            "naso-verify",
+            include_str!("../../crates/naso-verify/src/lib.rs"),
+        ),
+    ] {
+        let defines_inverse = path.contains("fn inverse_of");
+        assert!(
+            !defines_inverse,
+            "{label} defines its own `inverse_of`. There must be ONE gate-inverse table, in \
+             naso-gates; two copies will drift and drift in an adjoint table silently \
+             computes wrong inverses rather than failing to compile."
+        );
+    }
+
+    // And naso-verify must reach the single table by re-export, not by owning a second one.
+    assert!(
+        include_str!("../../crates/naso-verify/src/lib.rs")
+            .contains("pub use naso_gates::{gate_inverse, statevector}"),
+        "naso-verify must re-export naso-gates rather than reimplement it"
     );
 
     // And confirm nothing in the COMPILER consumes it yet. This is the honest state of the

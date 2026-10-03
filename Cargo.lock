@@ -1511,6 +1511,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "naso-gates"
+version = "0.1.0"
+
+[[package]]
 name = "naso-lsp"
 version = "0.1.0"
 dependencies = [
@@ -1540,6 +1544,7 @@ dependencies = [
  "indexmap",
  "naga",
  "naso-compiler",
+ "naso-gates",
  "rayon",
  "serde",
  "serde_json",

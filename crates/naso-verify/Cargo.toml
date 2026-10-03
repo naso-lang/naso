@@ -14,6 +14,10 @@ z3 = ["dep:z3", "dep:z3-sys"]
 # Core Naso compiler types
 naso-compiler = { path = "../../compiler" }
 
+# Gate matrices, the adjoint relation, and CPU state-vector simulation. A leaf crate with
+# no dependencies, re-exported above so existing `naso_verify::statevector` paths keep working.
+naso-gates = { path = "../naso-gates" }
+
 # SMT Solver
 #
 # `gh-release` downloads the OFFICIAL PREBUILT z3-glibc archive instead of

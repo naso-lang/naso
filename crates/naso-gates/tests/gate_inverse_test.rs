@@ -14,10 +14,10 @@
 //! producing the wrong inverse at runtime. Only applying the gates and comparing amplitudes
 //! catches that. So the assertions below check amplitudes, not table shape.
 
-use naso_verify::gate_inverse::{
+use naso_gates::gate_inverse::{
     all_gates, apply_gate, apply_toffoli, arity, inverse_of, is_self_inverse,
 };
-use naso_verify::statevector::{Complex, Gate, StateVector};
+use naso_gates::statevector::{Complex, Gate, StateVector};
 
 /// Tolerance for identities built from rotations and `1/sqrt(2)`.
 const TOL: f64 = 1e-9;

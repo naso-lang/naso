@@ -128,7 +128,44 @@ fn run(ir: &str, driver: &str) -> String {
         String::from_utf8_lossy(&clang.stderr)
     );
 
-    let out = Command::new(dir.join("prog")).output().expect("run exe");
+    // The program is run UNDER A TIMEOUT, and a hang is reported as a hang.
+    //
+    // `Command::output()` blocks forever, which turns a non-terminating loop into a
+    // stuck test suite that reports nothing: no test name, no assertion, and a CI job
+    // that eventually dies on its own job timeout. The first version of this helper
+    // had no timeout, so a mutation that sent `continue` to the loop header instead of
+    // the step block -- skipping a counted loop's increment -- wedged the whole binary
+    // with zero diagnostic output.
+    //
+    // The timeout is generous enough that a slow machine still passes, and short
+    // enough that a real infinite loop is reported within it. These programs are
+    // straight-line integer arithmetic over a handful of iterations; 20s is many
+    // orders of magnitude more than they need.
+    let mut child = Command::new(dir.join("prog"))
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn exe");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        match child.try_wait().expect("poll exe") {
+            Some(_) => break,
+            None => {
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "the compiled program did not terminate within 20s.\n\
+                         A loop whose counter does not advance never ends, so this is \
+                         almost always an infinite loop rather than slowness: check that \
+                         `continue` targets the loop's step block (which carries the \
+                         increment) and not the header.\n--- IR ---\n{ir}"
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+    let out = child.wait_with_output().expect("read exe output");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
@@ -365,15 +402,26 @@ fn count(n: i64) -> i64 {
          because nothing would ever reach the exit. Found: {header_branch:?}\n--- IR ---\n{ir}"
     );
 
-    // And the BODY must jump back to the header, or the loop would run once.
+    // And the BODY must reach the step block, which is what carries the loop back to
+    // the header. This was `br label %while_cond` until `continue` was implemented:
+    // a counted loop's increment has to run on every iteration, including one ended by
+    // `continue`, so the body now falls through to a dedicated step block and THAT
+    // block branches to the header. Branching the body straight to the header is what
+    // made `continue` skip the increment and hang.
     let body = ir
         .split("while_body:")
         .nth(1)
         .and_then(|rest| rest.split("while_exit:").next())
         .expect("body block present");
     assert!(
-        body.contains("br label %while_cond"),
-        "the body must branch back to the header to re-test the condition.\n--- IR ---\n{ir}"
+        body.contains("br label %while_step"),
+        "the body must branch to the step block, which carries the increment and then \
+         re-tests the condition.\n--- IR ---\n{ir}"
+    );
+    assert!(
+        ir.contains("while_step:"),
+        "the step block must exist so `continue` has somewhere to land that still \
+         runs the increment.\n--- IR ---\n{ir}"
     );
 
     // The BODY must contain the statement it was given.
@@ -501,78 +549,59 @@ fn break_and_continue_lower_to_their_own_pir_nodes() {
     }
 }
 
-/// The backend refuses `break`, and says what is missing rather than what is wrong.
+/// A bare `break` and `continue` are now EXECUTED, not refused.
 ///
-/// Paired with `a_while_loop_runs_its_body_until_the_condition_becomes_false`, which
-/// proves `while` itself works. Without that pairing, a backend refusing everything
-/// would pass this suite.
+/// This test previously asserted the opposite -- that the backend refused both with
+/// "no loop stack is threaded". It was correct when written and is now wrong, so it
+/// is replaced rather than deleted: a reader diffing the history needs to see that
+/// the refusal became an implementation, and where the execution tests for it live
+/// (`llvm_break_continue_execution_test.rs`).
+///
+/// The guard kept here is the one that still has teeth: a `break` OUTSIDE a loop
+/// must stay refused, because there is nothing to leave and silently ignoring it
+/// would run code the author meant to skip.
 #[test]
-fn break_is_refused_by_the_backend_with_a_message_that_names_the_construct() {
-    let msg = compile_error(
-        "fn f(n: i64) -> i64 { let mut i = 0; while i < n { i = i + 1; if i > 3 { break; } } i }\n",
-    );
+fn break_outside_a_loop_is_still_refused() {
+    let msg = compile_error("fn f(n: i64) -> i64 { if n > 0 { break; } n }\n");
     assert!(
-        msg.contains("`break` is parsed and lowered, but this backend does not yet emit it"),
-        "the diagnostic must name `break` and say the backend does not emit it, rather \
-         than describing a missing variable: {msg}"
-    );
-    assert!(
-        msg.contains("no loop stack is threaded"),
-        "the diagnostic must name the actual missing mechanism, so a reader knows this \
-         is a backend gap and not a bad program: {msg}"
-    );
-    assert!(
-        msg.contains("Refused rather than compiled to a no-op")
-            || msg.contains("rather than compiled to a no-op"),
-        "the diagnostic must say why it refuses instead of approximating, since a \
-         no-op `break` inside an `if` would exit no loop at all: {msg}"
-    );
-    assert!(
-        !msg.contains("no allocation is known for it"),
-        "the OLD failure named an undeclared variable, which sent readers looking for a \
-         missing declaration. That wording must be gone: {msg}"
+        msg.contains("no enclosing loop"),
+        "`break` outside a loop must be refused as having nothing to leave: {msg}"
     );
 }
 
-/// The same for `continue`, whose wrong implementation is an infinite loop.
+/// `continue` outside a loop is refused on the same terms.
 #[test]
-fn continue_is_refused_by_the_backend_with_a_message_that_names_the_construct() {
-    let msg = compile_error(
-        "fn f(n: i64) -> i64 { let mut i = 0; while i < n { i = i + 1; if i > 2 { continue; } } i }\n",
-    );
+fn continue_outside_a_loop_is_still_refused() {
+    let msg = compile_error("fn f(n: i64) -> i64 { if n > 0 { continue; } n }\n");
     assert!(
-        msg.contains("`continue` is parsed and lowered, but this backend does not yet emit it"),
-        "the diagnostic must name `continue` and the gap: {msg}"
-    );
-    assert!(
-        msg.contains("would be an infinite loop"),
-        "the diagnostic must say what the wrong implementation would do: {msg}"
+        msg.contains("no enclosing loop"),
+        "`continue` outside a loop must be refused: {msg}"
     );
 }
 
-/// `break v;` is refused too, and specifically for carrying a value.
+/// `break v;` is still refused, and specifically for carrying a value.
 ///
-/// A `break` with a value is a strictly bigger job than a bare one: the loop has to
-/// produce that value at its exit, so the loop's own type is constrained by it. That
-/// is worth stating rather than folding into the bare-`break` message.
+/// Bare `break` is emitted, so this refusal is now a real boundary rather than a
+/// missing feature. The reason it must stay a boundary: a loop's result would merge
+/// every `break` path AND the fall-through, and the fall-through has computed
+/// nothing. Filling it with a zero would let an uninitialised result through under
+/// the same name as a real one.
 #[test]
-fn a_break_carrying_a_value_is_also_refused_and_is_a_distinct_case() {
-    let bare = compile_error(
+fn a_break_carrying_a_value_is_refused_and_is_a_distinct_case() {
+    let bare = build_ir(
         "fn f(n: i64) -> i64 { let mut i = 0; while i < n { i = i + 1; if i > 3 { break; } } i }\n",
     );
     let with_value = compile_error(
         "fn f(n: i64) -> i64 { let mut i = 0; while i < n { i = i + 1; if i > 3 { break i; } } i }\n",
     );
     assert!(
-        !with_value.is_empty() && !bare.is_empty(),
-        "both forms must be refused rather than one silently accepted"
+        bare.contains("while_exit"),
+        "a bare `break` must be emitted, branching to the loop's exit:\n{bare}"
     );
-    // Both must be refused by the SAME mechanism, since neither is emitted. What must
-    // not happen is `break i;` compiling while `break;` is refused -- that would mean
-    // the value-carrying form silently dropped `i`, computing a different answer.
     assert!(
-        with_value.contains("`break`") && bare.contains("`break`"),
-        "both forms must be refused as `break`\n--- bare ---\n{bare}\n--- with value ---\n{with_value}"
+        with_value.contains("fall-through"),
+        "`break v` must still be refused, and the reason must name the missing \
+         fall-through value rather than merely failing: {with_value}"
     );
 }
 

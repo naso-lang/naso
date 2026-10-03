@@ -173,6 +173,16 @@ pub enum PirExpr {
         cond: Box<PirExpr>,
         /// Run while `cond` holds.
         body: Box<PirExpr>,
+        /// Run after `body` on every iteration, BEFORE the condition is re-tested.
+        ///
+        /// This exists because `continue` must not skip it. A counted loop's
+        /// `for i in n` advances its counter here; without a step block, `continue`
+        /// would jump to the header and skip the increment, so the counter would never
+        /// move and the loop would never terminate.
+        ///
+        /// `None` for a source `while`, which has nothing to advance -- and there
+        /// `continue` targets the header directly.
+        step: Option<Box<PirExpr>>,
     },
 }
 
@@ -634,8 +644,17 @@ impl PirModule {
             // its induction variable would otherwise look like it does not depend
             // on it, and a rewrite keyed on that would drop the update -- turning a
             // terminating loop into an infinite one.
-            PirExpr::While { cond, body } => {
-                self.expr_contains_var(cond, var) || self.expr_contains_var(body, var)
+            //
+            // ALL THREE, including the step. A counter advanced only in `step` would
+            // otherwise look like the loop does not depend on it, and a rewrite keyed
+            // on that would drop the increment -- turning a terminating loop into an
+            // infinite one, silently.
+            PirExpr::While { cond, body, step } => {
+                self.expr_contains_var(cond, var)
+                    || self.expr_contains_var(body, var)
+                    || step
+                        .as_deref()
+                        .is_some_and(|s| self.expr_contains_var(s, var))
             }
             // A `break` with a value CONSUMES that value on the path it exits, so it
             // must be counted. `continue` has nothing to count.
@@ -889,11 +908,19 @@ fn pir_expr_to_string(expr: &PirExpr, _indent: usize) -> String {
             None => "break".to_string(),
         },
         PirExpr::Continue => "continue".to_string(),
-        PirExpr::While { cond, body } => format!(
-            "while {} {{ {} }}",
-            pir_expr_to_string(cond, 0),
-            pir_expr_to_string(body, 0)
-        ),
+        PirExpr::While { cond, body, step } => match step {
+            Some(st) => format!(
+                "while {} {{ {}; {} }}",
+                pir_expr_to_string(cond, 0),
+                pir_expr_to_string(body, 0),
+                pir_expr_to_string(st, 0)
+            ),
+            None => format!(
+                "while {} {{ {} }}",
+                pir_expr_to_string(cond, 0),
+                pir_expr_to_string(body, 0)
+            ),
+        },
         PirExpr::Assign { target, value } => {
             format!(
                 "{} = {}",

@@ -204,8 +204,14 @@ fn expr_contains_var(expr: &PirExpr, var: &str) -> bool {
         //
         // Skipping the BODY would be exactly the `Stmts` bug documented above, one
         // level down: the body of a loop body still contains statements.
-        PirExpr::While { cond, body } => {
-            expr_contains_var(cond, var) || expr_contains_var(body, var)
+        //
+        // The step is included: a `[1]` value consumed only by a loop's step must still
+        // be SEEN as consumed, or the loop is a hole through which a linear value escapes
+        // validation.
+        PirExpr::While { cond, body, step } => {
+            expr_contains_var(cond, var)
+                || expr_contains_var(body, var)
+                || step.as_deref().is_some_and(|s| expr_contains_var(s, var))
         }
         // A `break v` consumes `v` on the path where it fires.
         PirExpr::Break { value } => match value {

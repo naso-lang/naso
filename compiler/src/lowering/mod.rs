@@ -1470,15 +1470,20 @@ impl LoweringContext {
                 self.statements.truncate(first_new);
                 self.schedule_nodes.truncate(first_sched);
 
-                // `i = i + 1` -- appended so it runs after the body.
-                body_parts.push(crate::ir::PirExpr::Assign {
+                // The counter increment is the loop's STEP, not part of the body.
+                //
+                // Appending it to the body -- which is what this did first -- means a
+                // `continue` in the body skips it, the counter never moves, and the loop
+                // never terminates. The backend gives `continue` the step block as its
+                // target precisely so the increment always runs.
+                let increment = crate::ir::PirExpr::Assign {
                     target: Box::new(crate::ir::PirExpr::Var(counter.clone())),
                     value: Box::new(crate::ir::PirExpr::Binary {
                         op: crate::ir::BinaryOp::Add,
                         left: Box::new(crate::ir::PirExpr::Var(counter.clone())),
                         right: Box::new(crate::ir::PirExpr::IntLit(1)),
                     }),
-                });
+                };
                 if let Some(tail) = &fl.body.expr {
                     body_parts.push(self.lower_expr(tail)?);
                 }
@@ -1526,6 +1531,7 @@ impl LoweringContext {
                         right: Box::new(count),
                     }),
                     body: Box::new(crate::ir::PirExpr::Stmts(body_parts)),
+                    step: Some(Box::new(increment)),
                 });
 
                 Ok(crate::ir::PirExpr::Stmts(parts))
@@ -1608,6 +1614,9 @@ impl LoweringContext {
                 Ok(crate::ir::PirExpr::While {
                     cond: Box::new(c),
                     body: Box::new(body_value),
+                    // A source `while` has nothing to advance: the author wrote the
+                    // update inside the body. `for` is the counted form and gets a step.
+                    step: None,
                 })
             }
             ExprKind::If(cond, then_branch, else_branch) => {

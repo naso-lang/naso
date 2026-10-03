@@ -370,8 +370,15 @@ fn count_in_expr(expr: &PirExpr, var: &str) -> usize {
         // used only inside a loop is SEEN. Returning 0 here -- the obvious thing when
         // a trip count is unknown -- would make the loop a hole through which a
         // linear value escapes validation entirely.
-        PirExpr::While { cond, body } => {
-            (count_in_expr(cond, var) + count_in_expr(body, var)).max(1)
+        //
+        // The STEP is included for the same reason as the condition and the body: a
+        // `[1]` value consumed only by a counted loop's increment is still consumed.
+        // Leaving the step out would make `for` a hole through which a linear value
+        // escapes validation, and the escape would be invisible -- the counter is the
+        // one thing a loop always touches.
+        PirExpr::While { cond, body, step } => {
+            let step_uses = step.as_deref().map_or(0, |s| count_in_expr(s, var));
+            (count_in_expr(cond, var) + count_in_expr(body, var) + step_uses).max(1)
         }
         // A `break v` CONSUMES `v` on the path where it fires, so it counts like any
         // other use. `continue` has no value, so it counts nothing -- reporting a use
@@ -426,8 +433,11 @@ fn expr_contains_var(expr: &PirExpr, var: &str) -> bool {
         PirExpr::Stmts(parts) => parts.iter().any(|p| expr_contains_var(p, var)),
         // BOTH halves: the condition is evaluated every iteration, so a value used
         // only there is still used by the loop.
-        PirExpr::While { cond, body } => {
-            expr_contains_var(cond, var) || expr_contains_var(body, var)
+        // The step is searched as well: a value used only in the increment is used.
+        PirExpr::While { cond, body, step } => {
+            expr_contains_var(cond, var)
+                || expr_contains_var(body, var)
+                || step.as_deref().is_some_and(|s| expr_contains_var(s, var))
         }
         PirExpr::Break { value } => match value {
             Some(v) => expr_contains_var(v, var),

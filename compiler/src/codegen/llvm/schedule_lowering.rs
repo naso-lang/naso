@@ -294,6 +294,9 @@ pub fn lower_schedule_tree_into<'ctx>(
                 current_function: function,
                 callee_params: lowering.callee_params,
                 in_statement_position: false,
+                // Empty: no loop is being lowered at the point this builder is created.
+                // The loop arms push and pop as they go.
+                loop_stack: Vec::new(),
             };
             let value = lowerer.build_expr(expr, quantities)?;
             // A type mismatch here is REFUSED rather than converted: the return type
@@ -1001,6 +1004,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
             current_function: self.function,
             callee_params: self.callee_params,
             in_statement_position: true,
+            loop_stack: Vec::new(),
         };
         // The value is discarded because a statement body's result is not the point --
         // its SIDE EFFECTS are. Every arm of `build_expr` that has a side effect emits

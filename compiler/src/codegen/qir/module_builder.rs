@@ -34,6 +34,12 @@ pub struct QIRModuleBuilder<'ctx> {
     variables: HashMap<String, (PointerValue<'ctx>, BasicTypeEnum<'ctx>)>,
     // Declared intrinsics
     declared_intrinsics: HashMap<String, FunctionValue<'ctx>>,
+    /// Enclosing loops, outermost first, so `break`/`continue` take the LAST.
+    ///
+    /// The type is shared with the LLVM backend so both resolve early exits the same
+    /// way. Two copies would be free to drift, and a drift between backends means a
+    /// program that exits its loop on one target and not the other.
+    loop_stack: Vec<crate::codegen::llvm::expr_lowering::LoopTargets<'ctx>>,
 }
 
 impl<'ctx> QIRModuleBuilder<'ctx> {
@@ -61,6 +67,7 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
             current_block: None,
             variables: HashMap::new(),
             declared_intrinsics: HashMap::new(),
+            loop_stack: Vec::new(),
         };
 
         // Declare QIR intrinsics
@@ -92,6 +99,7 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
             current_block: None,
             variables: HashMap::new(),
             declared_intrinsics: HashMap::new(),
+            loop_stack: Vec::new(),
         };
 
         qir_builder.declare_intrinsics()?;
@@ -466,7 +474,7 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
                  no-op, which would be an infinite loop."
                     .to_string(),
             )),
-            PirExpr::While { cond, body } => {
+            PirExpr::While { cond, body, step } => {
                 let func = self.current_function().unwrap();
                 let header = self.llvm_context.append_basic_block(func, "while_cond");
                 let body_block = self.llvm_context.append_basic_block(func, "while_body");
@@ -491,6 +499,34 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
                 self.current_block = Some(body_block);
                 self.builder.position_at_end(body_block);
                 self.build_expr(body)?;
+
+                // The step runs in its own block, which is where `continue` will land.
+                // A counted loop advances its counter here, so branching straight back
+                // to the header from a `continue` would skip the increment and the loop
+                // would never terminate.
+                let step_block = self.llvm_context.append_basic_block(func, "while_step");
+                self.loop_stack
+                    .push(crate::codegen::llvm::expr_lowering::LoopTargets {
+                        continue_target: step_block,
+                        break_target: exit_block,
+                    });
+                if self
+                    .builder
+                    .get_insert_block()
+                    .and_then(|b| b.get_terminator())
+                    .is_none()
+                {
+                    self.builder
+                        .build_unconditional_branch(step_block)
+                        .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                }
+                self.loop_stack.pop();
+
+                self.current_block = Some(step_block);
+                self.builder.position_at_end(step_block);
+                if let Some(st) = step {
+                    self.build_expr(st)?;
+                }
                 self.builder
                     .build_unconditional_branch(header)
                     .map_err(|e| CodegenError::InstructionError(e.to_string()))?;

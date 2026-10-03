@@ -142,9 +142,60 @@ pub struct PirExprLowerer<'ctx, 'a> {
     /// statement position by construction, so `ScheduleLowering` always sets this true
     /// and `LLVMModuleBuilder` sets it per statement.
     pub in_statement_position: bool,
+    /// The enclosing loops, outermost first, so the INNERMOST is last.
+    ///
+    /// `break` and `continue` carry no target in the PIR, deliberately: which loop
+    /// they mean is decided by the pass that owns the control-flow graph, and a
+    /// lowering pass tracking a "current loop" would bind a `break` inside an `if`
+    /// to the wrong one -- silently, because the resulting program is still well
+    /// formed.
+    ///
+    /// So the backend resolves it from the CFG it is building, and that resolution
+    /// needs this stack. Each entry is the block a `continue` jumps to (the header,
+    /// which re-tests the guard) and the block a `break` jumps to (the exit).
+    ///
+    /// The stack is pushed by the loop arm and popped on the way out, INCLUDING on
+    /// the error path -- a `?` between push and pop would leave a stale loop on the
+    /// stack and let a later `break` outside any loop jump to a dead block.
+    pub loop_stack: Vec<LoopTargets<'ctx>>,
+}
+
+/// Where `break` and `continue` go for one enclosing loop.
+#[derive(Clone, Copy)]
+pub struct LoopTargets<'ctx> {
+    /// Re-enter here: the block that finishes this iteration and then re-tests the
+    /// guard.
+    ///
+    /// The STEP, not the header, and the distinction is load-bearing. A counted
+    /// loop advances its counter in the step, so a `continue` aimed at the header
+    /// would re-test the guard without ever moving the counter: the loop would not
+    /// terminate. For a source `while` the step is empty and the two are equivalent,
+    /// so one target serves both.
+    pub continue_target: inkwell::basic_block::BasicBlock<'ctx>,
+    /// Leave here: the block after the loop.
+    pub break_target: inkwell::basic_block::BasicBlock<'ctx>,
 }
 
 impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
+    /// An `i64` zero, for a construct that produces no value but sits where the PIR
+    /// demands one.
+    ///
+    /// `break` and `continue` are control flow, not expressions with results. The PIR
+    /// still types them, so a caller can demand a value; this is what they produce. It
+    /// is a PLACEHOLDER: in both cases the block was terminated by the branch just
+    /// emitted, so nothing downstream can read it.
+    fn zero_placeholder(&mut self) -> CodegenResult<inkwell::values::IntValue<'ctx>> {
+        let tl = self.value_builder.type_lowering();
+        self.value_builder
+            .builder()
+            .build_int_cast(
+                tl.int_type(crate::codegen::abi::IntWidth::I1).const_zero(),
+                tl.int_type(crate::codegen::abi::IntWidth::I64),
+                "control_flow_result",
+            )
+            .map_err(|e| CodegenError::InstructionError(e.to_string()))
+    }
+
     /// Lower a PIR expression, returning the value it evaluates to.
     // `quantities` is threaded through recursively and read by no arm today: every
     // quantity-dependent decision (which a `[0]` binding erases, which alias scope a
@@ -441,28 +492,70 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
             // loop stack, or as a no-op, produces a program that builds clean and
             // computes the wrong thing -- for `break` inside an `if`, skipping nothing
             // at all. So the backend says what is missing and what does work.
+            //
+            // `break` leaves the INNERMOST loop on the stack, which is the last entry
+            // because the loop arm pushes outer-first.
+            //
+            // `value` is REFUSED rather than ignored. `break v;` makes the loop's result
+            // be `v`, so emitting it needs the exit block to carry a phi merged from
+            // every `break` path and every fall-through path -- and the phi's TYPE, which
+            // is not known until one of those is built. Guessing it would silently coerce
+            // every `break` value. So `break v` says so, and bare `break` works.
+            //
+            // The branch TERMINATES the block the `break` was in, so nothing may be
+            // appended after it. `Stmts` therefore checks the block's terminator before
+            // building each further part, rather than guessing which construct may come
+            // last in a block.
             PirExpr::Break { value } => {
-                let _ = value;
-                Err(CodegenError::UnsupportedFeature(
-                    "`break` is parsed and lowered, but this backend does not yet emit \
-                     it: the enclosing loop is known only from the control-flow graph \
-                     being built, and no loop stack is threaded through expression \
-                     lowering. It is refused rather than compiled to a no-op, because a \
-                     `break` inside an `if` that did nothing would exit no loop at all \
-                     and still build. `while` loops themselves work; see \
-                     `llvm_while_execution_test`."
-                        .to_string(),
-                ))
+                if value.is_some() {
+                    return Err(CodegenError::UnsupportedFeature(
+                        "`break` WITH A VALUE parses and lowers, but is not emitted. \
+                         Making it work needs the loop's result merged from every `break` \
+                         path AND from the fall-through path, and the fall-through has no \
+                         value: a `while` whose condition simply goes false reaches the \
+                         exit having computed nothing. Filling that in with a zero would \
+                         let an uninitialised result through under the same name as a \
+                         real one, which is the failure mode worth refusing. Bare \
+                         `break` and `continue` are fully supported in `while` and `for`."
+                            .to_string(),
+                    ));
+                }
+                let targets = self.loop_stack.last().copied().ok_or_else(|| {
+                    CodegenError::UnsupportedFeature(
+                        "`break` outside a loop: no enclosing loop is being built, so \
+                         there is nothing to leave."
+                            .to_string(),
+                    )
+                })?;
+                self.value_builder
+                    .builder()
+                    .build_unconditional_branch(targets.break_target)
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                // A `break` produces no value of its own. The zero is a PLACEHOLDER for
+                // a caller that demands one; the block is already terminated, so nothing
+                // downstream can read it.
+                Ok(self.zero_placeholder()?.into())
             }
-            PirExpr::Continue => Err(CodegenError::UnsupportedFeature(
-                "`continue` is parsed and lowered, but this backend does not yet emit \
-                 it, for the same reason as `break`: restarting the innermost loop \
-                 requires the loop the control-flow graph is inside, which expression \
-                 lowering is not currently given. Refused rather than compiled to a \
-                 no-op, which would be an infinite loop."
-                    .to_string(),
-            )),
-            PirExpr::While { cond, body } => {
+            //
+            // `continue` re-enters the loop at its HEADER, so the guard is
+            // re-evaluated. It must NOT jump to the top of the body: that would skip the
+            // body entirely, and for a counted loop it would skip the counter update and
+            // never terminate.
+            PirExpr::Continue => {
+                let targets = self.loop_stack.last().copied().ok_or_else(|| {
+                    CodegenError::UnsupportedFeature(
+                        "`continue` outside a loop: no enclosing loop is being built, so \
+                         there is no next iteration to restart."
+                            .to_string(),
+                    )
+                })?;
+                self.value_builder
+                    .builder()
+                    .build_unconditional_branch(targets.continue_target)
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                Ok(self.zero_placeholder()?.into())
+            }
+            PirExpr::While { cond, body, step } => {
                 let func = self.current_function;
                 let context = self.value_builder.type_lowering().context();
                 let header = context.append_basic_block(func, "while_cond");
@@ -512,9 +605,57 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                     .build_conditional_branch(header_bool, body_block, exit_block)
                     .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
 
-                // Body, then jump back to the header.
+                // Body, then the step, then jump back to the header.
+                //
+                // The loop context is pushed BEFORE the body is built and popped after,
+                // including on the error path. Without the pop on the error path, a
+                // failed build would leave a stale entry and a later `break` outside any
+                // loop would jump to a dead block.
+                //
+                // `continue` targets the STEP, not the header. A counted loop advances
+                // its counter there, so jumping straight to the header would skip the
+                // increment: the counter would never move and the loop would never
+                // terminate. That is the same infinite loop a no-op `continue` produces,
+                // arrived at correctly this time.
+                let step_block = context.append_basic_block(func, "while_step");
+                // Position at the BODY before building it. This line was missing, so the
+                // body was emitted into whichever block the builder was last positioned
+                // at -- the header, which already had its conditional branch. The
+                // symptom was an empty `while_body` and a `while_step` with no
+                // predecessors, which LLVM rejected as malformed.
                 self.value_builder.builder().position_at_end(body_block);
-                self.build_expr(body, quantities)?;
+                self.loop_stack.push(LoopTargets {
+                    continue_target: step_block,
+                    break_target: exit_block,
+                });
+                let body_result = self.build_expr(body, quantities);
+                self.loop_stack.pop();
+                body_result?;
+
+                // Fall-through from the body into the step, but ONLY if the body did not
+                // already terminate its block with a `break` or `continue`. Branching an
+                // already-terminated block would give it two terminators.
+                if self
+                    .value_builder
+                    .builder()
+                    .get_insert_block()
+                    .and_then(|b| b.get_terminator())
+                    .is_none()
+                {
+                    self.value_builder
+                        .builder()
+                        .build_unconditional_branch(step_block)
+                        .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                }
+
+                self.value_builder.builder().position_at_end(step_block);
+                if let Some(st) = step {
+                    // The step is built with NO loop on the stack: a `break` inside it
+                    // has no loop to leave, because the step runs after the body and
+                    // before the guard, and leaving the loop from there would skip the
+                    // remaining step statements.
+                    self.build_expr(st, quantities)?;
+                }
                 self.value_builder
                     .builder()
                     .build_unconditional_branch(header)
@@ -586,17 +727,28 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 // previous behaviour.
                 self.value_builder.builder().position_at_end(then_block);
                 let then_val = self.build_expr(then_branch, quantities)?;
+                //
+                // An arm that ends in `break` or `continue` has ALREADY terminated its
+                // block, and does not reach the merge at all. Branching it to the merge
+                // anyway gives the block two terminators, which LLVM rejects as
+                // malformed -- `then: br label %while_exit` followed immediately by
+                // `br label %if_merge`.
+                //
+                // So the branch is emitted only when the arm is still open, and the
+                // PHI takes an incoming entry only from an arm that reaches the merge.
+                // A PHI listing a predecessor that does not jump to it is equally
+                // invalid, so skipping one here and the other there is not two
+                // workarounds for one bug: they are the same fact, that this arm does
+                // not flow into the merge.
                 let then_end = self.value_builder.builder().get_insert_block();
-                self.value_builder
-                    .builder()
-                    .position_at_end(then_end.unwrap_or(then_block));
-                self.value_builder
-                    .builder()
-                    .build_unconditional_branch(merge_block)
-                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
-                // The PHI's incoming block must be the block that actually jumps to the
-                // merge, not the arm's first block.
+                let then_open = then_end.and_then(|b| b.get_terminator()).is_none();
                 let then_incoming = then_end.unwrap_or(then_block);
+                if then_open {
+                    self.value_builder
+                        .builder()
+                        .build_unconditional_branch(merge_block)
+                        .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                }
 
                 // Else branch.
                 //
@@ -622,14 +774,15 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 if else_val.get_type() != then_type {
                     else_val = self.coerce_to(else_val, then_type, "the missing `else` branch")?;
                 }
-                self.value_builder
-                    .builder()
-                    .position_at_end(else_end.unwrap_or(else_block));
-                self.value_builder
-                    .builder()
-                    .build_unconditional_branch(merge_block)
-                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                // Same rule as the then-arm: a `break` in the else-arm closes it.
+                let else_open = else_end.and_then(|b| b.get_terminator()).is_none();
                 let else_incoming = else_end.unwrap_or(else_block);
+                if else_open {
+                    self.value_builder
+                        .builder()
+                        .build_unconditional_branch(merge_block)
+                        .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                }
 
                 // Merge block
                 self.value_builder.builder().position_at_end(merge_block);
@@ -638,7 +791,30 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                     .builder()
                     .build_phi(then_type, "if_phi")
                     .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
-                phi.add_incoming(&[(&then_val, then_incoming), (&else_val, else_incoming)]);
+                //
+                // Only an arm that actually branches to the merge is listed as a
+                // predecessor. `add_incoming` takes `&dyn BasicValue` rather than the
+                // enum, so the values are referenced, not moved -- `then_val` is
+                // returned below.
+                //
+                // If NEITHER arm reaches the merge, the merge is unreachable and a phi
+                // there would have no predecessors at all, which is itself invalid. The
+                // then-value is returned instead: it is the one the source computed, and
+                // no path from this branch reaches the merge anyway.
+                let mut incoming: Vec<(
+                    &dyn inkwell::values::BasicValue<'ctx>,
+                    inkwell::basic_block::BasicBlock<'ctx>,
+                )> = Vec::new();
+                if then_open {
+                    incoming.push((&then_val, then_incoming));
+                }
+                if else_open {
+                    incoming.push((&else_val, else_incoming));
+                }
+                if incoming.is_empty() {
+                    return Ok(then_val);
+                }
+                phi.add_incoming(&incoming);
                 Ok(phi.as_basic_value())
             }
             PirExpr::Reversible { body, inverse } => {
@@ -889,6 +1065,26 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 let names_before: Vec<String> = self.value_builder.variable_names();
                 let mut build_result = Ok(());
                 for part in parts {
+                    // Stop if the previous part TERMINATED this block. `break` and
+                    // `continue` both end their block with an unconditional branch, so
+                    // `if c { break; } s = s + i;` would otherwise try to append a store
+                    // AFTER a terminator, which inkwell permits and which produces a
+                    // block with two terminators.
+                    //
+                    // `get_insert_block` IS the current block -- it calls
+                    // `LLVMGetInsertBlock`, so it tracks `position_at_end` correctly. An
+                    // intermediate note here claimed it returned "the last block
+                    // created", which is wrong; the empty `while_body` that note
+                    // described had a different cause, found below.
+                    if self
+                        .value_builder
+                        .builder()
+                        .get_insert_block()
+                        .and_then(|b| b.get_terminator())
+                        .is_some()
+                    {
+                        break;
+                    }
                     match self.build_expr(part, quantities) {
                         Ok(v) => last = Some(v),
                         Err(e) => {

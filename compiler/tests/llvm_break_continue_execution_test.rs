@@ -531,3 +531,126 @@ fn f() -> i64 {
          step skips the increment and the loop never terminates.\n--- IR ---\n{ir}"
     );
 }
+
+/// `break v` is refused, and the refusal names a substitute that WORKS.
+///
+/// `break v` is not merely unimplemented -- it is redundant. A mutable binding
+/// initialised before the loop already has a definite value on both exits,
+/// because the initialiser covers the fall-through. This test exists so the
+/// refusal is a teaching moment rather than a dead end, and so the substitute it
+/// recommends is pinned by execution instead of by assertion.
+#[test]
+fn break_with_a_value_is_refused_and_the_substitution_executed() {
+    let msg = compile_error(
+        "fn f() -> i64 { let mut s = 0; while s < 10 { s = s + 1; if s == 3 { break s; } } s }\n",
+    );
+    assert!(
+        msg.contains("let mut r = 0"),
+        "the refusal must show the working substitution, not just say it is refused: {msg}"
+    );
+    assert!(
+        msg.contains("does not need to be"),
+        "the refusal must say the form is REDUNDANT, not merely unimplemented -- that is \
+         the substantive claim, and it is what makes the substitution the right answer: {msg}"
+    );
+    assert!(
+        msg.contains("fall-through"),
+        "the refusal must explain WHY the sugar is unnecessary -- the fall-through \\
+         has no value: {msg}"
+    );
+}
+
+/// The substitution for `break v`, in a `while`, executed on the CPU.
+///
+/// `r` is set to `i * 10` when `i` reaches 3, giving 30. This is the exact program
+/// the `break s` refusal above tells the reader to write instead.
+#[test]
+fn the_substitution_for_break_with_a_value_works_in_a_while() {
+    let ir = build_ir(
+        "\
+fn first_third() -> i64 {
+    let mut r = 0;
+    let mut i = 0;
+    while i < 10 { i = i + 1; if i == 3 { r = i * 10; break; } }
+    r
+}
+",
+    );
+    assert_eq!(
+        run(
+            &ir,
+            r#"
+#include <stdio.h>
+long naso_first_third(void);
+int main(void){ printf("%ld\n", naso_first_third()); return 0; }
+"#
+        ),
+        "30",
+        "the break fires when i == 3, so r = 30. 0 would mean the assignment before \\
+         the break was lost -- the exact bug a `break v` implementation would have \\
+         to get right.\n--- IR ---\n{ir}"
+    );
+}
+
+/// The substitution in a counted `for`, executed.
+///
+/// Same guarantee on a different loop form, because `for` lowers through a different
+/// path (a synthesized counter plus a `while`) and could have dropped the assignment
+/// in the step block.
+#[test]
+fn the_substitution_for_break_with_a_value_works_in_a_counted_for() {
+    let ir = build_ir(
+        "\
+fn third_of_ten() -> i64 {
+    let mut r = 0;
+    for i in 10 { if i == 3 { r = i * 10; break; } }
+    r
+}
+",
+    );
+    assert_eq!(
+        run(
+            &ir,
+            r#"
+#include <stdio.h>
+long naso_third_of_ten(void);
+int main(void){ printf("%ld\n", naso_third_of_ten()); return 0; }
+"#
+        ),
+        "30",
+        "the assignment before the break must survive the counted loop's lowering.\n--- IR ---\n{ir}"
+    );
+}
+
+/// The fall-through case: the initialiser is what makes the substitution safe.
+///
+/// This is the reason the sugar is unnecessary rather than merely inconvenient. If
+/// the loop finishes without breaking, `r` must still hold a sensible value -- here
+/// the initialiser 0. A scheme where the loop result existed only on `break` paths
+/// would have no answer here at all.
+#[test]
+fn the_substitution_is_defined_on_the_fall_through_path_too() {
+    let ir = build_ir(
+        "\
+fn never_breaks() -> i64 {
+    let mut r = 0;
+    let mut i = 0;
+    while i < 5 { i = i + 1; }
+    r
+}
+",
+    );
+    assert_eq!(
+        run(
+            &ir,
+            r#"
+#include <stdio.h>
+long naso_never_breaks(void);
+int main(void){ printf("%ld\n", naso_never_breaks()); return 0; }
+"#
+        ),
+        "0",
+        "a loop that completes without breaking leaves the initialiser in place, so \\
+         the substitution has a definite value on both exits.\n--- IR ---\n{ir}"
+    );
+}

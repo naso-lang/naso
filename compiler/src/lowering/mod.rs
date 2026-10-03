@@ -1633,14 +1633,40 @@ impl LoweringContext {
                     else_branch: Box::new(e),
                 })
             }
+            //
+            // REFUSED, and this replaces a placeholder that compiled to a wrong answer.
+            //
+            // This used to lower the block's statements, then return
+            //
+            //     PirExpr::Reversible { body: IntLit(0), inverse: IntLit(0) }
+            //
+            // so `let x = reversible { r = 5; r = 6; };` compiled, ran, and gave `x` the
+            // value 0 -- a fabricated result, under the name of the block that was
+            // supposed to compute it. `x` was 0 because of a literal in the compiler,
+            // and nothing in the IR distinguished that from a real computation.
+            //
+            // For a reversible block that is worse than an ordinary unimplemented
+            // feature. The whole point of the construct is that the computation is
+            // UNDONE -- the inverse is the semantics. A `Reversible` whose inverse is
+            // `IntLit(0)` does not uncompute anything; it silently deletes the
+            // uncomputation, which for a linear resource is a soundness hole, not just
+            // a missing feature.
+            //
+            // Statement-position `reversible { ... }` is unaffected: it is lowered by
+            // `lower_stmt`, which emits the body's statements directly, and that path
+            // is exercised and correct.
             ExprKind::Reversible(block) => {
-                // Lower reversible block expression
-                let b = self.lower_reversible_expr(block)?;
-                // For now just return a placeholder
-                Ok(PirExpr::Reversible {
-                    body: Box::new(b),
-                    inverse: Box::new(PirExpr::IntLit(0)),
-                })
+                let _ = block;
+                Err(LoweringError::Unsupported(
+                    "`reversible { ... }` in EXPRESSION position cannot be lowered: neither \
+                 the block's value nor its INVERSE is computed. The inverse is the \
+                 semantics of a reversible block -- the part that undoes the \
+                 computation -- so emitting the block without it would silently drop the \
+                 uncomputation, and the block's value would be a constant from the \
+                 compiler rather than a result. Use `reversible { ... }` as a STATEMENT, \
+                 where its body is emitted directly."
+                        .to_string(),
+                ))
             }
             ExprKind::QuantumOp(qop) => self.lower_quantum_op(qop),
             // `e as T` is a numeric cast. Lower it to the inner expression and let
@@ -1680,17 +1706,19 @@ impl LoweringContext {
             _ => Err(LoweringError::Unsupported(format!("{:?}", lit))),
         }
     }
-
-    fn lower_reversible_expr(
-        &mut self,
-        block: &crate::ast::expr::ReversibleBlock,
-    ) -> Result<crate::ir::PirExpr, LoweringError> {
-        // Lower the body of the reversible block
-        for stmt in &block.body.stmts {
-            self.lower_stmt(stmt)?;
-        }
-        Ok(crate::ir::PirExpr::IntLit(0)) // Placeholder
-    }
+    // `lower_reversible_expr` is GONE, and that is the point.
+    //
+    // It lowered a reversible block's statements and then returned
+    // `IntLit(0) // Placeholder` as the block's value. Nothing called it any more
+    // once expression-position `reversible` began refusing, so it was dead code --
+    // but dead code that returns a fabricated value is worse than no code, because
+    // the next person needing a reversible block's value will find it, see it does
+    // "the work", and wire it back up. Its removal is why the refusal is not a
+    // one-line guard someone can route around: there is no longer a function that
+    // appears to do this.
+    //
+    // Statement-position `reversible` never used it -- `lower_stmt` emits those
+    // bodies directly, which is why that form still works.
 
     fn lower_quantum_op(
         &mut self,

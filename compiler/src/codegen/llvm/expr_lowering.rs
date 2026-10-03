@@ -522,14 +522,23 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
             PirExpr::Break { value } => {
                 if value.is_some() {
                     return Err(CodegenError::UnsupportedFeature(
-                        "`break` WITH A VALUE parses and lowers, but is not emitted. \
-                         Making it work needs the loop's result merged from every `break` \
-                         path AND from the fall-through path, and the fall-through has no \
-                         value: a `while` whose condition simply goes false reaches the \
-                         exit having computed nothing. Filling that in with a zero would \
-                         let an uninitialised result through under the same name as a \
-                         real one, which is the failure mode worth refusing. Bare \
-                         `break` and `continue` are fully supported in `while` and `for`."
+                        "`break` WITH A VALUE is not emitted, and does not need to be: \
+                         it carries no information this language cannot already express. \
+                         Bind the result to a mutable variable BEFORE the loop, assign \
+                         it and then use a bare `break` --
+
+                             let mut r = 0;
+                             for i in 10 { if i == 3 { r = i * 10; break; } }
+                             r
+
+                         That form has a definite value on BOTH exits, because the \
+                         initialiser covers the fall-through. `break v` would need the \
+                         loop result merged from every `break` path AND from the \
+                         fall-through, and the fall-through computes nothing -- filling \
+                         it in would mean inventing a value, which is exactly the \
+                         uninitialised-result-under-a-real-name failure worth refusing. \
+                         The substitution above is verified by execution in \
+                         `llvm_break_continue_execution_test.rs`."
                             .to_string(),
                     ));
                 }
@@ -859,14 +868,37 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 phi.add_incoming(&incoming);
                 Ok(phi.as_basic_value())
             }
-            PirExpr::Reversible { body, inverse } => {
-                // A reversible block runs `body` then `inverse`; `inverse` is an
-                // undo, not part of the value, so it is not emitted here. It is
-                // deliberately bound rather than discarded, so the omission is visible
-                // in this file rather than silent.
-                let _ = inverse;
-                self.build_expr(body, quantities)
-            }
+            //
+            // REFUSED rather than emitted.
+            //
+            // This arm ran `body` and dropped `inverse`, on the reasoning that the
+            // inverse "is an undo, not part of the value". That is true of the RESULT
+            // and false of the SEMANTICS: for a reversible block the inverse is the
+            // part that uncomputes. Running the body without it is not a partial
+            // implementation of uncomputation, it is the opposite of one -- it leaves
+            // behind precisely the garbage the block existed to erase, which for a
+            // linear resource is a soundness hole rather than a missing feature.
+            //
+            // A comment said the omission was "deliberately bound rather than
+            // discarded, so the omission is visible in this file". A comment is not a
+            // guarantee. Nothing checked it, and a `Reversible` reaching here from a
+            // PIR fixture compiled to a program that quietly did half of what it
+            // said.
+            //
+            // Lowering refuses expression-position `reversible` outright, so this arm
+            // normally sees nothing. It refuses anyway rather than trusting that: a
+            // backend must not run a construct whose defining operation it cannot
+            // perform, no matter who produced it. The suite pins this by building the
+            // node directly -- with lowering refusing first, that path is otherwise
+            // unreachable, and a mutation restoring the old behaviour survived every
+            // other test in the file.
+            PirExpr::Reversible { .. } => Err(CodegenError::UnsupportedFeature(
+                "a `Reversible` block reached codegen, and this backend does not \
+                 perform uncomputation. The INVERSE is not optional -- it is the part \
+                 that undoes the computation -- so emitting the body alone would leave \
+                 the state the block existed to erase. Refused rather than half-run."
+                    .to_string(),
+            )),
             // `base[indices...]`: a real load out of a caller-owned tensor buffer.
             //
             // This used to evaluate the base, throw the indices away, and return the

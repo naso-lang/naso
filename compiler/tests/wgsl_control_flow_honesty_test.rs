@@ -241,3 +241,82 @@ fn a_refused_emission_does_not_leave_a_silent_success() {
         }
     }
 }
+
+/// An unknown kernel call must be REFUSED, not commented out.
+///
+/// The same defect as the `emit_expr` catch-all, in the one arm that survived that
+/// fix. `wgsl.rs` emits only `quantize_int8_symmetric` and
+/// `dequantize_int8_symmetric`; anything else wrote
+///
+/// ```text
+/// // Unknown call: <name>
+/// ```
+///
+/// into the shader and returned `Ok`. Verified reachable by constructing the PIR
+/// directly — a `PirExpr::Call` naming an unknown kernel produced a module containing
+/// the comment and no diagnostic.
+///
+/// The consequence is the one that matters: the call is a load or a store, and the
+/// buffer keeps whatever it held before. A shader that validates and is missing its
+/// arithmetic is worse than one that refuses.
+#[test]
+fn an_unknown_kernel_call_is_refused_rather_than_commented_out() {
+    let mut m = PirModule::default();
+    m.statements.push(PirStatement {
+        id: StmtId(0),
+        domain: AffineDomain::universe(0, 0),
+        body: PirExpr::Call {
+            name: String::from("some_unknown_kernel"),
+            args: vec![int(1)],
+        },
+        quantity: Quantity::One,
+        mutability: Mutability::Immutable,
+        span: None,
+    });
+    match generate_wgsl(&m, WgslTarget::WebGpu) {
+        Ok(shader) => panic!(
+            "an unknown call must not compile to WGSL silently. The shader contains a \
+             comment in place of the operation, so it validates and computes the \
+             wrong result.\n--- shader ---\n{shader}"
+        ),
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("some_unknown_kernel"),
+                "the refusal must NAME the kernel it cannot emit: {msg}"
+            );
+        }
+    }
+}
+
+/// The known kernels must still emit — the refusal cannot be "refuse every call".
+#[test]
+fn a_recognised_quantize_call_is_still_emitted() {
+    let mut m = PirModule::default();
+    m.quantities.insert("x".to_string(), Quantity::Many);
+    m.quantities.insert("y".to_string(), Quantity::Many);
+    m.statements.push(PirStatement {
+        id: StmtId(0),
+        domain: AffineDomain::universe(0, 0),
+        body: PirExpr::Call {
+            name: String::from("quantize_int8_symmetric"),
+            args: vec![
+                PirExpr::Var(String::from("x")),
+                PirExpr::Var(String::from("y")),
+            ],
+        },
+        quantity: Quantity::One,
+        mutability: Mutability::Immutable,
+        span: None,
+    });
+    match generate_wgsl(&m, WgslTarget::WebGpu) {
+        Ok(_) => {}
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("cannot emit a call"),
+                "a recognised quantize call must still emit: {msg}"
+            );
+        }
+    }
+}

@@ -216,7 +216,37 @@ fn collect_called_names_stmt<'a>(
         StmtKind::Let(s) => collect_called_names_expr(&s.value, by_name, out),
         StmtKind::LetInOut(s) => collect_called_names_expr(&s.value, by_name, out),
         StmtKind::LetConsume(s) => collect_called_names_expr(&s.value, by_name, out),
-        StmtKind::Expr(e) | StmtKind::Return(Some(e)) => collect_called_names_expr(e, by_name, out),
+        //
+        // A statement-position `forall` is a LOOP and it IS emitted -- `check_forall`
+        // walks its body, so the emitter can build it. The ordering collector did not,
+        // so every call inside a loop body was invisible here while still being real
+        // in the output.
+        //
+        // The observable failure: `fn caller { forall i in ... { helper(i) } }` with
+        // `helper` declared AFTER `caller` emitted
+        //
+        //     fn caller(...) { ... let t = helper(f32(i)); ... }
+        //     fn helper(...) { ... }
+        //
+        // A caller referencing a later definition. WGSL has no forward declarations,
+        // so that module does not parse -- and this backend reported success, because
+        // "generated a string" is the only thing it checks.
+        //
+        // `check_forall` is the model to follow: it validates the body with
+        // `check_stmt`. This walks it with `collect_called_names_stmt`, and the loop's
+        // tail expression too, for the same reason.
+        StmtKind::Expr(e) | StmtKind::Return(Some(e)) => {
+            if let ExprKind::Forall(loop_) = &e.kind {
+                for inner in &loop_.body.stmts {
+                    collect_called_names_stmt(inner, by_name, out);
+                }
+                if let Some(tail) = &loop_.body.expr {
+                    collect_called_names_expr(tail, by_name, out);
+                }
+            } else {
+                collect_called_names_expr(e, by_name, out);
+            }
+        }
         _ => {}
     }
 }

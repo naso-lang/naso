@@ -248,7 +248,27 @@ impl WgslContext {
                 } else if name.contains("dequantize_int8_symmetric") {
                     self.emit_dequantize_call(wgsl, args, indent)?;
                 } else {
-                    wgsl.push_str(&format!("{}// Unknown call: {}\n", indent_str, name));
+                    //
+                    // REFUSED, not commented out.
+                    //
+                    // This wrote `// Unknown call: <name>` into the shader and returned
+                    // `Ok`, so a call to a kernel this backend cannot emit produced a
+                    // module that validates under naga and is missing the operation.
+                    // Same defect as the `emit_expr` catch-all this file used to have,
+                    // and with the same consequence: the buffer is left holding whatever
+                    // it held before, and nothing reports it.
+                    //
+                    // Verified reachable by constructing the PIR directly: a
+                    // `PirExpr::Call` naming an unknown kernel returned `Ok` with the
+                    // comment in the output.
+                    return Err(CodegenError::UnsupportedFeature(format!(
+                        "the WGSL backend cannot emit a call to `{}`. It emits only \
+                         `quantize_int8_symmetric` and `dequantize_int8_symmetric`; \
+                         this previously wrote a `// Unknown call` comment into the \
+                         shader and reported success, leaving the operation simply \
+                         absent.",
+                        name
+                    )));
                 }
             }
             PirExpr::Var(v) => {

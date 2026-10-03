@@ -222,6 +222,14 @@ fn matrix() -> Vec<Row> {
             note: "an affine band has no data-dependent runtime exit",
         },
         Row {
+            construct: "adding two booleans",
+            src: "fn f(a: bool, b: bool) -> bool { a + b }",
+            llvm: Outcome::Emits,
+            note: "KNOWN GAP, pre-existing and verified at HEAD: `bool` lowers to i1 and \
+                   `unify_types` does not separate arithmetic on bool from arithmetic on \
+                   ints, so this compiles rather than being refused",
+        },
+        Row {
             construct: "expression-position `reversible`",
             src: "fn f(a: i64) -> i64 { let x = reversible { a + 1 }; x }",
             llvm: Outcome::Refused,

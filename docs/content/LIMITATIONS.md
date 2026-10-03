@@ -71,6 +71,7 @@ construct, and neither is a placeholder value, a shader comment, or an exit stat
 | widthless `int` parameter | **refused** | no exact ABI slot without a width <!-- construct:widthless `int` parameter --> |
 | `break` in an affine `forall` band | **refused** | an affine band has no data-dependent runtime exit <!-- construct:`break` in an affine `forall` band --> |
 | expression-position `reversible` | **refused** | <!-- construct:expression-position `reversible` --> |
+| adding two booleans | **emits** | KNOWN GAP, pre-existing and verified at HEAD: `bool` lowers to `i1` and `unify_types` does not separate arithmetic on `bool` from arithmetic on integers, so this compiles rather than being refused <!-- construct:adding two booleans --> |
 
 ## Other targets
 

@@ -135,6 +135,35 @@ fn infer_var(checker: &mut TypeChecker, ident: &Ident, span: Span) -> Result<Typ
 }
 
 /// Infer binary operation type
+/// The common type of an integer paired with a float, or `None` if they are not.
+///
+/// `None` means "fall back to unification", which produces the ordinary type-mismatch
+/// diagnostic. It is deliberately NOT an error by itself: this only decides whether a
+/// PROMOTION applies, and the caller keeps the existing rejection path for everything else.
+///
+/// Only the INTEGER/FLOAT case is handled. There is deliberately no integer/integer
+/// branch: `unify_types` already accepts every int-int pair regardless of width -- `i8 +
+/// i64`, `i8 + i16` and `i64 + i64` all typecheck with such a branch disabled, verified by
+/// probing each -- so one here would be unreachable code. A mutation disabling it
+/// survived, which is how that was established. The backend owns the width rule
+/// (`promote_binary_operands` sign-extends into the wider type); duplicating the width
+/// arithmetic here would only create a second place for the two to disagree.
+///
+/// This must agree with `promote_binary_operands`. If they diverge, the typechecker admits
+/// programs the backend refuses, or the backend promotes something typed as an integer --
+/// the silent-wrong-answer shape this rule exists to prevent.
+fn numeric_common(lhs: &Type, rhs: &Type) -> Option<Type> {
+    use crate::ast::ty::TypeKind;
+    let is_int = |t: &Type| matches!(t.kind, TypeKind::Int | TypeKind::UInt | TypeKind::Nat);
+    if matches!(lhs.kind, TypeKind::Float) && is_int(rhs) {
+        return Some(lhs.clone());
+    }
+    if matches!(rhs.kind, TypeKind::Float) && is_int(lhs) {
+        return Some(rhs.clone());
+    }
+    None
+}
+
 fn infer_binary(
     checker: &mut TypeChecker,
     op: BinOp,
@@ -145,16 +174,34 @@ fn infer_binary(
     let lhs_ty = infer_expr(checker, lhs)?;
     let rhs_ty = infer_expr(checker, rhs)?;
 
-    // For arithmetic/comparison ops, both operands should have same numeric type
-    // Result is Bool for comparisons, same type for arithmetic
+    // For arithmetic/comparison ops the operands are brought to a COMMON numeric type.
+    //
+    // This used to `unify_types` both operands, which demanded they already match, so
+    // `count * factor` with `count: i64, factor: f32` was rejected here and the LLVM
+    // backend's promotion could never be reached from source. The promotion exists in
+    // `codegen::llvm::expr_lowering::promote_binary_operands`; this is the rule that has to
+    // agree with it.
     let result_ty = match op {
-        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
-            // Unify lhs and rhs types
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+            match numeric_common(&lhs_ty, &rhs_ty) {
+                Some(t) => t,
+                None => {
+                    unify::unify_types(checker, &lhs_ty, &rhs_ty)?;
+                    lhs_ty
+                }
+            }
+        }
+        // `%` is arithmetic too, but only on integers. The backend refuses a mixed
+        // remainder rather than truncating the float divisor, so it is NOT promoted here
+        // either -- otherwise the typechecker would admit a program the backend rejects.
+        BinOp::Rem => {
             unify::unify_types(checker, &lhs_ty, &rhs_ty)?;
             lhs_ty
         }
         BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-            unify::unify_types(checker, &lhs_ty, &rhs_ty)?;
+            if numeric_common(&lhs_ty, &rhs_ty).is_none() {
+                unify::unify_types(checker, &lhs_ty, &rhs_ty)?;
+            }
             Type::new(TypeKind::Bool, Quantity::Many, span)
         }
         BinOp::And | BinOp::Or => {

@@ -150,6 +150,19 @@ pub struct QIRModuleBuilder<'ctx> {
     /// This set is what tells the two apart, and it is populated at the point of allocation,
     /// where the backend knows the value is a qubit.
     quantum_var: HashSet<String>,
+
+    /// Whether the `Let` being built occupies a whole statement, and so must outlive its own
+    /// fabricated body.
+    ///
+    /// `LetBinding` carries no body, so lowering `let a = qalloc(1);` at statement position
+    /// produces a `Let` whose `body` is a placeholder. Popping the binding after that
+    /// placeholder made it invisible to the NEXT statement, so a gate applied to `a` read an
+    /// unbound name.
+    ///
+    /// The flag is set by the CALLER, never inferred from the body's shape: a genuine
+    /// expression body of `0` is indistinguishable from the placeholder, so guessing would
+    /// either leak a binding past its scope or wrongly free one.
+    in_statement_position: bool,
     // Declared intrinsics
     declared_intrinsics: HashMap<String, FunctionValue<'ctx>>,
     /// Enclosing loops, outermost first, so `break`/`continue` take the LAST.
@@ -185,6 +198,7 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
             current_block: None,
             variables: HashMap::new(),
             quantum_var: HashSet::new(),
+            in_statement_position: false,
             declared_intrinsics: HashMap::new(),
             loop_stack: Vec::new(),
         };
@@ -218,6 +232,7 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
             current_block: None,
             variables: HashMap::new(),
             quantum_var: HashSet::new(),
+            in_statement_position: false,
             declared_intrinsics: HashMap::new(),
             loop_stack: Vec::new(),
         };
@@ -358,10 +373,38 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
             }
         }
 
-        // Build quantum operations from statements
+        // Build every statement into ONE function, in order.
+        //
+        // This used to emit one `void` function per statement (`qir_stmt_<id>`), which had two
+        // consequences, both visible in the output rather than inferred:
+        //
+        // 1. NOTHING CALLED those functions and nothing gave them an order. A module of
+        //    unreferenced functions does not specify a circuit -- a consumer cannot know the
+        //    `h` must precede the `cx`.
+        // 2. Locals could not cross a statement boundary, because each function has its own
+        //    frame, so a `[1]` qubit bound by `qalloc` in one statement was unbound in the
+        //    next and the backend substituted the integer 0.
+        //
+        // One entry function fixes both by construction: statements are emitted in sequence
+        // into a single basic block, so their order is the program's order and a binding made
+        // by one statement is visible to the next.
+        let void_type = self.llvm_context.void_type();
+        let fn_type = void_type.fn_type(&[], false);
+        let function = self.module.add_function("qir_entry", fn_type, None);
+        self.current_function = Some(function);
+        let entry = self.llvm_context.append_basic_block(function, "entry");
+        self.current_block = Some(entry);
+        self.builder.position_at_end(entry);
+
         for stmt in &pir_module.statements {
             self.build_statement(stmt)?;
         }
+
+        self.builder
+            .build_return(None)
+            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+        self.current_function = None;
+        self.current_block = None;
 
         // Verify the module
         self.module
@@ -371,37 +414,29 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
         Ok(())
     }
 
-    // Build a PIR statement
+    /// Build one PIR statement into the open `qir_entry` function.
+    ///
+    /// This no longer creates a function, and it no longer clears the locals. Both were what
+    /// made a binding from an earlier statement invisible, and clearing them mid-function
+    /// would be the same bug in a new place: `variables` maps a name to its `alloca`, and an
+    /// alloca belongs to the function that created it.
     fn build_statement(&mut self, stmt: &PirStatement) -> CodegenResult<()> {
-        // Create a function for this statement
-        let func_name = format!("qir_stmt_{}", stmt.id.0);
-        let void_type = self.llvm_context.void_type();
-        let fn_type = void_type.fn_type(&[], false);
-        let function = self.module.add_function(&func_name, fn_type, None);
-
-        self.current_function = Some(function);
-        let entry = self.llvm_context.append_basic_block(function, "entry");
-        self.current_block = Some(entry);
-        self.builder.position_at_end(entry);
-
-        // Build the statement body
-        self.build_expr(&stmt.body)?;
-
-        // Return void
-        self.builder
-            .build_return(None)
-            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
-
-        self.current_function = None;
-        self.current_block = None;
-        // `variables` is cleared: each statement is its own function, so its locals are gone.
+        if self.current_function.is_none() {
+            return Err(CodegenError::QirError(
+                "build_statement was called with no open entry function".to_string(),
+            ));
+        }
+        // Build the statement body.
         //
-        // `quantum_var` deliberately PERSISTS. It records that a NAME denotes a qubit, which
-        // is precisely the fact that survives the scope reset and is needed to tell "a qubit
-        // that went out of scope" apart from "a scalar that was never defined". Clearing it
-        // here would restore the old silent `i64 0`.
-        self.variables.clear();
-
+        // A statement-position `Let` carries a fabricated body, so the flag is set here -- at
+        // the CALLER, which knows this is a whole statement -- rather than inferred from the
+        // body's shape. A genuine expression body of `0` is indistinguishable from the
+        // placeholder, so guessing would either leak a binding or wrongly free one.
+        let was = self.in_statement_position;
+        self.in_statement_position = true;
+        let result = self.build_expr(&stmt.body);
+        self.in_statement_position = was;
+        result?;
         Ok(())
     }
 
@@ -514,13 +549,15 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
 
                 let result = self.build_expr(body)?;
 
-                self.variables.remove(name);
-                // `quantum_var` is deliberately NOT popped here. Its whole purpose is to
-                // outlive this `let`'s scope so that a LATER statement can tell "this name is a
-                // qubit" from "this name is a scalar". Popping it would make the set empty
-                // again by the time the gate is emitted, which is exactly the silent `i64 0`
-                // this exists to prevent. The set is per-MODULE, and a name is never rebound to
-                // a different kind of value inside one module, so not popping is correct.
+                // A statement-position `let` outlives its own statement. See the field's doc
+                // comment: the placeholder body would otherwise end the binding's scope
+                // immediately, and the next statement could not see it. An expression-position
+                // `let` still scopes normally, which is what keeps a binding inside a block
+                // from leaking.
+                if !self.in_statement_position {
+                    self.variables.remove(name);
+                    self.quantum_var.remove(name);
+                }
                 Ok(result)
             }
             // QIR models qubits and their measurement, not integer arithmetic.

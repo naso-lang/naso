@@ -58,6 +58,17 @@ fn build(dir: &Path, name: &str, source: &str, target: &str) -> (bool, String) {
 /// The smallest circuit that applies one gate and discharges the qubit.
 const ONE_GATE: &str = "fn f() {\n    let [1] a: Qubit = qalloc(1);\n    hadamard(a);\n    let m = measure(a);\n    let _ = m;\n}\n";
 
+/// A Bell pair, split across statements so each operand's alloca is separate:
+///
+///     let [1] a = qalloc(1);
+///     let [1] b = qalloc(1);
+///     hadamard(a);
+///     cnot(a, b);
+///
+/// The circuit is only correct if the `h` and the `cx`'s control resolve to the SAME qubit,
+/// which is what makes this the discriminating case for operand identity.
+const BELL_PAIR: &str = "fn bell() {\n    let [1] a: Qubit = qalloc(1);\n    let [1] b: Qubit = qalloc(1);\n    hadamard(a);\n    cnot(a, b);\n    let m = measure(a);\n    let n = measure(b);\n    let _ = m;\n    let _ = n;\n}\n";
+
 /// The LLVM backend accepts a one-gate circuit, so the source language and one backend
 /// genuinely support this. Without this, the QIR failures below could be blamed on the
 /// program rather than on the backend.
@@ -87,92 +98,140 @@ fn the_llvm_backend_accepts_a_one_gate_circuit() {
 /// it accepts the program. The two arms are otherwise near-identical -- same intrinsic
 /// naming, same argument order -- which is why one works and the other does not.
 ///
-/// Two source statements naming ONE qubit: the QIR backend refuses, because it emits each
-/// statement as a separate `void` function.
+/// A circuit whose qubits are bound in EARLIER statements now compiles to a correct QIR
+/// circuit.
 ///
-/// # What changed, and what did not
+/// # What this asserts, and why it is the identity that matters
 ///
-/// This file originally recorded that QIR refused a gate with a spurious linearity error,
-/// `Linear variable 'a' used 2 times`. Both earlier defects are FIXED and covered elsewhere:
+/// The source is a Bell pair: allocate two qubits, `hadamard(a)`, `cnot(a, b)`. The emitted
+/// text is checked for OPERAND IDENTITY -- that the `h` and the first `cx` argument are loads
+/// of the SAME alloca `%a`, and that `%b` is a different one. A presence check
+/// (`qir.contains("call void @qir.h(")`) would be satisfied by a circuit applying `h` and `cx`
+/// to unrelated qubits, which is exactly what this backend used to emit.
 ///
-///   * the linearity checker no longer counts a gate operand as a consumption, so a gate
-///     BORROW is not mistaken for a double USE;
-///   * `qir_intrinsic_for` maps lowering's operation names onto real QIR intrinsics, so
-///     `qalloc` resolves to `qir.qubit_alloc` instead of `qir.qalloc`.
+/// # Why it could not work before
 ///
-/// Neither fix is sufficient, and this test is why: the refusal below is neither of those
-/// errors. It is the REMAINING structural defect -- `build_statement` creates a fresh
-/// `void` function per `PirStatement` and clears `self.variables` between them, so a `[1]`
-/// qubit bound by `let [1] a = qalloc(1)` is not in scope when a LATER statement applies a
-/// gate to `a`.
+/// `build_statement` emitted one `void` function per PIR statement, so a binding made by one
+/// statement was invisible to the next -- the gate read an unbound name and got the integer 0.
+/// Three changes fixed that, and all three are needed:
 ///
-/// The backend used to paper over that with `i64 0`, which made the gate operate on an
-/// integer rather than the qubit. It now refuses and names the cause.
+///   * statements are emitted into ONE `qir_entry` function in order, so the program's order
+///     IS the emitted order and nothing is an unreferenced function;
+///   * a statement-position `let` outlives its own placeholder body, via `in_statement_position`
+///     -- set by the caller, never inferred from the body's shape, because a genuine body of
+///     `0` is indistinguishable from the placeholder;
+///   * a qubit-producing operation yields a null POINTER, not the generic integer zero.
 ///
-/// # Why the refusal is right and a fix is not yet safe
+/// # What this does NOT claim
 ///
-/// Emitting this correctly means either sharing an `alloca` across statements -- which is
-/// unsound, because two `void` functions have no caller-ordered relationship, so a gate in
-/// statement 3 could execute before the allocation in statement 1 -- or restructuring the
-/// emitter to produce one entry-point function per Naso function, which is the same shape the
-/// LLVM backend already has. That is a real design change with its own risk, so it is not
-/// smuggled in here.
-///
-/// Note the contrast with `the_llvm_backend_accepts_a_one_gate_circuit`: LLVM emits this
-/// same program, because its schedule tree gives every statement a place in one function.
+/// QIR text is not execution. This circuit has never been run against a QPU or a simulator,
+/// and `qir_entry` carries no ENTRYPOINT attribute, so no QIR driver would find it either.
+/// What is established is that the emitted module is a well-formed, correctly-ordered circuit
+/// on the intended qubits -- which is what makes numerical verification possible next.
 #[test]
-fn the_qir_backend_refuses_a_gate_on_a_qubit_bound_in_an_earlier_statement() {
-    let dir = scratch("qir_scope");
-    let (ok, stderr) = build(&dir, "scope", ONE_GATE, "qir");
+fn a_bell_pair_compiles_to_one_ordered_circuit_on_the_right_qubits() {
+    let dir = scratch("qir_bell");
+    let (ok, stderr) = build(&dir, "bell", BELL_PAIR, "qir");
     assert!(
-        !ok,
-        "this test records the per-statement scoping defect. If QIR now emits this, the \
-         emitter must share qubit identity across statements -- check that a gate in a later \
-         statement acts on the qubit an EARLIER statement allocated, then update this test, \
-         the capability matrix and LIMITATIONS.md."
+        ok,
+        "a Bell pair should compile to QIR now. It did not, so the per-statement scoping \
+         defect is back or something else refuses it: {stderr}"
+    );
+
+    let qir = std::fs::read_to_string(dir.join("bell.out")).expect("read emitted QIR");
+
+    // ONE function, so the order of the statements is the order of the circuit.
+    assert_eq!(
+        qir.matches("define void @qir_entry").count(),
+        1,
+        "statements must be emitted into a single entry function: {qir}"
     );
     assert!(
-        stderr.contains("not bound in this statement"),
-        "the expected failure is the unbound-operand refusal naming the per-statement scoping, \
-         but got: {stderr}"
+        !qir.contains("qir_stmt_"),
+        "no per-statement functions should remain -- nothing would order them: {qir}"
+    );
+
+    // Exactly two allocations for two qubits. More means an operand that was not reused.
+    assert_eq!(
+        qir.matches("call ptr @qir.qubit_alloc()").count(),
+        2,
+        "two qubits should mean two allocations: {qir}"
+    );
+
+    // The identity check: the gate operands are loads of the same two allocas, and the
+    // `cx` takes a-load then b-load, so it controls `a` onto `b` as the source says.
+    let (h_operand, cx_control, cx_target) = operands_of_gates(&qir);
+    assert_eq!(
+        h_operand, cx_control,
+        "`hadamard(a)` and `cnot(a, b)` must act on the SAME first qubit; got h on {h_operand} \
+         and cx controlled on {cx_control}"
+    );
+    assert_ne!(
+        h_operand, cx_target,
+        "`cnot(a, b)` must target the SECOND qubit, not the one the h acted on; both were \
+         {cx_target}"
+    );
+
+    // And the program order must be the emitted order: allocate, h, cx, measure.
+    let i_alloc = qir.find("call ptr @qir.qubit_alloc()").expect("allocation");
+    let i_h = qir.find("call void @qir.h(").expect("h");
+    let i_cx = qir.find("call void @qir.cx(").expect("cx");
+    assert!(
+        i_alloc < i_h && i_h < i_cx,
+        "the circuit must read allocate -> h -> cx; offsets were {i_alloc}, {i_h}, {i_cx}: {qir}"
     );
 }
 
-/// `qalloc` now resolves to a real QIR intrinsic and yields a POINTER, not an integer.
+/// The SSA names the `h` and the two `cx` operands were given.
 ///
-/// # Why pointer-ness is the point
-///
-/// The generic placeholder for a void intrinsic is `result_type`'s integer zero. Returning
-/// that for `qir.qubit_alloc` typed every qubit binding as `i64`, and a later gate then passed
-/// an `i64` where `qir.h(ptr)` wants a `ptr` -- rejected by the LLVM verifier. QIR models a
-/// qubit as a pointer, so a qubit-producing operation must yield a null pointer of that type.
-///
-/// # What is still not proven
-///
-/// This asserts the INTRINSIC is found and the refusal has moved on. It does NOT claim a
-/// qubit survives between statements -- that is the scoping defect above, and the test below
-/// still fails for it.
-#[test]
-fn the_qir_backend_now_recognises_qalloc() {
-    let dir = scratch("qir_alloc");
-    // Allocation only, in a single statement, so the scoping defect cannot mask the result.
-    let source = "fn f() {\n    let [1] a: Qubit = qalloc(1);\n    let _ = a;\n}\n";
-    let (ok, stderr) = build(&dir, "alloc", source, "qir");
-    if !ok {
-        assert!(
-            !stderr.contains("Unknown QIR intrinsic 'qir.qalloc'"),
-            "`qalloc` should map to `qir.qubit_alloc`. If this fails, the intrinsic mapping \
-             regressed and every quantum program is refused again: {stderr}"
-        );
-    }
-    // When it does emit, the allocation must be a real pointer call, never an integer zero.
-    if ok {
-        let qir = std::fs::read_to_string(dir.join("alloc.qir")).expect("read emitted QIR");
-        assert!(
-            qir.contains("call ptr @qir.qubit_alloc()"),
-            "a qubit allocation must be a pointer-returning call: {qir}"
-        );
-    }
+/// Both operand sites are `load ptr, ptr %a` -- the SAME alloca, loaded twice -- which is
+/// what makes the identity check meaningful. Comparing the load RESULTS (`%a2` vs `%a3`)
+/// would be wrong: those are distinct SSA names precisely because they are two separate
+/// loads, and they would compare unequal even in a correct circuit. So this strips the
+/// `load ..., ptr ` prefix and returns the alloca each operand came from.
+fn operands_of_gates(qir: &str) -> (String, String, String) {
+    let call_args = |needle: &str| -> Vec<String> {
+        let start = qir.find(needle).expect("gate call present");
+        let line = qir[start..].lines().next().expect("call occupies one line");
+        let args = line
+            .rsplit_once('(')
+            .expect("a call has an argument list")
+            .1;
+        args.trim_end_matches(')')
+            .split(',')
+            .map(|a| a.trim().to_string())
+            .collect()
+    };
+
+    // The CALL line names the load's RESULT (`%a3`), which is a distinct SSA name on every
+    // use -- so it cannot be compared. What identifies the qubit is the alloca that load
+    // READS, which is on the preceding line: `%a3 = load ptr, ptr %a, align 8` -> `%a`.
+    //
+    // So walk back from the call to the instruction that defined its operand. Reporting the
+    // slot name rather than the value is what makes "same qubit" a decidable question.
+    let pointee = |arg: &str| -> String {
+        let value = arg.trim_start_matches("ptr ").trim();
+        let def = qir
+            .lines()
+            .find(|l| l.trim_start().starts_with(&format!("{value} =")))
+            .unwrap_or_else(|| panic!("no defining instruction for operand {arg:?}"));
+        let after = def
+            .split_once(", ptr ")
+            .unwrap_or_else(|| panic!("operand {value} is not a pointer load: {def}"));
+        after
+            .1
+            .split(',')
+            .next()
+            .expect("the loaded-from slot")
+            .trim()
+            .to_owned()
+    };
+
+    let h = call_args("call void @qir.h(");
+    let cx = call_args("call void @qir.cx(");
+    assert_eq!(h.len(), 1, "hadamard takes one operand, got {h:?}");
+    assert_eq!(cx.len(), 2, "cnot takes two operands, got {cx:?}");
+    (pointee(&h[0]), pointee(&cx[0]), pointee(&cx[1]))
 }
 
 /// A program with no quantum operations at all compiles to QIR successfully.

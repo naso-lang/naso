@@ -111,8 +111,8 @@ compiled output into that check.
 | Construct | QIR | WGSL straight-line | WGSL compute | Note |
 |---|---|---|---|---|
 | empty function | **emits** | **emits** | **refused** | a compute kernel with no tensor parameter has nothing to bind <!-- construct:empty function --> |
-| qubit allocation and measurement | **refused** | **refused** | **refused** | the measurement is in a second statement, where the qubit allocated in the first is out of scope <!-- construct:qubit allocation and measurement --> |
-| a single gate | **refused** | **refused** | **refused** | the gate is in a second statement, where the qubit allocated in the first is out of scope <!-- construct:a single gate --> |
+| qubit allocation and measurement | **emits** | **refused** | **refused** | emits one ordered `qir_entry` allocating the qubit and reading it back with `qir.mz` <!-- construct:qubit allocation and measurement --> |
+| a single gate | **emits** | **refused** | **refused** | emits `qir.h` on the allocated qubit; a gate BORROWS, so the qubit is still readable by the measurement <!-- construct:a single gate --> |
 | scalar float multiply | **refused** | **emits** | **refused** | QIR has no scalar arithmetic; it emits one void quantum operation <!-- construct:scalar float multiply --> |
 | scalar integer add | **refused** | **emits** | **refused** | <!-- construct:scalar integer add --> |
 | function call | **refused** | **emits** | **refused** | <!-- construct:function call --> |
@@ -194,7 +194,20 @@ Two consequences are now enforced:
   missing. The builder emits `h`, `cx`, `x` and `z` but drops `S_alice_measure` entirely, so
   Bob's conditional corrections never appear.
 
-**Teleportation is not emitted by the QIR backend today.** It emits some of the right gate
-names, on qubits that are not the ones the fixture names, and omits the measurement and
-correction steps. QIR output from this backend is structural text; it has never been executed
-against a QPU or a simulator.
+The fix has three parts, all now in place: statements are emitted into ONE `qir_entry`
+function in order (so the program's order is the circuit's, and nothing is an unreferenced
+function), a statement-position `let` outlives its own placeholder body, and a
+qubit-producing operation yields a pointer rather than the generic integer zero. The `let`
+lifetime is decided by a flag the CALLER sets, never inferred from the body's shape — a
+genuine expression body of `0` is indistinguishable from the placeholder.
+
+**What `emits` does not mean here.** A Bell pair now compiles to the correct circuit, with
+operand identity pinned by test: `compiler/tests/qir_gate_emission_gap_test` compares the
+alloca each gate operand was loaded from, because comparing the load *results* would
+compare unequal SSA names even in a correct circuit.
+
+But QIR output from this backend is still structural text. Nothing executes `qir_entry`,
+which carries no `ENTRYPOINT` attribute, and no QPU or simulator has seen this output.
+Register-array indexing (`q[1]`) remains refused, and the `teleport.pir` fixture still cannot
+express a shared qubit — its parser gives every operand a fresh allocation, which is a
+property of the fixture, not the backend.

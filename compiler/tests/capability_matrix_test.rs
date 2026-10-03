@@ -339,36 +339,39 @@ fn target_matrix() -> Vec<TargetRow> {
         // as its scalar rows. It refuses scalar arithmetic by design -- it emits one `void`
         // function per quantum operation and has no arithmetic.
         //
-        // Two EARLIER defects are fixed and no longer the cause. A gate operand is BORROWED,
-        // and the linearity checker no longer mistakes a borrow for a double USE;
-        // `qalloc` now maps to `qir.qubit_alloc` rather than the nonexistent `qir.qalloc`.
+        // QIR now EMITS both of these. Three defects stood between it and doing so, and all
+        // three are fixed:
         //
-        // The refusal that remains is structural: the emitter builds one `void` function per
-        // PIR statement and clears its locals between them, so a `[1]` qubit bound by
-        // `qalloc` in one statement is not in scope when a later statement gates it. The
-        // backend refuses rather than substituting a placeholder, because a placeholder would
-        // emit valid QIR applying gates to something other than the qubit.
+        //   * a gate operand is BORROWED, and the linearity checker no longer mistakes a
+        //     borrow for a double USE;
+        //   * `qalloc` maps to `qir.qubit_alloc` rather than the nonexistent `qir.qalloc`;
+        //   * statements are emitted into ONE `qir_entry` function in order, and a
+        //     statement-position `let` outlives its own placeholder body -- so a qubit bound
+        //     in one statement is the SAME qubit when a later statement gates it.
         //
-        // LLVM accepts both programs -- its schedule tree gives every statement a place in one
-        // function -- so the source language and one backend support them. The gap is
-        // specific to QIR emission.
+        // `emits` here means the QIR text is produced and well-formed. It does NOT mean the
+        // circuit was executed: nothing runs `qir_entry`, which carries no ENTRYPOINT
+        // attribute, and no QPU or simulator has seen this output. Operand identity is
+        // pinned separately, by `qir_gate_emission_gap_test`, which compares the alloca each
+        // gate operand was loaded from -- a presence check cannot detect a gate acting on the
+        // wrong qubit, which is how the previous "passing" fixtures hid a wrong circuit.
         TargetRow {
             construct: "qubit allocation and measurement",
             src: "fn f() { let [1] a: Qubit = qalloc(1); let m = measure(a); let _ = m; }",
             kernel: "f",
-            qir: Outcome::Refused,
+            qir: Outcome::Emits,
             wgsl_straight: Outcome::Refused,
             wgsl_compute: Outcome::Refused,
-            note: "the measurement is in a second statement, where the qubit allocated in the first is out of scope",
+            note: "emits one ordered `qir_entry` allocating the qubit and reading it back with `qir.mz`",
         },
         TargetRow {
             construct: "a single gate",
             src: "fn f() { let [1] a: Qubit = qalloc(1); hadamard(a); let m = measure(a); let _ = m; }",
             kernel: "f",
-            qir: Outcome::Refused,
+            qir: Outcome::Emits,
             wgsl_straight: Outcome::Refused,
             wgsl_compute: Outcome::Refused,
-            note: "the gate is in a second statement, where the qubit allocated in the first is out of scope",
+            note: "emits `qir.h` on the allocated qubit; a gate BORROWS, so the qubit is still readable by the measurement",
         },
         TargetRow {
             construct: "scalar float multiply",

@@ -36,7 +36,7 @@
 
 use naso_compiler::codegen::CodegenTarget;
 use naso_compiler::codegen::llvm::module_builder::LLVMModuleBuilder;
-use naso_compiler::codegen::{CodegenContext, OptLevel};
+use naso_compiler::codegen::{CodegenContext, CodegenPipeline, OptLevel};
 
 /// What a target did with a construct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,6 +228,298 @@ fn matrix() -> Vec<Row> {
             note: "",
         },
     ]
+}
+
+/// What the QIR backend did with a construct.
+fn qir_outcome(src: &str) -> Outcome {
+    let pir = match lower(src) {
+        Ok(p) => p,
+        Err(_) => return Outcome::Refused,
+    };
+    let Ok(cc) = CodegenContext::new(CodegenTarget::Host, OptLevel::None) else {
+        return Outcome::Refused;
+    };
+    match CodegenPipeline::new(cc).emit_qir(&pir) {
+        Ok(_) => Outcome::Emits,
+        Err(_) => Outcome::Refused,
+    }
+}
+
+/// What the straight-line WGSL backend did.
+fn wgsl_straight_outcome(src: &str) -> Outcome {
+    let Ok(program) = typechecked(src) else {
+        return Outcome::Refused;
+    };
+    match naso_compiler::codegen::wgsl_straight::generate_wgsl_straight_line(&program) {
+        Ok(_) => Outcome::Emits,
+        Err(_) => Outcome::Refused,
+    }
+}
+
+/// What the compute WGSL backend did, given the kernel name that owns the tensors.
+///
+/// The kernel name is a parameter, not a global, so each row states which function the
+/// caller is asking to compile as a compute entry point.
+fn wgsl_compute_outcome(src: &str, kernel: &str) -> Outcome {
+    let Ok(program) = typechecked(src) else {
+        return Outcome::Refused;
+    };
+    match naso_compiler::codegen::wgsl_compute::generate_wgsl_compute(&program, kernel) {
+        Ok(_) => Outcome::Emits,
+        Err(_) => Outcome::Refused,
+    }
+}
+
+/// Parse and typecheck, which every source-level backend entry point requires.
+fn typechecked(src: &str) -> Result<naso_compiler::ast::Program, String> {
+    let mut program = naso_compiler::parser::parse_program(src).map_err(|e| e.to_string())?;
+    let checked = naso_compiler::typecheck::check_program(&mut program);
+    if !checked.errors.is_empty() {
+        return Err(checked.errors[0].to_string());
+    }
+    Ok(checked.program)
+}
+
+/// Lower, as the PIR-level backends require.
+fn lower(src: &str) -> Result<naso_compiler::ir::pir_types::PirModule, String> {
+    let program = typechecked(src)?;
+    naso_compiler::lowering::lower_program(&program).map_err(|e| e.to_string())
+}
+
+/// The QIR and WGSL half of the matrix.
+///
+/// Split out because these backends are built for a different job than LLVM and their
+/// refusals are NOT the same refusals. QIR refuses every scalar computation -- it emits
+/// one `void` quantum operation and has no scalar arithmetic at all -- while refusing
+/// those is correct for it. Recording that as a shared row would imply QIR is a worse
+/// LLVM, which it is not.
+struct TargetRow {
+    construct: &'static str,
+    src: &'static str,
+    /// Kernel name for the compute WGSL backend; unused by the others.
+    kernel: &'static str,
+    qir: Outcome,
+    wgsl_straight: Outcome,
+    wgsl_compute: Outcome,
+    note: &'static str,
+}
+
+fn target_matrix() -> Vec<TargetRow> {
+    vec![
+        TargetRow {
+            construct: "empty function",
+            src: "fn f() { }",
+            kernel: "f",
+            qir: Outcome::Emits,
+            wgsl_straight: Outcome::Emits,
+            // A compute kernel with no tensor parameter has nothing to bind, so this
+            // is REFUSED -- not because empty functions are unsupported, but because
+            // the compute ABI is defined in terms of tensor parameters. Naming the
+            // kernel that does own one is the row below.
+            wgsl_compute: Outcome::Refused,
+            note: "a compute kernel with no tensor parameter has nothing to bind",
+        },
+        TargetRow {
+            construct: "scalar float multiply",
+            src: "fn f(a: f32, b: f32) -> f32 { a * b }",
+            kernel: "main",
+            qir: Outcome::Refused,
+            wgsl_straight: Outcome::Emits,
+            wgsl_compute: Outcome::Refused,
+            note: "QIR has no scalar arithmetic; it emits one void quantum operation",
+        },
+        TargetRow {
+            construct: "scalar integer add",
+            src: "fn f(a: i64) -> i64 { a + 1 }",
+            kernel: "main",
+            qir: Outcome::Refused,
+            wgsl_straight: Outcome::Emits,
+            wgsl_compute: Outcome::Refused,
+            note: "",
+        },
+        TargetRow {
+            construct: "function call",
+            src: "fn g(a: f32) -> f32 { a }\nfn f(a: f32) -> f32 { g(a) }",
+            kernel: "main",
+            qir: Outcome::Refused,
+            wgsl_straight: Outcome::Emits,
+            wgsl_compute: Outcome::Refused,
+            note: "",
+        },
+        TargetRow {
+            construct: "tensor kernel entry point",
+            src: "fn compute(a: Tensor[f32, 8]) { }",
+            kernel: "compute",
+            // QIR accepts this: it emits a void quantum operation and its parameter ABI
+            // does not constrain it the way the compute WGSL ABI does. Refusing scalar
+            // work in QIR above is about arithmetic, not about parameters.
+            qir: Outcome::Emits,
+            wgsl_straight: Outcome::Refused,
+            wgsl_compute: Outcome::Emits,
+            note: "the only shape the compute path accepts is a tensor-parameter kernel",
+        },
+        TargetRow {
+            construct: "`if` in straight-line WGSL",
+            src: "fn f(a: f32) -> f32 { if a > 0.0 { 1.0 } else { 0.0 } }",
+            kernel: "main",
+            qir: Outcome::Refused,
+            wgsl_straight: Outcome::Refused,
+            wgsl_compute: Outcome::Refused,
+            note: "control flow has no place in a straight-line shader",
+        },
+        TargetRow {
+            construct: "tensor subscript in straight-line WGSL",
+            src: "fn f(x: Tensor[f32, 4]) -> f32 { x[0] }",
+            kernel: "main",
+            qir: Outcome::Refused,
+            wgsl_straight: Outcome::Refused,
+            wgsl_compute: Outcome::Refused,
+            note: "a `tensor` type has no WGSL equivalent in that position",
+        },
+        TargetRow {
+            construct: "assignment",
+            src: "fn f(a: i64) { let mut x = a; x = 1; }",
+            kernel: "f",
+            qir: Outcome::Refused,
+            wgsl_straight: Outcome::Emits,
+            wgsl_compute: Outcome::Refused,
+            note: "assignment to a `Var` is not expressible in QIR",
+        },
+    ]
+}
+
+/// The published line for a construct, or a panic naming what is missing.
+fn published_row(construct: &str) -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the compiler crate must live inside the repository")
+        .join("docs/content/LIMITATIONS.md");
+    let published = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} must exist and be readable.\n{e}", path.display()));
+    let marker = format!("<!-- construct:{construct} -->");
+    published
+        .lines()
+        .find(|l| l.contains(&marker))
+        .unwrap_or_else(|| {
+            panic!(
+                "LIMITATIONS.md is missing the row for {construct:?}.\n  expected marker: {marker}"
+            )
+        })
+        .to_string()
+}
+
+#[test]
+fn the_target_capability_matrix_matches_reality() {
+    let mut wrong = Vec::new();
+    for row in target_matrix() {
+        for (name, expected, actual) in [
+            ("QIR", row.qir, qir_outcome(row.src)),
+            (
+                "WGSL straight-line",
+                row.wgsl_straight,
+                wgsl_straight_outcome(row.src),
+            ),
+            (
+                "WGSL compute",
+                row.wgsl_compute,
+                wgsl_compute_outcome(row.src, row.kernel),
+            ),
+        ] {
+            if expected != actual {
+                wrong.push(format!(
+                    "{construct:?} on {name}: matrix says {expected:?}, actual is {actual:?}\n  source: {src}",
+                    construct = row.construct,
+                    src = row.src.replace('\n', " ")
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "the target capability matrix has drifted from the compiler.\n\n{}",
+        wrong.join("\n\n")
+    );
+}
+
+/// A documented refusal reason must reach the published page.
+///
+/// Otherwise the QIR/WGSL table tells an author only THAT something is refused and not
+/// why -- and for these backends the WHY is the interesting part, since refusing scalar
+/// arithmetic is correct for QIR rather than a gap.
+#[test]
+fn every_refused_target_row_publishes_its_reason() {
+    for row in target_matrix() {
+        if row.note.is_empty() || row.qir != Outcome::Refused {
+            continue;
+        }
+        let first_clause: String = row
+            .note
+            .split([',', '.'])
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let line = published_row(row.construct);
+        assert!(
+            line.contains(&first_clause),
+            "LIMITATIONS.md row for {:?} omits its documented reason {:?}.\n  row: {line}",
+            row.construct,
+            first_clause
+        );
+    }
+}
+
+/// The published QIR/WGSL section must match the target matrix.
+///
+/// Without this the new table is prose that drifts, which is the whole failure mode the
+/// capability matrix exists to prevent. Only the constructs and the three labels are
+/// checked; the note is prose and may be reworded freely.
+#[test]
+fn the_published_target_section_matches_the_target_matrix() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the compiler crate must live inside the repository")
+        .join("docs/content/LIMITATIONS.md");
+    let published = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} must exist and be readable.\n{e}", path.display()));
+
+    for row in target_matrix() {
+        let marker = format!("<!-- construct:{} -->", row.construct);
+        let line = published
+            .lines()
+            .find(|l| l.contains(&marker))
+            .unwrap_or_else(|| {
+                panic!(
+                    "LIMITATIONS.md is missing {:?}. The QIR/WGSL table must list every \
+                     target-matrix row.\n  expected marker: {marker}",
+                    row.construct
+                )
+            });
+        for (name, outcome) in [
+            ("QIR", row.qir),
+            ("WGSL straight-line", row.wgsl_straight),
+            ("WGSL compute", row.wgsl_compute),
+        ] {
+            let label = match outcome {
+                Outcome::Emits => "**emits**",
+                Outcome::Refused => "**refused**",
+            };
+            // Count occurrences so a row that gets the right label in the wrong column
+            // cannot pass by having it somewhere else in the line.
+            let found = line.matches(label).count();
+            let expected_count = [row.qir, row.wgsl_straight, row.wgsl_compute]
+                .iter()
+                .filter(|o| **o == outcome)
+                .count();
+            assert_eq!(
+                found, expected_count,
+                "LIMITATIONS.md row for {:?} shows {found} occurrence(s) of {label:?} \
+                 but the matrix says {name} is {outcome:?}, so {expected_count} \
+                 expected.\n  row: {line}\n\nRegenerate the document.",
+                row.construct
+            );
+        }
+    }
 }
 
 #[test]

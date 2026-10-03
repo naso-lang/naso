@@ -84,6 +84,35 @@ honest about their current state:
 | **WGSL** | Generates shaders, validated with `naga`. No GPU execution has been performed: there is no `/dev/dri`, no Vulkan ICD, and no browser WebGPU in the build environment. |
 | **Cranelift** | **Not implemented.** `naso build --target cranelift` refuses with an explicit diagnostic rather than returning a result. |
 
+## QIR and WGSL backends
+
+These refuse a *different* set of constructs than LLVM, and the refusals are correct for
+them: QIR emits one void quantum operation and has no scalar arithmetic at all, so
+refusing `a + b` is not a worse LLVM. Recording these in the same table as the LLVM rows
+would imply otherwise, so they are separate.
+
+| Construct | QIR | WGSL straight-line | WGSL compute | Note |
+|---|---|---|---|---|
+| empty function | **emits** | **emits** | **refused** | a compute kernel with no tensor parameter has nothing to bind <!-- construct:empty function --> |
+| scalar float multiply | **refused** | **emits** | **refused** | QIR has no scalar arithmetic; it emits one void quantum operation <!-- construct:scalar float multiply --> |
+| scalar integer add | **refused** | **emits** | **refused** | <!-- construct:scalar integer add --> |
+| function call | **refused** | **emits** | **refused** | <!-- construct:function call --> |
+| tensor kernel entry point | **emits** | **refused** | **emits** | the only shape the compute path accepts is a tensor-parameter kernel <!-- construct:tensor kernel entry point --> |
+| `if` in straight-line WGSL | **refused** | **refused** | **refused** | control flow has no place in a straight-line shader <!-- construct:`if` in straight-line WGSL --> |
+| tensor subscript in straight-line WGSL | **refused** | **refused** | **refused** | a `tensor` type has no WGSL equivalent in that position <!-- construct:tensor subscript in straight-line WGSL --> |
+| assignment | **refused** | **emits** | **refused** | assignment to a `Var` is not expressible in QIR <!-- construct:assignment --> |
+
+**QIR output is structural.** A validated circuit text is not QPU execution.
+
+**WGSL is validated with `naga`, which is not GPU execution.** There is no `/dev/dri`, no
+Vulkan ICD, and no browser WebGPU in the build environment, so no generated shader has
+ever been run. `naga` proves the module parses and its types line up; it proves nothing
+about what the shader computes.
+
+**A compute kernel is chosen by name and must own tensor parameters.** The compute WGSL
+path takes the kernel name as an argument, and refuses a kernel with no tensor parameter
+because the ABI is defined in terms of those bindings.
+
 ## Verification claims
 
 Stated precisely, because the distinction matters:

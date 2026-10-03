@@ -239,6 +239,11 @@ jobs:
       - name: Test the CLI end-to-end suite
         run: cargo test --features llvm --test cli_end_to_end_test
 
+      - name: Test the forward/inverse stream representation
+        run: |
+          cargo test --features llvm --test dual_stream_test
+          cargo test --features llvm --doc dual_stream
+
       - name: Test the WGSL extent refusal suite
         run: cargo test --features llvm --test wgsl_extent_test
 

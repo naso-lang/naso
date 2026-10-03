@@ -349,7 +349,15 @@ fn bigger(a: i64, b: f32) -> f64 { a + b }
 fn narrower(a: f32, b: i64) -> f64 { a - b }
 fn less(a: i64, b: f32) -> bool { a < b }
 ",
-        "#include <stdio.h>\ndouble naso_scaled(long,double);\ndouble naso_bigger(long,double);\ndouble naso_narrower(double,long);\nint naso_less(long,double);\nint main(void){ printf(\"%.2f %.2f %.2f %d\\n\", naso_scaled(3,2.5), naso_bigger(3,2.5), naso_narrower(2.5,7), naso_less(3,2.5)); return 0; }\n",
+        // `_Bool` for `naso_less`, NOT `int`. Naso lowers `bool` to LLVM `i1`, which on
+        // x86-64 SysV is returned in AL with the upper bits UNDEFINED. Declaring the C
+        // prototype as `int` reads those undefined bits, so the printed value is whatever
+        // happened to be in the register -- it was 0 locally and -2057277440 on CI, from the
+        // same compiler and the same source.
+        //
+        // This is the sharpest argument for running tests rather than reasoning about them:
+        // the harness was wrong, the compiler was right, and only execution showed it.
+        "#include <stdio.h>\n#include <stdbool.h>\ndouble naso_scaled(long,double);\ndouble naso_bigger(long,double);\ndouble naso_narrower(double,long);\nbool naso_less(long,double);\nint main(void){ printf(\"%.2f %.2f %.2f %d\\n\", naso_scaled(3,2.5), naso_bigger(3,2.5), naso_narrower(2.5,7), naso_less(3,2.5)); return 0; }\n",
     );
     assert_eq!(
         out.trim(),
@@ -440,8 +448,7 @@ fn mixed_width_integers_are_reachable_and_promote() {
     let out = run_naso_program(
         "widths",
         "\
-fn widen(small: i8, big: i64) -> i64 { small + big }
-",
+fn widen(small: i8, big: i64) -> i64 { small + big }\n",
         "#include <stdio.h>\nlong naso_widen(signed char, long);\nint main(void){ printf(\"%ld %ld\\n\", naso_widen(-5, 100), naso_widen(7, 1)); return 0; }\n",
     );
     assert_eq!(
@@ -475,5 +482,35 @@ fn subtract(a: i64, b: i64) -> i64 { a - b }
         out.trim(),
         "17 -6",
         "plain same-width integer arithmetic must be unaffected by the promotion rule."
+    );
+}
+
+/// A `bool` return crosses the C ABI as `i1`, so the harness MUST declare `_Bool`.
+///
+/// CI caught this the only way it could be caught: the same compiler and the same source
+/// printed `0` locally and `-2057277440` on the runner. `i1` is returned in AL with the
+/// upper bits undefined, so an `int` prototype reads whatever is in the register.
+///
+/// Asserting `naso_less(3, 2.5) == 0` passes with an `int` prototype whenever the garbage
+/// bits happen to be zero, which is most of the time on a developer's machine and not on
+/// CI. That is a test that fails in production and passes locally -- the worst shape.
+///
+/// Both directions are asserted so the test is not accidentally satisfied by a compiler
+/// that returns a constant.
+#[test]
+fn a_bool_return_must_be_declared_as_c_bool_in_the_harness() {
+    let out = run_naso_program(
+        "boolabi",
+        "fn is_less(a: f32, b: f32) -> bool { a < b }\n",
+        // `_Bool`, not `int`. See the comment on the test above.
+        "#include <stdio.h>\n#include <stdbool.h>\nbool naso_is_less(double,double);\n\
+         int main(void){ printf(\"%d %d\\n\", naso_is_less(3, 2.5), naso_is_less(2.5, 9)); return 0; }\n",
+    );
+    assert_eq!(
+        out.trim(),
+        "0 1",
+        "3 < 2.5 is false and 2.5 < 9 is true. A value other than 0 1 means the return was \
+         read with the wrong width: Naso lowers `bool` to LLVM `i1`, returned in AL with \
+         undefined upper bits."
     );
 }

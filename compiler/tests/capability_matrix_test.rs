@@ -224,10 +224,11 @@ fn matrix() -> Vec<Row> {
         Row {
             construct: "adding two booleans",
             src: "fn f(a: bool, b: bool) -> bool { a + b }",
-            llvm: Outcome::Emits,
-            note: "KNOWN GAP, pre-existing and verified at HEAD: `bool` lowers to i1 and \
-                   `unify_types` does not separate arithmetic on bool from arithmetic on \
-                   ints, so this compiles rather than being refused",
+            llvm: Outcome::Refused,
+            note: "FIXED. `unify_kinds` accepts (Bool, Bool) for `==`, and the arithmetic \
+                   arm called it without asking whether the operator applied, so `true + \
+                   true` reached LLVM as `add i1` and wrapped to 0. Refused by \
+                   `typecheck::inference::bool_operator`",
         },
         Row {
             construct: "expression-position `reversible`",

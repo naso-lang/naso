@@ -1920,6 +1920,21 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
     /// **No bitwise operations across the float boundary.** `&`, `|`, `^`, `<<`, `>>` on
     /// a float would mean converting the float to an integer -- dropping its fraction --
     /// and then applying a bit operation to a number the source never wrote.
+    /// Whether `op` is arithmetic, and so has no meaning on a one-bit (bool) operand.
+    ///
+    /// `BinaryOp` is Naso's own, from `ir::pir_types`, so this list is spelled out rather
+    /// than shared with `typecheck::inference::bool_operator`. The two lists must agree: a
+    /// mismatch shows up as a program one layer accepts and the other refuses. Since the
+    /// codegen list is necessarily about the low-level shape (`i1`) and the typechecker
+    /// list about the source-level type (`bool`), they are kept adjacent by testing both
+    /// layers on the same source in `bool_operator_test`.
+    fn op_is_arithmetic(op: BinaryOp) -> bool {
+        matches!(
+            op,
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod
+        )
+    }
+
     fn promote_binary_operands(
         &mut self,
         op: BinaryOp,
@@ -1929,33 +1944,45 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
         use crate::ir::BinaryOp as B;
 
         match (left.get_type(), right.get_type()) {
+            // A one-bit integer is a lowered `bool`, NOT a small number.
+            //
+            // This arm must come BEFORE the same-width arm. `i1 + i1` is same-width, so it
+            // used to match there and pass straight through to `add i1`, which has no
+            // defined meaning and wraps to 0. Ordering the arms by "same width" rather than
+            // by "is this a bool" is what let it through: there is no width difference on
+            // an `i1 + i1`, so a backstop keyed on differing widths could never catch it.
+            //
+            // Only ARITHMETIC reaches this function. Comparisons and the logical operators
+            // take a separate path, because `icmp` and `and i1` on two booleans are correct
+            // and must not be caught by an arithmetic guard -- keying on bit width alone
+            // refused `==` and `&` as well.
+            //
+            // The typechecker refuses these operators on `bool` too, but this remains the
+            // backstop for any path reaching codegen without the typechecker, which is the
+            // same class of hole as the QIR/WGSL public PIR entry points.
+            //
+            // Guarded on the OPERATOR as well as the width. This function is the single
+            // call site for every binary operation, so keying on bit width alone also
+            // refused `==` and `&` on two booleans -- both of which are correct (`icmp eq
+            // i1` and `and i1`) and which the typechecker deliberately allows. Only the
+            // arithmetic operators may refuse.
+            (BasicTypeEnum::IntType(l), BasicTypeEnum::IntType(r))
+                if (l.get_bit_width() == 1 || r.get_bit_width() == 1)
+                    && Self::op_is_arithmetic(op) =>
+            {
+                Err(CodegenError::UnsupportedFeature(
+                    "arithmetic on a boolean operand is refused. A `bool` lowers to a \
+                     one-bit integer (i1 here), which is the same LLVM shape as a small \
+                     integer, so `add i1` would silently wrap to 0 -- an answer the source \
+                     never wrote. Convert explicitly if that is what you meant."
+                        .to_string(),
+                ))
+            }
             // Same-width integers already agree.
             (BasicTypeEnum::IntType(l), BasicTypeEnum::IntType(r))
                 if l.get_bit_width() == r.get_bit_width() =>
             {
                 Ok((left, right))
-            }
-            // A one-bit integer is a lowered `bool`, NOT a small number.
-            //
-            // The typechecker rejects `i64 + bool` ("expected `Int`, found `Bool`"), but
-            // `bool` reaches here as LLVM `i1` and is indistinguishable from an integer
-            // by shape alone. Promoting `i1` to `i64` would silently treat `true` as 1
-            // and `false` as 0 -- an arithmetic answer the source never wrote.
-            //
-            // This arm is the backstop for any path that reaches codegen without the
-            // typechecker having run, which is the same class of hole as the QIR/WGSL
-            // public PIR entry points.
-            (BasicTypeEnum::IntType(l), BasicTypeEnum::IntType(r))
-                if l.get_bit_width() == 1 || r.get_bit_width() == 1 =>
-            {
-                Err(CodegenError::UnsupportedFeature(
-                    "arithmetic on a boolean operand is refused. A `bool` lowers to a \
-                     one-bit integer (i1 here), which is the same LLVM shape as a small \
-                     integer, so widening it to i64 would silently read `true` as 1 and \
-                     `false` as 0 -- an answer the source never wrote. Convert \
-                     explicitly if that is what you meant."
-                        .to_string(),
-                ))
             }
             (BasicTypeEnum::IntType(_), BasicTypeEnum::IntType(_)) => {
                 let (l, r) = (left.get_type(), right.get_type());

@@ -135,6 +135,82 @@ fn infer_var(checker: &mut TypeChecker, ident: &Ident, span: Span) -> Result<Typ
 }
 
 /// Infer binary operation type
+/// Which operators are meaningful on `bool`, and which are arithmetic on numbers.
+///
+/// The distinction is not cosmetic. `unify_kinds` accepts `(Bool, Bool)`, which is right
+/// for `a == b` and wrong for `a + b`: nothing stops the arithmetic arm from calling it, so
+/// `true + true` reached LLVM as `add i1`, which has no defined meaning and wraps to 0.
+/// Measured before this rule existed, every operator on two `bool`s was accepted:
+///
+/// ```text
+/// + - * / % == != < > && || & |   -> all ACCEPTED
+/// ```
+///
+/// `icmp slt i1` for `<` was the same story in miniature.
+///
+/// So the operator set is declared ONCE here, and both the typechecker and the tests read
+/// it. Adding an operator to `BinOp` without deciding its meaning on `bool` is then a
+/// compile-visible omission rather than a silent acceptance.
+/// Whether `op` is meaningful when both operands are `bool`.
+///
+/// The single source of truth for the rule. The refusal sites ask it, and the test suite
+/// asserts against it, so the documentation and the behaviour cannot drift.
+pub fn bool_operator(op: BinOp) -> bool {
+    matches!(
+        op,
+        // Equality: meaningful, and already returns Bool.
+        BinOp::Eq | BinOp::Ne
+        // Short-circuiting logic: meaningful.
+            | BinOp::And
+            | BinOp::Or
+        // Bitwise on i1: well-defined (it IS the logical connective), non-short-circuiting.
+            | BinOp::BitAnd
+            | BinOp::BitOr
+            | BinOp::BitXor
+    )
+}
+
+/// Refuse an operator that has no meaning on `bool`.
+///
+/// Separate from `unify_types` on purpose: unification asks whether two types can be the
+/// same, and `(Bool, Bool)` certainly can -- correctly, for `a == b`. The question here is
+/// whether the OPERATOR means anything, which is a different question needing a different
+/// answer. Routing arithmetic through unification meant `true + true` typechecked and
+/// reached LLVM as `add i1`, which has no defined meaning and wraps to 0.
+fn refuse_operator_on(op: BinOp, span: Span) -> TypeError {
+    TypeError::OperatorNotDefinedOnType {
+        op: op.to_string(),
+        ty: "bool".to_string(),
+        span,
+    }
+}
+
+/// Whether a type is `bool`.
+fn is_bool_kind(ty: &Type) -> bool {
+    matches!(ty.kind, crate::ast::ty::TypeKind::Bool)
+}
+
+/// Refuse `op` on `bool` unless [`bool_operator`] says the operator is defined there.
+///
+/// One gate for all three refusal sites, so the rule exists once. The arithmetic and
+/// remainder arms call it unconditionally (their operators are never legal on `bool`); the
+/// comparison arm calls it to learn whether `==`/`!=` may proceed.
+fn refuse_if_bool_op_undefined(
+    op: BinOp,
+    lhs_ty: &Type,
+    rhs_ty: &Type,
+    span: Span,
+) -> Result<(), TypeError> {
+    if !is_bool_kind(lhs_ty) && !is_bool_kind(rhs_ty) {
+        return Ok(());
+    }
+    if bool_operator(op) {
+        Ok(())
+    } else {
+        Err(refuse_operator_on(op, span))
+    }
+}
+
 /// The common type of an integer paired with a float, or `None` if they are not.
 ///
 /// `None` means "fall back to unification", which produces the ordinary type-mismatch
@@ -183,6 +259,9 @@ fn infer_binary(
     // agree with it.
     let result_ty = match op {
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+            // Refused BEFORE unifying, because unification succeeding is not evidence
+            // that the operator applies.
+            refuse_if_bool_op_undefined(op, &lhs_ty, &rhs_ty, span)?;
             match numeric_common(&lhs_ty, &rhs_ty) {
                 Some(t) => t,
                 None => {
@@ -195,10 +274,14 @@ fn infer_binary(
         // remainder rather than truncating the float divisor, so it is NOT promoted here
         // either -- otherwise the typechecker would admit a program the backend rejects.
         BinOp::Rem => {
+            refuse_if_bool_op_undefined(op, &lhs_ty, &rhs_ty, span)?;
             unify::unify_types(checker, &lhs_ty, &rhs_ty)?;
             lhs_ty
         }
         BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+            // `<` on two booleans reached LLVM as `icmp slt i1`; booleans have no order.
+            // Equality IS defined on `bool`, so only the ordering comparisons are refused.
+            refuse_if_bool_op_undefined(op, &lhs_ty, &rhs_ty, span)?;
             if numeric_common(&lhs_ty, &rhs_ty).is_none() {
                 unify::unify_types(checker, &lhs_ty, &rhs_ty)?;
             }

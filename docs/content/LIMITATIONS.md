@@ -71,7 +71,7 @@ construct, and neither is a placeholder value, a shader comment, or an exit stat
 | widthless `int` parameter | **refused** | no exact ABI slot without a width <!-- construct:widthless `int` parameter --> |
 | `break` in an affine `forall` band | **refused** | an affine band has no data-dependent runtime exit <!-- construct:`break` in an affine `forall` band --> |
 | expression-position `reversible` | **refused** | <!-- construct:expression-position `reversible` --> |
-| adding two booleans | **emits** | KNOWN GAP, pre-existing and verified at HEAD: `bool` lowers to `i1` and `unify_types` does not separate arithmetic on `bool` from arithmetic on integers, so this compiles rather than being refused <!-- construct:adding two booleans --> |
+| adding two booleans | **refused** | FIXED. `unify_kinds` accepts `(Bool, Bool)` for `==`, and the arithmetic arm called it without asking whether the operator applied, so `true + true` reached LLVM as `add i1` and wrapped to `0`. Refused by `typecheck::inference::bool_operator`; ordering comparisons (`<`, `>=`) are refused for the same reason since booleans have no order <!-- construct:adding two booleans --> |
 
 ## Other targets
 

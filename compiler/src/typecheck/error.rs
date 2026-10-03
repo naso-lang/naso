@@ -67,6 +67,24 @@ pub enum TypeError {
         span: Span,
     },
 
+    /// An operator was applied to a type it does not define.
+    ///
+    /// Distinct from `TypeMismatch` because "expected `Int`, found `Bool`" does not tell a
+    /// user that `+` is arithmetic and `bool` is not a number -- which is the whole reason
+    /// the program is wrong. Saying so is the difference between a diagnostic that guides
+    /// and one that merely reports.
+    #[error(
+        "`{op}` is not defined on `bool`: it is arithmetic, and `bool` is not a number. \
+         The operators defined on `bool` are `==`, `!=`, `&&`, `||`, `&`, `|` and `^`."
+    )]
+    OperatorNotDefinedOnType {
+        /// The operator as written, e.g. `+`.
+        op: String,
+        /// The type it was applied to.
+        ty: String,
+        span: Span,
+    },
+
     #[error("quantity mismatch: expected `{expected}`, found `{found}`")]
     QuantityMismatch {
         expected: Quantity,

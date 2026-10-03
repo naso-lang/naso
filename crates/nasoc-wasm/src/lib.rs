@@ -203,6 +203,7 @@ fn extract_span_from_error(e: &TypeError) -> Option<Span> {
         LinearNotConsumedOnAllPaths { span, .. } => Some(*span),
         LinearConsumedUnderGuard { span } => Some(*span),
         TypeMismatch { span, .. } => Some(*span),
+        OperatorNotDefinedOnType { span, .. } => Some(*span),
         QuantityMismatch { span, .. } => Some(*span),
         ArgumentCountMismatch { span, .. } => Some(*span),
         TypeArgumentCountMismatch { span, .. } => Some(*span),

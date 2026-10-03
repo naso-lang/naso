@@ -430,10 +430,28 @@ fn tensor_extent(kind: &TypeKind, span: Span) -> CodegenResult<u32> {
                 span.line
             ))
         }),
+        // A symbolic extent is refused, and this is NOT a gap waiting to be filled with
+        // a WGSL `override`.
+        //
+        // The obvious fix is `override N: u32 = ...;` sizing the binding. That does not
+        // work, and it was checked rather than assumed: feeding `array<f32, N>` with `N` an
+        // override to naga 25.0.1 -- the same validator this project's shaders are checked
+        // with -- fails validation with "'out' is invalid". A binding's array size must be
+        // a compile-time constant in WGSL. Using an override as an INDEX is valid, but that
+        // is a different thing and does not give the binding a size.
+        //
+        // So real support means either monomorphising one shader per extent, or binding a
+        // runtime-sized array and passing the extent as an override alongside it -- which
+        // changes the ABI, since the host must then supply the length. Both are design
+        // decisions rather than a codegen tweak, so the honest answer is to refuse and say
+        // why.
         None => Err(CodegenError::UnsupportedFeature(format!(
-            "tensor extent at line {} is not a compile-time constant; the \
-             entry point's bounds guard needs a value, and a symbolic extent \
-             needs monomorphisation, which is not implemented",
+            "tensor extent at line {} is not a compile-time constant. A WGSL storage \
+             binding's array size must be a constant: `array<f32, N]` with `N` an \
+             `override` fails naga validation, so that fix does not apply. Supporting \
+             this means either monomorphising one shader per extent, or binding a \
+             runtime-sized array and passing the length as an override, which changes \
+             the ABI. Neither is implemented.",
             span.line
         ))),
     }

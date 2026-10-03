@@ -3,7 +3,12 @@
 //! This module provides the codegen pipeline for Naso, supporting multiple backends:
 //! - LLVM (via inkwell) for native code generation
 //! - QIR (Quantum Intermediate Representation) for quantum programs
-//! - Cranelift for fast JIT compilation
+//! - Cranelift: NOT IMPLEMENTED. It refuses, rather than returning a stub constant.
+//!   There is no PIR lowering for it (no statement walk, control flow, ABI, or
+//!   memory model), so `naso build --target cranelift` reports that plainly.
+//!   It previously JIT-compiled a function returning the literal 42 and printed
+//!   that as the result of any program -- two unrelated programs, same output,
+//!   exit 0. See `cranelift::jit::compile_and_execute`.
 //! - WGSL for WebGPU compute shaders
 
 pub mod abi;

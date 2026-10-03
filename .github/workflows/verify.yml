@@ -222,5 +222,29 @@ jobs:
             --test linearity_at_emission_boundary_test \
             --test llvm_shipped_kernel_execution_test
 
+      # The `cranelift` feature used to be built and tested by NOTHING. Every other
+      # line in this workflow passes `--features llvm`, so a backend that JIT-compiled
+      # a function returning the literal 42 and printed that as any program's result
+      # sat in the tree uncompiled and undetected.
+      #
+      # A feature nobody enables cannot be reviewed by CI, so it is built and linted
+      # here. The suite asserts the backend REFUSES; it does not assert it executes,
+      # because it does not.
+      - name: Build and test the cranelift feature
+        run: |
+          # (1) `cranelift` ALONE must build and link. This is the property that was
+          #     broken: `runtime::jit::ffi` declared five extern "C" symbols no
+          #     library in this repo provides, so `--features cranelift
+          #     --all-targets` failed with
+          #       rust-lld: error: undefined symbol: jit_context_create
+          #     Nothing noticed, because nothing ever built the feature alone.
+          cargo build --features cranelift --all-targets
+
+          # (2) The behaviour test needs a `CodegenContext`, so it runs with both
+          #     features. It asserts the backend REFUSES; it does not assert it
+          #     executes, because it does not.
+          cargo clippy --features "llvm cranelift" --all-targets -- -D warnings
+          cargo test --features "llvm cranelift" --test cranelift_honesty_test
+
       - name: Clippy with the llvm feature
         run: cargo clippy --features llvm --all-targets -- -D warnings

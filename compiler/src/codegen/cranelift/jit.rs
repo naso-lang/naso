@@ -33,7 +33,11 @@ impl CraneliftJit {
         Ok(Self { module, ctx })
     }
 
-    /// Compile a simple function returning 42
+    /// Compile a function that returns the constant 42.
+    ///
+    /// This takes NO arguments from a PIR module and computes NOTHING. It is a
+    /// JIT-harness self-test, and its result must never be presented as a Naso
+    /// program's. `compile_and_execute` refuses rather than routing through here.
     pub fn compile_trivial_function(&mut self) -> CodegenResult<FuncId> {
         self.ctx.func.signature = Signature {
             params: vec![],
@@ -71,8 +75,13 @@ impl CraneliftJit {
         Ok(func_id)
     }
 
-    /// Execute a compiled function
-    pub fn execute_function(&mut self, func_id: FuncId) -> CodegenResult<i32> {
+    /// Execute a function compiled by `compile_trivial_function`.
+    ///
+    /// The transmute below assumes the SystemV `() -> i32` signature that
+    /// `compile_trivial_function` declares. Passing any other `FuncId` would call it
+    /// with the wrong ABI, so the caller must be the trivial path only. That is why
+    /// this is private to the harness's own tests rather than part of the pipeline.
+    pub(crate) fn execute_function(&mut self, func_id: FuncId) -> CodegenResult<i32> {
         self.module
             .finalize_definitions()
             .map_err(|e| CodegenError::CraneliftError(format!("Failed to finalize: {}", e)))?;
@@ -93,16 +102,52 @@ impl CraneliftJit {
     }
 }
 
-/// Dummy function for symbol registration
-#[allow(dead_code)]
-extern "C" fn dummy_function() -> i32 {
-    0
-}
-
-/// Compile and execute a PIR module via Cranelift JIT (stub)
+/// Compile and execute a PIR module via Cranelift JIT.
+///
+/// # REFUSED -- this backend does not execute Naso code
+///
+/// This function used to ignore `_module` entirely, JIT a hardcoded function that
+/// returns the literal 42, and return that. Reached from the CLI it was worse than
+/// wrong, because it was indistinguishable from success:
+///
+/// ```text
+/// $ naso build --target cranelift kernels/sum_1_to_10.naso   # LLVM: 45
+/// JIT execution result: 42
+/// $ naso build --target cranelift kernels/returns_7.naso      # LLVM: 7
+/// JIT execution result: 42
+/// ```
+///
+/// Two different programs, the same output, exit status 0. `42` is the JIT stub's
+/// own constant, not a value anything computed. Nothing downstream can detect this:
+/// the number is a plausible `i32` and the call succeeded.
+///
+/// So this refuses. The Cranelift backend has no lowering from PIR -- no statement
+/// walk, no control flow, no ABI, no memory model -- and `CraneliftJit`'s only
+/// function is a constant-returning stub. Reporting success from it would be a
+/// fabricated answer, which is the one outcome this language must never produce.
+///
+/// # Why CI did not catch it
+///
+/// The `cranelift` feature is never built or tested in CI. Every workflow line passes
+/// `--features llvm`, so this file was not compiled by a single check until an audit
+/// asked what it did. Two fixes are needed, not one: refuse here, and add the feature
+/// to CI so the next gap in it cannot hide.
+///
+/// `CraneliftJit` itself is kept. It is a working JIT harness and its constant is
+/// honestly labelled `trivial_fn`, but it takes no PIR and so cannot be reachable
+/// from the compiler pipeline.
 pub fn compile_and_execute(_module: &PirModule, _context: &CodegenContext) -> CodegenResult<i32> {
-    let mut jit = CraneliftJit::new()?;
-    jit.compile_and_execute_trivial()
+    Err(CodegenError::CraneliftError(
+        "The Cranelift backend does not execute Naso programs yet, and no Naso \
+         lowering exists for it: there is no statement walk, no control flow, no \
+         ABI, and no memory model.\n\n\
+         This used to JIT a function that returns the constant 42 and print that as \
+         the program's result. Two unrelated programs both printed 42, with exit \
+         status 0, which is a fabricated answer rather than a visible failure.\n\n\
+         Use `--target llvm` or `--target qir`. When the Cranelift lowering lands, \
+         this must be implemented rather than stubbed."
+            .to_string(),
+    ))
 }
 
 #[cfg(test)]

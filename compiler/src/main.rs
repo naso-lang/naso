@@ -49,7 +49,12 @@ fn print_usage() {
     eprintln!("  check <file>          Type check program");
     eprintln!("  build [options] <file>  Build program to target");
     eprintln!("Build options:");
-    eprintln!("  --target <llvm|qir|cranelift|wgsl>  Target backend (default: llvm)");
+    eprintln!("  --target <llvm|qir|wgsl>  Target backend (default: llvm)");
+    // `cranelift` is still accepted by the parser so existing scripts do not break on
+    // an unknown-target error, but it is not a working backend and says so itself.
+    eprintln!(
+        "                     (cranelift is accepted but NOT implemented; it refuses rather than returning a stub)"
+    );
     eprintln!("  -o, --output <file>            Output file path");
     eprintln!("  --opt <0|1|2|3>                Optimization level (default: 2)");
     eprintln!("  --triple <target>              Target triple (host, nvptx64, wasm32, aarch64)");

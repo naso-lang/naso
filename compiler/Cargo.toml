@@ -7,6 +7,10 @@ edition = "2024"
 default = []
 llvm = ["dep:inkwell"]
 cranelift = ["dep:cranelift", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native"]
+# Enables `runtime::jit`, which declares extern "C" symbols that no library in this
+# repository provides. OFF by default because `--features cranelift` otherwise fails
+# to link; see `src/runtime/jit/mod.rs` for what implementing it would require.
+naso-jit-ffi = []
 serde = ["serde/derive"]
 wasm-debug = ["dep:web-sys"]
 

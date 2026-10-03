@@ -288,3 +288,36 @@ fn the_documented_blockers_to_wiring_reversible_are_still_real() {
         "a non-reversible operation must not resolve to qir.h either."
     );
 }
+
+/// The gate-inverse table exists and is verified, and NO PRODUCER USES IT YET.
+///
+/// Step 4 of the reversible work built `naso_verify::gate_inverse::inverse_of`, checked
+/// numerically against a CPU state-vector simulator: every gate composed with its table
+/// entry returns the original state, and the historical `S`-dagger defect is asserted
+/// impossible.
+///
+/// The remaining blocker is narrower than it was and is stated here so it is not lost: no
+/// lowering pass constructs an inverse operation from this table. `reversible` stays refused
+/// because the inverse representation cannot yet be EMITTED by a backend, not because the
+/// inverse is unknown. Wiring the table into a producer without also giving
+/// `ScheduleTree` and the LLVM backend a way to carry an inverse `PirExpr` would reintroduce
+/// exactly the drop-the-inverse defect that was fixed earlier.
+#[test]
+fn the_gate_inverse_table_has_a_verified_entry_for_every_gate_but_no_producer() {
+    let table = include_str!("../../crates/naso-verify/src/gate_inverse.rs");
+    assert!(
+        table.contains("pub fn inverse_of"),
+        "the gate-inverse table is missing from naso-verify"
+    );
+
+    // And confirm nothing in the COMPILER consumes it yet. This is the honest state of the
+    // work: infrastructure without a caller is not a feature, and treating it as one would
+    // repeat the dual_stream failure.
+    let lowering = include_str!("../src/lowering/mod.rs");
+    assert!(
+        !lowering.contains("gate_inverse") && !lowering.contains("inverse_of"),
+        "lowering now references the gate-inverse table. That is progress, and it is only \
+         correct if the emitted inverse survives every backend: check that ScheduleTree and \
+         the LLVM emitter carry an inverse PirExpr rather than dropping it."
+    );
+}

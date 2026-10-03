@@ -15,6 +15,7 @@ pub mod cache;
 pub mod cli;
 pub mod config;
 pub mod error;
+pub mod gate_inverse;
 #[cfg(feature = "z3")]
 pub mod lower;
 pub mod model;
@@ -31,6 +32,7 @@ pub mod quantum;
 pub mod smtlib;
 #[cfg(feature = "z3")]
 pub mod solver;
+pub mod statevector;
 
 #[cfg(feature = "z3")]
 use crate::config::SolverConfig;

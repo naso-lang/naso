@@ -242,6 +242,11 @@ jobs:
       - name: Test the early-exit domain transformation
         run: cargo test --features llvm --test early_exit_domain_test
 
+      - name: Gate inverse table and state-vector simulator
+        run: |
+          cargo test -p naso-verify --test gate_inverse_test
+          cargo test -p naso-verify --test statevector_test
+
       - name: Test the bool operator rule
         run: cargo test --features llvm --test bool_operator_test
 

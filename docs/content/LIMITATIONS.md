@@ -87,14 +87,32 @@ honest about their current state:
 
 ## QIR and WGSL backends
 
-These refuse a *different* set of constructs than LLVM, and the refusals are correct for
-them: QIR emits one void quantum operation and has no scalar arithmetic at all, so
+These refuse a *different* set of constructs than LLVM, and most of the refusals are correct
+for them: QIR emits one void quantum operation and has no scalar arithmetic at all, so
 refusing `a + b` is not a worse LLVM. Recording these in the same table as the LLVM rows
 would imply otherwise, so they are separate.
+
+**Two rows below are genuine gaps rather than design.** LLVM accepts both programs, so the
+source language and one backend support them:
+
+- `qalloc` lowers to a quantum operation whose name has no entry in the QIR intrinsic table,
+  so a circuit cannot even be allocated. LLVM's quantum arm declares whatever intrinsic a
+  name implies; QIR has a fixed declared set and refuses anything outside it.
+- A gate operand is *borrowed*, not consumed, but the QIR gate arm re-checks quantity on
+  each operand. So `hadamard(a)` followed by `measure(a)` — a correct program that uses the
+  linear qubit once in each of two different senses — is reported as using `a` twice.
+
+Until both are fixed, the QIR backend emits no gate sequence at all. That is what blocks
+end-to-end numerical verification of compiler-emitted circuits: there is no gate list to
+hand a simulator. The gate matrices and their inverses are themselves verified in
+`naso-gates` against a CPU state-vector simulator; what is missing is the link from
+compiled output into that check.
 
 | Construct | QIR | WGSL straight-line | WGSL compute | Note |
 |---|---|---|---|---|
 | empty function | **emits** | **emits** | **refused** | a compute kernel with no tensor parameter has nothing to bind <!-- construct:empty function --> |
+| qubit allocation and measurement | **refused** | **refused** | **refused** | `qalloc` has no entry in the QIR intrinsic table <!-- construct:qubit allocation and measurement --> |
+| a single gate | **refused** | **refused** | **refused** | a gate BORROWS a qubit, but the QIR gate arm re-checks quantity per operand and reports a double use <!-- construct:a single gate --> |
 | scalar float multiply | **refused** | **emits** | **refused** | QIR has no scalar arithmetic; it emits one void quantum operation <!-- construct:scalar float multiply --> |
 | scalar integer add | **refused** | **emits** | **refused** | <!-- construct:scalar integer add --> |
 | function call | **refused** | **emits** | **refused** | <!-- construct:function call --> |

@@ -242,6 +242,9 @@ jobs:
       - name: Test the early-exit domain transformation
         run: cargo test --features llvm --test early_exit_domain_test
 
+      - name: QIR gate emission gap
+        run: cargo test --features llvm --test qir_gate_emission_gap_test
+
       - name: Gate inverse table and state-vector simulator
         run: |
           cargo test -p naso-gates --test gate_inverse_test

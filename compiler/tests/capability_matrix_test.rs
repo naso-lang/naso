@@ -333,8 +333,38 @@ fn target_matrix() -> Vec<TargetRow> {
             wgsl_compute: Outcome::Refused,
             note: "a compute kernel with no tensor parameter has nothing to bind",
         },
+        // -- quantum operations: refused, and the reason is specific --------------
+        //
+        // These are recorded because the QIR backend's refusal here is NOT the same
+        // refusal as its scalar rows. It refuses scalar arithmetic by design -- it emits
+        // one `void` quantum operation. It refuses GATES because it cannot emit them: a
+        // gate operand is BORROWN, and the gate arm re-checks quantity on each operand, so
+        // `hadamard(a)` followed by `measure(a)` is reported as using the linear qubit
+        // twice. Separately, `qalloc` has no entry in the QIR intrinsic table.
+        //
+        // LLVM accepts both of these programs, so the source language and one backend
+        // support them -- the gap is specific to QIR emission.
+        TargetRow {
+            construct: "qubit allocation and measurement",
+            src: "fn f() { let [1] a: Qubit = qalloc(1); let m = measure(a); let _ = m; }",
+            kernel: "f",
+            qir: Outcome::Refused,
+            wgsl_straight: Outcome::Refused,
+            wgsl_compute: Outcome::Refused,
+            note: "`qalloc` has no entry in the QIR intrinsic table",
+        },
+        TargetRow {
+            construct: "a single gate",
+            src: "fn f() { let [1] a: Qubit = qalloc(1); hadamard(a); let m = measure(a); let _ = m; }",
+            kernel: "f",
+            qir: Outcome::Refused,
+            wgsl_straight: Outcome::Refused,
+            wgsl_compute: Outcome::Refused,
+            note: "a gate BORROWS a qubit, but the QIR gate arm re-checks quantity per operand and reports a double use",
+        },
         TargetRow {
             construct: "scalar float multiply",
+
             src: "fn f(a: f32, b: f32) -> f32 { a * b }",
             kernel: "main",
             qir: Outcome::Refused,

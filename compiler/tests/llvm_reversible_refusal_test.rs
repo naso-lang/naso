@@ -314,3 +314,110 @@ fn the_backend_refuses_a_reversible_that_arrives_as_pir() {
          knows this is a backend gap and not a bad program: {msg}"
     );
 }
+
+/// A `Reversible` must also be refused by the QIR backend.
+///
+/// QIR had the identical defect: it ran `body` and dropped `inverse`, justified
+/// by the comment "The inverse would be handled by quantum compiler". Nothing
+/// handled it. `ancilla_emission.rs` does read `inverse`, but that file is not
+/// declared in `qir/mod.rs`, so it is not compiled at all -- the comment
+/// described work that does not exist.
+///
+/// This is the more damaging half of the bug in a QIR backend. QIR's contract is
+/// that the emitted circuit is reversible; a `Reversible` with no adjoint emits
+/// the forward operation alone, under a type signature asserting a reversibility
+/// the output does not have. Nothing downstream executes on a QPU to catch it.
+///
+/// Like the LLVM case, the node is built directly as PIR: lowering refuses
+/// expression-position `reversible` first, so no source program can reach here,
+/// and a mutation restoring the old behaviour would survive otherwise.
+#[test]
+fn the_qir_backend_refuses_a_reversible_that_arrives_as_pir() {
+    use naso_compiler::codegen::qir::QIRModuleBuilder;
+    let _ctx = inkwell::context::Context::create();
+    let cc = CodegenContext::new(CodegenTarget::Host, OptLevel::Default).expect("context");
+    let mut builder = QIRModuleBuilder::new(&cc).expect("builder");
+    let stmt = PirStatement {
+        id: StmtId(0),
+        domain: AffineDomain::universe(0, 0),
+        body: PirExpr::Reversible {
+            body: Box::new(PirExpr::IntLit(1)),
+            inverse: Box::new(PirExpr::IntLit(0)),
+        },
+        quantity: Quantity::Many,
+        mutability: Mutability::Immutable,
+        span: None,
+    };
+    let module = PirModule {
+        statements: vec![stmt],
+        schedule: ScheduleTree::new(
+            ScheduleNode::domain(StmtId(0), AffineDomain::universe(0, 0)),
+            vec![],
+        ),
+        ..Default::default()
+    };
+    let err = builder
+        .build_module(&module)
+        .expect_err("QIR must not emit a `Reversible` with no adjoint");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("INVERSE"),
+        "the refusal must name the inverse as the missing operation: {msg}"
+    );
+    assert!(
+        msg.contains("reversible") || msg.contains("reversibility"),
+        "the refusal must say what QIR's contract is, since that is why this is \
+         worse here than in a classical backend: {msg}"
+    );
+}
+
+/// Both backends must refuse it, for the same reason.
+///
+/// If one backend accepted a `Reversible` the other refused, the same program
+/// would mean two different things depending on `--target`, and a quantum kernel
+/// that is safe on one target would silently drop its uncomputation on another.
+/// The two refusals are checked for the shared claim rather than compared for
+/// equality, because each names its own backend's consequence.
+#[test]
+fn llvm_and_qir_agree_that_a_reversible_is_refused() {
+    use naso_compiler::codegen::qir::QIRModuleBuilder;
+    let _ctx = inkwell::context::Context::create();
+    let make = || PirModule {
+        statements: vec![PirStatement {
+            id: StmtId(0),
+            domain: AffineDomain::universe(0, 0),
+            body: PirExpr::Reversible {
+                body: Box::new(PirExpr::IntLit(1)),
+                inverse: Box::new(PirExpr::IntLit(0)),
+            },
+            quantity: Quantity::Many,
+            mutability: Mutability::Immutable,
+            span: None,
+        }],
+        schedule: ScheduleTree::new(
+            ScheduleNode::domain(StmtId(0), AffineDomain::universe(0, 0)),
+            vec![],
+        ),
+        ..Default::default()
+    };
+    let cc = CodegenContext::new(CodegenTarget::Host, OptLevel::Default).expect("context");
+
+    let mut llvm_b = LLVMModuleBuilder::new(&cc).expect("llvm builder");
+    let llvm_msg = llvm_b
+        .build_module(&make())
+        .expect_err("LLVM must refuse")
+        .to_string();
+
+    let mut qir_b = QIRModuleBuilder::new(&cc).expect("qir builder");
+    let qir_msg = qir_b
+        .build_module(&make())
+        .expect_err("QIR must refuse")
+        .to_string();
+
+    for (name, msg) in [("LLVM", &llvm_msg), ("QIR", &qir_msg)] {
+        assert!(
+            msg.contains("INVERSE"),
+            "{name} must name the inverse as the missing operation: {msg}"
+        );
+    }
+}

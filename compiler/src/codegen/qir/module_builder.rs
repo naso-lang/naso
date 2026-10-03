@@ -537,11 +537,37 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
                 self.builder.position_at_end(exit_block);
                 Ok(self.result_type.const_zero().into())
             }
-            PirExpr::Reversible { body, inverse: _ } => {
-                // For QIR, we just build the body
-                // The inverse would be handled by quantum compiler
-                self.build_expr(body)
-            }
+            //
+            // REFUSED, matching the LLVM backend.
+            //
+            // This ran `body` and dropped `inverse`, on the comment "For QIR, we just
+            // build the body / The inverse would be handled by quantum compiler".
+            //
+            // There is no quantum compiler doing that. Nothing else in this backend
+            // reads `inverse`: `ancilla_emission.rs` does, but that file is not
+            // declared in `qir/mod.rs`, so it is not even compiled. The comment
+            // described work that does not exist.
+            //
+            // For a QIR program this is the worst place to be wrong. QIR's entire
+            // contract is that the emitted circuit is reversible, and a `Reversible`
+            // whose inverse is dropped emits a circuit that is not: it is the forward
+            // operation with no adjoint, so the garbage the block existed to uncompute
+            // stays in the register. Emitting that under a QIR type signature asserts
+            // reversibility the output does not have.
+            //
+            // Refusing is also the honest answer about what this backend can verify:
+            // nothing here executes on a QPU or checks an adjoint, so there is no
+            // evidence a `Reversible` came out reversible.
+            PirExpr::Reversible { .. } => Err(CodegenError::UnsupportedFeature(
+                "a `Reversible` block reached QIR codegen, and this backend does not \
+                 emit adjoints. The INVERSE is not optional -- it is the part that \
+                 uncomputes, and QIR's contract is that the emitted circuit is \
+                 reversible. Emitting the body alone would produce the forward \
+                 operation with no adjoint, asserting a reversibility the output does \
+                 not have. Refused rather than emitting a circuit that lies about \
+                 being reversible."
+                    .to_string(),
+            )),
             PirExpr::Index { base, indices: _ } => {
                 let base_val = self.build_expr(base)?;
                 Ok(base_val)

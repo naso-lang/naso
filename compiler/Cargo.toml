@@ -15,6 +15,12 @@ serde = ["serde/derive"]
 wasm-debug = ["dep:web-sys"]
 
 [dependencies]
+# Gate matrices and the verified adjoint relation, in a leaf crate with no dependencies.
+#
+# This is what Phase A was for: `naso-verify` depends on this crate, so the adjoint table
+# could not live there and still be reachable from lowering and codegen.
+naso-gates = { workspace = true }
+
 logos = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }

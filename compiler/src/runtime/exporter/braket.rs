@@ -207,10 +207,24 @@ impl BraketExporter {
                 QIROperation::Measure { qubit, basis } => {
                     // Handle non-Z basis with pre-rotation
                     if *basis != 0 {
+                        // An unsupported basis is REFUSED, not defaulted to X.
+                        //
+                        // The old `_ => "h"` answered a basis index this exporter does not
+                        // implement with the X-basis rotation, so measuring in basis 3 -- or
+                        // a typo'd basis -- read out the X axis while reporting the requested
+                        // one. That is a specific wrong answer with no diagnostic, and it
+                        // would corrupt any circuit whose results depended on the basis.
                         let basis_gate = match basis {
                             1 => "h",   // X basis
                             2 => "sdg", // Y basis (S† then H)
-                            _ => "h",
+                            other => {
+                                return Err(ExporterError::UnsupportedOperation(format!(
+                                    "measurement in basis {other} is not implemented: this \
+                                     exporter supports basis 0 (Z), 1 (X) and 2 (Y). \
+                     Assuming X would read out a different axis than the circuit asked \
+                     for. Refused rather than guessed."
+                                )));
+                            }
                         };
                         instructions.push(BraketInstruction::Gate {
                             gate_name: basis_gate.to_string(),
@@ -481,6 +495,18 @@ mod tests {
     use crate::ast::Quantity;
     use crate::codegen::qir::{QIRModule, QIROperation};
 
+    /// A minimal QIR module containing one measurement in `basis`.
+    ///
+    /// Built by struct literal rather than a constructor: `QIRModule` has no `new`, and adding
+    /// one for a test would be a change to production API made only to serve a test.
+    fn module_measuring_in(basis: usize) -> QIRModule {
+        QIRModule {
+            qubit_count: 1,
+            qubit_quantities: vec![crate::ast::Quantity::One],
+            operations: vec![QIROperation::Measure { qubit: 0, basis }],
+        }
+    }
+
     #[test]
     fn test_braket_exporter_creation() {
         let exporter = BraketExporter::new();
@@ -696,5 +722,41 @@ mod tests {
              indistinguishable from a one-qubit gate: {}",
             result.output
         );
+    }
+    /// An unsupported measurement basis must be REFUSED, not defaulted to X.
+    ///
+    /// The old code answered any basis it did not implement with the X-basis rotation, so a
+    /// circuit measuring in an unimplemented basis read out the X axis while reporting the
+    /// basis it had been asked for. A specific wrong answer with no diagnostic.
+    #[test]
+    fn an_unsupported_measurement_basis_is_refused_rather_than_read_as_x() {
+        let module = module_measuring_in(7);
+        let result = BraketExporter::new().export(&module);
+        assert!(
+            result.is_err(),
+            "basis 7 must not silently read out the X axis"
+        );
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("basis 7") && message.contains("not implemented"),
+            "the diagnostic must name the basis and say what is unsupported, got: {message}"
+        );
+    }
+
+    /// The three supported bases still work, so the refusal is not catching valid input.
+    #[test]
+    fn every_supported_measurement_basis_still_exports() {
+        for (basis, expected) in [(0usize, None), (1, Some("h")), (2, Some("sdg"))] {
+            let module = module_measuring_in(basis);
+            let result = BraketExporter::new().export(&module);
+            assert!(result.is_ok(), "basis {basis} is supported and must export");
+            if let Some(gate) = expected {
+                let rendered = format!("{:?}", result.unwrap());
+                assert!(
+                    rendered.contains(gate),
+                    "basis {basis} should apply `{gate}`, got: {rendered}"
+                );
+            }
+        }
     }
 }

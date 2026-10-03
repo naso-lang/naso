@@ -341,6 +341,23 @@ fn the_gate_inverse_table_has_a_verified_entry_for_every_gate_but_no_producer() 
         "naso-verify must re-export naso-gates rather than reimplement it"
     );
 
+    // The OpenQASM exporter is now WIRED to the verified table. It used to carry its own
+    // hand-written copy, which is the arrangement that let the S-dagger defect exist: two
+    // copies of an adjoint relation do not fail to build when they disagree, they emit a
+    // circuit computing the wrong function.
+    let openqasm = include_str!("../src/runtime/exporter/openqasm.rs");
+    assert!(
+        openqasm.contains("naso_gates::gate_inverse::inverse_of"),
+        "the OpenQASM exporter must take its adjoint relation from naso-gates::inverse_of \
+         rather than keeping a second table that can drift from the verified one"
+    );
+    assert!(
+        !openqasm.contains("\"sdg\" => \"s\""),
+        "a literal sdg-to-s mapping has reappeared in the OpenQASM exporter. S-dagger is \
+         the ADJOINT of S, not S; applying S where S-dagger was written computes a \
+         different state."
+    );
+
     // And confirm nothing in the COMPILER consumes it yet. This is the honest state of the
     // work: infrastructure without a caller is not a feature, and treating it as one would
     // repeat the dual_stream failure.

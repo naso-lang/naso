@@ -22,6 +22,61 @@ use crate::runtime::exporter::{
 };
 use std::collections::HashMap;
 
+/// The OpenQASM gate name for a verified [`Gate`].
+///
+/// Every variant maps to a name; the gates the simulator models all have a standard
+/// OpenQASM spelling. `iswap` and `cphase` are NOT here because they are not modelled --
+/// they are handled explicitly at the call site rather than being given a gate they do
+/// not have.
+fn openqasm_name_of_gate(gate: naso_gates::statevector::Gate) -> &'static str {
+    use naso_gates::statevector::Gate;
+    match gate {
+        Gate::H => "h",
+        Gate::X => "x",
+        Gate::Y => "y",
+        Gate::Z => "z",
+        Gate::S => "s",
+        Gate::Sdg => "sdg",
+        Gate::T => "t",
+        Gate::Tdg => "tdg",
+        Gate::Rx(_) => "rx",
+        Gate::Ry(_) => "ry",
+        Gate::Rz(_) => "rz",
+        Gate::Cx => "cx",
+        Gate::Cy => "cy",
+        Gate::Cz => "cz",
+        Gate::Ccx => "ccx",
+        Gate::Swap => "swap",
+    }
+}
+
+/// The verified [`Gate`] an OpenQASM gate name denotes, if the simulator models it.
+///
+/// `None` for a gate with no matrix here, which is what makes an unmodelled gate a refusal
+/// upstream rather than an assumption of self-inverseness.
+fn gate_from_openqasm_name(name: &str) -> Option<naso_gates::statevector::Gate> {
+    use naso_gates::statevector::Gate;
+    Some(match name {
+        "h" => Gate::H,
+        "x" => Gate::X,
+        "y" => Gate::Y,
+        "z" => Gate::Z,
+        "s" => Gate::S,
+        "sdg" => Gate::Sdg,
+        "t" => Gate::T,
+        "tdg" => Gate::Tdg,
+        "rx" => Gate::Rx(0.0),
+        "ry" => Gate::Ry(0.0),
+        "rz" => Gate::Rz(0.0),
+        "cx" => Gate::Cx,
+        "cy" => Gate::Cy,
+        "cz" => Gate::Cz,
+        "ccx" => Gate::Ccx,
+        "swap" => Gate::Swap,
+        _ => return None,
+    })
+}
+
 /// OpenQASM 3.0 exporter
 pub struct OpenQASMExporter {
     /// Include gate definitions in output
@@ -151,10 +206,21 @@ impl OpenQASMExporter {
 
                     // For non-Z basis, add basis rotation before measurement
                     if *basis != 0 {
+                        // An unsupported basis is REFUSED, not defaulted to X. See the
+                        // Braket exporter for the same fix; the reasoning is identical: the
+                        // old `_ => "h"` read out the X axis while the circuit reported the
+                        // basis it had asked for.
                         let basis_gate = match basis {
                             1 => "h",   // X basis = H then Z
                             2 => "sdg", // Y basis = S† then H then Z (simplified)
-                            _ => "h",
+                            other => {
+                                return Err(ExporterError::UnsupportedOperation(format!(
+                                    "measurement in basis {other} is not implemented: this \
+                                     exporter supports basis 0 (Z), 1 (X) and 2 (Y). \
+                     Assuming X would read out a different axis than the circuit asked \
+                     for. Refused rather than guessed."
+                                )));
+                            }
                         };
                         output.push_str(&format!("{} q[{}];\n", basis_gate, qubit));
                         *operation_counts.entry(basis_gate.to_string()).or_insert(0) += 1;
@@ -249,27 +315,49 @@ impl OpenQASMExporter {
     /// adjoint relation for every gate -- the part of a quantum compiler that is
     /// easiest to get subtly wrong and cheapest to get right once.
     #[allow(dead_code)]
-    fn generate_adjoint(&self, name: &str, qubits: &[usize], params: &[f64]) -> String {
+    fn generate_adjoint(
+        &self,
+        name: &str,
+        qubits: &[usize],
+        params: &[f64],
+    ) -> Result<String, ExporterError> {
+        // The adjoint relation comes from `naso_gates::inverse_of`, the one table that is
+        // checked NUMERICALLY against a state-vector simulator. It used to be a second
+        // hand-written table here, which is precisely the arrangement that let the
+        // S-dagger defect exist at all: two copies of an adjoint relation drift, and drift
+        // does not fail to build -- it emits a circuit computing the wrong function.
+        //
+        // The two gates below are not in `naso_gates` yet: `iswap` and `cphase` are
+        // self-inverse or parameter-symmetric, and are declared as such HERE rather than
+        // silently falling through. See `adjoints_an_unmodelled_gate_are_refused` for why
+        // the unmodelled case must not be guessed.
         let adjoint_name = match name {
-            "h" => "h",
-            "x" => "x",
-            "y" => "y",
-            "z" => "z",
-            "s" => "sdg",
-            "sdg" => "s",
-            "t" => "tdg",
-            "tdg" => "t",
-            "rx" => "rx",
-            "ry" => "ry",
-            "rz" => "rz",
-            "cx" => "cx",
-            "cy" => "cy",
-            "cz" => "cz",
-            "ccx" => "ccx",
-            "swap" => "swap",
             "iswap" => "iswap",
             "cphase" => "cphase",
-            _ => name,
+            other => match gate_from_openqasm_name(other) {
+                Some(gate) => match naso_gates::gate_inverse::inverse_of(gate) {
+                    // A rotation keeps its name; the negation happens to the angle below.
+                    naso_gates::statevector::Gate::Rx(_) => "rx",
+                    naso_gates::statevector::Gate::Ry(_) => "ry",
+                    naso_gates::statevector::Gate::Rz(_) => "rz",
+                    other_gate => openqasm_name_of_gate(other_gate),
+                },
+                // An unrecognised gate has no adjoint relation, so it cannot be inverted.
+                //
+                // This used to return `name` -- i.e. to ASSUME the gate was self-inverse.
+                // A gate that is not self-inverse, exported through here, would emit its own
+                // forward application where an inverse belonged, and the resulting circuit
+                // would compute a different function with no diagnostic. That is the same
+                // fabrication class already fixed in the QIR classifier, which used to map
+                // every unknown gate onto `qir.h`.
+                None => {
+                    return Err(ExporterError::UnsupportedOperation(format!(
+                        "no adjoint relation for gate `{other}`: it is not in the verified \
+                         gate table, and assuming it is self-inverse would emit a circuit \
+                         computing the wrong function. Refused rather than guessed."
+                    )));
+                }
+            },
         };
 
         let qubit_str = qubits
@@ -279,7 +367,7 @@ impl OpenQASMExporter {
             .join(", ");
 
         if params.is_empty() {
-            format!("{} {};", adjoint_name, qubit_str)
+            Ok(format!("{} {};", adjoint_name, qubit_str))
         } else {
             // For parameterized gates, negate the angle for adjoint
             let neg_params = params
@@ -287,7 +375,7 @@ impl OpenQASMExporter {
                 .map(|p| format!("{:.10}", -p))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("{}({}) {};", adjoint_name, neg_params, qubit_str)
+            Ok(format!("{}({}) {};", adjoint_name, neg_params, qubit_str))
         }
     }
 }
@@ -349,6 +437,18 @@ mod tests {
     use super::*;
     use crate::ast::Quantity;
     use crate::codegen::qir::{QIRModule, QIROperation};
+
+    /// A minimal QIR module containing one measurement in `basis`.
+    ///
+    /// Built by struct literal rather than a constructor: `QIRModule` has no `new`, and adding
+    /// one for a test would be a change to production API made only to serve a test.
+    fn module_measuring_in(basis: usize) -> QIRModule {
+        QIRModule {
+            qubit_count: 1,
+            qubit_quantities: vec![crate::ast::Quantity::One],
+            operations: vec![QIROperation::Measure { qubit: 0, basis }],
+        }
+    }
 
     #[test]
     fn test_openqasm_exporter_creation() {
@@ -478,60 +578,174 @@ mod tests {
         assert!(result.output.contains("h q[0];"));
         assert!(result.output.contains("c[0] = measure q[0];"));
     }
+
+    /// An unsupported measurement basis must be REFUSED, not defaulted to X.
+    ///
+    /// The old code answered any basis it did not implement with the X-basis rotation, so a
+    /// circuit measuring in an unimplemented basis read out the X axis while reporting the
+    /// basis it had been asked for.
+    #[test]
+    fn an_unsupported_measurement_basis_is_refused_rather_than_read_as_x() {
+        let module = module_measuring_in(7);
+        let result = OpenQASMExporter::new().export(&module);
+        assert!(
+            result.is_err(),
+            "basis 7 must not silently read out the X axis"
+        );
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("basis 7") && message.contains("not implemented"),
+            "the diagnostic must name the basis and say what is unsupported, got: {message}"
+        );
+    }
+
+    /// The three supported bases still work, so the refusal is not catching valid input.
+    #[test]
+    fn every_supported_measurement_basis_still_exports() {
+        for (basis, expected) in [(0usize, None), (1, Some("h")), (2, Some("sdg"))] {
+            let module = module_measuring_in(basis);
+            let result = OpenQASMExporter::new().export(&module);
+            assert!(result.is_ok(), "basis {basis} is supported and must export");
+            if let Some(gate) = expected {
+                let rendered = format!("{:?}", result.unwrap());
+                assert!(
+                    rendered.contains(gate),
+                    "basis {basis} should apply `{gate}`, got: {rendered}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod adjoint_tests {
     use super::OpenQASMExporter;
 
-    /// The adjoint table encodes which gate is its own inverse and which rotates the
-    /// other way. Getting it wrong silently emits a circuit computing the wrong
-    /// function, and no shape assertion catches that, so the entries that differ are
-    /// pinned here rather than the method merely being allowed to be unused.
+    /// The adjoint relation is now read from `naso_gates::inverse_of`, so these tests check
+    /// two things: that the exporter wires the verified table through faithfully, and that
+    /// the relation itself is numerically correct.
+    ///
+    /// The second half is what matters. A shape assertion -- "sdg comes back for s" -- passes
+    /// just as well whether the table is right or wrong, which is why the gate-inverse tests
+    /// in `naso-gates` apply the gates and compare amplitudes instead.
     #[test]
-    fn a_self_inverse_gate_is_its_own_adjoint() {
+    fn the_exporter_adjoints_agree_with_the_verified_table() {
+        use naso_gates::gate_inverse::inverse_of;
+        use naso_gates::statevector::Gate;
         let e = OpenQASMExporter::new();
-        for g in ["h", "x", "y", "z", "cx", "ccx", "swap"] {
+
+        // Every gate the simulator models, cross-checked against the one table.
+        for (name, gate) in [
+            ("h", Gate::H),
+            ("x", Gate::X),
+            ("y", Gate::Y),
+            ("z", Gate::Z),
+            ("s", Gate::S),
+            ("sdg", Gate::Sdg),
+            ("t", Gate::T),
+            ("tdg", Gate::Tdg),
+            ("cx", Gate::Cx),
+            ("cy", Gate::Cy),
+            ("cz", Gate::Cz),
+            ("swap", Gate::Swap),
+        ] {
+            let expected = match inverse_of(gate) {
+                Gate::H => "h",
+                Gate::X => "x",
+                Gate::Y => "y",
+                Gate::Z => "z",
+                Gate::S => "s",
+                Gate::Sdg => "sdg",
+                Gate::T => "t",
+                Gate::Tdg => "tdg",
+                Gate::Cx => "cx",
+                Gate::Cy => "cy",
+                Gate::Cz => "cz",
+                Gate::Swap => "swap",
+                other => panic!("unexpected inverse {other:?} for {gate:?}"),
+            };
             assert_eq!(
-                e.generate_adjoint(g, &[0], &[]),
-                format!("{g} q[0];"),
-                "{g} is self-inverse"
+                e.generate_adjoint(name, &[0], &[]).unwrap(),
+                format!("{expected} q[0];"),
+                "the exporter's adjoint for `{name}` must be the verified one"
             );
         }
     }
 
     /// `s` and `t` are NOT self-inverse; their adjoints are the dagger variants, and
-    /// the mapping has to go both ways.
+    /// the mapping has to go both ways. This is the specific relation that shipped wrong
+    /// once already.
     #[test]
     fn a_phase_gate_adjoint_is_its_dagger() {
         let e = OpenQASMExporter::new();
-        assert_eq!(e.generate_adjoint("s", &[1], &[]), "sdg q[1];");
-        assert_eq!(e.generate_adjoint("sdg", &[1], &[]), "s q[1];");
-        assert_eq!(e.generate_adjoint("t", &[0], &[]), "tdg q[0];");
-        assert_eq!(e.generate_adjoint("tdg", &[0], &[]), "t q[0];");
+        assert_eq!(e.generate_adjoint("s", &[1], &[]).unwrap(), "sdg q[1];");
+        assert_eq!(e.generate_adjoint("sdg", &[1], &[]).unwrap(), "s q[1];");
+        assert_eq!(e.generate_adjoint("t", &[0], &[]).unwrap(), "tdg q[0];");
+        assert_eq!(e.generate_adjoint("tdg", &[0], &[]).unwrap(), "t q[0];");
     }
 
-    /// A rotation's adjoint negates its angle. Dropping the negation makes `rx(theta)`
-    /// come out as its own inverse, i.e. the identity rather than the inverse.
+    /// A rotation's adjoint keeps its name and negates its angle. Dropping the negation
+    /// makes `rx(theta)` come out as its own inverse, i.e. the identity rather than the
+    /// inverse.
     #[test]
     fn a_parameterised_rotation_negates_its_angle() {
         let e = OpenQASMExporter::new();
         assert_eq!(
-            e.generate_adjoint("rx", &[0], &[0.25]),
+            e.generate_adjoint("rx", &[0], &[0.25]).unwrap(),
             "rx(-0.2500000000) q[0];"
         );
     }
 
-    /// Every operand of a two-qubit gate is kept, and an unrecognised gate passes
-    /// through unchanged rather than being dropped from the circuit.
+    /// Every operand of a two-qubit gate is kept.
     #[test]
     fn a_multi_qubit_gate_keeps_every_operand() {
         let e = OpenQASMExporter::new();
-        assert_eq!(e.generate_adjoint("cz", &[0, 1], &[]), "cz q[0], q[1];");
         assert_eq!(
-            e.generate_adjoint("rz", &[2, 3], &[1.5]),
+            e.generate_adjoint("cz", &[0, 1], &[]).unwrap(),
+            "cz q[0], q[1];"
+        );
+        assert_eq!(
+            e.generate_adjoint("rz", &[2, 3], &[1.5]).unwrap(),
             "rz(-1.5000000000) q[2], q[3];"
         );
-        assert_eq!(e.generate_adjoint("unknown", &[0], &[]), "unknown q[0];");
+    }
+
+    /// An UNMODELLED gate must be REFUSED, not assumed self-inverse.
+    ///
+    /// This arm used to return the name unchanged, which asserted that any gate the table
+    /// did not mention was its own inverse. For a gate that is not self-inverse, that emits
+    /// the forward application where an inverse belonged, and the circuit computes a
+    /// different function with no diagnostic -- the same fabrication class the QIR
+    /// classifier had, where every unknown gate became a Hadamard.
+    #[test]
+    fn an_unmodelled_gate_has_no_adjoint_rather_than_being_its_own() {
+        let e = OpenQASMExporter::new();
+        for unknown in ["unknown", "frobnicate", "s_dagger_typod", ""] {
+            let err = e
+                .generate_adjoint(unknown, &[0], &[])
+                .expect_err("an unmodelled gate must not be assumed self-inverse");
+            assert!(
+                err.to_string().contains("no adjoint relation"),
+                "the diagnostic must say what is wrong, got: {err}"
+            );
+        }
+    }
+
+    /// The two gates the simulator does not model are handled by name, explicitly.
+    ///
+    /// They are `iswap` (self-inverse) and `cphase` (self-inverse once the angle is
+    /// negated). Declaring them here is honest -- they are asserted to be self-inverse, not
+    /// swept into the unknown arm -- and a test pins that so the declaration stays true.
+    #[test]
+    fn the_two_unmodelled_gates_are_declared_self_inverse() {
+        let e = OpenQASMExporter::new();
+        assert_eq!(
+            e.generate_adjoint("iswap", &[0, 1], &[]).unwrap(),
+            "iswap q[0], q[1];"
+        );
+        assert_eq!(
+            e.generate_adjoint("cphase", &[0, 1], &[0.5]).unwrap(),
+            "cphase(-0.5000000000) q[0], q[1];"
+        );
     }
 }

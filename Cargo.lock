@@ -1498,6 +1498,7 @@ dependencies = [
  "indexmap",
  "inkwell",
  "logos",
+ "naso-gates",
  "num-complex",
  "proptest",
  "rand 0.8.8",

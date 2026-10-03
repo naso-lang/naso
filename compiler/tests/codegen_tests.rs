@@ -1803,7 +1803,11 @@ mod parser_tests {
         let pir = parse_pir(&load_pir_text("teleport")).unwrap();
         assert_eq!(pir.statements.len(), 4);
         assert_eq!(pir.parameters, vec!["N"]);
-        assert_eq!(pir.quantities.get("q[0]"), Some(&Quantity::One));
+        // `Many`, not `One`: these are qubits, and a gate entangles a qubit rather
+        // than consuming it. Teleportation applies 3-4 gates to each of the three.
+        // The fixture previously said `One` while discarding the operand names, so
+        // the annotation was both wrong and unenforced -- see teleport.pir.
+        assert_eq!(pir.quantities.get("q[0]"), Some(&Quantity::Many));
         assert_eq!(pir.quantities.get("b0"), Some(&Quantity::Zero));
         assert_eq!(pir.quantities.get("b1"), Some(&Quantity::Zero));
         // Statement ids are assigned in fixture order.

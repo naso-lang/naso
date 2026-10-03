@@ -219,6 +219,7 @@ jobs:
             --test llvm_forall_early_exit_test \
             --test llvm_reversible_refusal_test \
             --test wgsl_control_flow_honesty_test \
+            --test linearity_at_emission_boundary_test \
             --test llvm_shipped_kernel_execution_test
 
       - name: Clippy with the llvm feature

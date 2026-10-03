@@ -117,8 +117,36 @@ S_bob_corrections_q2 = {
 }
 
 [quantities]
-q[0] = One
-q[1] = One
-q[2] = One
+#
+# These are QUBITS, and a qubit is not a linear value in the consume-once sense.
+#
+# They were annotated `One`, which means "consumed exactly once", and that is wrong
+# for a qubit. Teleportation applies 3-4 gates to each of these three qubits:
+#
+#     q[0]: CNOT, H, measure                              -- 3 uses
+#     q[1]: H, CNOT, CNOT, measure                        -- 4 uses
+#     q[2]: CNOT, X, Z                                    -- 3 uses
+#
+# A gate does not CONSUME a qubit, it entangles it and hands it on. `One` is the
+# annotation for a resource that leaves the program when used -- a classical bit, an
+# allocated buffer -- and a qubit is the opposite: it persists and is reused.
+#
+# This was not visible while the fixture's `[1]` claim went unchecked. The quantum
+# operand names in the bodies (`H q[1]`) were DISCARDED by the fixture parser, which
+# replaced every gate operand with a fresh anonymous `qir.qubit_alloc()`. So the three
+# declared names appeared zero times in the lowered body, and a linearity check
+# counting occurrences of `q[0]` correctly reported `used 0 times`.
+#
+# The check was right and the fixture was unsound: it declared named linear qubits
+# and then modelled gates on anonymous allocations, which is precisely the
+# destroy-and-reuse failure QTT exists to prevent -- the gates were not operating on
+# the declared qubits at all.
+#
+# `Many` is the honest annotation: a qubit wire may be used any number of times.
+# Consuming a qubit is a separate, explicit act (measurement / release), and that is
+# where `[1]` does belong -- on the measured bits below, not on the wires.
+q[0] = Many
+q[1] = Many
+q[2] = Many
 b0 = Zero
 b1 = Zero

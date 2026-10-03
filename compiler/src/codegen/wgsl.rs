@@ -349,8 +349,22 @@ enum ElementType {
     U8,
 }
 
-/// Entry point: generate WGSL from PIR module
+/// Entry point: generate WGSL from PIR module.
+///
+/// Linearity is checked BEFORE emission, and before anything else can refuse for an
+/// unrelated reason.
+///
+/// The ordering matters. This function used to call `verify_wgsl_linearity` nowhere
+/// at all -- the check existed, was correct, was covered by tests, and was invoked
+/// only by those tests. So the diagnostic that should have caught a doubled `[1]`
+/// value never ran, and the only thing standing between a violating module and a
+/// shader was whether the emitter happened to choke on it for some other reason.
+///
+/// That is the failure this removes: "refused, but for the wrong reason" is not a
+/// check. `verify_wgsl_linearity` is checked first so that a linear violation is
+/// always reported AS a linear violation.
 pub fn generate_wgsl(module: &PirModule, target: WgslTarget) -> CodegenResult<String> {
+    verify_wgsl_linearity(module)?;
     let mut ctx = WgslContext::new(module.clone(), target);
     ctx.generate()
 }

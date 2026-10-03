@@ -1886,6 +1886,154 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
             .into()
     }
 
+    /// Bring a binary operation's two operands to one common type, or refuse naming why.
+    ///
+    /// These are the USUAL ARITHMETIC CONVERSIONS, and the rules are the ones a reader
+    /// of C or Rust already has, because inventing a different rule here would make the
+    /// same expression mean different things depending on which backend ran it.
+    ///
+    /// - **integer + integer** -> the WIDER of the two widths (`i8 + i64` is `i64`). The
+    ///   narrower operand is sign-extended, which is what Naso's own integer arithmetic
+    ///   already assumes: `/` is `build_int_signed_div` and `<` is `SLT`, so no unsigned
+    ///   reading exists here that extension could contradict.
+    /// - **integer + float** -> the FLOAT type (`i64 + f32` is `double`, via `sitofp`).
+    ///   Naso has exactly one float representation -- `TypeKind::Float` carries no width
+    ///   and `ElemType` has a single `F64` variant -- so there is no width to argue about
+    ///   and `f32` is already `double` in LLVM.
+    /// - **float + float** -> unchanged, handled by the caller.
+    ///
+    /// # What this deliberately does NOT do
+    ///
+    /// **No silent truncation.** The only conversion here that could lose information is
+    /// `fptosi`, float to integer, and it is never emitted. Mixed `%` is therefore
+    /// REFUSED rather than answered by truncating the divisor: `7 % 2.5` has no integer
+    /// answer without silently reading `2.5` as `2`. The language defines no float `%`,
+    /// so inventing one here would be a definition the source never asked for.
+    ///
+    /// **No silent wrap.** `sitofp` cannot overflow for any integer LLVM has: the widest
+    /// is `i128`, about `1.7e38`, while `double` reaches `1.8e308`. It ROUNDS -- an `i64`
+    /// above `2^53` is not exactly representable -- and rounding is inherent to converting
+    /// an integer to a float, not a wrap. Refusing it would make `i64 + f32` unusable.
+    /// Widening an integer likewise cannot overflow, since `sext` into a wider type is
+    /// exact by definition.
+    ///
+    /// **No bitwise operations across the float boundary.** `&`, `|`, `^`, `<<`, `>>` on
+    /// a float would mean converting the float to an integer -- dropping its fraction --
+    /// and then applying a bit operation to a number the source never wrote.
+    fn promote_binary_operands(
+        &mut self,
+        op: BinaryOp,
+        left: BasicValueEnum<'ctx>,
+        right: BasicValueEnum<'ctx>,
+    ) -> CodegenResult<(BasicValueEnum<'ctx>, BasicValueEnum<'ctx>)> {
+        use crate::ir::BinaryOp as B;
+
+        match (left.get_type(), right.get_type()) {
+            // Same-width integers already agree.
+            (BasicTypeEnum::IntType(l), BasicTypeEnum::IntType(r))
+                if l.get_bit_width() == r.get_bit_width() =>
+            {
+                Ok((left, right))
+            }
+            // A one-bit integer is a lowered `bool`, NOT a small number.
+            //
+            // The typechecker rejects `i64 + bool` ("expected `Int`, found `Bool`"), but
+            // `bool` reaches here as LLVM `i1` and is indistinguishable from an integer
+            // by shape alone. Promoting `i1` to `i64` would silently treat `true` as 1
+            // and `false` as 0 -- an arithmetic answer the source never wrote.
+            //
+            // This arm is the backstop for any path that reaches codegen without the
+            // typechecker having run, which is the same class of hole as the QIR/WGSL
+            // public PIR entry points.
+            (BasicTypeEnum::IntType(l), BasicTypeEnum::IntType(r))
+                if l.get_bit_width() == 1 || r.get_bit_width() == 1 =>
+            {
+                Err(CodegenError::UnsupportedFeature(
+                    "arithmetic on a boolean operand is refused. A `bool` lowers to a \
+                     one-bit integer (i1 here), which is the same LLVM shape as a small \
+                     integer, so widening it to i64 would silently read `true` as 1 and \
+                     `false` as 0 -- an answer the source never wrote. Convert \
+                     explicitly if that is what you meant."
+                        .to_string(),
+                ))
+            }
+            (BasicTypeEnum::IntType(_), BasicTypeEnum::IntType(_)) => {
+                let (l, r) = (left.get_type(), right.get_type());
+                let (BasicTypeEnum::IntType(l), BasicTypeEnum::IntType(r)) = (l, r) else {
+                    unreachable!("matched IntType above")
+                };
+                let wider = if l.get_bit_width() > r.get_bit_width() {
+                    l
+                } else {
+                    r
+                };
+                let lv = left.into_int_value();
+                let rv = right.into_int_value();
+                Ok((
+                    self.value_builder
+                        .builder()
+                        .build_int_cast_sign_flag(lv, wider, true, "promote_int")?
+                        .into(),
+                    self.value_builder
+                        .builder()
+                        .build_int_cast_sign_flag(rv, wider, true, "promote_int")?
+                        .into(),
+                ))
+            }
+            // Mixed. The integer becomes the float type via `sitofp`.
+            (BasicTypeEnum::IntType(_), BasicTypeEnum::FloatType(f))
+            | (BasicTypeEnum::FloatType(f), BasicTypeEnum::IntType(_)) => {
+                if op == B::Mod {
+                    return Err(CodegenError::UnsupportedFeature(
+                        "`%` with one integer and one floating-point operand is refused. \
+                         Naso defines no remainder on floats, so the only way to answer it \
+                         would be to convert the float operand to an integer -- `2.5` would \
+                         become `2` -- and that silent truncation would be a number the \
+                         source never wrote. Write `/`, which promotes to float arithmetic, \
+                         or make both operands integers."
+                            .to_string(),
+                    ));
+                }
+                if matches!(op, B::And | B::Or | B::Xor | B::Shl | B::Shr) {
+                    return Err(CodegenError::UnsupportedFeature(format!(
+                        "{op:?} is not defined when one operand is a floating-point value. \
+                         These are bit operations on integers; converting the integer to a \
+                         float to apply one would compute something the source never wrote."
+                    )));
+                }
+                // Track which side held the integer, because `sitofp` needs the value
+                // and the result must go back on the side it came from.
+                let (int_val, float_val, int_is_left) = match (left, right) {
+                    (BasicValueEnum::IntValue(i), f @ BasicValueEnum::FloatValue(_)) => {
+                        (i, f, true)
+                    }
+                    (f @ BasicValueEnum::FloatValue(_), BasicValueEnum::IntValue(i)) => {
+                        (i, f, false)
+                    }
+                    _ => unreachable!("matched Int/Float above"),
+                };
+                // `sitofp` produces the float operand's own type, so after this both
+                // sides are the same LLVM float type and no further cast is needed.
+                let promoted = self.value_builder.builder().build_signed_int_to_float(
+                    int_val,
+                    f,
+                    "promote_to_float",
+                )?;
+                let (new_left, new_right) = if int_is_left {
+                    (promoted.into(), float_val)
+                } else {
+                    (float_val, promoted.into())
+                };
+                Ok((new_left, new_right))
+            }
+            (l, r) => Err(CodegenError::UnsupportedFeature(format!(
+                "binary operation on operands of different types ({l:?} and {r:?}). \
+                 Neither is an integer that could be widened to the other, and Naso \
+                 defines no conversion between them."
+            ))),
+        }
+    }
+
     fn build_binary_op(
         &mut self,
         op: BinaryOp,
@@ -1899,26 +2047,26 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
         // used to abort the compiler rather than fail gracefully -- the int-only arm
         // below could not have produced the multiply even had it been reached.
         //
-        // Mixing the two is refused rather than converted. `f64 * i64` has no single
-        // correct answer: it differs on whether the integer is exactly representable, and
-        // picking a conversion here is precisely the implicit widening this backend
-        // must not insert.
-        match (left.get_type(), right.get_type()) {
-            (BasicTypeEnum::FloatType(_), BasicTypeEnum::FloatType(_)) => {
-                return self.build_float_binary_op(
-                    op,
-                    left.into_float_value(),
-                    right.into_float_value(),
-                );
-            }
-            (BasicTypeEnum::IntType(_), BasicTypeEnum::IntType(_)) => {}
-            (l, r) => {
-                return Err(CodegenError::UnsupportedFeature(format!(
-                    "binary operation on operands of different types ({l:?} and {r:?}). \
-                     Converting one to the other would be an implicit widening or \
-                     narrowing, so it is refused."
-                )));
-            }
+        // Float + float is unchanged. Integer + integer is promoted to the wider width.
+        // Mixed goes through `promote_binary_operands`, which refuses the cases that
+        // have no honest answer rather than picking one.
+        if let (BasicTypeEnum::FloatType(_), BasicTypeEnum::FloatType(_)) =
+            (left.get_type(), right.get_type())
+        {
+            return self.build_float_binary_op(
+                op,
+                left.into_float_value(),
+                right.into_float_value(),
+            );
+        }
+        let (left, right) = self.promote_binary_operands(op, left, right)?;
+
+        // Promotion can make the operands FLOAT (`i64 < f32`), so after it the pair is
+        // no longer guaranteed integral. Re-dispatch rather than calling `into_int_value`
+        // unconditionally: that PANICS on a `double`, which would abort the compiler
+        // instead of building the comparison the source asked for.
+        if let (BasicValueEnum::FloatValue(l), BasicValueEnum::FloatValue(r)) = (&left, &right) {
+            return self.build_float_binary_op(op, *l, *r);
         }
 
         let left_int: IntValue<'ctx> = left.into_int_value();

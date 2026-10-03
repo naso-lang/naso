@@ -70,7 +70,6 @@ construct, and neither is a placeholder value, a shader comment, or an exit stat
 | quantity used as a type | **refused** | `Many` is a quantity; write `[1] Qubit` <!-- construct:quantity used as a type --> |
 | widthless `int` parameter | **refused** | no exact ABI slot without a width <!-- construct:widthless `int` parameter --> |
 | `break` in an affine `forall` band | **refused** | an affine band has no data-dependent runtime exit <!-- construct:`break` in an affine `forall` band --> |
-| mixed integer/float binary ops | **refused** | no implicit numeric promotion; operands must match <!-- construct:mixed integer/float binary ops --> |
 | expression-position `reversible` | **refused** | <!-- construct:expression-position `reversible` --> |
 
 ## Other targets

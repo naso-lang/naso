@@ -222,12 +222,6 @@ fn matrix() -> Vec<Row> {
             note: "an affine band has no data-dependent runtime exit",
         },
         Row {
-            construct: "mixed integer/float binary ops",
-            src: "fn f(a: i64, b: f32) -> f64 { a + b }",
-            llvm: Outcome::Refused,
-            note: "no implicit numeric promotion; operands must match",
-        },
-        Row {
             construct: "expression-position `reversible`",
             src: "fn f(a: i64) -> i64 { let x = reversible { a + 1 }; x }",
             llvm: Outcome::Refused,

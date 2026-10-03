@@ -236,6 +236,9 @@ jobs:
       - name: Test the quantum parameter ABI suite
         run: cargo test --features llvm --test quantum_param_abi_test
 
+      - name: Test the mixed arithmetic promotion suite
+        run: cargo test --features llvm --test mixed_arith_promotion_test
+
       - name: Test the capability matrix
         run: cargo test --features llvm --test capability_matrix_test
 

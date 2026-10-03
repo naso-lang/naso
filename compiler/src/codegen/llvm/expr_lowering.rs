@@ -550,16 +550,27 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                     )
                 })?;
                 if targets.affine_band {
+                    // The DOMAIN TRANSFORMATION for this case exists and is tested in
+                    // `ir::early_exit`: a `break` at a constant prefix of the iteration
+                    // shortens the band to a prefix of its original range, and a `continue`
+                    // leaves the domain alone. It is not wired into emission yet, because a
+                    // backend must then emit the SHORTENED band rather than the original
+                    // one, and doing that half-way would run iterations the program breaks
+                    // out of.
+                    //
+                    // So the refusal stays, but it now says what the answer would be rather
+                    // than only that there isn't one.
                     return Err(CodegenError::UnsupportedFeature(
-                        "`break` inside an affine `forall` loop. This is NOT the same as \
-                         being outside a loop -- there IS a loop here, but its trip count \
-                         is statically known and its body is emitted as straight-line \
-                         code inside that iteration space, so there is no runtime exit to \
-                         branch to. Leaving early would also break the polyhedral form \
-                         the schedule pass exists to produce: the dependence analysis \
-                         that chose this band assumes every iteration runs. Use a \
-                         `while` or a counted `for` when the number of iterations is \
-                         not known in advance."
+                        "`break` inside an affine `forall` loop. The loop has a statically \
+                         known trip count and its body is emitted inside that iteration \
+                         space, so there is no runtime exit to branch to.\n\n\
+                         The domain transformation for this is KNOWN and tested in \
+                         `ir::early_exit`: when the break guard names a constant point in \
+                         the iteration -- `i >= k` with `k` a literal -- the band shortens \
+                         to `min(hi, k - 1)`, which stays affine. What is missing is \
+                         emission of the shortened band. A guard depending on runtime data \
+                         (`i >= n / 2`) has no affine answer at all, and a `while` loop is \
+                         the right construct for it."
                             .to_string(),
                     ));
                 }

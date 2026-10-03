@@ -10,6 +10,7 @@
 pub mod access_relation;
 pub mod affine_domain;
 pub mod affine_map;
+pub mod early_exit;
 pub mod pir_types;
 pub mod pretty_print;
 pub mod schedule_tree;

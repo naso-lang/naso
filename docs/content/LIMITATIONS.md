@@ -69,7 +69,7 @@ construct, and neither is a placeholder value, a shader comment, or an exit stat
 | tensor with a zero extent | **refused** | no elements to index <!-- construct:tensor with a zero extent --> |
 | quantity used as a type | **refused** | `Many` is a quantity; write `[1] Qubit` <!-- construct:quantity used as a type --> |
 | widthless `int` parameter | **refused** | no exact ABI slot without a width <!-- construct:widthless `int` parameter --> |
-| `break` in an affine `forall` band | **refused** | an affine band has no data-dependent runtime exit <!-- construct:`break` in an affine `forall` band --> |
+| `break` in an affine `forall` band | **refused** | the DOMAIN TRANSFORMATION is known and tested (`ir::early_exit`): a `break` at a constant prefix of the iteration shortens the band to `min(hi, k - 1)`, which stays affine, and `continue` leaves the domain alone and predicates the body. What is missing is emission of the shortened band, so the refusal stands. A guard depending on runtime data (`i >= n / 2`) has no affine answer and needs a `while` loop <!-- construct:`break` in an affine `forall` band --> |
 | expression-position `reversible` | **refused** | <!-- construct:expression-position `reversible` --> |
 | adding two booleans | **refused** | FIXED. `unify_kinds` accepts `(Bool, Bool)` for `==`, and the arithmetic arm called it without asking whether the operator applied, so `true + true` reached LLVM as `add i1` and wrapped to `0`. Refused by `typecheck::inference::bool_operator`; ordering comparisons (`<`, `>=`) are refused for the same reason since booleans have no order <!-- construct:adding two booleans --> |
 
@@ -132,6 +132,8 @@ Kept deliberately, and refused rather than approximated:
 - `reversible { ... }` uncomputation. `compiler/src/lowering/reversible_lowering.rs`
   contains an inverse generator that nothing calls; it is unwired and unverified, and its
   measurement path fabricates a qubit operand.
-- `break` / `continue` inside affine `forall` bands, which have no data-dependent runtime
+- `break` / `continue` inside affine `forall` bands. The iteration-domain transformation for
+  a constant-prefix guard is implemented and tested in `ir::early_exit`, but no backend emits
+  the shortened band yet, and a guard on runtime data has no affine form. A `while` loop
   exit.
 - Cranelift, entirely.

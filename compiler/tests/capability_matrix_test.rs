@@ -219,7 +219,12 @@ fn matrix() -> Vec<Row> {
             construct: "`break` in an affine `forall` band",
             src: "fn f(n: i64) -> i64 { let mut s = 0; forall i in 0..n { if i > 3 { break; } s = s + i; } s }",
             llvm: Outcome::Refused,
-            note: "an affine band has no data-dependent runtime exit",
+            note: "the DOMAIN TRANSFORMATION is known and tested (`ir::early_exit`): a \
+                   `break` at a constant prefix of the iteration shortens the band to \
+                   `min(hi, k - 1)`, which stays affine, and `continue` leaves the domain \
+                   alone and predicates the body. What is missing is emission of the \
+                   shortened band, so the refusal stands. A guard depending on runtime data \
+                   (`i >= n / 2`) has no affine answer and needs a `while` loop",
         },
         Row {
             construct: "adding two booleans",

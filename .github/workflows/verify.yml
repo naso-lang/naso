@@ -239,6 +239,9 @@ jobs:
       - name: Test the CLI end-to-end suite
         run: cargo test --features llvm --test cli_end_to_end_test
 
+      - name: Test the early-exit domain transformation
+        run: cargo test --features llvm --test early_exit_domain_test
+
       - name: Test the bool operator rule
         run: cargo test --features llvm --test bool_operator_test
 

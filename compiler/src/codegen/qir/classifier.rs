@@ -129,8 +129,14 @@ pub fn qir_intrinsic_name(class: ReversibleClass, gate_name: &str) -> &'static s
             "z" => "qir.z",
             "s" => "qir.s",
             "t" => "qir.t",
-            "sdg" => "qir.s", // S-dagger uses same intrinsic with different args
-            "tdg" => "qir.t", // T-dagger uses same intrinsic with different args
+            // S-dagger and T-dagger are the ADJOINTS of S and T: distinct QIR
+            // entry points, not the same intrinsic with different arguments.
+            //
+            // S = diag(1, i) and S-dagger = diag(1, -i), so applying S where S-dagger
+            // was written sends |1> to i|1> instead of -i|1>. Every downstream amplitude
+            // differs. The previous mapping here did exactly that.
+            "sdg" => "qir.s__adj",
+            "tdg" => "qir.t__adj",
             "rx" => "qir.rx",
             "ry" => "qir.ry",
             "rz" => "qir.rz",
@@ -146,12 +152,19 @@ pub fn qir_intrinsic_name(class: ReversibleClass, gate_name: &str) -> &'static s
             "measure" | "mz" => "qir.mz",
             "mx" => "qir.mx",
             "my" => "qir.my",
-            _ => "qir.h", // default
+            // An unknown gate has no intrinsic. Returning "qir.h" made every unrecognised
+            // gate a Hadamard, which computes a specific wrong answer rather than
+            // refusing -- the silent-fabrication failure this file must not have. A
+            // mis-spelled gate name produced working code applying the wrong unitary.
+            _ => "qir.unknown", // not a real entry point; callers must refuse this
         },
         ReversibleClass::Permutation => "qir.swap",
         ReversibleClass::Measurement => "qir.mz",
         ReversibleClass::ClassicalControl => "qir.if",
-        ReversibleClass::NonReversible => "qir.h", // fallback
+        // A non-reversible operation has NO unitary intrinsic, and answering "qir.h"
+        // made every one of them a Hadamard. Same fabrication as the unknown-gate arm
+        // above: a specific wrong answer instead of a refusal.
+        ReversibleClass::NonReversible => "qir.non_reversible",
     }
 }
 

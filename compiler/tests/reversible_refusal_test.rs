@@ -164,6 +164,11 @@ fn the_refusal_names_uncomputation_not_an_unrelated_construct() {
 /// 2. `ScheduleNode` has no field that can hold a `PirExpr`, so an inverse tree built
 ///    from it carries loop structure but no operations.
 /// 3. `reversible_lowering` exports entry points nothing calls.
+/// 4. There is no gate-to-inverse table, so no operation's inverse is COMPUTED rather
+///    than assumed. A forward/inverse stream representation was built and then deleted,
+///    because a representation with no producer is an unreferenced scaffold -- 906 lines
+///    whose tests only tested themselves. Rebuilding it means bringing the inverse
+///    producer with it, not ahead of it.
 #[test]
 fn the_documented_blockers_to_wiring_reversible_are_still_real() {
     use std::collections::BTreeMap;
@@ -228,5 +233,58 @@ fn the_documented_blockers_to_wiring_reversible_are_still_real() {
         "`mod.rs` now CALLS `reversible_lowering::lower_reversible_block`. Blocker 3 is \\
          GONE and, if the other two still hold, the inverse is being discarded silently \\
          -- which is the defect just fixed. Verify the emitted inverse before trusting it."
+    );
+    // Blocker 4: no gate-to-inverse table, so no inverse is ever computed.
+    //
+    // Checked by the ABSENCE of the representation that had no producer. If someone
+    // reintroduces a forward/inverse stream module without also introducing the producer
+    // that builds one, this fails -- which is the point. A representation whose only
+    // references are its own module and its own tests is a scaffold, and shipping it
+    // repeats the original failure in a new shape: everything compiles, nothing emits.
+    let ir_mod = include_str!("../src/ir/mod.rs");
+    assert!(
+        !ir_mod.contains("dual_stream"),
+        "a dual_stream module was reintroduced. That is acceptable ONLY alongside a \
+         producer that constructs DualStream from lowered source. Check first that \
+         something outside the module itself builds one:\n  \
+         grep -rn 'DualStream::' --include=*.rs compiler/src/ crates/"
+    );
+
+    // And confirm the classifier does not quietly claim S-dagger is S.
+    //
+    // `classifier.rs` mapped "sdg" onto the same intrinsic as "s", with a comment saying it
+    // "uses same intrinsic with different args". S-dagger is the ADJOINT of S: S sends
+    // |1> to i|1>, S-dagger to -i|1>. Every downstream amplitude differs. The file is
+    // undeclared and inert, so nothing was wrong today -- but an inverse table built from
+    // that mapping would compute wrong inverses, silently. FIXED, and asserted here so it
+    // cannot come back.
+    let classifier = include_str!("../src/codegen/qir/classifier.rs");
+    assert!(
+        !classifier.contains("\"sdg\" => \"qir.s\","),
+        "classifier.rs maps sdg onto qir.s. S-dagger is the ADJOINT of S, not S with \
+         different arguments; applying S where S-dagger was written computes a different \
+         state."
+    );
+    assert!(
+        classifier.contains("\"sdg\" => \"qir.s__adj\""),
+        "sdg must map to the adjoint entry point qir.s__adj."
+    );
+    assert!(
+        classifier.contains("\"tdg\" => \"qir.t__adj\""),
+        "tdg must map to the adjoint entry point qir.t__adj."
+    );
+
+    // A fabricated default is the same defect wearing a different hat: an unrecognised
+    // gate used to resolve to "qir.h", so a MIS-SPELLED gate name compiled and applied a
+    // Hadamard. Every default arm must now be a sentinel that callers can refuse on, and
+    // no arm may resolve a gate to Hadamard by default.
+    assert!(
+        !classifier.contains("_ => \"qir.h\""),
+        "an unknown gate must not resolve to qir.h. A mis-spelled gate name would compile \
+         and apply a Hadamard -- a specific wrong answer instead of a refusal."
+    );
+    assert!(
+        !classifier.contains("NonReversible => \"qir.h\""),
+        "a non-reversible operation must not resolve to qir.h either."
     );
 }

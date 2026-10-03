@@ -149,3 +149,84 @@ fn the_refusal_names_uncomputation_not_an_unrelated_construct() {
          the whole point of the construct: {msg}"
     );
 }
+
+/// The reason `reversible` stays refused must stay TRUE, not merely asserted.
+///
+/// `reversible_lowering.rs` contains a plausible-looking inverse generator: 831 lines
+/// with 12 passing unit tests. It is tempting to wire it up. This test fails the moment
+/// any of the three blockers it documents is resolved, so the day real uncomputation
+/// becomes possible, whoever does it is told to update the refusal and the matrix
+/// together rather than leaving a stale "cannot" in place.
+///
+/// The three blockers, asserted individually:
+///
+/// 1. `PirModule` has one `schedule` field and no inverse carrier.
+/// 2. `ScheduleNode` has no field that can hold a `PirExpr`, so an inverse tree built
+///    from it carries loop structure but no operations.
+/// 3. `reversible_lowering` exports entry points nothing calls.
+#[test]
+fn the_documented_blockers_to_wiring_reversible_are_still_real() {
+    use std::collections::BTreeMap;
+
+    // Blocker 1: no inverse carrier on PirModule.
+    let fields: BTreeMap<&str, bool> = vec![
+        ("statements", true),
+        ("schedule", true),
+        ("accesses", true),
+        ("quantities", true),
+    ]
+    .into_iter()
+    .collect();
+    let module_src = include_str!("../src/ir/pir_types.rs");
+    let pir_module = module_src
+        .split("pub struct PirModule")
+        .nth(1)
+        .and_then(|s| s.split("}").next())
+        .expect("PirModule must be a struct");
+    for name in fields.keys() {
+        assert!(
+            pir_module.contains(&format!("pub {name}:")),
+            "PirModule should still have `{name}`"
+        );
+    }
+    assert!(
+        !pir_module.contains("inverse"),
+        "PirModule now has an `inverse` field, so blocker 1 is GONE. `reversible` may \\
+         be wireable -- update the refusal in `lower_reversible_block`, the row in \\
+         `capability_matrix_test.rs`, and `docs/content/LIMITATIONS.md` together."
+    );
+
+    // Blocker 2: ScheduleNode cannot carry an expression, so an inverse tree built
+    // from schedule nodes alone has no operations in it.
+    //
+    // Checked as a CAPABILITY over every variant's fields, not as the presence of one
+    // hard-coded field name. A mutant that adds a differently-named `expr` field is a
+    // real capability change and must be caught; asserting on a literal name would miss
+    // it, and adding a variant to an enum used by exhaustive matches makes such a
+    // mutation uncompilable rather than detectable.
+    let schedule_src = include_str!("../src/ir/schedule_tree.rs");
+    let node = schedule_src
+        .split("pub enum ScheduleNode")
+        .nth(1)
+        .and_then(|s| s.split("\n}").next())
+        .expect("ScheduleNode must be an enum");
+    assert!(
+        !node.contains("PirExpr"),
+        "ScheduleNode can now carry a PirExpr, so blocker 2 is GONE. An inverse schedule \
+         could carry real operations -- re-investigate wiring `reversible`."
+    );
+
+    // Blocker 3: the entry points are still uncalled.
+    let rev_src = include_str!("../src/lowering/reversible_lowering.rs");
+    assert!(
+        rev_src.contains("pub fn lower_reversible_block"),
+        "the entry point should still exist"
+    );
+    let lowering_src = include_str!("../src/lowering/mod.rs");
+    assert!(
+        !lowering_src.contains("reversible_lowering::lower_reversible_block"),
+        "`mod.rs` now CALLS `reversible_lowering::lower_reversible_block`. Blocker 3 is \\
+         GONE and, if the other two still hold, the inverse is being discarded silently \\
+         -- which is the defect just fixed. Verify the emitted inverse before trusting it."
+    );
+}

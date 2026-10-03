@@ -17,6 +17,56 @@
 #![allow(clippy::match_like_matches_macro)]
 #![allow(clippy::collapsible_if)]
 
+//! # THIS MODULE IS UNWIRED AND PRODUCES NOTHING EMITTABLE
+//!
+//! Nothing calls `lower_reversible_block` or `lower_reversible_block_to_pair`. The
+//! statement-position `reversible` path in `mod.rs` refuses instead, which is correct:
+//! see `tests/reversible_refusal_test.rs`.
+//!
+//! ## Why it is not simply wired up
+//!
+//! Investigated before deciding. Three independent blockers, any one of which is fatal:
+//!
+//! 1. **The result has nowhere to go.** `PirModule` carries `statements: Vec<PirStatement>`
+//!    and ONE `schedule: ScheduleTree`. This module returns a *pair* of trees
+//!    (`ReversibleSchedulePair { forward, inverse, .. }`). There is no second schedule
+//!    field and no `PirModule` variant carrying an inverse, so the inverse tree would be
+//!    dropped at the return.
+//!
+//! 2. **The inverse tree contains no operations.** `build_inverse_schedule` emits
+//!    `ScheduleNode::domain(stmt_id, domain)` per inverse step -- loop structure only.
+//!    `ScheduleNode` has no field carrying a `PirExpr` (its fields are `members`,
+//!    `coincident`, `iterators`, `child`, `domain`, `stmt_id`). Every `InverseOperation.expr`
+//!    computed by `generate_inverse_operations` is DISCARDED: the tree says "run step N
+//!    here" with no step N.
+//!
+//! 3. **No backend reads an inverse tree.** Grepping the codegen tree for one returns
+//!    nothing outside this file's own tests. LLVM, QIR and WGSL each walk
+//!    `statements` in order.
+//!
+//! ## The trap to avoid
+//!
+//! Wiring steps 1-7 and pushing `pair.inverse` into a field that looks right would
+//! produce a module that COMPILES, PASSES this file's own 12 unit tests, and emits the
+//! forward pass with no uncomputation -- exactly the defect that was just fixed at the
+//! `mod.rs` call site, reintroduced one layer down. That is why `mod.rs` refuses rather
+//! than calling into here, and why this banner exists.
+//!
+//! ## What real completion requires
+//!
+//! A PIR representation that can hold a second, ordered operation stream -- an inverse
+//! statement list, or a `PirModule` field carrying both -- plus backend support for
+//! emitting it. The gate is in `tests/capability_matrix_test.rs`, which pins
+//! `reversible { ... }` as **refused** and fails if that changes without the reasoning
+//! changing too.
+//!
+//! ## Two module-level lint suppressions
+//!
+//! `#![allow(clippy::match_like_matches_macro)]` and `#![allow(clippy::collapsible_if)]`
+//! sit at the top of this file. They are left in place only because the module is dead
+//! code; fixing them is a mechanical cleanup to do when it is wired, not a reason to
+//! spend the effort now.
+
 use super::{LoweringContext, LoweringError};
 use crate::ast::Quantity;
 use crate::ir::{

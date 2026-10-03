@@ -230,6 +230,15 @@ jobs:
       # A feature nobody enables cannot be reviewed by CI, so it is built and linted
       # here. The suite asserts the backend REFUSES; it does not assert it executes,
       # because it does not.
+      - name: Test the reversible refusal suite
+        run: cargo test --features llvm --test reversible_refusal_test
+
+      - name: Test the quantum parameter ABI suite
+        run: cargo test --features llvm --test quantum_param_abi_test
+
+      - name: Test the capability matrix
+        run: cargo test --features llvm --test capability_matrix_test
+
       - name: Build and test the cranelift feature
         run: |
           # (1) `cranelift` ALONE must build and link. This is the property that was

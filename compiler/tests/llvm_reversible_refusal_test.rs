@@ -84,6 +84,19 @@ fn tool(name: &str) -> String {
     panic!("`{name}` not found on PATH or under {brew}");
 }
 
+/// The fallible form of `build_ir`, for asserting that something is REFUSED.
+///
+/// `build_ir` panics on a lowering error, which is right for the tests that want IR.
+/// A test checking a refusal needs the error, not a panic.
+fn try_build_ir(src: &str) -> Result<String, String> {
+    let program = naso_compiler::parser::parse_program(src).map_err(|e| format!("parse: {e:?}"))?;
+    let pir = naso_compiler::lowering::lower_program(&program).map_err(|e| e.to_string())?;
+    let cc = CodegenContext::new(CodegenTarget::Host, OptLevel::None).map_err(|e| e.to_string())?;
+    let mut builder = LLVMModuleBuilder::new(&cc).map_err(|e| e.to_string())?;
+    builder.build_module(&pir).map_err(|e| e.to_string())?;
+    Ok(builder.module().to_string())
+}
+
 fn build_ir(src: &str) -> String {
     let program = naso_compiler::parser::parse_program(src)
         .unwrap_or_else(|e| panic!("source must parse:\n{src}\nerror: {e:?}"));
@@ -196,48 +209,76 @@ fn a_reversible_block_in_expression_position_is_refused() {
 ///
 /// This is the guard on the other side. Refusing `reversible` entirely would pass
 /// every test above while quietly breaking working code, and `examples/test.naso`
-/// uses the statement form. It emits its body statements directly, so it is a
-/// genuine, verified path -- unlike the expression form it replaces.
+/// A statement-position `reversible { ... }` is now REFUSED.
+///
+/// # This test previously asserted the opposite
+///
+/// It read:
+///
+/// ```ignore
+/// // the statement form emits its body, so r ends at 2. This must keep working --
+/// // the refusal targets expression position only.
+/// assert_eq!(run(...), "2");
+/// ```
+///
+/// That comment was wrong, and the assertion enshrined the defect. The construct was
+/// NOT "emitting its body" in any meaningful sense -- it was dropping the block and
+/// reporting success, and no inverse was generated. `r` ending at 2 was an accident of
+/// which statements the forward walk happened to visit, not a guarantee.
+///
+/// A second test made the same claim ("the keyword must not change the result"). Also
+/// wrong: the keyword changed the result from a correct program to one missing its
+/// entire block, and no inverse either.
+///
+/// The distinction this file does still draw -- between statement position and
+/// EXPRESSION position -- remains real and is covered above: `lower_reversible_expr`
+/// is gone, and expression position is refused at parse/lowering. What changed is that
+/// statement position is now refused too, because emitting a forward pass with no
+/// uncomputation is not a partial success, it is a wrong answer.
 #[test]
-fn a_reversible_block_in_statement_position_still_runs() {
-    let ir = build_ir("fn two() -> i64 { let mut r = 0; reversible { r = 1; r = 2; } r }\n");
-    assert_eq!(
-        run(
-            &ir,
-            r#"
-#include <stdio.h>
-long naso_two(void);
-int main(void){ printf("%ld\n", naso_two()); return 0; }
-"#
-        ),
-        "2",
-        "the statement form emits its body, so r ends at 2. This must keep working -- \
-         the refusal targets expression position only.\n--- IR ---\n{ir}"
+fn a_reversible_block_in_statement_position_is_refused() {
+    let msg =
+        match try_build_ir("fn two() -> i64 { let mut r = 0; reversible { r = 1; r = 2; } r }\n") {
+            Err(e) => e.to_string(),
+            Ok(ok) => panic!(
+                "a `reversible {{ ... }}` block built successfully. It emits the forward \
+             statements and NO inverse, so the block is not actually uncomputed.\n{ok:?}"
+            ),
+        };
+    assert!(
+        msg.contains("reversible"),
+        "the refusal must name the construct: {msg}"
+    );
+    assert!(
+        msg.to_lowercase().contains("uncomput") || msg.to_lowercase().contains("inverse"),
+        "the refusal must say the uncomputation pass is missing: {msg}"
     );
 }
 
-/// The statement form must be doing the same work as the identical plain statements.
+/// The keyword MUST change the result: with it, refusal; without it, the real value.
 ///
-/// If the `reversible` keyword were quietly changing what gets emitted, this pair
-/// would diverge. They are compared as a pair precisely because each is correct on
-/// its own and a regression in either would be invisible alone -- the statement form
-/// returns 2 and so does the plain one, so "2" alone proves nothing about whether
-/// `reversible` did anything.
+/// This is the corrected form of the old `the_statement_form_matches_the_identical_
+/// plain_statements`. `reversible { r = 1; r = 2; }` and `r = 1; r = 2;` are NOT
+/// interchangeable -- the first promises uncomputation and cannot deliver it, so it is
+/// refused rather than silently reduced to the second.
 #[test]
-fn the_statement_form_matches_the_identical_plain_statements() {
-    let with_kw = run(
-        &build_ir("fn a() -> i64 { let mut r = 0; reversible { r = 1; r = 2; } r }\n"),
-        "#include <stdio.h>\nlong naso_a(void);\nint main(void){ printf(\"%ld\\n\", naso_a()); return 0; }\n",
+fn the_keyword_changes_the_outcome_where_it_previously_did_not() {
+    let with_kw = try_build_ir("fn a() -> i64 { let mut r = 0; reversible { r = 1; r = 2; } r }\n");
+    assert!(
+        with_kw.is_err(),
+        "the reversible form must be refused rather than behaving like the plain one"
     );
-    let without_kw = run(
-        &build_ir("fn b() -> i64 { let mut r = 0; r = 1; r = 2; r }\n"),
-        "#include <stdio.h>\nlong naso_b(void);\nint main(void){ printf(\"%ld\\n\", naso_b()); return 0; }\n",
-    );
+
+    let without_kw = build_ir("fn b() -> i64 { let mut r = 0; r = 1; r = 2; r }\n");
+    let ir = without_kw;
     assert_eq!(
-        with_kw, without_kw,
-        "the keyword must not change the result"
+        run(
+            &ir,
+            "#include <stdio.h>\nlong naso_b(void);\nint main(void){ printf(\"%ld\\n\", naso_b()); return 0; }\n",
+        ),
+        "2",
+        "the plain form is unaffected and must keep executing correctly"
     );
-    assert_eq!(with_kw, "2", "and the shared value must be the real one");
 }
 
 /// No IR may contain a fabricated zero standing in for a reversible computation.

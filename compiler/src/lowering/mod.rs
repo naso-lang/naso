@@ -445,7 +445,47 @@ impl LoweringContext {
                     shape,
                 }
             }
-            crate::ast::ty::TypeKind::QRegister(_) => ParamKind::QRegister,
+            // `Qubit` is a single wire and `QRegister` a register of them; the ABI
+            // treats both as a caller-owned pointer with no element type the LLVM
+            // backend indexes, so both map to the same slot.
+            //
+            // `Qubit` previously fell through to `Unsupported("Qubit")`, which meant
+            // NO quantum parameter type worked -- the one type the whole language
+            // exists for had no ABI at all.
+            crate::ast::ty::TypeKind::QRegister(_) | crate::ast::ty::TypeKind::Qubit => {
+                ParamKind::QRegister
+            }
+            // The parser resolves `QRegister` to `Named("QRegister", args)`, NOT to
+            // `TypeKind::QRegister` -- so the arm above was unreachable and BARE
+            // `QRegister` produced `Unsupported("QRegister")`. Measured:
+            //
+            //     fn f(q: QRegister)            -> Unsupported("QRegister")
+            //     fn f(q: QRegister[f32, 4])    -> Unsupported("QRegister<Float, 4>")
+            //
+            // Every quantum parameter type was therefore unusable: `Qubit` missed for
+            // want of an arm, `QRegister` for want of a reachable one. Matched by name
+            // so both spellings land on the pointer ABI.
+            crate::ast::ty::TypeKind::Named(n, _)
+                if n.name == "QRegister" || n.name == "Qubits" =>
+            {
+                ParamKind::QRegister
+            }
+            // A quantity is not a type. `Many` and `One` parse as `Named` because
+            // they are ordinary identifiers in type position, so `fn f(q: Many)`
+            // silently became `Unsupported("Many")` -- a diagnostic that names a
+            // quantity as though it were the author's intended type.
+            //
+            // They are the quantity ANNOTATION, written `[0]` / `[1]` before the
+            // type, so the fix is to point at that spelling rather than pass the
+            // string through.
+            crate::ast::ty::TypeKind::Named(n, _) if n.name == "Many" || n.name == "One" => {
+                ParamKind::Unsupported(format!(
+                    "`{}` is a quantity, not a type. Quantities are written as an \
+                     annotation before the type: `[1] Qubit` consumes exactly once, \
+                     `[0] Qubit` is borrowed and may be reused",
+                    n
+                ))
+            }
             _ => match elem_kind(ty) {
                 Some(elem) => ParamKind::Scalar(elem),
                 None => ParamKind::Unsupported(format!("{ty}")),
@@ -1209,18 +1249,54 @@ impl LoweringContext {
         Ok(())
     }
 
+    /// REFUSED, not silently dropped.
+    ///
+    /// This used to lower the forward statements and then `Ok(())`, with a comment
+    /// reading "(simplified - full implementation in reversible_lowering.rs)".
+    /// Measured, against a control:
+    ///
+    /// ```text
+    /// fn g(a: i64) -> i64 { let b = a + 1; b }                     -> 2 statements
+    /// fn g(a: i64) -> i64 { reversible { let b = a + 1; b } }      -> 1 statement
+    /// fn f(q: Many) -> Many { h(q) }                                -> 1 statement
+    /// fn f(q: Many) -> Many { reversible { h(q) } }                 -> 0 statements
+    /// ```
+    ///
+    /// So a `reversible` block dropped its body AND generated no inverse. The missing
+    /// schedule tree was the uncomputation pass, which is the entire point of the
+    /// construct: `reversible { h(q) }` is supposed to emit `h` and then uncompute it.
+    /// What it emitted was whatever the forward walk happened to produce, and `Ok`.
+    ///
+    /// Why the existing `PirExpr::Reversible` refusals in the LLVM and QIR backends did
+    /// not catch this: this path never CONSTRUCTS a `PirExpr::Reversible`. It emits no
+    /// node for the backend to reject, so those guards are bypassed entirely. The same
+    /// lesson as the Cranelift `42`: the defect was visible only by asking what this
+    /// path does with its input, not whether the input is correct.
+    ///
+    /// `reversible_lowering.rs` holds a real inverse generator (dataflow DAG, ancilla
+    /// allocation, measurement uncompute) but nothing calls it, and its measurement path
+    /// fabricates a qubit with `unwrap_or(PirExpr::IntLit(0))`. Until that is wired and
+    /// verified, refusing here is the honest answer -- an explicitly unimplemented
+    /// construct is recoverable, a silently non-reversing one is not.
     fn lower_reversible_block(
         &mut self,
         block: &crate::ast::expr::ReversibleBlock,
     ) -> Result<(), LoweringError> {
-        // Lower forward block body
-        for stmt in &block.body.stmts {
-            self.lower_stmt(stmt)?;
-        }
-
-        // Create schedule tree for reversible block
-        // (simplified - full implementation in reversible_lowering.rs)
-        Ok(())
+        // Naming what is being dropped is more useful than a bare refusal: the author
+        // can see that the block is the problem and not, say, the call inside it.
+        let n = block.body.stmts.len();
+        let plural = if n == 1 { "statement" } else { "statements" };
+        Err(LoweringError::Unsupported(format!(
+            "a `reversible {{ ... }}` block is not implemented (this one holds {n} \\
+                     {plural}). \\
+             The forward pass and, critically, the uncomputation pass it names are not \
+             generated. This previously lowered the block's statements, emitted no \
+             inverse, and reported success -- so the program was neither correctly \
+             executed nor correctly uncomputed. `reversible_lowering.rs` contains an \
+             inverse generator that nothing calls; it is unwired and unverified, and \
+             its measurement path fabricates a qubit operand. No backend can lower a \
+             reversible block until that is wired and tested."
+        )))
     }
 
     fn lower_expr(&mut self, expr: &crate::ast::Expr) -> Result<crate::ir::PirExpr, LoweringError> {

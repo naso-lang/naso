@@ -28,19 +28,10 @@ pub struct VarInfo {
     pub moved: bool,
     /// Whether this variable is erased (quantity 0)
     pub erased: bool,
-    /// Referenced only from an ERASED construct (a `proof` or `requires` block).
-    ///
-    /// Such a reference is real -- the obligation or precondition is about the value -- but
-    /// it consumes nothing at runtime. It must therefore satisfy "a `[1]` value is used
-    /// exactly once" WITHOUT counting against `used_at`.
-    ///
-    /// A synthetic entry in `used_at` would have been the obvious implementation and it is
-    /// wrong: `used_at` is both the double-use detector (`Quantity::One`) and the budget for
-    /// `Quantity::Bounded(n)`, so a fake span turns an erased reference into a real one.
-    pub referenced_in_erased: bool,
 }
 
-/// The use-state of a single variable, snapshotted across a proof block.
+/// The use-state of a single variable, snapshotted across an erased region.
+///
 ///
 /// A proof block is erased: it reads values to state obligations but does not
 /// consume them. Restoring this state afterwards means an obligation can
@@ -50,7 +41,6 @@ pub struct VarInfo {
 pub struct VarUseState {
     used_at: Vec<Span>,
     moved: bool,
-    referenced_in_erased: bool,
 }
 
 impl VarUseState {
@@ -58,7 +48,6 @@ impl VarUseState {
         Self {
             used_at: info.used_at.clone(),
             moved: info.moved,
-            referenced_in_erased: info.referenced_in_erased,
         }
     }
 
@@ -71,7 +60,6 @@ impl VarUseState {
     fn apply_to(&self, info: &mut VarInfo) {
         info.used_at = self.used_at.clone();
         info.moved = self.moved;
-        info.referenced_in_erased = self.referenced_in_erased;
     }
 
     /// Drop uses recorded since the snapshot, recording instead that the value was
@@ -82,13 +70,11 @@ impl VarUseState {
     /// nor draw from a `[n]` budget.
     pub fn erase_uses_since_inner(&self, info: &mut VarInfo) {
         // Did the erased construct reference this value at all?
-        let referenced = !info.used_at.is_empty();
         info.used_at = self.used_at.clone();
         info.moved = self.moved;
         // Record it on the dedicated flag rather than as a synthetic span: `used_at` is the
         // double-use detector for `[1]` and the budget for `[n]`, so a fake entry would make
         // an erased reference look like a real one.
-        info.referenced_in_erased |= referenced;
     }
 
     ///
@@ -104,7 +90,6 @@ impl VarUseState {
         Self {
             used_at: vec![span],
             moved: true,
-            referenced_in_erased: false,
         }
     }
 }
@@ -134,16 +119,12 @@ impl VarInfo {
             used_at: Vec::new(),
             moved: false,
             erased: quantity == Quantity::Zero,
-            referenced_in_erased: false,
         }
     }
 
     /// Record a use of this variable
     pub fn record_use(&mut self, span: Span) {
         self.used_at.push(span);
-        if self.quantity == Quantity::One {
-            // Linear variable - track usage count
-        }
     }
 
     /// Whether this value can be referenced at this program point.
@@ -247,6 +228,14 @@ pub struct TypeEnv {
     pub moved_vars: HashSet<Ident>,
     /// Variables marked as erasable (quantity 0)
     pub erasable_vars: HashSet<Ident>,
+    /// Depth of nesting inside ERASED regions -- `proof` blocks and `requires` blocks.
+    ///
+    /// While non-zero, a reference is recorded NOWHERE: it does not enter `used_at`, so it
+    /// can neither trip the `[1]` double-use check nor consume a `[n]` budget. This is a
+    /// counter rather than a flag because erased regions nest -- a
+    /// `forall` inside a precondition -- and a flag cleared by the inner region would
+    /// re-enable counting for the rest of the outer one.
+    pub erased_depth: u32,
     /// Generic parameters in scope
     pub generics: IndexMap<Ident, GenericParam>,
     /// Quantity variables in scope (for dependent quantities)
@@ -474,6 +463,16 @@ impl TypeEnv {
                 });
             }
 
+            // A reference from an ERASED region observes without consuming, so it is
+            // recorded as an erased reference and never enters `used_at`. Both the double-use
+            // check below and the bounded budget below read `used_at`, so keeping erased
+            // references out of it is what makes a proposition able to mention the same
+            // linear value twice -- which `forall i { assert(t[i] <= e); assert(t[i] >= g); }`
+            // must be able to do.
+            if self.erased_depth > 0 {
+                return Ok(());
+            }
+
             // Check for linear variable used twice BEFORE recording the use
             if info.quantity == Quantity::One && !info.used_at.is_empty() {
                 return Err(TypeError::LinearVariableUsedTwice {
@@ -663,9 +662,18 @@ impl TypeEnv {
         for (name, info) in self.vars.iter().skip(guard.vars_initial_len) {
             // Skip consume bindings - they represent a consumption point
             // Skip inout bindings - they are borrowed for the scope duration
+            // A reference from an erased region is deliberately absent from `used_at`, so
+            // a `[1]` value mentioned ONLY in a proof block or a precondition still reads as
+            // never consumed -- and that is the CORRECT verdict. Nothing at runtime touches
+            // it: a proposition is erased before codegen, so the value is dropped. Treating
+            // an erased reference as consumption would let a linear tensor be declared,
+            // proved about, and silently discarded.
+            //
+            // The earlier version of this check excused erased references and had a test
+            // asserting it. That was wrong in the direction that matters, and the test was
+            // rewritten rather than kept.
             if info.quantity == Quantity::One
                 && info.used_at.is_empty()
-                && !info.referenced_in_erased
                 && !info.moved
                 && info.mutability != Mutability::Consume
                 && info.mutability != Mutability::InOut

@@ -382,6 +382,8 @@ fn check_proof(checker: &mut TypeChecker, block: &ProofBlock) -> Result<(), Type
     let guard = checker.env.enter_scope();
     let prev_proof = checker.in_proof;
     checker.in_proof = true;
+    // Entering an erased region: references from here observe without consuming.
+    checker.env.erased_depth += 1;
     // A proof block is erased, so it observes values without consuming them.
     // Without this, a quantified obligation about a `[1]` linear parameter
     // would consume it and make the runtime loop report a double use.
@@ -400,6 +402,7 @@ fn check_proof(checker: &mut TypeChecker, block: &ProofBlock) -> Result<(), Type
     // recorded uses, and leaving them in place makes the next error blame the proof block
     // for a double use instead of reporting the real fault.
     checker.env.erase_uses_since(&uses);
+    checker.env.erased_depth -= 1;
     checker.in_proof = prev_proof;
     checker.env.exit_scope(guard)?;
     outcome
@@ -501,6 +504,9 @@ pub fn check_function(checker: &mut TypeChecker, func: &Function) -> Result<(), 
     if !func.requires.is_empty() {
         let prev_proof = checker.in_proof;
         checker.in_proof = true;
+        // Entering an erased region, same as a `proof` block: a precondition observes the
+        // values it constrains without consuming them.
+        checker.env.erased_depth += 1;
         // Like a proof block, a precondition is ERASED: it observes values without
         // consuming them, so a `[1]` linear parameter referenced in `requires` is not
         // reported as used up here and again in the body.
@@ -530,6 +536,7 @@ pub fn check_function(checker: &mut TypeChecker, func: &Function) -> Result<(), 
             outcome?;
         }
         checker.env.erase_uses_since(&uses);
+        checker.env.erased_depth -= 1;
         checker.in_proof = prev_proof;
     }
 

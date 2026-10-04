@@ -196,9 +196,12 @@ fn a_non_boolean_precondition_is_a_type_error() {
 /// A precondition may reference the parameters it constrains -- that is the whole point.
 #[test]
 fn a_precondition_over_a_parameter_typechecks() {
+    // The body consumes `t` so that the ONLY thing under test is the precondition. Without
+    // that, `t` is a genuine linear leak -- nothing at runtime reads it -- and the test was
+    // passing a precondition check while asserting the wrong thing about linearity.
     let src = "fn q(n: int, t: [1] Tensor[i8, 16]) \
                requires { assert(n > 0); forall i in 0..16 { assert(t[i] <= 127); } } { \
-               return true; }";
+               let consume a = t; return true; }";
     let errors = typecheck(src);
     assert!(
         errors.is_empty(),
@@ -251,16 +254,26 @@ fn an_erased_reference_consumes_no_bounded_budget() {
 
 /// A `[1]` value referenced ONLY in an erased block is used, not leaked.
 ///
-/// The other direction: erase too much and a genuinely unused linear value goes unreported,
-/// which is a linearity hole reported as silence.
+/// The other direction: erase too much and a genuinely unused linear value goes unreported,/// A reference from a proof block is NOT consumption, so a `[1]` value mentioned only
+/// there is still a leak.
+///
+/// This test previously asserted the OPPOSITE, on the reasoning that "the obligation
+/// references `t`, so it is not leaked". That reasoning was wrong in the direction that
+/// matters: a proof block is erased before codegen, so nothing at runtime reads `t`. A
+/// `[1]` value that is never consumed is dropped, and dropping a linear value is exactly
+/// the failure this compiler exists to make impossible.
+///
+/// The distinction that does hold is the one below: the proof may REFERENCE `t` as often as
+/// it likes without being told it is used twice.
 #[test]
-fn an_only_erased_reference_is_not_an_unused_linear_leak() {
+fn an_erased_reference_is_not_consumption() {
     let src = "fn q(t: [1] Tensor[i8, 16]) { \
                  proof { forall i in 0..16 { assert(t[i] <= 127); } } }";
     let errors = typecheck(src);
     assert!(
-        errors.is_empty(),
-        "`t` is referenced by the obligation, so it is not leaked: got {errors:?}"
+        errors.iter().any(|e| e.contains("unused linear variable")),
+        "a `[1]` value no runtime code touches is a leak even if a proof mentions it: \
+         got {errors:?}"
     );
 }
 
@@ -273,5 +286,58 @@ fn a_truly_unused_linear_value_is_still_reported() {
     assert!(
         !errors.is_empty(),
         "an unreferenced `[1]` value must still be reported as unused"
+    );
+}
+
+/// A proposition may mention the same `[1]` value REPEATEDLY.
+///
+/// This is not a relaxation of linearity -- nothing is consumed by a proposition. It fixes a
+/// bug where erasure was applied at the wrong GRANULARITY: uses were rewound after the region
+/// as a whole, but a reference made by a construct NESTED inside the region was checked
+/// against the budget while the region was still open. So
+///
+/// ```text
+/// forall i in 0..16 { assert(t[i] <= 10); assert(t[i] >= 0); }
+/// ```
+///
+/// reported `t` used twice, and a quantised tensor kernel could not state its two-sided range
+/// at all.
+#[test]
+fn a_quantified_proposition_may_repeat_a_linear_value() {
+    let src = concat!(
+        "fn q(t: [1] Tensor[i8, 16]) requires { forall i in 0..16 {\n",
+        "               assert(t[i] <= 10);\n",
+        "               assert(t[i] >= 0);\n",
+        "             } } { proof { forall i in 0..16 {\n",
+        "               assert(t[i] <= 10); assert(t[i] == t[i]); } }\n",
+        "  let consume a = t; return true; }",
+    );
+    let errors = typecheck(src);
+    assert_eq!(
+        errors,
+        Vec::<String>::new(),
+        "repeating a reference is legal, got {errors:?}"
+    );
+}
+
+/// The erasure must not leak OUT of the region: the body still consumes `t`.
+///
+/// The negative control for the test above. If the erased flag simply suppressed the unused
+/// check without the body consuming anything, the pair above and here would both pass while
+/// `[1]` enforcement was quietly gone.
+#[test]
+fn a_value_referenced_only_in_propositions_is_still_an_unused_linear_leak() {
+    let src = concat!(
+        "fn q(t: [1] Tensor[i8, 16]) requires { forall i in 0..16 {\n",
+        "               assert(t[i] <= 10);\n",
+        "               assert(t[i] >= 0);\n",
+        "             } } { proof { forall i in 0..16 {\n",
+        "               assert(t[i] <= 10); assert(t[i] == t[i]); } }\n",
+        "  return true; }",
+    );
+    let errors = typecheck(src);
+    assert!(
+        errors.iter().any(|e| e.contains("unused linear variable")),
+        "a `[1]` value the body never consumes is still a leak, got {errors:?}"
     );
 }

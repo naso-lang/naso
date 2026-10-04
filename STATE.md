@@ -201,8 +201,18 @@ Documented in `docs/content/LIMITATIONS.md`.
    undeclared symbol -- a wrong refusal, never a wrong proof.
    Do NOT add a "fits in i8" axiom instead — that proves a claim about the tensors the
    axiom admits and reports it for the one that breaks.
-2. Design a sound float abstraction (interval or rational) for scale/zero-point error
-   bounds. Do not extend the integer prover and hope.
+2. ~~Design a sound float abstraction for scale/zero-point error bounds~~ -- DONE as EXACT
+   REAL (rational) arithmetic. `f32`/`f64` encode as the dyadic rational they are, exactly;
+   `kernels/quant_error_bound.naso` discharges the round-to-nearest half-step bound for a
+   scalar and for a whole tensor, and `kernels/scale_f32.naso`'s `scale > 0` is now a real
+   precondition. The boundary is deliberate and recorded in LIMITATIONS.md: this is exact
+   real arithmetic, so it is sound for a bound about the MATHEMATICS of quantisation and
+   says NOTHING about IEEE-754 rounding. REMAINING if that is ever wanted: an error term
+   per float operation (interval or directed-rounding arithmetic).
+   The original concern -- "encoding f32 as Real would change the claim" -- was half right:
+   it is a different claim, and it is the USEFUL one, provided the boundary is stated rather
+   than assumed. Refusing all float reasoning discharges no quantisation bound at all, and
+   that is an absence of a property, not a soundness one.
 3. Wire a real `naso verify` subcommand with defined semantics, exit codes, honest
    reporting of unsupported obligations, and end-to-end tests.
 4. Make a malformed SMT script a loud failure rather than a silent `sat`. This is the

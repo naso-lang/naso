@@ -269,6 +269,27 @@ jobs:
       # suite also contains many "expected proof" cases. Running it alone makes a silent
       # regression -- the pass finding nothing, which looks exactly like success -- visible
       # as a failing step rather than as a slightly lower count in a wall of numbers.
+      # The shipped quantisation error bound. Named separately because the whole point of
+      # this file is that a KERNEL is discharged, not that a prover can prove hand-written
+      # snippets: a prover regression could leave the kernel reporting a warning and this
+      # step would be the only thing that noticed.
+      - name: Test the shipped quantisation error bound
+        run: >-
+          cargo test -p naso-verify --lib --
+          --exact
+          prover::obligations::tests::the_shipped_quantisation_error_bound_kernel_is_fully_discharged
+          prover::obligations::tests::the_error_bound_kernel_fails_without_its_range_premise
+          prover::obligations::tests::every_assertion_in_a_quantified_body_is_checked
+          prover::obligations::tests::every_assertion_in_a_quantified_premise_is_used
+          prover::obligations::tests::a_float_literal_is_the_exact_binary_value_not_the_printed_one
+        working-directory: .
+
+      # Float-literal exactness. The encoder emits exact rationals; these pin that it still
+      # does, since a rounded literal is well-formed SMT meaning something else.
+      - name: Test float literal exactness
+        run: cargo test -p naso-verify --lib -- float_literal pow2_decimal is_exact_past_64
+        working-directory: .
+
       - name: Test call-site precondition discharge
         run: >-
           cargo test -p naso-verify --lib --

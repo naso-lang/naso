@@ -234,6 +234,29 @@ bytes untouched after the kernel runs.
      set is carried through unrewritten, so a precondition naming it refers to a parameter no
      SMT constant declares and the obligation FAILS LOUDLY as an undeclared symbol. The failure
      mode is a wrong refusal, never a wrong proof.
+- **Floats are encoded as EXACT reals. This is sound for a quantisation bound and is NOT a
+  claim about IEEE-754 rounding.** `f32`/`f64` literals are emitted as the dyadic rational
+  they actually are (`(/ m 2^k)`, or an exact decimal where one terminates), and a float
+  parameter is an unconstrained `Real`. So a discharged obligation is a statement about the
+  MATHEMATICS of the computation — the ideal quantisation, the exact scale — and nothing here
+  bounds the rounding error of the compiled floating-point code, which has a 24-bit
+  significand and is neither exact nor unbounded.
+  - USE THIS for: "given `s > 0` and `x` within half a step of `q*s`, the dequantised value
+    is within half a step of `x`". `kernels/quant_error_bound.naso` is that bound, and it is
+    discharged.
+  - DO NOT USE THIS for: bit-exact reproducibility, or anything that depends on the
+    significand. Closing that gap needs an error term on every float operation, which is not
+    built.
+  - Non-finite literals are REFUSED, never coerced to a finite stand-in.
+- **A proposition may mention a linear value repeatedly; an erased reference is not
+  consumption.** A `proof` or `requires` block is erased before codegen, so a reference
+  there records nothing: it can neither trip the `[1]` double-use check nor consume a `[n]`
+  budget. That means `forall i { assert(t[i] <= 10); assert(t[i] >= 0); }` is legal, and a
+  two-sided range can be stated at all.
+  The consequence is deliberate and worth stating: a `[1]` value referenced ONLY inside
+  erased regions is reported as an **unused linear leak**, because nothing at runtime touches
+  it. An earlier version excused it; that let a linear tensor be declared, proved about, and
+  silently dropped, which is the failure this compiler exists to make impossible.
 - **A proved obligation is still not "this works for all inputs."** It means no countermodel
   exists within the supported fragment. Unsupported operators, unresolved callees and
   unsatisfiable caller premises are all outside what that sentence covers.

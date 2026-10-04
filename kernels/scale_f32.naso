@@ -39,9 +39,19 @@
 //   constant, since occupancy is not modelled), no tiling or fusion, and no
 //   schedule transformation -- the loop runs in source order.
 //
-//   The proof block below is EASED but NOT DISCHARGED. Float reasoning is not
-//   supported by the prover, so `scale > 0.0` is reported as unproved rather
-//   than as proved. Nothing in this file claims otherwise.
+//   `scale > 0.0` and `lo < hi` are now REAL PRECONDITIONS, not proof goals.
+//   They were `proof { assert(..) }` entries, which the prover reported as
+//   unproved because nothing constrains a free parameter -- correctly, but
+//   uselessly: a statement the author must supply and the program must uphold
+//   is a precondition, and writing it as one is what makes it checkable. They
+//   now live in `requires { .. }`, where the prover discharges the obligations
+//   they guard AND every call site must satisfy them.
+//
+//   Floats are encoded as EXACT reals. That is sound for a bound about the
+//   mathematics of scaling and is NOT a claim about IEEE-754 rounding: no
+//   obligation in this file bounds the rounding error of the compiled f32
+//   arithmetic. See `kernels/quant_error_bound.naso` for the bound that IS
+//   discharged.
 
 /// Elementwise scale and clamp: `out[i] = clamp(in[i] * scale, lo, hi)`.
 ///
@@ -54,11 +64,10 @@ fn scale_clamp_f32(
     scale: f32,
     lo: f32,
     hi: f32
-) {
-    proof {
-        assert(scale > 0.0);
-        assert(lo < hi);
-    }
+) requires {
+    assert(scale > 0.0);
+    assert(lo < hi);
+} {
 
     forall i in 0..1024 {
         let v = input[i] * scale;

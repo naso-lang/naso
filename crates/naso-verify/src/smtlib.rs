@@ -315,7 +315,14 @@ impl fmt::Display for Term {
 pub enum Constant {
     Bool(bool),
     Int(i64),
-    Real(String),     // Decimal string
+    Real(String), // Decimal string
+    /// An arbitrary-precision integer numeral, rendered verbatim.
+    ///
+    /// `Int(i64)` cannot hold every integer this prover needs: a subnormal `f64` has a
+    /// dyadic denominator of `2^1074`, far past 64 bits. SMT-LIB2 integers are arbitrary
+    /// precision, so the digits are carried as a string. `String` is NOT a substitute -- it
+    /// renders QUOTED, which is a different SMT constant entirely.
+    Numeral(String),
     BitVec(u32, u64), // (width, value)
     String(String),
 }
@@ -326,6 +333,7 @@ impl fmt::Display for Constant {
             Constant::Bool(b) => write!(f, "{}", if *b { "true" } else { "false" }),
             Constant::Int(i) => write!(f, "{}", i),
             Constant::Real(s) => write!(f, "{}", s),
+            Constant::Numeral(s) => write!(f, "{}", s),
             Constant::BitVec(w, v) => write!(f, "(_ bv{} {})", v, w),
             Constant::String(s) => write!(f, "\"{}\"", s.replace('"', "\\\"")),
         }

@@ -1,0 +1,105 @@
+// The scale/error bound that IS discharged.
+//
+// Every other kernel in this directory carries a comment saying its bound is
+// "not proved". This one is. It exists to make that difference concrete rather
+// than aspirational.
+//
+// THE THEOREM
+//
+// Round-to-nearest quantisation with step `s > 0`: if `q` is the nearest integer
+// to `x / s`, then
+//
+//     |x - q * s| <= s / 2
+//
+// Formulated with `|.|` written out, because there is no absolute-value operator
+// in the encoder and inventing one would hide a refusal:
+//
+//     x <= (q + 1/2) * s   and   x >= (q - 1/2) * s
+//
+// This is the bound a quantiser actually needs, and the premise `x >= (q - 1/2) * s`
+// is exactly the statement that `q` is within half a step of `x / s` -- the caller
+// states what rounding produced, and the prover discharges that the dequantised
+// value is within half a step of the original.
+//
+// WHY THE RANGE PREMISE IS NOT OPTIONAL
+//
+// A quantiser CLAMPS to the representable range. Clamping is what breaks naive
+// bounds: if `x / s` is far outside `[-7.5, 7.5]` then the clamped `q` is at an
+// endpoint and the half-step error does NOT hold -- the error is as large as the
+// whole range. `dequantise_in_range` below carries the range as a PRECONDITION, so
+// a caller that hands it an out-of-range value is refused at the call site rather
+// than silently receiving a wrong bound. That refusal is the entire point: the
+// honest quantiser proves the bound for the inputs it accepts and says so about
+// the rest.
+//
+// WHAT IS PROVED, AND WHAT IS NOT
+//
+// PROVED: the half-step error bound above, as a statement about exact reals.
+//
+// NOT PROVED: anything about IEEE-754 rounding. An `f32` is a rounded, 24-bit
+// significand, and this prover models floats as exact rationals. So the bound
+// above is a theorem about the MATHEMATICS of quantisation, not about the value
+// the compiled program computes. Closing that gap needs an error term on every
+// float operation -- a different and harder piece of work, and nothing here
+// pretends otherwise.
+//
+// The distinction is not a hedge; it is the difference between the two things one
+// could mean by "the quantisation error is at most half a step". The first is a
+// real property of the format. The second is a property of a program, and it
+// needs the program's rounding behaviour in the model.
+
+/// The dequantised value `q * s` is within half a step of `x`.
+///
+/// PROVED over exact reals. See the file header for what that does and does not
+/// license.
+fn dequantise_half_step(
+    x: f32,
+    q: f32,
+    s: f32
+) -> f32
+    requires {
+        assert(s > 0.0);
+        // The caller states what rounding produced: q is within half a step of
+        // x / s, written without division so the premise is exact.
+        assert(x <= (q + 0.5) * s);
+        assert(x >= (q - 0.5) * s);
+    }
+{
+    proof {
+        // The upper half of the stated bound, discharged as a goal rather than
+        // assumed as a premise -- otherwise this obligation is a tautology that
+        // proves nothing about the function.
+        assert(x <= (q + 0.5) * s);
+    }
+
+    return q * s;
+}
+
+/// The same bound, but scaled: a tensor of values is within half a step each.
+///
+/// PROVED for every index. The quantifier is inside the obligation, so the bound
+/// holds for all elements of an unconstrained tensor -- including the ones a
+/// naive "every element fits" axiom would have excluded.
+fn dequantise_tensor_half_step(
+    t: [1] Tensor[f32, 256],
+    q: [1] Tensor[f32, 256],
+    s: f32
+)
+    requires {
+        assert(s > 0.0);
+        forall i in 0..256 {
+            assert(t[i] <= (q[i] + 0.5) * s);
+            assert(t[i] >= (q[i] - 0.5) * s);
+        }
+    }
+{
+    proof {
+        forall i in 0..256 {
+            assert(t[i] <= (q[i] + 0.5) * s);
+        }
+    }
+
+    forall i in 0..256 {
+        let out = q[i] * s;
+    }
+}

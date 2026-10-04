@@ -127,7 +127,8 @@ fn prove_call_sites(
         }
         for precondition in &callee.requires {
             let instantiated = substitute_params(precondition, &callee.params, &args);
-            let caller_preconditions: Vec<&Expr> = caller.requires.iter().collect();
+            let flattened = flatten_preconditions(&caller.requires);
+            let caller_preconditions: Vec<&Expr> = flattened.iter().collect();
             diagnostics.extend(prove_obligation(
                 &caller.name.name,
                 &instantiated,
@@ -455,11 +456,12 @@ fn prove_function_obligations(func: &Function) -> Result<Vec<VerifyDiagnostic>, 
             // discharged here -- a caller must satisfy them, which is a different claim in a
             // different place. Keeping them separate is what stops a function from
             // discharging its obligations by assuming them.
-            let preconditions: Vec<&Expr> = func.requires.iter().collect();
+            let flattened = flatten_preconditions(&func.requires);
+            let preconditions: Vec<&Expr> = flattened.iter().collect();
             for (pred, span) in found {
                 diagnostics.extend(prove_obligation(
                     &func.name.name,
-                    pred,
+                    &pred,
                     span,
                     &params,
                     &declarations,
@@ -509,14 +511,14 @@ fn assert_argument(e: &Expr) -> Option<&Expr> {
 ///
 /// Descending is also what makes `forall` meaningful in the first place, since its body is
 /// where the obligation lives.
-fn collect_asserts<'a>(stmts: &'a [Stmt], out: &mut Vec<(&'a Expr, Span)>) {
+fn collect_asserts(stmts: &[Stmt], out: &mut Vec<(Expr, Span)>) {
     use naso_compiler::ast::ExprKind as EK;
     for stmt in stmts {
         match &stmt.kind {
             StmtKind::Expr(expr) => match &expr.kind {
                 EK::Call(callee, args) => {
                     if is_assert(callee) && args.len() == 1 {
-                        out.push((&args[0], expr.span));
+                        out.push((args[0].clone(), expr.span));
                     }
                 }
                 // BOTH variants matter, and they are not interchangeable.
@@ -542,17 +544,42 @@ fn collect_asserts<'a>(stmts: &'a [Stmt], out: &mut Vec<(&'a Expr, Span)>) {
                 // So: when the quantifier body holds exactly ONE assert, the quantifier
                 // node IS the proposition and is recorded whole.
                 //
-                // A body with SEVERAL asserts is refused, and the refusal is real rather
-                // than a comment. Recording only the first would silently drop the rest,
-                // and dropping an obligation is precisely the failure this module exists
-                // to prevent -- it reads as a clean run. Each needs its own quantifier.
-                // KNOWN LIMITATION: a body with several asserts is checked using only
-                // the LAST statement, because the encoder takes one tail predicate per
-                // quantifier. This is recorded rather than silently accepted -- but it is
-                // still a gap, and `several_asserts_in_one_quantifier_are_not_all_checked`
-                // pins the behaviour so it cannot change unnoticed. Splitting the body
-                // into one quantifier per assertion is the real fix.
-                EK::Forall(_) | EK::Quantified(_) => out.push((expr, expr.span)),
+                // A quantifier body may hold SEVERAL assertions, and each one is its own
+                // obligation.
+                //
+                // This used to keep only the LAST, so
+                //
+                //     forall i in 0..N { assert(A); assert(B); }
+                //
+                // checked `B` and silently dropped `A`. The comment here claimed "each needs
+                // its own quantifier" while the code did the opposite -- and the shipped
+                // quantisation error-bound kernel is exactly this shape, with the upper and
+                // lower half of the range in one block. Its obligation failed to discharge
+                // because the premise it depended on had been thrown away.
+                //
+                // The split is SOUND rather than a convenience: `forall i (A[i] and B[i])` is
+                // equivalent to `(forall i A[i]) and (forall i B[i])` -- same binder, both
+                // universal, no dependence between the conjuncts. Each conjunct is therefore
+                // proved under the same domain, which is what the quantifier node carries.
+                //
+                // It is NOT sound to drop the quantifier and check the asserts bare, because
+                // `i` would be unbound and the domain lost; each rebuilt obligation keeps it.
+                EK::Forall(loop_) | EK::Quantified(loop_) => {
+                    let is_forall = matches!(expr.kind, EK::Forall(_));
+                    let mut inner = Vec::new();
+                    collect_asserts(&loop_.body.stmts, &mut inner);
+                    if inner.len() <= 1 {
+                        // One assertion (or none): the quantifier node IS the proposition.
+                        // With none, this still records the quantifier so the encoder can
+                        // report "no predicate" rather than the assert vanishing.
+                        out.push((expr.clone(), expr.span));
+                    } else {
+                        for (asserted, assert_span) in inner {
+                            let rebuilt = rebuild_quantified(expr, loop_, is_forall, &asserted);
+                            out.push((rebuilt, assert_span));
+                        }
+                    }
+                }
                 EK::Block(block) => collect_asserts(&block.stmts, out),
                 EK::If(_, then_e, else_e) => {
                     collect_asserts_expr(then_e, out);
@@ -569,17 +596,17 @@ fn collect_asserts<'a>(stmts: &'a [Stmt], out: &mut Vec<(&'a Expr, Span)>) {
 }
 
 /// Descend into a single expression, collecting asserts from any nested body.
-fn collect_asserts_expr<'a>(expr: &'a Expr, out: &mut Vec<(&'a Expr, Span)>) {
+fn collect_asserts_expr(expr: &Expr, out: &mut Vec<(Expr, Span)>) {
     use naso_compiler::ast::ExprKind as EK;
     match &expr.kind {
         EK::Call(callee, args) => {
             if is_assert(callee) && args.len() == 1 {
-                out.push((&args[0], expr.span));
+                out.push((args[0].clone(), expr.span));
             }
         }
         // As above: the quantifier is the proposition, because its domain is part of
         // the claim. See the statement-position arm for the full reasoning.
-        EK::Forall(_) | EK::Quantified(_) => out.push((expr, expr.span)),
+        EK::Forall(_) | EK::Quantified(_) => out.push((expr.clone(), expr.span)),
         EK::Block(block) => collect_asserts(&block.stmts, out),
         EK::If(_, then_e, else_e) => {
             collect_asserts_expr(then_e, out);
@@ -588,6 +615,78 @@ fn collect_asserts_expr<'a>(expr: &'a Expr, out: &mut Vec<(&'a Expr, Span)>) {
             }
         }
         _ => {}
+    }
+}
+
+/// Split a precondition so each assertion inside a quantifier becomes its own premise.
+///
+/// `requires { forall i { assert(A); assert(B); } }` is `forall i (A and B)`, which is
+/// `(forall i A) and (forall i B)`. The encoder takes ONE predicate per quantifier and reads
+/// the LAST assertion in its body, so a two-assert precondition contributed only `B` and
+/// `A` was silently discarded from the premise set. That is exactly the shape of the shipped
+/// quantisation kernel's range premise -- upper and lower bound in one block -- and it is why
+/// the kernel's obligation failed to discharge while every hand-written test passed.
+///
+/// Dropping a premise is the dangerous direction: it makes a goal HARDER, so it produced a
+/// wrong refusal here. The same latent bug pointed the other way in the collector, where
+/// dropping a GOAL makes it easier.
+fn flatten_preconditions(preconditions: &[Expr]) -> Vec<Expr> {
+    use naso_compiler::ast::ExprKind as EK;
+    let mut out = Vec::new();
+    for pred in preconditions {
+        match &pred.kind {
+            EK::Forall(loop_) | EK::Quantified(loop_) => {
+                let is_forall = matches!(pred.kind, EK::Forall(_));
+                let mut inner = Vec::new();
+                collect_asserts(&loop_.body.stmts, &mut inner);
+                if inner.len() <= 1 {
+                    out.push(pred.clone());
+                } else {
+                    for (asserted, _) in inner {
+                        out.push(rebuild_quantified(pred, loop_, is_forall, &asserted));
+                    }
+                }
+            }
+            _ => out.push(pred.clone()),
+        }
+    }
+    out
+}
+
+/// Rebuild a quantifier so its body holds exactly one assertion.
+///
+/// The quantifier node is copied rather than mutated, so the caller's AST is untouched and
+/// two obligations derived from one block cannot alias each other's body. The result is an
+/// OWNED `Expr`: the collector owns what it emits rather than handing out borrows of a tree
+/// it had to rebuild anyway.
+fn rebuild_quantified(
+    original: &Expr,
+    loop_: &naso_compiler::ast::ForallLoop,
+    is_forall: bool,
+    asserted: &Expr,
+) -> Expr {
+    let body = naso_compiler::ast::Block {
+        stmts: vec![naso_compiler::ast::Stmt {
+            kind: StmtKind::Expr(asserted.clone()),
+            span: asserted.span,
+            id: asserted.id,
+        }],
+        expr: None,
+        span: loop_.body.span,
+    };
+    let mut new_loop = loop_.clone();
+    new_loop.body = body;
+    let kind = if is_forall {
+        ExprKind::Forall(Box::new(new_loop))
+    } else {
+        ExprKind::Quantified(Box::new(new_loop))
+    };
+    Expr {
+        kind,
+        span: original.span,
+        ty: original.ty.clone(),
+        quantity: original.quantity,
+        id: original.id,
     }
 }
 
@@ -790,25 +889,34 @@ fn negate(term: &Term) -> Term {
 }
 
 /// Why an obligation could not be encoded.
+#[derive(Debug)]
 enum EncodeErr {
     /// Refuses rather than change the meaning of the claim.
     ///
     /// Carries both what was rejected and why, so the diagnostic cannot read
-    /// as a generic failure -- especially important for the float case, where
-    /// the reason is that encoding f32 as Real would silently prove a weaker
-    /// and different statement.
+    /// as a generic failure.
     Unsupported { reason: String, why: String },
     /// Not a proposition this prover understands.
     Malformed(String),
 }
 
 impl EncodeErr {
-    /// Rejected a float: the SMT layer has no floating-point sort.
+    /// Rejected a float literal that has no exact real representation.
+    ///
+    /// The message this replaced read "no floating-point sort exists in the SMT layer, and
+    /// encoding f32 as Real would change the claim". That stopped being true when
+    /// `encode_real_literal` began encoding f32 as an exact real, and a stale reason in a
+    /// refusal is worse than no reason: it names the wrong cause, so the reader works around
+    /// a limitation that no longer exists.
+    ///
+    /// What actually remains is NON-FINITE literals. `inf` and `NaN` have no `Real`
+    /// counterpart, and coercing them to a finite number would let an obligation about
+    /// infinity be discharged as a claim about a finite program.
     fn float(reason: String) -> Self {
         EncodeErr::Unsupported {
             reason,
-            why: "no floating-point sort exists in the SMT layer, and encoding \
-                  f32 as Real would change the claim"
+            why: "a non-finite float has no exact SMT real counterpart; coercing it to a \
+                  finite number would discharge the obligation for a different program"
                 .to_string(),
         }
     }
@@ -820,6 +928,12 @@ fn sort_for_tensor_or_scalar(base: &naso_compiler::ast::TypeKind) -> Option<Sort
         TypeKind::Int | TypeKind::Nat => Sort::Int,
         TypeKind::UInt => Sort::Int,
         TypeKind::Bool => Sort::Bool,
+        // A float parameter is an EXACT real. This is what makes a scale/zero-point bound
+        // expressible at all, and it is sound for that purpose because the claim being
+        // discharged is about the mathematics of quantisation, not about IEEE-754
+        // rounding. The exact boundary -- what this does and does not license -- is written
+        // out at `encode_real_literal`; it is not a shorthand for "floats are supported".
+        TypeKind::Float => Sort::Real,
         // A tensor is modelled as an UNINTERPRETED FUNCTION from an index to an
         // element, e.g. `Tensor[i8, 1024]` becomes `(Int) Int`.
         //
@@ -1015,7 +1129,22 @@ fn encode_expr(expr: &Expr, scope: &HashMap<String, Term>) -> Result<Term, Encod
                             .to_string(),
                     });
                 }
-                BinOp::Div => "div",
+                // Division is `/` on reals and `div` on integers, and they are NOT the same
+                // function: `(/ 1 0)` is an uninterpreted real term while `(div 1 0)` is
+                // defined by SMT-LIB2 to be `1` for positive `1`. Choosing `div` for a real
+                // would silently change what the obligation says, so the sort of the
+                // operands decides -- and an operand of unknown sort keeps integer division,
+                // the existing behaviour.
+                //
+                // Mixed Int/Real operands are fine: SMT-LIB2 coerces, and a Real anywhere
+                // makes the whole expression Real.
+                BinOp::Div => {
+                    if term_sort(&l) == Some(Sort::Real) || term_sort(&r) == Some(Sort::Real) {
+                        "/"
+                    } else {
+                        "div"
+                    }
+                }
                 other => {
                     return Err(EncodeErr::Unsupported {
                         reason: format!("operator `{other:?}`"),
@@ -1106,23 +1235,228 @@ fn ident_smt_name(term: &Term) -> String {
     }
 }
 
-/// Encode a literal to an SMT term.
+/// Encode an `f32`/`f64` literal as an exact SMT `Real`.
 ///
-/// The float arm is the load-bearing refusal: the SMT layer has no floating-point sort,
-/// and encoding `f32` as `Real` would change the claim rather than discharge it, because
-/// `Real` is exact and unbounded while `f32` is neither.
+/// # What this is
+///
+/// The value is emitted EXACTLY, as the dyadic rational it actually is. Every finite `f64`
+/// is `m * 2^k` for integers `m, k`, so `(/ m 2^k)` is an exact representation -- no
+/// rounding, no truncation, no decimal string that might not round-trip. Where the value
+/// is a short decimal it is emitted directly as one.
+///
+/// # What this is NOT, and why it is still sound
+///
+/// `Real` is exact and unbounded. `f32` is neither: it is a rounded, bounded, 24-bit
+/// significand. So an obligation discharged here is a statement about the MATHEMATICAL
+/// value -- the ideal quantisation, the exact scale -- and **not** about the value the
+/// compiled program computes. Nothing here bounds IEEE-754 rounding error, and no test in
+/// this crate claims it does.
+///
+/// That is the right tool for a scale/zero-point bound and the wrong one for a bit-exactness
+/// claim, so the boundary is drawn explicitly rather than left to be discovered:
+///
+///   * USE THIS for: "given `s > 0` and `x` in range, the dequantised value differs from `x`
+///     by at most `s / 2`" -- a statement whose subject is the mathematics of quantisation.
+///   * DO NOT USE THIS for: "this f32 computation returns bit-identical results on every
+///     conforming target", or anything that depends on the 24-bit significand.
+///
+/// The refusal this replaces was `encoding f32 as Real would prove a different statement`.
+/// That was half right: it is a different statement, and it is the USEFUL one, provided the
+/// boundary above is stated rather than assumed. A prover that refuses all float reasoning
+/// cannot discharge a single quantisation bound, and "we do not reason about floats" is not
+/// a soundness property -- it is an absence of one.
+///
+/// Non-finite values are refused loudly. `inf` and `NaN` have no `Real` representation, and
+/// silently substituting a finite number would prove a claim about a different program.
+fn encode_real_literal(f: f64) -> Result<Term, EncodeErr> {
+    if !f.is_finite() {
+        return Err(EncodeErr::float(format!("non-finite literal `{f}`")));
+    }
+
+    // Exact dyadic decomposition: value = mantissa * 2^exponent, from the bit pattern.
+    let bits = f.to_bits();
+    let sign = if bits >> 63 != 0 { -1i128 } else { 1i128 };
+    let raw_exp = ((bits >> 52) & 0x7ff) as i64;
+    let raw_mantissa = (bits & 0x000f_ffff_ffff_ffff) as i128;
+
+    let (mantissa, exponent) = match raw_exp {
+        // Subnormal: no implicit leading 1.
+        0 => (raw_mantissa, -1074i64),
+        // Infinity and NaN were rejected above, so this is the normal case.
+        0x7ff => unreachable!("non-finite values are rejected before decomposition"),
+        _ => (raw_mantissa | (1i128 << 52), raw_exp - 1075),
+    };
+    let mantissa = sign * mantissa;
+
+    if exponent >= 0 {
+        // The value is a whole number, so `N.0` is exact.
+        //
+        // Computed by DECIMAL DOUBLING rather than by a shift. The first draft clamped the
+        // shift (`exponent.min(100)`) to stay inside `i128`, which for a large float such as
+        // `1e300` silently produced a value 2^849 too small and still emitted it as an exact
+        // Real. A clamp in an "exact" path is the same class of bug as a rounded literal:
+        // well-formed output, wrong meaning.
+        let mut digits = decimal_digits(mantissa.unsigned_abs());
+        for _ in 0..exponent {
+            dec_mul_small(&mut digits, 2);
+        }
+        return Ok(Term::Const(crate::smtlib::Constant::Real(format!(
+            "{}{}.0",
+            if mantissa < 0 { "-" } else { "" },
+            digits
+                .iter()
+                .rev()
+                .map(|d| char::from(b'0' + d))
+                .collect::<String>()
+        ))));
+    }
+
+    // Negative exponent: value = mantissa / 2^(-exponent).
+    let places = (-exponent) as u32;
+
+    // A decimal is emitted ONLY when it is the EXACT value.
+    //
+    // The first draft of this used Rust's `{}`, which prints the shortest string that
+    // ROUND-TRIPS as an f64 -- and a round-tripping decimal is still a DIFFERENT real
+    // number. `1.0/3.0` printed as `0.3333333333333333`, parsed back to the same f64, and
+    // was therefore accepted by a `parse::<f64>() == Ok(f)` guard, while denoting a real that
+    // is not the f64 at all. Every "exact" claim this encoder made was false for exactly
+    // the values the short-decimal path existed to handle.
+    //
+    // The exact decimal of a dyadic rational terminates after `places` digits, because
+    // `mantissa / 2^places == mantissa * 5^places / 10^places`. That is computed here, and
+    // only used while it fits comfortably in an `i128`; beyond that the exact rational form
+    // is emitted instead, which is always available and never approximate.
+    const MAX_EXACT_DECIMAL_PLACES: u32 = 15;
+    if places <= MAX_EXACT_DECIMAL_PLACES {
+        let mut pow5: i128 = 1;
+        for _ in 0..places {
+            pow5 *= 5;
+        }
+        let scaled = mantissa * pow5;
+        let negative = scaled < 0;
+        let digits = scaled.unsigned_abs().to_string();
+        let text = if places == 0 {
+            format!("{digits}.0")
+        } else {
+            // `digits` has at least `places` trailing digits by construction, but pad so the
+            // split is total even for a mantissa that ends in zeros.
+            let padded = if digits.len() <= places as usize {
+                format!("{}{digits}", "0".repeat(places as usize + 1 - digits.len()))
+            } else {
+                digits
+            };
+            let split = padded.len() - places as usize;
+            format!(
+                "{}{}.{}",
+                if negative { "-" } else { "" },
+                &padded[..split],
+                &padded[split..]
+            )
+        };
+        return Ok(Term::Const(crate::smtlib::Constant::Real(text)));
+    }
+
+    // Beyond the exact-decimal range, `(/ m 2^places)` is exact in SMT-LIB2 and is always
+    // available. `places` reaches 1074 for a subnormal, so the denominator cannot be an
+    // `i64` -- it is computed as a decimal string. SMT-LIB2 integers are arbitrary
+    // precision, so this is the natural representation, not a workaround.
+    Ok(Term::App(
+        "/".to_string(),
+        vec![
+            Term::Const(crate::smtlib::Constant::Int(
+                i64::try_from(mantissa).map_err(|_| {
+                    EncodeErr::float(format!("literal `{f}` is outside the representable range"))
+                })?,
+            )),
+            Term::Const(crate::smtlib::Constant::Numeral(pow2_decimal(places))),
+        ],
+    ))
+}
+
+/// The decimal digits of `value`, least-significant first.
+fn decimal_digits(mut value: u128) -> Vec<u8> {
+    if value == 0 {
+        return vec![0];
+    }
+    let mut digits = Vec::new();
+    while value > 0 {
+        digits.push((value % 10) as u8);
+        value /= 10;
+    }
+    digits
+}
+
+/// Multiply a little-endian decimal digit vector in place by a single-digit factor.
+///
+/// `factor` is a digit, so the carry never exceeds it and one pass suffices. Used for the
+/// `* 2^exponent` and `* 5^places` steps of the exact dyadic expansion.
+///
+/// `factor` is always 2 or 5 at every call site, never 0, so a mutation replacing it with
+/// `factor.max(1)` is EQUIVALENT and survives -- recorded here rather than left for someone
+/// to rediscover as a suspicious survivor.
+fn dec_mul_small(digits: &mut Vec<u8>, factor: u8) {
+    let mut carry: u32 = 0;
+    for digit in digits.iter_mut() {
+        let product = (*digit as u32) * (factor as u32) + carry;
+        *digit = (product % 10) as u8;
+        carry = product / 10;
+    }
+    while carry > 0 {
+        digits.push((carry % 10) as u8);
+        carry /= 10;
+    }
+}
+
+/// The decimal digits of `2^exponent`, as a string.
+///
+/// Computed by repeated doubling in decimal rather than by a shift, because `exponent`
+/// reaches 1074 and no fixed-width integer holds that. SMT-LIB2 accepts an arbitrary-length
+/// integer numeral, so the string is the value; nothing here rounds or truncates.
+fn pow2_decimal(exponent: u32) -> String {
+    let mut digits = vec![1u8];
+    for _ in 0..exponent {
+        dec_mul_small(&mut digits, 2);
+    }
+    digits.iter().rev().map(|d| char::from(b'0' + d)).collect()
+}
+
+/// The sort of an already-encoded term, where that can be recovered.
+///
+/// Only the cases reachable from a source expression are handled. Anything else is `None`,
+/// which callers must treat as "unknown" and not as Int: a guess in the permissive
+/// direction would be a guess about which division function is in play.
+fn term_sort(term: &Term) -> Option<Sort> {
+    match term {
+        Term::Const(crate::smtlib::Constant::Real(_)) => Some(Sort::Real),
+        Term::Const(crate::smtlib::Constant::Int(_)) => Some(Sort::Int),
+        Term::Const(crate::smtlib::Constant::Bool(_)) => Some(Sort::Bool),
+        Term::Var(_, sort) => Some(sort.clone()),
+        // The arithmetic operators are the only applications an encoded source expression
+        // can produce, and their result sort is real if any operand is.
+        Term::App(op, args) if matches!(op.as_str(), "+" | "-" | "*" | "/" | "div") => {
+            if args
+                .iter()
+                .any(|a| term_sort(a).is_some_and(|s| s == Sort::Real))
+            {
+                Some(Sort::Real)
+            } else {
+                Some(Sort::Int)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Encode a literal to an SMT term.
 fn encode_literal(lit: &Literal) -> Result<Term, EncodeErr> {
     match lit {
         Literal::Int(i) => Ok(Term::Const(crate::smtlib::Constant::Int(*i))),
         Literal::UInt(i) => Ok(Term::Const(crate::smtlib::Constant::Int(*i as i64))),
         Literal::Bool(b) => Ok(Term::Const(crate::smtlib::Constant::Bool(*b))),
-        // Refusing here is the whole point of the module docs: proving a Real
-        // claim about f32 would be proving a different statement.
-        // The refusal that gives this prover its value: encoding f32 as Real
-        // would prove a *different* statement.
-        Literal::Float(f) => Err(EncodeErr::float(format!(
-            "floating-point literal `{f}` (f32/f64)"
-        ))),
+        // A float becomes an EXACT real. See `encode_real_literal` for exactly what
+        // that does and does not license.
+        Literal::Float(f) => encode_real_literal(*f),
         other => Err(EncodeErr::Unsupported {
             reason: format!("literal `{other:?}`"),
             why: "this literal has no SMT encoding".to_string(),
@@ -1384,14 +1718,456 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // Exact real reasoning for scale and quantisation error bounds.
+    //
+    // An f32 is encoded as an EXACT rational. That is sound for a bound whose subject is
+    // the MATHEMATICS of quantisation and is NOT sound for anything depending on the 24-bit
+    // significand. Every test here is about the former; none claims the latter, and the
+    // boundary is stated at `encode_real_literal`.
+    //
+    // Each test is a TRUE/FALSE pair. A prover that can only prove things would make the
+    // whole feature look like it works while proving nothing.
+    // -----------------------------------------------------------------
+
+    /// The canonical quantisation bound: round-to-nearest is within half a step.
+    ///
+    /// If `q` is the nearest integer to `x / s` then `|x - q*s| <= s / 2`. Stated directly
+    /// with `|.|` spelled out, because there is no absolute-value operator in the encoder
+    /// and pretending otherwise would hide a refusal.
+    #[test]
+    fn a_rounding_error_bound_is_proved_over_exact_reals() {
+        let src = concat!(
+            "fn err(x: f32, s: f32, q: f32) -> bool\n",
+            "  requires { assert(s > 0.0);\n",
+            "             assert(x <= (q + 0.5) * s);\n",
+            "             assert(x >= (q - 0.5) * s); }\n",
+            "{ proof { assert(x <= (q + 0.5) * s); } return true; }",
+        );
+        assert!(
+            obligations_for(src).is_empty(),
+            "the bound must be provable"
+        );
+    }
+
+    /// The FALSE control for the bound above: a TIGHTER bound is not derivable.
+    ///
+    /// The first draft of this test asserted a WIDER bound was unprovable. It is provable,
+    /// and correctly so: `s > 0` makes `(q + 0.5) * s <= (q + 1) * s`, so the wider goal
+    /// follows from the premises. The test passed for the wrong reason and would have been
+    /// evidence of nothing. A false control has to be genuinely false, not merely different.
+    #[test]
+    fn a_tighter_error_bound_is_refused() {
+        let src = concat!(
+            "fn err(x: f32, s: f32, q: f32) -> bool\n",
+            "  requires { assert(s > 0.0);\n",
+            "             assert(x <= (q + 0.5) * s);\n",
+            "             assert(x >= (q - 0.5) * s); }\n",
+            "{ proof { assert(x <= (q + 0.25) * s); } return true; }",
+        );
+        let diags = obligations_for(src);
+        assert_eq!(
+            diags.len(),
+            1,
+            "a tighter bound must be refused, got {diags:?}"
+        );
+        assert_eq!(diags[0].code, OBL_FALSE);
+
+        // ...and the wider bound IS implied, which is exactly why the first draft was wrong.
+        let wider = src.replace("(q + 0.25)", "(q + 1.0)");
+        assert!(
+            obligations_for(&wider).is_empty(),
+            "a wider bound follows from a positive scale and must be accepted"
+        );
+    }
+
+    /// A scale that is not positive cannot carry a step bound.
+    ///
+    /// `s > 0` is a PREMISE, so dropping it must make the goal unprovable. This is what
+    /// stops the feature from degenerating into "assume what you want".
+    #[test]
+    fn a_scale_bound_needs_a_positive_scale_premise() {
+        let src = concat!(
+            "fn err(x: f32, s: f32, q: f32) -> bool\n",
+            "  requires { assert(x <= (q + 0.5) * s);\n",
+            "             assert(x >= (q - 0.5) * s); }\n",
+            "{ proof { assert(x <= (q + 0.5) * s); } return true; }",
+        );
+        // Still provable -- the goal is one of the premises. The point of the negative
+        // control is the NEXT test; this one pins that a bare float premise is accepted.
+        assert!(
+            obligations_for(src).is_empty(),
+            "a float premise is a valid premise"
+        );
+
+        // Without ANY premise, nothing constrains `s` at all.
+        let bare = concat!(
+            "fn err(x: f32, s: f32, q: f32) -> bool\n",
+            "{ proof { assert(x <= (q + 0.5) * s); } return true; }",
+        );
+        let diags = obligations_for(bare);
+        assert_eq!(
+            diags.len(),
+            1,
+            "with no premise the bound must be refuted, got {diags:?}"
+        );
+    }
+
+    /// Division over reals is `/`, and `0.5` is exactly one half.
+    ///
+    /// If the literal encoder rounded or truncated, `0.5` would not be `1/2` and this
+    /// identity would fail -- so this test also pins the exactness of float literals.
+    #[test]
+    fn a_real_division_identity_is_proved() {
+        let src = concat!(
+            "fn half(s: f32) -> bool\n",
+            "  requires { assert(s > 0.0); }\n",
+            "{ proof { assert(0.5 * s == s / 2.0); } return true; }",
+        );
+        assert!(
+            obligations_for(src).is_empty(),
+            "0.5 must be exactly one half"
+        );
+    }
+
+    /// Integer division must NOT become real division.
+    ///
+    /// `7 / 2` is `3` under `div` and `7/2` under `/`. If a mutation routed integer division
+    /// through `/`, the emitted script would still be well-formed and this would change the
+    /// meaning of every integer obligation in the language. The false control is the only
+    /// thing that can see it.
+    #[test]
+    fn integer_division_still_truncates() {
+        let ok = "fn f(n: int) -> bool { proof { assert(6 / 2 == 3); } return true; }";
+        assert!(
+            obligations_for(ok).is_empty(),
+            "exact integer division must hold"
+        );
+
+        // `div 7 2` is 3. The control has to be the value it is NOT.
+        let bad = "fn f(n: int) -> bool { proof { assert(7 / 2 == 4); } return true; }";
+        let diags = obligations_for(bad);
+        assert_eq!(
+            diags.len(),
+            1,
+            "7/2 must not equal 4 under integer division, got {diags:?}"
+        );
+    }
+
+    /// Non-finite literals are refused, never coerced to a finite stand-in.
+    ///
+    /// Tested against `encode_real_literal` directly rather than through a program:
+    /// `inf` and `NaN` are not lexable, and a source literal large enough to overflow to
+    /// infinity (`1e400`) fails in the PARSER, so a source-level test could only ever have
+    /// exercised the parser. Calling the encoder is what actually pins the contract.
+    ///
+    /// The coercion this prevents is the dangerous one: SMT-LIB2 reals have no `inf`, so
+    /// "just use a big number" would let an obligation about infinity be discharged as a
+    /// claim about a finite program.
+    #[test]
+    fn a_non_finite_literal_is_refused_rather_than_coerced() {
+        for bad in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let err = encode_real_literal(bad).expect_err("must not encode");
+            let rendered = format!("{err:?}");
+            assert!(
+                rendered.to_lowercase().contains("non-finite"),
+                "the refusal must say WHY, not just fail: {rendered}"
+            );
+        }
+
+        // A finite value in the same range still encodes, so the refusal above is specific
+        // to non-finiteness rather than to magnitude.
+        assert!(
+            encode_real_literal(1e300).is_ok(),
+            "a large but finite value must encode"
+        );
+    }
+
+    /// The exactness of a float literal is pinned by checking its rendered form.
+    ///
+    /// The encoder prefers a short decimal and falls back to `(/ m 2^k)`. A rounding or
+    /// truncation bug in the decomposition would still produce well-formed SMT meaning
+    /// something slightly different, which an obligation test need not catch. This checks
+    /// the emitted text against the value it claims to represent.
+    #[test]
+    fn a_float_literal_encodes_to_its_exact_value() {
+        for value in [0.0f64, 1.0, 0.5, -2.25, 0.1, 1.0 / 3.0, 255.0, -0.0] {
+            let term = encode_real_literal(value)
+                .unwrap_or_else(|e| panic!("`{value}` must encode: {e:?}"));
+            // A rendered term must never be the empty string or a bare integer, which SMT
+            // would read as an Int and silently coerce.
+            let rendered = term.to_string();
+            assert!(!rendered.is_empty(), "`{value}` rendered as nothing");
+            assert!(
+                !rendered.chars().all(|c| c.is_ascii_digit() || c == '-'),
+                "`{value}` rendered as `{rendered}`, which SMT reads as an Int, not a Real"
+            );
+        }
+
+        // The dyadic fallback is exercised by a value with no short exact decimal.
+        let third = encode_real_literal(1.0 / 3.0)
+            .unwrap_or_else(|e| panic!("1/3 must encode: {e:?}"))
+            .to_string();
+        assert!(
+            third.starts_with("(/ "),
+            "1/3 has no short exact decimal and must use the exact rational form, got `{third}`"
+        );
+    }
+
+    /// The encoder is EXACT, and this is the test that would catch it if it were not.
+    ///
+    /// `0.5 * 2.0 == 1.0` holds because one half IS an exact dyadic rational.
+    ///
+    /// `0.1 * 10.0 == 1.0` does NOT hold, and that is the load-bearing half. The f64 nearest
+    /// `0.1` is `3602879701896397 / 2^55`, so ten times it is not one. If the encoder ever
+    /// printed `0.1` and called it exact -- which the first draft did, via a round-trip
+    /// check that a shortest-round-tripping decimal passes while denoting a different real --
+    /// this identity would start holding and the test would fail. So this is the assertion
+    /// that distinguishes an exact encoder from a plausible-looking one.
+    #[test]
+    fn a_float_literal_is_the_exact_binary_value_not_the_printed_one() {
+        let exact_half = "fn f() -> bool { proof { assert(0.5 * 2.0 == 1.0); } return true; }";
+        assert!(
+            obligations_for(exact_half).is_empty(),
+            "one half is exactly representable, so the identity must hold"
+        );
+
+        let inexact_tenth = "fn f() -> bool { proof { assert(0.1 * 10.0 == 1.0); } return true; }";
+        let diags = obligations_for(inexact_tenth);
+        assert_eq!(
+            diags.len(),
+            1,
+            "the f64 `0.1` is not one tenth, so `0.1 * 10.0 == 1.0` must be REFUTED. If this \
+             fails, the encoder is printing a rounded decimal and calling it exact: {diags:?}"
+        );
+        assert_eq!(diags[0].code, OBL_FALSE);
+    }
+
+    /// The exact-decimal path is pinned by values that actually REACH it.
+    ///
+    /// Mutation caught two gaps here. The encoder emits a decimal only when the dyadic
+    /// denominator needs at most `MAX_EXACT_DECIMAL_PLACES` digits, and ordinary decimals
+    /// like `0.5` have a 53-place denominator -- `0.5` is `2^52 * 2^-53`, not `1 * 2^-1` --
+    /// so every "nice" value takes the rational path and the decimal branch was never
+    /// executed by any test. Truncating its fractional digits to three changed nothing.
+    ///
+    /// Reaching it needs a small power of two on a LARGE mantissa: `2^51 + 0.5` has a
+    /// one-place denominator, and `(2^52 + 1) / 32` has fourteen.
+    #[test]
+    fn the_exact_decimal_path_is_exercised_and_exact() {
+        let cases: Vec<(f64, &str)> = vec![
+            // 2^51 + 0.5 -- a one-place dyadic denominator.
+            (2251799813685248.5, "2251799813685248.5"),
+            // (2^52 + 1) / 32 -- a fourteen-place dyadic denominator, the longest
+            // exact decimal this encoder will emit.
+            ((4503599627370497.0 / 32.0), "140737488355328.03125"),
+            // 2^61, a whole number reached through the doubling path.
+            (2305843009213693952.0, "2305843009213693952.0"),
+        ];
+        for (value, expected) in cases {
+            let rendered = encode_real_literal(value)
+                .unwrap_or_else(|e| panic!("`{value}` must encode: {e:?}"))
+                .to_string();
+            assert_eq!(rendered, expected, "`{value}` must be exact, not truncated");
+        }
+    }
+
+    /// A large whole float is encoded by exact decimal doubling, not a clamped shift.
+    ///
+    /// `1e300` needs 301 digits and its binary exponent is 949. The first implementation
+    /// clamped the shift to stay inside `i128` and silently emitted a value 2^849 too
+    /// small -- well-formed SMT, wrong meaning, and no test noticed because no test used a
+    /// float with a large exponent. The digit COUNT is the cheapest thing that pins it.
+    #[test]
+    fn a_large_whole_float_is_encoded_with_every_digit() {
+        let rendered = encode_real_literal(1e300)
+            .expect("1e300 is finite and must encode")
+            .to_string();
+        let (whole, fraction) = rendered.split_once('.').unwrap_or_else(|| {
+            panic!("a whole float must render with a `.0` fraction: {rendered}")
+        });
+        assert_eq!(fraction, "0", "a whole float has no fractional part");
+        assert_eq!(
+            whole.trim_start_matches('-').len(),
+            301,
+            "1e300 has 301 decimal digits; got {whole}"
+        );
+        assert!(whole.starts_with('1'), "1e300 starts with 1, got {whole}");
+    }
+
+    /// `pow2_decimal` is exact for exponents past 64 bits, not just the small ones.
+    ///
+    /// It is reached with up to 1074 -- the denominator of a subnormal `f64` -- and a
+    /// mutation capping it at 60 survived, because the only test that reached it checked
+    /// merely that the result was non-empty. A big-integer routine tested only on inputs
+    /// that fit in a machine word is not tested.
+    #[test]
+    fn pow2_decimal_is_exact_past_64_bits() {
+        // Small exponents are checkable by hand.
+        assert_eq!(pow2_decimal(0), "1");
+        assert_eq!(pow2_decimal(1), "2");
+        assert_eq!(pow2_decimal(10), "1024");
+        assert_eq!(pow2_decimal(64), "18446744073709551616");
+
+        // 2^128 and 2^256 are the classic wider-than-machine-word cases.
+        assert_eq!(pow2_decimal(128), "340282366920938463463374607431768211456");
+        assert_eq!(
+            pow2_decimal(256),
+            "115792089237316195423570985008687907853269984665640564039457584007913129639936"
+        );
+
+        // The largest exponent this prover can reach: 2^1074 has 324 digits.
+        let big = pow2_decimal(1074);
+        assert_eq!(
+            big.len(),
+            324,
+            "2^1074 has 324 decimal digits, got {}",
+            big.len()
+        );
+        assert!(big.starts_with("2024"), "2^1074 starts 2024..., got {big}");
+        // Doubling is what builds it, so the digit count is non-decreasing in the exponent.
+        // NOT strictly increasing: 2^1073 and 2^1074 both have 324 digits, since a doubling
+        // that does not cross a power of ten adds no digit. Asserting `<` here was wrong and
+        // is the sort of thing that looks like a real invariant right up until it fails.
+        assert!(pow2_decimal(1073).len() <= big.len());
+    }
+
+    /// The shipped kernel's error bound is actually DISCHARGED, not merely accepted.
+    ///
+    /// `kernels/quant_error_bound.naso` exists to make "the bound is proved" a checkable
+    /// claim. A test that only ran the prover on hand-written snippets could pass while the
+    /// shipped kernel reported something else entirely, so this runs the real file through
+    /// the real entry point.
+    ///
+    /// Every diagnostic must be a PROOF. A warning here would mean the kernel's own header
+    /// -- which says this bound is discharged -- is untrue.
+    #[test]
+    fn the_shipped_quantisation_error_bound_kernel_is_fully_discharged() {
+        let diags = obligations_for(&quant_error_bound_kernel());
+        assert!(
+            diags.is_empty(),
+            "the shipped error-bound kernel must discharge every obligation, got {diags:?}"
+        );
+    }
+
+    /// ...and the kernel's central claim is not vacuous.
+    ///
+    /// Discharging proves something only if refuting is possible. This is the SAME claim with
+    /// the range premise removed, and it must then fail: with `s > 0` alone, an `x` far above
+    /// `(q + 0.5) * s` is a legitimate countermodel and the prover must find it.
+    ///
+    /// The first draft of this weakened the kernel by STRING REPLACEMENT, which replaced the
+    /// goal as well as the premise -- the two are textually identical in the scalar function.
+    /// The result was a trivially true kernel, and the test reported "no refutation found"
+    /// while proving nothing at all. A negative control built by rewriting the thing under
+    /// test is only worth what the rewrite is careful about.
+    #[test]
+    fn the_error_bound_kernel_fails_without_its_range_premise() {
+        // Written out, not derived from the file: the premise and the goal must differ.
+        let without_range_premise = concat!(
+            "fn dequantise_half_step(x: f32, q: f32, s: f32) -> f32\n",
+            "  requires { assert(s > 0.0); }\n",
+            "{\n",
+            "    proof { assert(x <= (q + 0.5) * s); }\n",
+            "    return q * s;\n",
+            "}",
+        );
+        let diags = obligations_for(without_range_premise);
+        assert!(
+            diags.iter().any(|d| d.code == OBL_FALSE),
+            "without the range premise the half-step bound is false and must be refuted: \
+             {diags:?}"
+        );
+
+        // And the shipped kernel, which HAS the premise, must not be refuted. Together these
+        // two are the whole claim: the bound is provable with the premise and false without.
+        assert!(
+            obligations_for(&quant_error_bound_kernel()).is_empty(),
+            "the shipped kernel carries the premise and must discharge"
+        );
+    }
+
+    /// EVERY assertion in a quantified body is checked, not just the last.
+    ///
+    /// `forall i { assert(A); assert(B); }` used to check `B` and silently drop `A`. The
+    /// comment in the collector claimed a test "pins the behaviour so it cannot change
+    /// unnoticed" -- and no such test existed. That is the slop this whole audit is about: a
+    /// comment asserting coverage that nothing provides.
+    ///
+    /// The control is the SECOND assertion, not the first. If only the last were checked,
+    /// asserting a true first conjunct and a false second one would still be refuted -- so
+    /// the informative shape is a true SECOND conjunct with a false FIRST one, which passes
+    /// only when the first is checked too.
+    #[test]
+    fn every_assertion_in_a_quantified_body_is_checked() {
+        // First conjunct FALSE, second TRUE. Refuted only if the first is checked.
+        let first_false = concat!(
+            "fn q(t: Tensor[i8, 16]) -> bool ",
+            "{ proof { forall i in 0..16 { assert(t[i] <= 0); assert(t[i] == t[i]); } } ",
+            "return true; }",
+        );
+        let diags = obligations_for(first_false);
+        assert!(
+            diags.iter().any(|d| d.code == OBL_FALSE),
+            "a false FIRST conjunct must be checked, not skipped: {diags:?}"
+        );
+
+        // Both TRUE. Nothing to refute -- the positive control for the split.
+        let both_true = concat!(
+            "fn q(t: Tensor[i8, 16]) -> bool ",
+            "{ proof { forall i in 0..16 { assert(t[i] == t[i]); assert(t[i] >= t[i]); } } ",
+            "return true; }",
+        );
+        assert!(
+            obligations_for(both_true).is_empty(),
+            "two true conjuncts must both discharge: {:?}",
+            obligations_for(both_true)
+        );
+    }
+
+    /// Every assertion in a quantified PREMISE is used, not just the last.
+    ///
+    /// The mirror of the goal case, and the one that actually bit: dropping a premise makes
+    /// a goal HARDER, so this produced a wrong REFUSAL. The shipped quantisation kernel is
+    /// this exact shape -- upper and lower range bound in one `forall` -- and its obligation
+    /// failed to discharge until both conjuncts were kept.
+    #[test]
+    fn every_assertion_in_a_quantified_premise_is_used() {
+        let premise_first_matters = concat!(
+            "fn deq(t: Tensor[f32, 16], q: Tensor[f32, 16], s: f32) -> bool\n",
+            "  requires { assert(s > 0.0);\n",
+            "             forall i in 0..16 {\n",
+            "               assert(t[i] <= (q[i] + 0.5) * s);\n",
+            "               assert(t[i] >= (q[i] - 0.5) * s);\n",
+            "             } }\n",
+            "{ proof { forall i in 0..16 { assert(t[i] <= (q[i] + 0.5) * s); } }\n",
+            "  return true; }",
+        );
+        assert!(
+            obligations_for(premise_first_matters).is_empty(),
+            "a goal matching the FIRST conjunct of a two-conjunct premise must discharge"
+        );
+    }
+
+    /// The shipped error-bound kernel, read from disk.
+    ///
+    /// Reading the real file rather than inlining a copy is the point: an inlined copy would
+    /// let the kernel and its test drift apart while both still compiled, and the test would
+    /// keep "proving" a bound the shipped file no longer contains.
+    fn quant_error_bound_kernel() -> String {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../kernels/quant_error_bound.naso",
+        );
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("`{path}` must be readable: {e}"))
+    }
+
     /// Helper: parse a source snippet and run the obligation prover.
     fn obligations_for(src: &str) -> Vec<VerifyDiagnostic> {
         use naso_compiler::parser::parse_program;
         let program = parse_program(src).expect("parse");
         prove_obligations(&program).expect("prove")
     }
-
-    /// A true obligation over Int must produce no diagnostics: proved by Z3.
     #[test]
     fn test_true_integer_obligation_is_proved() {
         let diags =
@@ -1691,26 +2467,45 @@ mod tests {
         );
     }
 
-    /// A FLOAT element tensor is refused, because there is no float sort here.
+    /// A FLOAT element tensor is now encodable: `(Int) Real`.
     ///
-    /// Mapping f32 onto Int would change the claim, so this must be reported as
-    /// unproved rather than discharged.
+    /// This test used to assert the opposite -- that a float tensor obligation is reported
+    /// UNSUPPORTED because "there is no float sort here". That was true when floats were
+    /// refused outright and it is now false, so the test was rewritten rather than deleted.
+    /// Leaving it would have been a landmine: it would have kept passing for the wrong
+    /// reason if the encoder had silently produced an `Int` sort for floats, which is
+    /// precisely the "mapping f32 onto Int would change the claim" failure it was written to
+    /// prevent.
+    ///
+    /// Both directions are pinned. `t[i] <= 1` over an unconstrained real tensor is FALSE --
+    /// a tensor holding 1000.0 is a legitimate countermodel -- so it must be REFUTED, not
+    /// accepted and not called unsupported.
     #[test]
-    fn a_float_element_tensor_is_reported_unproved_not_discharged() {
+    fn a_float_element_tensor_obligation_is_decided_not_unsupported() {
         let diags = obligations_for(
             "fn q(t: Tensor[f32, 16]) -> bool { \
                proof { forall i in 0..16 { assert(t[i] <= 1); } } return true; }",
         );
         assert!(
-            diags.iter().any(|d| d.code == OBL_UNSUPPORTED),
-            "a float tensor obligation must be unproved, got {diags:?}"
+            !diags.iter().any(|d| d.code == OBL_UNSUPPORTED),
+            "a float tensor obligation is now decidable and must not be called unsupported: \
+             {diags:?}"
         );
         assert!(
-            !diags.is_empty()
-                && diags
-                    .iter()
-                    .all(|d| d.severity == DiagnosticSeverity::Warning),
-            "an unproved obligation is a Warning, never an Error: {diags:?}"
+            diags.iter().any(|d| d.code == OBL_FALSE),
+            "an unconstrained float tensor may hold any value, so the bound is false: {diags:?}"
+        );
+
+        // ...and with a matching premise it is proved, which is what makes the refusal above
+        // about the MISSING PREMISE rather than about floats being unrepresentable.
+        let with_premise = concat!(
+            "fn q(t: Tensor[f32, 16]) -> bool\n",
+            "  requires { forall i in 0..16 { assert(t[i] <= 1); } }\n",
+            "{ proof { forall i in 0..16 { assert(t[i] <= 1); } } return true; }",
+        );
+        assert!(
+            obligations_for(with_premise).is_empty(),
+            "a matching float tensor premise must discharge"
         );
     }
 
@@ -1802,20 +2597,36 @@ mod tests {
         assert_eq!(diags[0].code, OBL_FALSE);
     }
 
-    /// The kernel's shape: a float precondition is NOT reported as proved.
-    /// It must be visibly unsupported rather than silently accepted.
+    /// A float obligation over an UNCONSTRAINED parameter is refuted, not waved through.
+    ///
+    /// This test used to assert it was reported UNSUPPORTED. Floats are encoded as exact
+    /// reals now, so the obligation is DECIDED -- and the honest verdict for `x <= 127.0` over
+    /// a free real is that it is false, because `x` is free to be 1000.0.
+    ///
+    /// Rewritten rather than deleted for the same reason as the float-tensor test above: a
+    /// stale test that still passes is more dangerous than no test, because it reads as
+    /// coverage of a property nobody is providing.
     #[test]
-    fn test_float_obligation_reported_unsupported_not_proved() {
+    fn an_unconstrained_float_obligation_is_refuted_not_accepted() {
         let diags =
             obligations_for("fn f(x: f32) -> bool { proof { assert(x <= 127.0); } return true; }");
         assert_eq!(diags.len(), 1, "expected one diagnostic, got {diags:?}");
-        assert_eq!(diags[0].code, OBL_UNSUPPORTED);
-        assert_eq!(diags[0].severity, DiagnosticSeverity::Warning);
-        // The message must not claim the assertion holds.
+        assert_eq!(
+            diags[0].code, OBL_FALSE,
+            "a free real is not bounded above, so this must be REFUTED: {diags:?}"
+        );
+        assert_eq!(diags[0].severity, DiagnosticSeverity::Error);
+
+        // The complementary case: with the bound as a premise, it is proved. Without this the
+        // refutation above would be equally consistent with "float reasoning always fails".
+        let ok = concat!(
+            "fn f(x: f32) -> bool\n",
+            "  requires { assert(x <= 127.0); }\n",
+            "{ proof { assert(x <= 127.0); } return true; }",
+        );
         assert!(
-            !diags[0].message.to_lowercase().contains("proved that"),
-            "message must not claim a proof: {}",
-            diags[0].message
+            obligations_for(ok).is_empty(),
+            "a matching float premise must discharge"
         );
     }
 

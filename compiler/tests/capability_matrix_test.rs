@@ -187,9 +187,16 @@ fn matrix() -> Vec<Row> {
         // -- refused, with a reason ------------------------------------------------
         Row {
             construct: "`reversible { ... }`",
+            // Arithmetic, deliberately: this row records the STILL-REFUSED part of the
+            // construct. A gate-only block now lowers and emits its uncomputation -- see
+            // `reversible_native_execution_test.rs`, which asserts that natively. The inverse
+            // of `x = a+1` needs to know which operand is bound and this pass is not told, so
+            // the honest answer here is still Refused. A row claiming Emits for arithmetic
+            // would overstate what works.
             src: "fn f(a: i64) -> i64 { reversible { let b = a + 1; b } }",
             llvm: Outcome::Refused,
-            note: "no inverse is generated; used to drop the block and report success",
+            note: "gate sequences uncompute; arithmetic, measurement, rotations, empty and \
+                   nested blocks still refused",
         },
         Row {
             construct: "nested tensors",

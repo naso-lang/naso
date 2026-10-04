@@ -288,6 +288,21 @@ jobs:
       - name: QIR intrinsic mapping resolves only to declared intrinsics
         run: cargo test --features llvm -p naso-compiler --lib codegen::qir
 
+      # The capability boundary of `reversible`, inverted from its former refusals: a gate
+      # block must now lower, and arithmetic / measurement / empty / nested blocks must still
+      # refuse BY NAME. Also asserts the four former structural blockers are resolved and that
+      # the TEMPORARY-VALUE module stayed unwired.
+      - name: reversible capability boundary and resolved blockers
+        run: cargo test --features llvm -p naso-compiler --test reversible_refusal_test
+
+      # `reversible { ... }` is now wired for gate sequences: forward pass AND uncomputation.
+      # The suite that matters here builds real executables (naso -> LLVM IR -> llc -> cc ->
+      # run, linked against libnaso_gates.a) and asserts DISTRIBUTIONS over 40 runs, each
+      # paired with a control that differs only by the absence of the block. A PIR-shape
+      # assertion would pass even if the backend reordered the statements on the way out.
+      - name: reversible uncomputation executes natively
+        run: cargo test --features llvm -p naso-compiler --test reversible_native_execution_test
+
       # `codegen_tests` carries the assertion that a fixture cannot express a SHARED qubit,
       # which is what pins the "valid QIR that is not the source program" defect. Without it
       # running, that failure mode could regress silently.

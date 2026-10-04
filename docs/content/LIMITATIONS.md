@@ -64,7 +64,7 @@ construct, and neither is a placeholder value, a shader comment, or an exit stat
 | 2-D tensors | **emits** | row-major <!-- construct:2-D tensors --> |
 | quantum parameters | **emits** | `Qubit` and `QRegister` both map to the pointer ABI <!-- construct:quantum parameters --> |
 | symbolic loop bounds | **emits** | affine schedule bands <!-- construct:symbolic loop bounds --> |
-| `reversible { ... }` | **refused** | no inverse is generated; used to drop the block and report success <!-- construct:`reversible { ... }` --> |
+| `reversible { ... }` | **refused** | gate sequences uncompute; arithmetic, measurement, rotations, empty and nested blocks still refused <!-- construct:`reversible { ... }` --> |
 | nested tensors | **refused** | one ptr per tensor has a single stride <!-- construct:nested tensors --> |
 | tensor with a zero extent | **refused** | no elements to index <!-- construct:tensor with a zero extent --> |
 | quantity used as a type | **refused** | `Many` is a quantity; write `[1] Qubit` <!-- construct:quantity used as a type --> |
@@ -186,21 +186,36 @@ Stated precisely, because the distinction matters:
 
 Kept deliberately, and refused rather than approximated:
 
-- `reversible { ... }` uncomputation. `compiler/src/lowering/reversible_lowering.rs`
-  contains an inverse generator that nothing calls. It is audited, not trusted: six of its
-  seven generators used to fabricate an inverse rather than fail — `S†`/`RX†`/`UNKNOWN`
-  (callee names no backend can resolve), `unmeasure` with a qubit operand invented as the
-  literal `0`, `unrng`, a wrong `Mul -> Div` mapping, `discard`, and `affine_inverse` — and
-  its ancilla check tested a struct field that is never assigned, so the predicate was a
-  constant. All seven are fixed; the gate adjoint now comes from the single numerically
-  verified table in `naso-gates`, and the rest refuse with a diagnostic naming the missing
-  capability. It is **still refused**, on four structural blockers that are unchanged:
-  `PirModule` has no field to carry an inverse, `ScheduleNode` cannot hold a `PirExpr`, no
-  backend reads an inverse tree, and the `PirExpr` the generator returns still has nowhere
-  to be stored. A compiled circuit now executes natively, so "a forward and an inverse
-  circuit both execute" is a test that can be written — it has not been, and until it is,
-  wiring this up would emit the forward pass alone, which is the defect the construct was
-  fixed for.
+- `reversible { ... }` over anything that is not a gate sequence. A block whose statements
+  are all quantum gate applications now lowers, emits the forward pass, and emits the
+  uncomputation — and `compiler/tests/reversible_native_execution_test.rs` builds real
+  executables and asserts the state is restored over many runs. Everything else in the
+  construct is still refused, including the case that was refused longest:
+
+  - Arithmetic and assignments. The inverse of `x = a*b` is `x/b`, which needs to know which
+    operand the statement binds, and this pass is not told. The audited generator in
+    `reversible_lowering.rs` used to map `Mul -> Div` and default everything else to `Add`,
+    which computes a different number rather than undoing one; all six of those fabrications
+    are fixed and now refuse by name.
+  - Measurement, and `qalloc` inside a block.
+  - Rotations. The adjoint of a rotation is the rotation by the *negated* angle, and the
+    lowering never supplies the angle, so it is refused rather than emitted un-negated —
+    which would apply a rotation by zero.
+  - Empty blocks, and blocks nested in control flow, where the surrounding branch decides
+    whether the forward pass ran at all.
+
+  So `compiler/src/lowering/reversible_lowering.rs` — the TEMPORARY-VALUE path, with its ancilla
+  bookkeeping — remains **unwired and refused**. What is wired is a narrower pass,
+  `compiler/src/lowering/uncomputation.rs`, which handles gate sequences only. Two modules,
+  two different claims: reporting the gate path as though it uncomputed temporaries would
+  overstate what works.
+
+  The uncomputation rides in the existing flat `statements` list, in reverse order after the
+  forward pass. That is deliberate: every backend already walks `statements` in order, so the
+  second half executes with no backend change and, critically, with no new field that a
+  backend could silently forget. A dedicated `inverse` carrier would have been an obligation
+  on every backend, and an obligation nobody tests is a silent drop.
+
 - `break` / `continue` inside affine `forall` bands. The iteration-domain transformation for
   a constant-prefix guard is implemented and tested in `ir::early_exit`, but no backend emits
   the shortened band yet, and a guard on runtime data has no affine form. A `while` loop

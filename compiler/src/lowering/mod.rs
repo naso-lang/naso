@@ -10,6 +10,7 @@ pub mod ast_to_pir;
 pub mod loop_extraction;
 pub mod reversible_lowering;
 pub mod simd;
+pub mod uncomputation;
 
 use crate::ast::Program;
 use crate::ir::validate::validate_pir;
@@ -1249,7 +1250,9 @@ impl LoweringContext {
         Ok(())
     }
 
-    /// REFUSED, not silently dropped.
+    /// Lower a `reversible { ... }` block: forward pass, then uncomputation.
+    ///
+    /// # The defect this replaced, and why refusing was right for so long
     ///
     /// This used to lower the forward statements and then `Ok(())`, with a comment
     /// reading "(simplified - full implementation in reversible_lowering.rs)".
@@ -1263,40 +1266,118 @@ impl LoweringContext {
     /// ```
     ///
     /// So a `reversible` block dropped its body AND generated no inverse. The missing
-    /// schedule tree was the uncomputation pass, which is the entire point of the
+    /// schedule tree WAS the uncomputation pass, which is the entire point of the
     /// construct: `reversible { h(q) }` is supposed to emit `h` and then uncompute it.
-    /// What it emitted was whatever the forward walk happened to produce, and `Ok`.
+    /// What it emitted instead was whatever the forward walk happened to produce, and `Ok`.
     ///
-    /// Why the existing `PirExpr::Reversible` refusals in the LLVM and QIR backends did
-    /// not catch this: this path never CONSTRUCTS a `PirExpr::Reversible`. It emits no
-    /// node for the backend to reject, so those guards are bypassed entirely. The same
-    /// lesson as the Cranelift `42`: the defect was visible only by asking what this
-    /// path does with its input, not whether the input is correct.
+    /// The existing `PirExpr::Reversible` refusals in the LLVM and QIR backends could not
+    /// catch this: this path never CONSTRUCTS a `PirExpr::Reversible`. It emitted no node
+    /// for a backend to reject, so the whole guard layer was bypassed. Same lesson as the
+    /// Cranelift `42` -- the defect was visible only by asking what this path DOES with its
+    /// input, not whether the input is correct.
     ///
-    /// `reversible_lowering.rs` holds a real inverse generator (dataflow DAG, ancilla
-    /// allocation, measurement uncompute) but nothing calls it, and its measurement path
-    /// fabricates a qubit with `unwrap_or(PirExpr::IntLit(0))`. Until that is wired and
-    /// verified, refusing here is the honest answer -- an explicitly unimplemented
-    /// construct is recoverable, a silently non-reversing one is not.
+    /// Refusing was then the honest answer, and it stayed refused until the inverse could
+    /// be COMPUTED rather than assumed. See `lowering::uncomputation` for the design.
+    ///
+    /// # Where the inverse goes, and why that is the whole trick
+    ///
+    /// Into `self.statements`, appended after the forward statements. Not into a second
+    /// field. Every backend already walks `statements` in order, so an appended statement
+    /// executes on all of them with no backend change -- and there is no new field for a
+    /// backend to forget to read. A second field would have recreated, one layer up, the
+    /// exact defect above: a place the uncomputation could silently not reach.
+    ///
+    /// # Statement-snapshot discipline
+    ///
+    /// The forward statements are recorded BEFORE lowering the body and read back AFTER, so
+    /// the inverse is computed from what was actually emitted rather than from what the
+    /// source spelled. Reading the source instead would compute the adjoint of an operation
+    /// that lowering may have renamed -- and a gate that is renamed on the way down is a
+    /// gate whose inverse is not the one you asked for.
     fn lower_reversible_block(
         &mut self,
         block: &crate::ast::expr::ReversibleBlock,
     ) -> Result<(), LoweringError> {
-        // Naming what is being dropped is more useful than a bare refusal: the author
-        // can see that the block is the problem and not, say, the call inside it.
-        let n = block.body.stmts.len();
-        let plural = if n == 1 { "statement" } else { "statements" };
-        Err(LoweringError::Unsupported(format!(
-            "a `reversible {{ ... }}` block is not implemented (this one holds {n} \\
-                     {plural}). \\
-             The forward pass and, critically, the uncomputation pass it names are not \
-             generated. This previously lowered the block's statements, emitted no \
-             inverse, and reported success -- so the program was neither correctly \
-             executed nor correctly uncomputed. `reversible_lowering.rs` contains an \
-             inverse generator that nothing calls; it is unwired and unverified, and \
-             its measurement path fabricates a qubit operand. No backend can lower a \
-             reversible block until that is wired and tested."
-        )))
+        // A block tail is a real statement. `reversible { h(q) }` -- no semicolon -- parses
+        // as a TAIL EXPRESSION, not as `body.stmts`, so counting only `stmts` reported
+        // "this one holds 0 statements" for a block that holds one. The count is the only
+        // thing the old refusal told the author, so it was wrong precisely when the author
+        // had written the shortest possible block.
+        let tail = block.body.expr.as_deref();
+        let n = block.body.stmts.len() + usize::from(tail.is_some());
+
+        if n == 0 {
+            return Err(LoweringError::Unsupported(
+                "an EMPTY `reversible { }` block is refused. With no body there is nothing to \
+                 run and nothing to uncompute, so accepting it would emit a circuit that \
+                 claims to be reversible because it does nothing -- an empty program is not \
+                 evidence that an uncomputation pass ran."
+                    .to_string(),
+            ));
+        }
+
+        // Remember where the forward statements start, so they can be read back AFTER
+        // lowering. The inverse must be derived from what was emitted, not from the source.
+        let forward_start = self.statements.len();
+        let schedule_start = self.schedule_nodes.len();
+
+        for stmt in &block.body.stmts {
+            self.lower_stmt(stmt)?;
+        }
+        // The tail is a statement too: it is lowered through `lower_stmt` rather than
+        // `lower_expr_stmt` so a `return` inside it is not lowered twice.
+        if let Some(tail) = tail {
+            self.lower_stmt(&crate::ast::Stmt::new(
+                crate::ast::StmtKind::Expr(tail.clone()),
+                tail.span,
+                tail.id,
+            ))?;
+        }
+
+        let forward = self.statements[forward_start..].to_vec();
+
+        // The first inverse id is allocated HERE, and this placement is load-bearing.
+        //
+        // It was allocated BEFORE the forward pass on the first attempt, and before the
+        // block's own tail statement was lowered, and both produced
+        // `DuplicateStatementId` from the IR validator. The second failure is the
+        // instructive one: the ids run 0,1 (the two `let`s), 2,3 (the two forward gates),
+        // then 4,5 -- which is the uncomputation -- and the ENCLOSING FUNCTION's tail then
+        // allocated 5 as well, because `next_stmt_id` had not been advanced past the
+        // uncomputation's own ids at the moment the tail ran.
+        //
+        // So the uncomputation has to advance the shared counter as it commits, not merely
+        // choose ids inside its own range. The counter is the single source of statement
+        // identity in this pass; an allocation that does not move it hands the same id to
+        // the next allocation, and the result is two different statements sharing a name.
+        let first_inverse_id = self.next_stmt_id();
+
+        // Any refusal here happens BEFORE the forward statements are committed, so a
+        // refused block leaves no partial emission behind. (The statements are already in
+        // `self.statements` by this point; the truncation below is what removes them.)
+        let inverse = match uncomputation::uncompute_statements(&forward, first_inverse_id) {
+            Ok(inverse) => inverse,
+            Err(e) => {
+                self.statements.truncate(forward_start);
+                self.schedule_nodes.truncate(schedule_start);
+                return Err(e);
+            }
+        };
+
+        // Commit: forward statements, then the uncomputation, in that order.
+        //
+        // Each committed statement consumes its id from the SHARED counter. Advancing
+        // `next_stmt_id` past the whole inverse range is what stops the next allocation --
+        // the enclosing function's tail, or the next statement -- from reissuing an id the
+        // uncomputation already used.
+        for stmt in inverse {
+            let id = stmt.id;
+            self.next_stmt_id = self.next_stmt_id.max(id.0 + 1);
+            self.statements.push(stmt);
+            self.schedule_nodes
+                .push(ScheduleNode::domain(id, AffineDomain::universe(0, 0)));
+        }
+        Ok(())
     }
 
     fn lower_expr(&mut self, expr: &crate::ast::Expr) -> Result<crate::ir::PirExpr, LoweringError> {

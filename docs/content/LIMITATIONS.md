@@ -213,12 +213,25 @@ bytes untouched after the kernel runs.
   so `u4` currently behaves as `i4`. Treat it as unimplemented until a test distinguishes
   them.
 - **No `i2`.** The addressing math generalizes, but nothing has been built or measured.
-- **No tensor indexing in the prover.** `ExprKind::Index` has no encoding arm, so a bound on
-  `input[i] / scale` cannot be discharged. The quantization *arithmetic* is verified by
-  execution; the quantization *bounds* are not machine-checked.
+- **Tensor element bounds are modelled; range bounds are not.** A tensor parameter is encoded
+  as an *uninterpreted function* from index to element, so an obligation about `t[i]` is
+  checked for every possible tensor. The consequence is deliberate and worth stating plainly:
+  a bound like `t[i] <= 127` is **refuted**, because a constant tensor with a huge element is a
+  legitimate countermodel. That is the honest answer, and it means an input range bound must
+  come from somewhere real — a parameter's range is not a proposition about its values.
+- **The prover cannot yet detect its own malformed scripts.** SMT-LIB is handed to Z3 through
+  `Solver::from_string`, which *silently discards* a script it cannot parse; the solver then
+  reports `sat` for a solver holding no assertions. Two emitter bugs were found and fixed this
+  way (a `declare-const` with a function sort, and an unbalanced paren), but the failure mode
+  is still reachable by a future emitter change. `Sort::Function` declarations and paren
+  balance are pinned by tests in `crates/naso-verify/src/smtlib.rs`; anything else relies on
+  review.
 - **No float reasoning in the prover.** Scale and zero-point error bounds still need an
   interval or rational abstraction. Claiming otherwise would be the exact dishonesty this
   page exists to prevent.
+- **`&&` and `||` are refused, not encoded.** They short-circuit, so they are not the same
+  proposition as `and`/`or` when an operand is undefined. Split the obligation into separate
+  assertions rather than have the prover silently strengthen what you wrote.
 - **No `naso verify` subcommand.** The verifier is a real library with passing tests, but the
   CLI does not expose it, so no source-level verification workflow exists yet.
 - **Shape must have an even extent.** `Tensor[i4, 15]` is a partial trailing byte whose

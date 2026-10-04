@@ -34,9 +34,23 @@ impl Script {
             .push(Command::DeclareFun(name.to_string(), args, ret));
     }
 
+    /// Declare a constant of the given sort.
+    ///
+    /// A FUNCTION sort cannot be expressed by `declare-const` in SMT-LIB2 -- it needs
+    /// `declare-fun` with a wrapped domain -- and emitting `declare-const` for one makes
+    /// Z3 reject the script. Since that rejection is silent (see `Command::DeclareFun`),
+    /// a tensor obligation would come back "refuted" with an empty model rather than as an
+    /// error. So the dispatch happens here: a function sort is declared as a function.
     pub fn declare_const(&mut self, name: &str, sort: Sort) {
-        self.commands
-            .push(Command::DeclareConst(name.to_string(), sort));
+        match sort {
+            Sort::Function(domain, ret) => {
+                self.commands
+                    .push(Command::DeclareFun(name.to_string(), domain, *ret));
+            }
+            other => self
+                .commands
+                .push(Command::DeclareConst(name.to_string(), other)),
+        }
     }
 
     pub fn assert(&mut self, term: Term) {
@@ -128,15 +142,31 @@ impl fmt::Display for Command {
                 }
                 write!(f, ") {})", def)
             }
-            Command::DeclareFun(name, args, ret) => {
+            Command::DeclareFun(name, domain, ret) => {
+                // The DOMAIN is a list of sorts, so it is wrapped: `(declare-fun t
+                // ((Int)) Int)`. When the domain is itself a single function sort, its
+                // `(Int) Int` rendering nests one level deeper, which is exactly what
+                // SMT-LIB2 requires for an uninterpreted function.
+                //
+                // Emitting `(declare-fun t (Int) Int)` instead makes Z3 reject the script,
+                // and the rejection is SILENT -- `from_string` discards an unparseable
+                // script and the solver then reports `sat` for a solver holding no
+                // assertions. Every obligation mentioning a tensor was reported REFUTED
+                // with an empty model: a false negative stacked on a false negative.
+                //
+                // Verified against Z3 directly: `(declare-const f (Int) Int)` answers
+                // `sat` (rejected and discarded), whereas `(declare-fun f ((Int)) Int)`
+                // answers `unsat` for the tautology `(not (= (f 0) (f 0)))` -- correct.
+                // `(declare-fun <name> (<domain>) <ret>)`
                 write!(f, "(declare-fun {} (", name)?;
-                for (i, arg) in args.iter().enumerate() {
+                write!(f, "(")?;
+                for (i, arg) in domain.iter().enumerate() {
                     if i > 0 {
                         write!(f, " ")?;
                     }
                     write!(f, "{}", arg)?;
                 }
-                write!(f, ") {})", ret)
+                write!(f, ")) {})", ret)
             }
             Command::DeclareConst(name, sort) => write!(f, "(declare-const {} {})", name, sort),
             Command::Assert(term) => write!(f, "(assert {})", term),
@@ -189,6 +219,9 @@ impl fmt::Display for Sort {
             Sort::BitVec(n) => write!(f, "(_ BitVec {})", n),
             Sort::Array(idx, elem) => write!(f, "(Array {} {})", idx, elem),
             Sort::Datatype(name) => write!(f, "{}", name),
+            // `(Int) Int` is the RANGE-sort notation -- correct as written. The
+            // declaration emitter is responsible for wrapping it into a `declare-fun`
+            // DOMAIN list, which is a different shape; see `Command::DeclareFun`.
             Sort::Function(args, ret) => {
                 write!(f, "(")?;
                 for (i, a) in args.iter().enumerate() {
@@ -494,5 +527,84 @@ pub mod theory {
     }
     pub fn array(idx: &str, elem: &str) -> String {
         format!("(Array {} {})", idx, elem)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A function-sorted constant MUST be printed as `declare-fun` with a wrapped domain.
+    ///
+    /// Regression for the silent-discard failure. `(declare-const f (Int) Int)` is not
+    /// valid SMT-LIB2: a `declare-const` takes a plain sort, and `(Int) Int` is the
+    /// range-sort notation for a function. Z3 rejects the whole script, and the rejection
+    /// is SILENT -- `Solver::from_string` drops a script it cannot parse and the solver
+    /// then reports `sat` for a solver holding no assertions at all.
+    ///
+    /// The visible symptom was every tensor obligation being reported REFUTED with an
+    /// empty model, which is a false negative layered on a false positive: the prover
+    /// confidently refuted a claim it never sent to Z3.
+    #[test]
+    fn a_function_sorted_constant_is_declared_as_a_function() {
+        let mut script = Script::new();
+        script.declare_const("f.t", Sort::Function(vec![Sort::Int], Box::new(Sort::Int)));
+        assert_eq!(script.to_string(), "(declare-fun f.t ((Int)) Int)\n");
+    }
+
+    /// A non-function sort still uses `declare-const` -- the fix must not widen it.
+    #[test]
+    fn a_plain_constant_uses_declare_const() {
+        let mut script = Script::new();
+        script.declare_const("n", Sort::Int);
+        assert_eq!(script.to_string(), "(declare-const n Int)\n");
+    }
+
+    /// A two-argument function sorts correctly, and nesting is balanced.
+    #[test]
+    fn a_multi_argument_function_domain_is_rendered_and_balanced() {
+        let mut script = Script::new();
+        script.declare_const(
+            "m",
+            Sort::Function(vec![Sort::Int, Sort::Bool], Box::new(Sort::Int)),
+        );
+        let out = script.to_string();
+        assert_eq!(out, "(declare-fun m ((Int Bool)) Int)\n");
+        // Balanced parens: an unbalanced script is silently discarded by Z3.
+        let depth = out.chars().fold(0i32, |a, c| match c {
+            '(' => a + 1,
+            ')' => a - 1,
+            _ => a,
+        });
+        assert_eq!(depth, 0, "unbalanced parentheses in {out}");
+    }
+
+    /// Every declaration the compiler emits must be balanced.
+    ///
+    /// A single stray `)` makes Z3 discard the entire script and report `sat`, so an
+    /// unbalanced emitter is indistinguishable from a prover that never ran. This walks the
+    /// shapes the obligation encoder actually produces rather than trusting any one of them.
+    #[test]
+    fn emitted_declarations_are_always_parenthesis_balanced() {
+        let sorts = [
+            Sort::Int,
+            Sort::Bool,
+            Sort::Real,
+            Sort::BitVec(4),
+            Sort::Array(Box::new(Sort::Int), Box::new(Sort::Int)),
+            Sort::Function(vec![Sort::Int], Box::new(Sort::Int)),
+            Sort::Function(vec![Sort::Int, Sort::Int], Box::new(Sort::Int)),
+        ];
+        for sort in sorts {
+            let mut script = Script::new();
+            script.declare_const("x", sort.clone());
+            let out = script.to_string();
+            let depth = out.chars().fold(0i32, |a, c| match c {
+                '(' => a + 1,
+                ')' => a - 1,
+                _ => a,
+            });
+            assert_eq!(depth, 0, "unbalanced for {sort:?}: {out}");
+        }
     }
 }

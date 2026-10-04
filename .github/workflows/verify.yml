@@ -247,6 +247,15 @@ jobs:
       - name: Refuse unimplementable quantum operations
         run: cargo test --features llvm --test entangle_refusal_test
 
+      # The obligation prover's own tests. These decide whether a claim is PROVED, REFUTED,
+      # or merely UNSUPPORTED, so a regression here is a soundness change. Both bugs fixed in
+      # this area lived here, and the symptom -- every tensor obligation reported "refuted"
+      # with an empty model, because Z3 had silently discarded a malformed script -- was
+      # invisible from outside this suite.
+      - name: Test the obligation prover
+        run: cargo test -p naso-verify --lib
+        working-directory: .
+
       # The compiler's emitted QIR, checked NUMERICALLY against hand-derived states.
       #
       # Needs `--features llvm` because the suite runs the real `naso` binary and parses what

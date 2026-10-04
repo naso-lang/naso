@@ -219,13 +219,15 @@ bytes untouched after the kernel runs.
   a bound like `t[i] <= 127` is **refuted**, because a constant tensor with a huge element is a
   legitimate countermodel. That is the honest answer, and it means an input range bound must
   come from somewhere real — a parameter's range is not a proposition about its values.
-- **The prover cannot yet detect its own malformed scripts.** SMT-LIB is handed to Z3 through
-  `Solver::from_string`, which *silently discards* a script it cannot parse; the solver then
-  reports `sat` for a solver holding no assertions. Two emitter bugs were found and fixed this
-  way (a `declare-const` with a function sort, and an unbalanced paren), but the failure mode
-  is still reachable by a future emitter change. `Sort::Function` declarations and paren
-  balance are pinned by tests in `crates/naso-verify/src/smtlib.rs`; anything else relies on
-  review.
+- **A malformed SMT script is now a loud error, but detection is structural, not semantic.**
+  Z3's `Solver::from_string` returns `()` and *discards* its error code, so an unparseable
+  script used to be dropped silently and answered `sat` for a solver holding no assertions —
+  which a verification driver reads as "obligation refuted". `verify()` now refuses instead,
+  by checking two things against the script: that parentheses balance, and that the number of
+  assertions Z3 actually loaded matches the number the script declares. Both checks are
+  structural. A script that is *syntactically* fine but semantically wrong — an undeclared
+  symbol, a mistyped sort — is still rejected by Z3 without a diagnostic, so this narrows the
+  hole rather than closing it. Treat a `ParseError` as an emitter bug, never as a failed proof.
 - **No float reasoning in the prover.** Scale and zero-point error bounds still need an
   interval or rational abstraction. Claiming otherwise would be the exact dishonesty this
   page exists to prevent.

@@ -310,18 +310,144 @@ pub fn verify(smt_script: &str, config: SolverConfig) -> Result<VerifyResult, Ve
     let mut solver = Solver::new(config)?;
 
     // Parse SMT-LIB2 script using high-level API
-    solver
-        .solver
-        .as_mut()
-        .ok_or_else(|| {
-            VerifyError::Solver(SolverError::ContextFailed(
-                "Solver not initialized".to_string(),
-            ))
-        })?
-        .from_string(smt_script);
+    let inner = solver.solver.as_mut().ok_or_else(|| {
+        VerifyError::Solver(SolverError::ContextFailed(
+            "Solver not initialized".to_string(),
+        ))
+    })?;
+
+    // Remember what the script CLAIMS, before handing it to Z3.
+    let (claimed_assertions, final_depth) = scan_script(smt_script);
+
+    // A script whose parentheses never balance cannot be a well-formed SMT-LIB command
+    // sequence. Check this BEFORE calling Z3, because Z3 recovers from the imbalance by
+    // discarding text from the unclosed paren onward -- and in that case the discarded
+    // region swallows the assertions, so both the script and Z3 agree the solver holds
+    // none. A count-based check then passes, and Z3 reports `sat` for an empty solver.
+    // Measured, not assumed: for an unbalanced `declare-fun`, the scanner and
+    // `get_assertions()` both reported 0.
+    if final_depth != 0 {
+        return Err(VerifyError::Solver(SolverError::ParseError(format!(
+            "unbalanced parentheses in the SMT-LIB script: {final_depth} unclosed `(` at \
+             end of input. The script was never valid, so no obligation was checked. This \
+             is an emitter bug -- fix it rather than reading the result."
+        ))));
+    }
+
+    inner.from_string(smt_script);
+
+    // `Solver::from_string` returns `()` and DISCARDS Z3's error code. A script Z3 cannot
+    // parse is silently dropped, and the solver then reports `sat` for a solver holding NO
+    // assertions at all.
+    //
+    // That is not a degraded answer, it is a wrong one. A verification driver asks "does
+    // this obligation hold?"; for a discarded script the honest answer is "this was never
+    // checked", and `sat` says the opposite. An obligation is proved by finding NO model
+    // satisfying its negation, so a discarded script makes the driver report the negation
+    // SAT -- i.e. REFUTED -- for a claim that was never sent anywhere. A false negative
+    // stacked on a false positive, and entirely silent.
+    //
+    // Two real bugs hid here before this check existed: a `declare-const` carrying a
+    // function sort, and a `declare-fun` with a dropped closing paren. Both were
+    // indistinguishable from correct behaviour.
+    //
+    // So: count what Z3 actually holds, and refuse to answer if it disagrees with what the
+    // script asked for.
+    let loaded_assertions = inner.get_assertions().len();
+    if loaded_assertions != claimed_assertions {
+        return Err(VerifyError::Solver(SolverError::ParseError(format!(
+            "Z3 rejected the script: it holds {loaded_assertions} assertion(s) but the \
+             script declares {claimed_assertions}. A script Z3 cannot parse is discarded \
+             silently, so this obligation was never checked. Fix the emitter rather than \
+             reading the result."
+        ))));
+    }
 
     // Check satisfiability
     solver.check_sat(&[])
+}
+
+/// Count the `assert` commands a script declares, at nesting depth zero.
+///
+/// Only depth zero counts: `(assert ...)` inside a `(check-sat-and-exit)` body or any other
+/// enclosing command belongs to that command, not to the solver's top-level assertion set.
+/// Z3's `get_assertions()` likewise reports only what `assert` added to the solver.
+///
+/// Parenthesis tracking is string-aware so a `;` comment containing an unmatched paren
+/// cannot corrupt the depth. SMT-LIB strings are rare in generated scripts but a `|...|`
+/// quoted symbol may contain both parens and semicolons, so both are skipped.
+#[cfg_attr(not(test), allow(dead_code))]
+fn count_top_level_asserts(script: &str) -> usize {
+    scan_script(script).0
+}
+
+/// Split a script into (top-level `assert` count, final paren depth).
+///
+/// The depth is returned because counting alone is NOT sufficient to detect a discarded
+/// script. Verified against Z3 with an unbalanced `declare-fun` whose closing paren was
+/// dropped: the script scanner and `get_assertions()` both reported ZERO assertions, so they
+/// agreed, the count-based check passed, and Z3 went on to answer `sat` for a solver holding
+/// nothing. The unclosed paren swallowed the assertion in both readings. A depth of
+/// non-zero at end-of-script is therefore its own malformed-script signal.
+fn scan_script(script: &str) -> (usize, usize) {
+    let bytes = script.as_bytes();
+    let mut i = 0;
+    let mut depth = 0usize;
+    let mut count = 0usize;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            // Comment to end of line.
+            b';' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            // Quoted symbol: may contain anything except an unescaped bar.
+            b'|' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'|' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            // Double-quoted string literal: skip to the closing quote, honouring escapes.
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    // SMT-LIB2 uses doubled quotes to escape a quote inside a string.
+                    if bytes[i] == b'"' && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'(' => {
+                depth += 1;
+                // A command starts with a symbol right after `(`. If that symbol is
+                // `assert`, this paren opens a top-level assertion.
+                if depth == 1 {
+                    let rest = &script[i + 1..];
+                    let word: String = rest
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                        .collect();
+                    if word == "assert" {
+                        count += 1;
+                    }
+                }
+                i += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+
+    (count, depth)
 }
 #[cfg(feature = "z3")]
 /// Execute multiple independent verification conditions in parallel.
@@ -362,5 +488,138 @@ impl SolverStats {
             VerifyResult::Unknown(_) => self.unknown_calls += 1,
             VerifyResult::Error(_) => self.error_calls += 1,
         }
+    }
+}
+
+#[cfg(all(test, feature = "z3"))]
+mod guard_tests {
+    use super::*;
+
+    /// A malformed script must be REFUSED, not answered.
+    ///
+    /// This is the regression for the silent-discard failure. `(declare-const f (Int) Int)`
+    /// is invalid SMT-LIB2 -- a `declare-const` takes a plain sort, and `(Int) Int` is the
+    /// range-sort notation for a function. Z3 rejects the script and `from_string` swallows
+    /// the error, so before this guard the result was `Sat` for a solver holding no
+    /// assertions: the driver reported the obligation REFUTED for a claim never sent to Z3.
+    #[test]
+    fn a_malformed_declaration_is_an_error_not_a_sat() {
+        let bad = "(set-logic UFLIA)\n\
+                   (declare-const f (Int) Int)\n\
+                   (assert (not (= (f 0) (f 0))))\n\
+                   (check-sat)\n(exit)\n";
+        let result = verify(bad, SolverConfig::default());
+        assert!(
+            matches!(result, Err(VerifyError::Solver(SolverError::ParseError(_)))),
+            "a discarded script must be a ParseError, got {result:?}"
+        );
+    }
+
+    /// An unbalanced parenthesis must also be refused. This is the second real bug: the
+    /// `declare-fun` emitter once dropped a closing paren.
+    #[test]
+    fn an_unbalanced_script_is_an_error_not_a_sat() {
+        // NOTE the missing `)` after the `Int` sort -- exactly the emitter bug.
+        let bad = "(set-logic UFLIA)\n\
+                   (declare-fun f ((Int)) Int\n\
+                   (assert (not (= (f 0) (f 0))))\n\
+                   (check-sat)\n(exit)\n";
+        let result = verify(bad, SolverConfig::default());
+        assert!(
+            matches!(result, Err(VerifyError::Solver(SolverError::ParseError(_)))),
+            "an unbalanced script must be a ParseError, got {result:?}"
+        );
+    }
+
+    /// A VALID function-sorted declaration must still work -- the guard must not simply
+    /// reject everything mentioning a function.
+    #[test]
+    fn a_valid_function_declaration_is_still_accepted() {
+        let good = "(set-logic UFLIA)\n\
+                    (declare-fun f ((Int)) Int)\n\
+                    (assert (not (= (f 0) (f 0))))\n\
+                    (check-sat)\n(exit)\n";
+        let result = verify(good, SolverConfig::default());
+        assert!(
+            result.is_ok(),
+            "a valid function declaration must be accepted, got {result:?}"
+        );
+        assert!(
+            result.as_ref().unwrap().is_unsat(),
+            "the tautology's negation is unsatisfiable, so the obligation is PROVED; got {result:?}"
+        );
+    }
+
+    /// The control: a script Z3 parses must produce a real answer, not an error.
+    #[test]
+    fn a_well_formed_script_is_answered_normally() {
+        let good = "(set-logic UFLIA)\n(assert (not (= 1 1)))\n(check-sat)\n(exit)\n";
+        let r = verify(good, SolverConfig::default()).expect("valid script");
+        assert!(r.is_unsat(), "got {r:?}");
+    }
+
+    #[test]
+    fn counts_top_level_asserts() {
+        assert_eq!(count_top_level_asserts("(assert (> 1 0))"), 1);
+        assert_eq!(
+            count_top_level_asserts("(assert (> 1 0))\n(assert (< 0 1))"),
+            2
+        );
+        assert_eq!(count_top_level_asserts("(set-logic UFLIA)\n"), 0);
+
+        // `(push 1)` CLOSES before the assert, so the assert really is at depth 1 -- and Z3
+        // agrees, loading 1 assertion. An earlier version of this test asserted 0 here,
+        // reasoning the assert was "nested inside another command". It was not, and the
+        // error was in the direction that would hide a genuinely discarded assertion.
+        assert_eq!(count_top_level_asserts("(push 1)\n(assert (> 1 0))"), 1);
+
+        // An assert that really is nested inside an unclosed command is not top level.
+        assert_eq!(count_top_level_asserts("(build (assert (> 1 0))"), 0);
+    }
+
+    #[test]
+    fn reports_unbalanced_parentheses() {
+        assert_eq!(scan_script("(assert (> 1 0))\n"), (1, 0));
+        assert_eq!(scan_script("(assert (> 1 0))\n(assert (< 0 1))\n"), (2, 0));
+        // The emitter bug that motivated this: a `declare-fun` missing its closing paren.
+        assert_eq!(
+            scan_script("(declare-fun f ((Int)) Int\n(assert (> 1 0))\n"),
+            (0, 1)
+        );
+    }
+
+    /// An assert swallowed by an unclosed command is dropped by Z3 AND by the scanner, so
+    /// the count check cannot see it -- only the balance check can. This is the measured
+    /// reason counting alone was insufficient.
+    #[test]
+    fn a_swallowed_assertion_is_caught_only_by_the_balance_check() {
+        let bad = "(set-logic UFLIA)\n\
+                   (declare-fun f ((Int)) Int\n\
+                   (assert (not (= (f 0) (f 0))))\n\
+                   (check-sat)\n(exit)\n";
+        let (claimed, depth) = scan_script(bad);
+        assert_eq!(claimed, 0, "the scanner sees zero assertions here too");
+        assert_ne!(depth, 0, "so only the balance check can catch this");
+        assert!(
+            matches!(
+                verify(bad, SolverConfig::default()),
+                Err(VerifyError::Solver(SolverError::ParseError(_)))
+            ),
+            "must be refused, not answered"
+        );
+    }
+
+    #[test]
+    fn ignores_assertions_inside_comments_and_strings() {
+        // A comment mentioning `assert` must not be counted.
+        assert_eq!(count_top_level_asserts("; (assert (> 1 0))\n"), 0);
+        // A quoted symbol may legally contain the word assert.
+        assert_eq!(count_top_level_asserts("|assert (x)|\n"), 0);
+        // A real assertion after either must still be found.
+        assert_eq!(
+            count_top_level_asserts("; (assert (> 1 0))\n(assert (> 1 0))"),
+            1
+        );
+        assert_eq!(count_top_level_asserts("|assert (x)|\n(assert (> 1 0))"), 1);
     }
 }

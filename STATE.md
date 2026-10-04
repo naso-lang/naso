@@ -162,11 +162,12 @@ Documented in `docs/content/LIMITATIONS.md`.
   consequence is deliberate: `t[i] <= 127` is **REFUTED**, since an unconstrained tensor
   has no range. That is honest, and it means an input-range bound must come from real
   evidence, not from the element type.
-- **The prover cannot detect its own malformed SMT scripts.** `Solver::from_string`
-  SILENTLY DISCARDS a script it cannot parse, then reports `sat` for a solver holding no
-  assertions. Two emitter bugs hid this way (`declare-const` with a function sort; a
-  dropped closing paren). Function-sort declarations and paren balance are now pinned by
-  tests in `crates/naso-verify/src/smtlib.rs`. A future emitter change can still hit this.
+- **Malformed SMT scripts are now a loud `ParseError`** (`verify()` refuses instead of
+  answering). Detection is STRUCTURAL: paren balance + assertion count vs. what Z3 loaded.
+  A script that parses but is semantically wrong (undeclared symbol, mistyped sort) is
+  still dropped by Z3 without a diagnostic. Narrows the hole; does not close it.
+- Counting alone was NOT enough: an unbalanced paren swallows the assertions, so the scanner
+  and Z3 agree on zero and the count check passes. The balance check is what catches that.
 - **`&&`/`||` are REFUSED**, not encoded as `and`/`or`. They short-circuit, so they are a
   different proposition when an operand is undefined. Split the assertion instead.
 - **No float reasoning in the prover.** Scale/zero-point error bounds need an interval

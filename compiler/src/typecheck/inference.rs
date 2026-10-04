@@ -1273,6 +1273,18 @@ fn infer_quantum_op(
             Ok(Type::unit(span))
         }
         QuantumOp::Entangle(args) => {
+            // Entangling zero qubits is not a degenerate case, it is a type error: the result
+            // type is `QRegister` of dimension = arity, so `entangle()` would infer a
+            // zero-dimensional register and typecheck as OK while asserting nothing at all.
+            // The old behaviour accepted it. Refused here rather than defaulted, because the
+            // arity IS the meaning -- there is no sensible value to substitute.
+            if args.len() < 2 {
+                return Err(TypeError::ArgumentCountMismatch {
+                    expected: 2,
+                    found: args.len(),
+                    span,
+                });
+            }
             for arg in args {
                 let arg_ty = infer_expr(checker, arg)?;
                 unify::unify_types(checker, &arg_ty, &Type::qubit(span))?;

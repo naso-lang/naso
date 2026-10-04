@@ -189,6 +189,49 @@ pub struct LoopTargets<'ctx> {
     pub affine_band: bool,
 }
 
+/// The LLVM intrinsic for a quantum operation, or `None` if this backend has none.
+///
+/// # Why an allowlist rather than `format!("qir.{op}")`
+///
+/// Every `qir.*` name below is emitted as a `declare` with no `define`. That is deliberate and
+/// separate: the QIR runtime does not exist here, so a module containing one will not link.
+/// This function does not change that. What it stops is the backend silently INVENTING a name
+/// for an operation it does not model, which produced a plausible-looking module and then a
+/// link error about a symbol the user never wrote.
+///
+/// # Where the names come from
+///
+/// Two producers, and they SPELL DIFFERENTLY -- getting this wrong is not theoretical:
+///
+/// - `GateKind`'s `Display`, used by the real lowerer: `H`, `CX`, `RX`, and `reset`.
+/// - The structural fixture parser in `compiler/tests/codegen_tests.rs`, whose `gate_name`
+///   lowercases and shortens: `h`, `cx`, `ccx`, `mz`, `swap`.
+///
+/// So the set carries both, plus the three non-gate operations. Adding a name here is not free:
+/// it asserts that this backend can emit the call, which is true of neither today.
+///
+/// `entangle` and `reset` are deliberately ABSENT. The QIR base profile declares no intrinsic
+/// for either, and a substitute computes something else: a release is not a `reset`, which
+/// returns the SAME qubit to |0> and leaves the binding usable; a CNOT is not an `entangle`,
+/// which leaves any qubit past the second unentangled while looking correct in the text.
+///
+/// Public so the backend's gate coverage is TESTABLE rather than only observable. A private
+/// allowlist can only be checked by compiling a program that happens to mention each name, and
+/// most of these names have no source spelling at all -- `H` and `CX` are what `GateKind`'s
+/// `Display` emits internally, and no `.naso` file can say them. Testing coverage through source
+/// programs therefore misses exactly the spellings most at risk of drifting.
+pub fn quantum_intrinsic_name(op: &str) -> Option<String> {
+    const KNOWN: &[&str] = &[
+        // `GateKind::Display`, as the real lowerer spells it.
+        "H", "X", "Y", "Z", "S", "T", "CX", "CY", "CZ", "RX", "RY", "RZ",
+        // The same gates as `tests/codegen_tests.rs::gate_name` spells them.
+        "h", "x", "y", "z", "s", "t", "cx", "cy", "cz", "rx", "ry", "rz", "ccx", "swap", "mz",
+        // Non-gate quantum operations from `QuantumOp`.
+        "qalloc", "measure", "phase",
+    ];
+    KNOWN.contains(&op).then(|| format!("qir.{op}"))
+}
+
 impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
     /// An `i64` zero, for a construct that produces no value but sits where the PIR
     /// demands one.
@@ -1268,7 +1311,20 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 // Quantum operations lower to a call of the runtime intrinsic
                 // with the same name, e.g. "h" -> "qir.h". Value arguments come
                 // first, then the qubits they act on.
-                let intrinsic_name = format!("qir.{}", op);
+                //
+                // The operation must be one this backend actually has an intrinsic for. The
+                // alternative -- formatting `qir.{op}` for any name that reached here -- emits
+                // a DECLARATION and nothing else, so `llc` accepts it and the failure surfaces
+                // later as a link error naming an internal function the user never wrote. That
+                // is how `entangle` came to be reported as compiled.
+                let intrinsic_name = quantum_intrinsic_name(op).ok_or_else(|| {
+                    CodegenError::UnsupportedFeature(format!(
+                        "`{op}` has no LLVM quantum intrinsic, so this backend cannot emit it. \
+                         The remaining quantum operations have declarations but no definitions \
+                         either, so none of them can be linked yet; refusing here makes that \
+                         visible at compile time instead of at link time."
+                    ))
+                })?;
 
                 let arg_values: CodegenResult<Vec<BasicValueEnum<'ctx>>> = args
                     .iter()

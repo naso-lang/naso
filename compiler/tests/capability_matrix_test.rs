@@ -241,6 +241,12 @@ fn matrix() -> Vec<Row> {
             llvm: Outcome::Refused,
             note: "",
         },
+        Row {
+            construct: "`entangle`",
+            src: "fn f() { let [1] a: Qubit = qalloc(1); let [1] b: Qubit = qalloc(1); let e = entangle(a, b); let _ = e; }",
+            llvm: Outcome::Refused,
+            note: "NO LLVM INTRINSIC. The QIR base profile declares none, and approximating it by a CNOT over the first two qubits would leave any further qubit unentangled while looking correct in the emitted text. `entangle` over fewer than two qubits is refused by the typechecker instead: its result type is a `QRegister` of dimension = arity, so `entangle()` inferred a zero-dimensional register and typechecked while asserting nothing <!-- construct:entangle -->",
+        },
     ]
 }
 

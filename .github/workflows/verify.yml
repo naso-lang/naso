@@ -242,6 +242,11 @@ jobs:
       - name: Test the early-exit domain transformation
         run: cargo test --features llvm --test early_exit_domain_test
 
+      # `entangle` must be refused rather than emitted as a dangling `qir.entangle` call that
+      # fails at link time with a symbol the user never wrote.
+      - name: Refuse unimplementable quantum operations
+        run: cargo test --features llvm --test entangle_refusal_test
+
       # The compiler's emitted QIR, checked NUMERICALLY against hand-derived states.
       #
       # Needs `--features llvm` because the suite runs the real `naso` binary and parses what

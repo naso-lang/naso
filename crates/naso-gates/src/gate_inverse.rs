@@ -5,7 +5,7 @@
 //! The obvious implementation of "inverse of a gate" is to assert that every gate is its own
 //! inverse. That is false. `X`, `Y`, `Z`, `H`, `CX`, `CZ`, and `Toffoli` are self-inverse;
 //! `S`, `T`, `RX`, `RY`, and `RZ` are not, and each needs a distinct inverse. An earlier
-//! version of the QIR classifier mapped `S`-dagger to `S`, which is exactly the bug this
+//! version of a QIR gate table mapped `S`-dagger to `S`, which is exactly the bug this
 //! table exists to make unrepresentable.
 //!
 //! # What "verified" means here

@@ -152,13 +152,26 @@ fn the_refusal_names_uncomputation_not_an_unrelated_construct() {
 
 /// The reason `reversible` stays refused must stay TRUE, not merely asserted.
 ///
-/// `reversible_lowering.rs` contains a plausible-looking inverse generator: 831 lines
-/// with 12 passing unit tests. It is tempting to wire it up. This test fails the moment
-/// any of the three blockers it documents is resolved, so the day real uncomputation
-/// becomes possible, whoever does it is told to update the refusal and the matrix
-/// together rather than leaving a stale "cannot" in place.
+/// `reversible_lowering.rs` contains an inverse generator with passing unit tests. It is
+/// tempting to wire it up. This test fails the moment any of the blockers it documents is
+/// resolved, so the day real uncomputation becomes possible, whoever does it is told to
+/// update the refusal and the matrix together rather than leaving a stale "cannot" in place.
 ///
-/// The three blockers, asserted individually:
+/// # What the audit found, which changed what this file asserts
+///
+/// The module was audited rather than trusted. Six of its generators FABRICATED an inverse
+/// instead of failing, each with a passing test: `S†`/`RX†`/`UNKNOWN` (names no backend can
+/// resolve), `unmeasure` with an invented `IntLit(0)` qubit operand, `unrng`, a wrong
+/// `Mul -> Div`, `discard`, and `affine_inverse`. A seventh defect sat in the verification:
+/// `verify_ancilla_zeroing` tested a struct field that is never assigned, so the predicate
+/// was a constant.
+///
+/// All six fabrications and the broken predicate are now fixed, and each fix has a test
+/// above. So the module is more honest than it was -- and STILL not wireable, on the
+/// structural blockers below. That distinction is the point: the blockers are what keep it
+/// refused, and they are unchanged.
+///
+/// The four blockers, asserted individually:
 ///
 /// 1. `PirModule` has one `schedule` field and no inverse carrier.
 /// 2. `ScheduleNode` has no field that can hold a `PirExpr`, so an inverse tree built
@@ -250,60 +263,204 @@ fn the_documented_blockers_to_wiring_reversible_are_still_real() {
          grep -rn 'DualStream::' --include=*.rs compiler/src/ crates/"
     );
 
-    // And confirm the classifier does not quietly claim S-dagger is S.
+    // The S-dagger defect: no SECOND gate-name table may exist, anywhere in the QIR
+    // backend.
     //
-    // `classifier.rs` mapped "sdg" onto the same intrinsic as "s", with a comment saying it
-    // "uses same intrinsic with different args". S-dagger is the ADJOINT of S: S sends
-    // |1> to i|1>, S-dagger to -i|1>. Every downstream amplitude differs. The file is
-    // undeclared and inert, so nothing was wrong today -- but an inverse table built from
-    // that mapping would compute wrong inverses, silently. FIXED, and asserted here so it
-    // cannot come back.
-    let classifier = include_str!("../src/codegen/qir/classifier.rs");
-    assert!(
-        !classifier.contains("\"sdg\" => \"qir.s\","),
-        "classifier.rs maps sdg onto qir.s. S-dagger is the ADJOINT of S, not S with \
-         different arguments; applying S where S-dagger was written computes a different \
-         state."
-    );
-    assert!(
-        classifier.contains("\"sdg\" => \"qir.s__adj\""),
-        "sdg must map to the adjoint entry point qir.s__adj."
-    );
-    assert!(
-        classifier.contains("\"tdg\" => \"qir.t__adj\""),
-        "tdg must map to the adjoint entry point qir.t__adj."
-    );
+    // `qir/classifier.rs` used to hold a 61-arm duplicate of the live table in
+    // `qir/module_builder.rs`, reachable from nothing but its own `mod tests`. Two copies
+    // of a gate table do not fail to build when they disagree -- they emit a wrong or
+    // nonexistent intrinsic. The duplicate is now DELETED, and the property that motivated
+    // deleting it is asserted live, in
+    // `codegen::qir::module_builder::tests::every_resolved_intrinsic_is_a_declared_one_and_unknown_ops_are_refused`,
+    // which walks the real mapping and checks every name resolves to a DECLARED entry
+    // point.
+    //
+    // That live test is strictly stronger than the string checks it replaces, and it
+    // catches what those checks blessed: the deleted classifier mapped `sdg` to
+    // `qir.s__adj`, which is correct as quantum and broken as code -- `qir.s__adj` is not in
+    // the QIR base profile and is not in `QIR_INTRINSICS`, so it named a symbol no runtime
+    // defines. The assertions below used to REQUIRE that mapping. `sdg` is now correctly
+    // REFUSED (no base-profile entry point, and no angle-taking intrinsic to express it
+    // as), and asserting a fabricated name survives here would be asserting a bug.
+    //
+    // The classifier's tests asserted its own arms, which is how a table with no caller
+    // keeps 682 lines looking healthy. What must not come back is a second table, and the
+    // live test is what holds that line.
+    let qir_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/codegen/qir");
+    for entry in std::fs::read_dir(&qir_dir).expect("the QIR backend source directory") {
+        let path = entry.expect("a directory entry").path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        assert!(
+            name != "classifier.rs" && name != "ancilla_emission.rs",
+            "`src/codegen/qir/{name}` is back. It was deleted because it was a 682-line \
+             scaffold with no `mod` declaration, reachable only from itself -- including a \
+             SECOND gate-name table that would drift from the live one. Before adding any \
+             QIR module, wire it into `qir/mod.rs` so it is compiled, or do not add it."
+        );
+    }
 
-    // A fabricated default is the same defect wearing a different hat: an unrecognised
-    // gate used to resolve to "qir.h", so a MIS-SPELLED gate name compiled and applied a
-    // Hadamard. Every default arm must now be a sentinel that callers can refuse on, and
-    // no arm may resolve a gate to Hadamard by default.
+    // A fabricated default is the same defect wearing a different hat: the live mapping
+    // used to resolve every unknown gate to "qir.h", so a MIS-SPELLED gate name compiled
+    // and applied a Hadamard. It returns `None` now, which the caller turns into a
+    // refusal. Asserted on the LIVE source, since this is the table that matters.
+    let live_map = include_str!("../src/codegen/qir/module_builder.rs");
     assert!(
-        !classifier.contains("_ => \"qir.h\""),
-        "an unknown gate must not resolve to qir.h. A mis-spelled gate name would compile \
-         and apply a Hadamard -- a specific wrong answer instead of a refusal."
+        live_map.contains("_ => return None"),
+        "the live intrinsic mapping must keep its `None` default arm, which is what turns an \
+         unrecognised operation into a refusal."
     );
     assert!(
-        !classifier.contains("NonReversible => \"qir.h\""),
-        "a non-reversible operation must not resolve to qir.h either."
+        !live_map.contains("\"_ => \"qir.h\""),
+        "the live intrinsic mapping must not resolve an unknown operation to qir.h. A \
+         mis-spelled gate name would compile and apply a Hadamard -- a specific wrong \
+         answer instead of a refusal."
     );
 }
 
-/// The gate-inverse table exists and is verified, and NO PRODUCER USES IT YET.
+/// The six fabricated callees must never come back.
+///
+/// This is the audit's regression guard, and it is deliberately a check on the SOURCE
+/// rather than on behaviour.
+///
+/// The six names below were emitted by `reversible_lowering.rs` as if they were functions.
+/// None of them exists anywhere in this repository: no lexer token, no `PirExpr` variant,
+/// no backend intrinsic. Each had a passing unit test that asserted the module produced
+/// exactly that call. So a behavioural test alone would not have caught them -- the module
+/// was consistent with itself and inconsistent with everything else.
+///
+/// Asserted on the source because that is the property: not "this call is refused today" but
+/// "no inverse generator may emit a callee that nothing can resolve". A gate name is
+/// different -- those ARE real, and `GateKind`'s `Display` is their source -- so the two are
+/// distinguished by where the name comes from, not by whether it looks like a gate.
+#[test]
+fn no_inverse_generator_emits_a_call_to_a_function_that_does_not_exist() {
+    let src = include_str!("../src/lowering/reversible_lowering.rs");
+
+    // And the inverse must not invent a quantum operand either. The measurement path used to
+    // fall back to `PirExpr::IntLit(0)` for the qubit, which is an integer standing in for a
+    // quantum pointer: a fabrication that does not fail, it produces valid-looking PIR.
+    let code = strip_rust_comments(src);
+    assert!(
+        !code.contains(".unwrap_or(PirExpr::IntLit(0))"),
+        "an inverse path is defaulting a missing qubit operand to the literal 0. A quantum \
+         operand that was never supplied must be an error; inventing one produces a circuit \
+         acting on a value that does not exist."
+    );
+
+    for fabricated in [
+        "unmeasure",
+        "unrng",
+        "affine_inverse",
+        "discard",
+        "UNKNOWN",
+        "\u{2020}", // the dagger the old hand-written adjoint table emitted: "S\u{2020}"
+    ] {
+        // The name MAY appear in a doc comment -- each of these is named in the comment
+        // recording what it replaced, and that is the point of writing it down. So the
+        // source is stripped of comments before the check. Otherwise this test would fail
+        // on the very documentation that explains the defect, and the fix would be to
+        // delete the explanation rather than the fabrication.
+        //
+        // What must not survive is an emitted call in CODE: the `name: "..."` form inside a
+        // `PirExpr::Call`.
+        let emitted_call = format!("name: \"{fabricated}\"");
+        assert!(
+            !code.contains(&emitted_call),
+            "`reversible_lowering.rs` builds a `PirExpr::Call` named `{fabricated}`. That is \
+             one of the six fabrications the audit removed: it is not a function anywhere in \
+             this repository, so the call names a callee that cannot resolve. Refuse instead \
+             -- see the doc comment on the generator for why each one was wrong."
+        );
+    }
+}
+
+/// Rust source with its line and block comments removed.
+///
+/// Needed because the property under test is "no CODE builds a call to a function that does
+/// not exist", and the doc comments naming each removed fabrication are exactly the text
+/// that must be allowed to contain those names. Checking the raw source would make the
+/// documentation of a defect into a second offence.
+///
+/// Not a Rust parser, and does not need to be: a line whose first non-space characters are
+/// `//`, or a `/* ... */` span, is a comment for this purpose. A `//` inside a string
+/// literal would also be stripped, which can only make the check stricter, never laxer --
+/// stripping more text can only remove matches, never add them.
+fn strip_rust_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut in_block = false;
+    for line in src.lines() {
+        let trimmed = line.trim_start();
+        if in_block {
+            if let Some(end) = line.find("*/") {
+                in_block = false;
+                out.push_str(&line[end + 2..]);
+            }
+            continue;
+        }
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        if let Some(idx) = line.find("/*") {
+            in_block = !line[idx..].contains("*/");
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// The adjoint table has exactly one definition, and the lowering consumes that one.
+///
+/// This is the fix for the largest of the six fabrications, asserted as a single-table
+/// invariant. `generate_quantum_adjoint` used to carry its own hand-written relation
+/// (`"S"` -> `"S\u{2020}"`). Two copies of an adjoint table do not fail to build when they
+/// disagree -- they quietly compute wrong inverses, which is the exact failure
+/// `naso-gates/src/gate_inverse.rs` was written to make unrepresentable.
+#[test]
+fn the_inverse_generator_uses_the_single_verified_table_and_defines_no_second_one() {
+    let src = include_str!("../src/lowering/reversible_lowering.rs");
+
+    assert!(
+        src.contains("naso_gates::gate_inverse::inverse_of"),
+        "`generate_quantum_adjoint` must take its adjoint relation from the verified table in \
+         naso-gates, not from a hand-written match."
+    );
+
+    // A second definition of the relation is the thing to forbid. `use` of the single table
+    // is the fix; a local `fn inverse_of` or a second `match gate {` building it is the bug.
+    assert!(
+        !src.contains("fn inverse_of"),
+        "a second gate-to-inverse definition has appeared in lowering. There must be ONE, in \
+         naso-gates; two copies drift, and they drift silently in exactly the direction that \
+         computes a wrong inverse."
+    );
+    assert!(
+        !src.contains("adjoint_gate"),
+        "`adjoint_gate` is the hand-written table this replaced. The inverse name comes from \
+         the verified table now, so there is no local name to bind."
+    );
+}
+
+/// The gate-inverse table exists, is verified, and now HAS ONE PRODUCER.
 ///
 /// Step 4 of the reversible work built `naso_verify::gate_inverse::inverse_of`, checked
 /// numerically against a CPU state-vector simulator: every gate composed with its table
 /// entry returns the original state, and the historical `S`-dagger defect is asserted
 /// impossible.
 ///
-/// The remaining blocker is narrower than it was and is stated here so it is not lost: no
-/// lowering pass constructs an inverse operation from this table. `reversible` stays refused
-/// because the inverse representation cannot yet be EMITTED by a backend, not because the
-/// inverse is unknown. Wiring the table into a producer without also giving
-/// `ScheduleTree` and the LLVM backend a way to carry an inverse `PirExpr` would reintroduce
-/// exactly the drop-the-inverse defect that was fixed earlier.
+/// This assertion used to read that NOTHING in the compiler consumes it. That is now
+/// deliberately no longer true: the audit found `generate_quantum_adjoint` computing its own
+/// hand-written relation instead, and pointing it at the verified table is the fix for the
+/// largest of the six fabrications. One producer, reading the one table.
+///
+/// What has NOT changed is why `reversible` stays refused, and this is the assertion that
+/// says so. Consuming the table is not EMITTING an inverse: the `PirExpr` the generator
+/// returns still has nowhere to be stored, so `ScheduleTree` and the LLVM emitter would
+/// still drop it. Wiring the table into a producer without also giving those a way to carry
+/// an inverse `PirExpr` would reintroduce exactly the drop-the-inverse defect that was fixed
+/// earlier. The refusal stands on the structural blockers above, and those are unchanged.
 #[test]
-fn the_gate_inverse_table_has_a_verified_entry_for_every_gate_but_no_producer() {
+fn the_gate_inverse_table_has_a_verified_entry_for_every_gate_and_one_producer() {
     let table = include_str!("../../crates/naso-gates/src/gate_inverse.rs");
     assert!(
         table.contains("pub fn inverse_of"),
@@ -358,14 +515,19 @@ fn the_gate_inverse_table_has_a_verified_entry_for_every_gate_but_no_producer() 
          different state."
     );
 
-    // And confirm nothing in the COMPILER consumes it yet. This is the honest state of the
-    // work: infrastructure without a caller is not a feature, and treating it as one would
-    // repeat the dual_stream failure.
+    // And the CALL SITE still does not. `reversible_lowering.rs` consumes the table to
+    // COMPUTE an inverse, but `mod.rs` -- the place that would actually invoke the pass --
+    // still contains no reference to it, which is what keeps `reversible` refused.
+    //
+    // This is the assertion that would fire if someone wired it up, and it is here to make
+    // that a deliberate act rather than an accident. The message names the condition that
+    // must be met first, because reaching this line does NOT mean the work is done.
     let lowering = include_str!("../src/lowering/mod.rs");
     assert!(
         !lowering.contains("gate_inverse") && !lowering.contains("inverse_of"),
-        "lowering now references the gate-inverse table. That is progress, and it is only \
-         correct if the emitted inverse survives every backend: check that ScheduleTree and \
-         the LLVM emitter carry an inverse PirExpr rather than dropping it."
+        "lowering/mod.rs now references the gate-inverse table. That is progress, and it is \
+         only correct if the emitted inverse survives every backend: check that ScheduleTree \
+         and the LLVM emitter carry an inverse PirExpr rather than dropping it. Until a \
+         forward AND an inverse circuit BOTH execute natively, `reversible` stays refused."
     );
 }

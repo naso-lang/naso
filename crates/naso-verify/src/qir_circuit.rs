@@ -64,7 +64,7 @@ impl std::fmt::Display for ParseError {
 /// Map a QIR intrinsic name onto a gate in the shared table.
 ///
 /// An unmapped name is an ERROR, not a fallback. Defaulting to Hadamard -- which the QIR
-/// classifier once did -- would turn a typo into a working-looking circuit that applies the
+/// a deleted QIR gate table once did -- would turn a typo into a working-looking circuit that applies the
 /// wrong unitary, and a numerical check built on such a parse would be checking the parser's
 /// guess rather than the compiler's output.
 fn gate_for(intrinsic: &str) -> Option<Gate> {

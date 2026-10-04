@@ -360,9 +360,9 @@ fn the_backend_refuses_a_reversible_that_arrives_as_pir() {
 ///
 /// QIR had the identical defect: it ran `body` and dropped `inverse`, justified
 /// by the comment "The inverse would be handled by quantum compiler". Nothing
-/// handled it. `ancilla_emission.rs` does read `inverse`, but that file is not
-/// declared in `qir/mod.rs`, so it is not compiled at all -- the comment
-/// described work that does not exist.
+/// handled it. (`ancilla_emission.rs` was the file this comment pointed at, but it had
+/// no `mod` declaration in `qir/mod.rs`, so it was never compiled and never read
+/// anything. It has been deleted, not wired.)
 ///
 /// This is the more damaging half of the bug in a QIR backend. QIR's contract is
 /// that the emitted circuit is reversible; a `Reversible` with no adjoint emits

@@ -54,11 +54,11 @@ fn qir_intrinsic_returns_qubit(op: &str) -> bool {
 /// # Why `None` rather than a guess
 ///
 /// An unmapped operation returns `None`, which the caller turns into a refusal. Falling back
-/// to `qir.h` -- which the QIR classifier once did -- would turn a mis-spelled or
+/// to `qir.h` -- which a former, deleted QIR gate table once did -- would turn a mis-spelled or
 /// not-yet-supported operation into a Hadamard: working code applying the wrong unitary.
 fn qir_intrinsic_for(op: &str) -> Option<&'static str> {
     // Lowering names a gate the way `GateKind`'s `Display` spells it -- "H", "CX" -- while
-    // hand-built PIR, the QIR classifier and the hardware exporters use the lowercase
+    // hand-built PIR and the hardware exporters use the lowercase
     // intrinsic-style name -- "h", "cx". Both spellings name the same operation, so both are
     // accepted here. Normalising on case rather than duplicating every arm keeps the mapping
     // to one line per operation, so a gate cannot be added to one spelling and forgotten in
@@ -751,9 +751,11 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
             // build the body / The inverse would be handled by quantum compiler".
             //
             // There is no quantum compiler doing that. Nothing else in this backend
-            // reads `inverse`: `ancilla_emission.rs` does, but that file is not
-            // declared in `qir/mod.rs`, so it is not even compiled. The comment
-            // described work that does not exist.
+            // reads `inverse`. The comment described work that does not exist.
+            //
+            // (`ancilla_emission.rs` used to be named here as the exception. It was a
+            // 682-line scaffold with no `mod` declaration in `qir/mod.rs`, so it was never
+            // compiled and never read anything. It has been deleted rather than wired.)
             //
             // For a QIR program this is the worst place to be wrong. QIR's entire
             // contract is that the emitted circuit is reversible, and a `Reversible`
@@ -1075,6 +1077,109 @@ mod tests {
             .module()
             .verify()
             .unwrap_or_else(|e| panic!("LLVM rejected the module: {e}\n{ir}"));
+    }
+
+    /// Every operation `qir_intrinsic_for` resolves MUST name a declared intrinsic.
+    ///
+    /// # Why this is the invariant, not "there is one gate table"
+    ///
+    /// This backend used to carry a second, undeclared gate-name table in
+    /// `qir/classifier.rs` -- a full duplicate of the one above, with its own arms. Two
+    /// copies of an intrinsic map do not fail to build when they disagree, they emit a
+    /// call to a symbol that does not exist, or silently apply the wrong unitary. That
+    /// file is now deleted, and this test is what keeps the property that motivated its
+    /// deletion: a name reaching `call_intrinsic` has to be a real, declared entry point.
+    ///
+    /// The deleted classifier mapped `sdg` to `qir.s__adj` "because S-dagger is the
+    /// adjoint of S". That name is not in the QIR base profile and is not in
+    /// `QIR_INTRINSICS` at all, so that mapping was correct as quantum and broken as code:
+    /// it passed the string checks written about it and named a symbol no runtime has.
+    /// `sdg` is correctly REFUSED here instead, via the `_ => return None` arm, because
+    /// the base profile declares no S-dagger entry point and there is no angle-taking
+    /// intrinsic to express one as.
+    ///
+    /// Enumerated as DATA rather than by scanning source text: a source scan cannot
+    /// enumerate the arms, so it cannot cover a table that grows.
+    #[test]
+    fn every_resolved_intrinsic_is_a_declared_one_and_unknown_ops_are_refused() {
+        // Every operation the lowering can name. `reset` and `entangle` are excluded
+        // because they resolve to None on purpose, and are asserted separately below.
+        let ops = [
+            "qalloc",
+            "qfree",
+            "h",
+            "hadamard",
+            "x",
+            "pauli_x",
+            "y",
+            "pauli_y",
+            "z",
+            "pauli_z",
+            "s",
+            "t",
+            "rx",
+            "ry",
+            "rz",
+            "cx",
+            "cnot",
+            "cy",
+            "cz",
+            "measure",
+            "mz",
+            "mx",
+            "my",
+            "phase",
+            "swap",
+            "iswap",
+            "ccx",
+            "toffoli",
+            "controlled",
+            "adjoint",
+        ];
+
+        for op in ops {
+            let resolved = qir_intrinsic_for(op)
+                .unwrap_or_else(|| panic!("`{op}` is lowered but resolves to no intrinsic"));
+            assert!(
+                QIR_INTRINSICS.iter().any(|i| i.name == resolved),
+                "`{op}` resolves to `{resolved}`, which is not in QIR_INTRINSICS. The call \
+                 would name a symbol no runtime defines. Either declare it in `primitives.rs` \
+                 or refuse the operation -- never resolve to a name that does not exist."
+            );
+        }
+
+        // The two refusals, asserted individually. `entangle` approximated by a CNOT and
+        // `reset` approximated by a release both compile into a circuit computing
+        // something else, which is the fabrication class this mapping must not have.
+        assert_eq!(
+            qir_intrinsic_for("reset"),
+            None,
+            "`reset(q)` returns the qubit to |0> IN PLACE. A release hands the qubit away, \
+             which is not what reset means."
+        );
+        assert_eq!(
+            qir_intrinsic_for("entangle"),
+            None,
+            "`entangle` has no single-intrinsic implementation; a CNOT would be a different \
+             operation."
+        );
+
+        // No fallback: an operation with no intrinsic is refused, never defaulted. A
+        // default of `qir.h` is what turned a mis-spelled gate name into working code
+        // applying a Hadamard.
+        //
+        // `sdg` and `tdg` are in this list deliberately. They are real, correct quantum
+        // operations with no base-profile entry point, and QIR's answer for them is a
+        // Z rotation by a sign-dependent angle -- which is exactly the rotation this
+        // backend refuses to emit, because it has no angle to supply. Refusing is the
+        // honest result; mapping them onto `s`/`t` would apply the wrong phase.
+        for op in ["sdg", "tdg", "", "not_a_gate", "H2", "ccz", "ryz"] {
+            assert_eq!(
+                qir_intrinsic_for(op),
+                None,
+                "`{op}` has no intrinsic and must be refused, not resolved to something"
+            );
+        }
     }
 
     /// A module whose function DECLARES a return type is refused, naming it.

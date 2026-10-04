@@ -168,7 +168,15 @@ because the ABI is defined in terms of those bindings.
 Stated precisely, because the distinction matters:
 
 - WGSL is checked with `naga`. `naga` validation is **not** GPU execution.
-- QIR emission is structural. It is **not** quantum execution.
+- QIR emission is structural. It is **not** quantum execution. The native
+  `.naso` -> LLVM IR -> `llc` -> `cc` -> run pipeline executes the four prelude builtins
+  (`qalloc`, `hadamard`, `cnot`, `measure`) against `libnaso_gates.a`; nothing beyond
+  those four is reachable from source.
+- `sdg` / `tdg` are refused by the QIR backend. They are real, correct quantum operations,
+  but the QIR base profile declares no entry point for them and expresses them instead as a
+  Z rotation by a sign-dependent angle — which is the rotation this backend already refuses,
+  because it has no angle to supply. Mapping them onto `s`/`t` would apply the wrong phase,
+  which is the historical defect the gate-inverse table exists to prevent.
 - Float proof obligations are reported as warnings, not discharged mathematical-real
   proofs.
 - Pointer ABI guards validate the supplied lengths. They cannot prove non-nullness,
@@ -179,8 +187,20 @@ Stated precisely, because the distinction matters:
 Kept deliberately, and refused rather than approximated:
 
 - `reversible { ... }` uncomputation. `compiler/src/lowering/reversible_lowering.rs`
-  contains an inverse generator that nothing calls; it is unwired and unverified, and its
-  measurement path fabricates a qubit operand.
+  contains an inverse generator that nothing calls. It is audited, not trusted: six of its
+  seven generators used to fabricate an inverse rather than fail — `S†`/`RX†`/`UNKNOWN`
+  (callee names no backend can resolve), `unmeasure` with a qubit operand invented as the
+  literal `0`, `unrng`, a wrong `Mul -> Div` mapping, `discard`, and `affine_inverse` — and
+  its ancilla check tested a struct field that is never assigned, so the predicate was a
+  constant. All seven are fixed; the gate adjoint now comes from the single numerically
+  verified table in `naso-gates`, and the rest refuse with a diagnostic naming the missing
+  capability. It is **still refused**, on four structural blockers that are unchanged:
+  `PirModule` has no field to carry an inverse, `ScheduleNode` cannot hold a `PirExpr`, no
+  backend reads an inverse tree, and the `PirExpr` the generator returns still has nowhere
+  to be stored. A compiled circuit now executes natively, so "a forward and an inverse
+  circuit both execute" is a test that can be written — it has not been, and until it is,
+  wiring this up would emit the forward pass alone, which is the defect the construct was
+  fixed for.
 - `break` / `continue` inside affine `forall` bands. The iteration-domain transformation for
   a constant-prefix guard is implemented and tested in `ir::early_exit`, but no backend emits
   the shortened band yet, and a guard on runtime data has no affine form. A `while` loop

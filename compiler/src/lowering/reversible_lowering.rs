@@ -23,9 +23,36 @@
 //! statement-position `reversible` path in `mod.rs` refuses instead, which is correct:
 //! see `tests/reversible_refusal_test.rs`.
 //!
-//! ## Why it is not simply wired up
+//! ## What the audit found (this section is new; read it before deciding anything)
 //!
-//! Investigated before deciding. Three independent blockers, any one of which is fatal:
+//! An earlier version of this banner listed three blockers, all of them structural, and
+//! left the impression that the module was otherwise sound. It was not. Six of its inverse
+//! generators FABRICATED an inverse rather than failing, and every one of them had a
+//! passing unit test:
+//!
+//! | Generator | What it emitted | Why that is a fabrication |
+//! |---|---|---|
+//! | `generate_quantum_adjoint` | `Call "S†"`, `Call "RX†"`, `Call "UNKNOWN"` | Names no backend can resolve, and a hand-written relation that could drift from the verified one. Now uses `naso_gates::gate_inverse::inverse_of`, and refuses an unrecognised gate. |
+//! | `generate_measurement_uncompute` | `Call "unmeasure"` with operand `IntLit(0)` | `unmeasure` is not a function, and on the no-argument branch the qubit operand was INVENTED -- an integer standing in for a quantum pointer. Now refused. |
+//! | `generate_rng_uncompute` | `Call "unrng"` | Not a function, and it takes no arguments, so it could not recover the entropy it claimed to uncompute. Now refused. |
+//! | `generate_arithmetic_inverse` | `Mul -> Div`, `Div -> Mul`, `_ -> Add` | `Mul -> Div` computes a DIFFERENT NUMBER instead of undoing one, and the default arm gave every comparison an "inverse" that was an addition. Now refused. |
+//! | `generate_assignment_inverse` | `Call "discard"` | Not a function, and "just discard a `[1]` binding" is the soundness hole this language exists to prevent. Now refused. |
+//! | `generate_affine_inverse` | `Call "affine_inverse"` | Ignored its own argument, called a function that does not exist, and claimed to invert a map that is not in general invertible. Now refused. |
+//!
+//! A seventh defect was in the VERIFICATION rather than the inverses:
+//! `verify_ancilla_zeroing` tested `DAGNode::inverse_op`, a field initialised to `None` at
+//! both construction sites and never assigned anywhere -- the inverses live in a separate
+//! map. The predicate was therefore a constant, and the "check" refused every quantum
+//! ancilla while claiming to verify one. It now consults the map that actually holds them.
+//!
+//! The lesson is the one this repository keeps relearning: a module whose tests exercise
+//! only its own output is measuring itself. Twelve tests passed while the module emitted six
+//! calls to functions that do not exist.
+//!
+//! ## Why it is still not wired up
+//!
+//! The fabrications are gone. The structural blockers are untouched, and any one of them is
+//! still fatal:
 //!
 //! 1. **The result has nowhere to go.** `PirModule` carries `statements: Vec<PirStatement>`
 //!    and ONE `schedule: ScheduleTree`. This module returns a *pair* of trees
@@ -43,6 +70,18 @@
 //! 3. **No backend reads an inverse tree.** Grepping the codegen tree for one returns
 //!    nothing outside this file's own tests. LLVM, QIR and WGSL each walk
 //!    `statements` in order.
+//! 4. **The adjoint table has no producer, and no carrier.** `naso_gates::gate_inverse`
+//!    is verified numerically, and `generate_quantum_adjoint` now consumes it -- but the
+//!    `PirExpr` it returns still has nowhere to be stored. Fixing the fabrications made
+//!    this module honest; it did not make it complete.
+//!
+//! ## The runtime now makes the goal testable, and that is the bar
+//!
+//! A compiled Naso circuit executes natively (`.naso` -> LLVM IR -> `llc` -> `cc` -> run,
+//! linked against `libnaso_gates.a`). So "both a forward AND an inverse circuit execute" is
+//! no longer hypothetical: it is a test that can be written and run. Until one is,
+//! `reversible` stays refused. A pass that lowers and refuses to emit is not a partial
+//! `reversible`; it is the defect this construct was fixed for, one layer down.
 //!
 //! ## The trap to avoid
 //!
@@ -109,8 +148,6 @@ struct DAGNode {
     is_zero_qty: bool,
     /// Whether this temp is an ancilla qubit
     is_ancilla: bool,
-    /// Inverse operation to uncompute this temp (if invertible)
-    inverse_op: Option<InverseOperation>,
     /// Dependencies: temps that must be uncomputed before this one
     dependencies: Vec<String>,
 }
@@ -224,7 +261,6 @@ impl DataflowDAG {
                     uses: Vec::new(),
                     is_zero_qty: is_zero,
                     is_ancilla,
-                    inverse_op: None,
                     dependencies: Vec::new(),
                 };
                 self.nodes.insert(name.clone(), node);
@@ -242,7 +278,6 @@ impl DataflowDAG {
                         uses: Vec::new(),
                         is_zero_qty: false,
                         is_ancilla: true,
-                        inverse_op: None,
                         dependencies: Vec::new(),
                     };
                     self.nodes.insert(var.clone(), node);
@@ -462,10 +497,10 @@ fn generate_inverse_operations(
             PirExpr::Let { name: _, value, .. } => {
                 generate_assignment_inverse(value.as_ref(), node.def_stmt)?
             }
-            _ => {
-                // Default: try affine map inversion for affine ops
-                generate_affine_inverse(&def_expr, node.def_stmt)?
-            }
+            // No rule, so no inverse. This arm used to read "try affine map
+            // inversion", which described a function that extracted nothing and called a
+            // callee that does not exist.
+            _ => generate_affine_inverse(&def_expr, node.def_stmt)?,
         };
 
         // Update the node with inverse op
@@ -505,49 +540,132 @@ fn is_rng(name: &str) -> bool {
     matches!(name, "rng" | "random" | "rand")
 }
 
-/// Generate adjoint for quantum gate
+/// Generate the adjoint of a quantum gate, from the ONE VERIFIED table.
+///
+/// # Why this consults `naso_gates::gate_inverse::inverse_of`
+///
+/// It used to hand-write the relation, mapping `"S"` to the string `"S\u{2020}"` and
+/// `"RX"` to `"RX\u{2020}"`. Neither is a name anything can lower or emit: `PirExpr::Call`
+/// with name `"S\u{2020}"` reaches no backend, and the QIR mapping has no arm for it either,
+/// so it would have been refused downstream -- or worse, defaulted to something. The table's
+/// OWN doc comment names this exact hazard ("an earlier version of the QIR classifier mapped
+/// S-dagger to S").
+///
+/// `naso_gates::gate_inverse::inverse_of` is verified numerically on a CPU state vector:
+/// every gate composed with its table entry returns the original state. That is the
+/// relation. There is exactly one of it in the tree, so a second copy here cannot drift
+/// from it -- which is the failure a duplicate adjoint table does NOT announce, it just
+/// quietly computes wrong inverses.
+///
+/// # Why an unrecognised gate is REFUSED
+///
+/// The old code mapped every unknown gate to `"UNKNOWN"` and returned `Ok`. That is a
+/// fabrication with no caller to reject it: the call emitted a callee named `UNKNOWN`,
+/// which is not a gate, not a function, and not an error. A name this function cannot
+/// invert has no inverse here, and saying so is the only honest answer.
+///
+/// # Why the adjoint is only computed for a gate this module can recognise
+///
+/// `GateKind`'s `Display` spells gates `"H"`, `"CX"`, `"RX"`. A `Custom(ident)` gate has
+/// no matrix and therefore no adjoint that can be computed without running the user
+/// function's transpose, so it is refused rather than assumed self-inverse. Assuming
+/// self-inverse is precisely the claim that is false for `S`, `T` and every rotation.
+fn gate_by_name(name: &str) -> Option<naso_gates::statevector::Gate> {
+    use naso_gates::statevector::Gate;
+    Some(match name {
+        "H" => Gate::H,
+        "X" => Gate::X,
+        "Y" => Gate::Y,
+        "Z" => Gate::Z,
+        "S" => Gate::S,
+        "Sdg" => Gate::Sdg,
+        "T" => Gate::T,
+        "Tdg" => Gate::Tdg,
+        "CX" => Gate::Cx,
+        "CY" => Gate::Cy,
+        "CZ" => Gate::Cz,
+        "CCX" => Gate::Ccx,
+        "SWAP" => Gate::Swap,
+        // A rotation's adjoint is the negated rotation, which the verified table computes.
+        // The angle is carried by the enclosing `QuantumOp`, not by the name, so the
+        // angle-free variants here are only used for gates with no angle.
+        "RX" => Gate::Rx(0.0),
+        "RY" => Gate::Ry(0.0),
+        "RZ" => Gate::Rz(0.0),
+        _ => return None,
+    })
+}
+
+/// Generate the adjoint for a quantum gate.
+///
+/// The inverse NAME comes from the verified table. A rotation's angle is a real negation of
+/// the original expression, which is what makes `RZ(θ)`'s inverse `RZ(-θ)`; the table gives
+/// the identity and the negation gives the angle, and neither is guessed.
 fn generate_quantum_adjoint(
     gate: &str,
     args: &[PirExpr],
-    _stmt_id: StmtId,
+    stmt_id: StmtId,
 ) -> Result<InverseOperation, LoweringError> {
-    let adjoint_gate = match gate {
-        "H" => "H",    // Self-adjoint
-        "X" => "X",    // Self-adjoint
-        "Y" => "Y",    // Self-adjoint
-        "Z" => "Z",    // Self-adjoint
-        "S" => "S†",   // S† = S^3
-        "T" => "T†",   // T† = T^7
-        "CX" => "CX",  // Self-adjoint
-        "CY" => "CY",  // Self-adjoint
-        "CZ" => "CZ",  // Self-adjoint
-        "RX" => "RX†", // RX(θ)† = RX(-θ)
-        "RY" => "RY†", // RY(θ)† = RY(-θ)
-        "RZ" => "RZ†", // RZ(θ)† = RZ(-θ)
-        _ => "UNKNOWN",
+    use naso_gates::gate_inverse::inverse_of;
+    use naso_gates::statevector::Gate;
+
+    // An angle, if the gate has one, has to come from the arguments. The name alone does not
+    // carry it: `RX` and `RX(1.1)` lower to the same operation name.
+    let angle: Option<f64> = args.iter().find_map(|a| match a {
+        PirExpr::FloatLit(s) => s.parse::<f64>().ok(),
+        PirExpr::IntLit(i) => Some(*i as f64),
+        _ => None,
+    });
+
+    let forward = match (gate, angle) {
+        ("RX", Some(t)) => Gate::Rx(t),
+        ("RY", Some(t)) => Gate::Ry(t),
+        ("RZ", Some(t)) => Gate::Rz(t),
+        ("RX" | "RY" | "RZ", None) => {
+            return Err(LoweringError::Unsupported(format!(
+                "`{gate}` on statement {stmt_id:?} carries no angle, so its adjoint cannot be \
+                 computed: the inverse of a rotation by theta is a rotation by -theta, and \
+                 there is no theta here to negate. Emitting the un-negated angle would \
+                 compute Rz(theta) twice instead of undoing it."
+            )));
+        }
+        _ => gate_by_name(gate).ok_or_else(|| {
+            LoweringError::NonReversibleOp(format!(
+                "`{gate}` on statement {stmt_id:?} is not a gate with a known adjoint, so its \
+                 inverse is not computed here. Assuming it is self-inverse would be wrong for \
+                 every phase and rotation gate; guessing an inverse would be wrong in a way \
+                 nothing downstream could detect."
+            ))
+        })?,
     };
 
-    // Create inverse call with negated angles for rotation gates
-    let inv_args = args
-        .iter()
-        .map(|arg| match arg {
-            PirExpr::Call { name, args } if matches!(name.as_str(), "RX" | "RY" | "RZ") => {
-                if let Some(PirExpr::Var(angle)) = args.first() {
-                    PirExpr::Unary {
-                        op: crate::ir::UnaryOp::Neg,
-                        expr: Box::new(PirExpr::Var(angle.clone())),
-                    }
-                } else {
-                    arg.clone()
-                }
-            }
-            _ => arg.clone(),
-        })
-        .collect();
+    let inverse = inverse_of(forward);
+
+    // The emitted inverse is a name a backend can actually resolve. `S` maps back to `Sdg`,
+    // which is a real gate; it is NOT mapped to `S`, which is the original defect this table
+    // was written to make unrepresentable.
+    let (name, inv_args): (String, Vec<PirExpr>) = match inverse {
+        Gate::H => ("H".to_string(), args.to_vec()),
+        Gate::X => ("X".to_string(), args.to_vec()),
+        Gate::Y => ("Y".to_string(), args.to_vec()),
+        Gate::Z => ("Z".to_string(), args.to_vec()),
+        Gate::S => ("S".to_string(), args.to_vec()),
+        Gate::Sdg => ("Sdg".to_string(), args.to_vec()),
+        Gate::T => ("T".to_string(), args.to_vec()),
+        Gate::Tdg => ("Tdg".to_string(), args.to_vec()),
+        Gate::Cx => ("CX".to_string(), args.to_vec()),
+        Gate::Cy => ("CY".to_string(), args.to_vec()),
+        Gate::Cz => ("CZ".to_string(), args.to_vec()),
+        Gate::Ccx => ("CCX".to_string(), args.to_vec()),
+        Gate::Swap => ("SWAP".to_string(), args.to_vec()),
+        Gate::Rx(_) => ("RX".to_string(), negate_first_angle(args)),
+        Gate::Ry(_) => ("RY".to_string(), negate_first_angle(args)),
+        Gate::Rz(_) => ("RZ".to_string(), negate_first_angle(args)),
+    };
 
     Ok(InverseOperation {
         expr: PirExpr::Call {
-            name: adjoint_gate.to_string(),
+            name,
             args: inv_args,
         },
         schedule_map: None,
@@ -556,109 +674,196 @@ fn generate_quantum_adjoint(
     })
 }
 
-/// Generate uncompute for measurement (requires ancilla)
+/// Negate the angle argument of a rotation, keeping the qubit operands unchanged.
+///
+/// A rotation is `RZ(angle, qubit)`: the FIRST argument is the angle, the rest are qubits.
+/// Negating every argument would negate the qubit, which is a type error at best and a
+/// silently wrong circuit at worst.
+fn negate_first_angle(args: &[PirExpr]) -> Vec<PirExpr> {
+    let mut out: Vec<PirExpr> = args.to_vec();
+    if let Some(first) = args.first() {
+        out[0] = PirExpr::Unary {
+            op: crate::ir::UnaryOp::Neg,
+            expr: Box::new(first.clone()),
+        };
+    }
+    out
+}
+
+/// Measurement uncomputation. REFUSED, because the previous version fabricated it.
+///
+/// # The defect this replaces
+///
+/// It returned `Ok(InverseOperation { expr: Call { name: "unmeasure", args: vec![qubit] } })`,
+/// where `qubit` was `args.first().cloned().unwrap_or(PirExpr::IntLit(0))`. Two separate
+/// fabrications in three lines:
+///
+/// 1. **`unmeasure` is not a function.** It exists nowhere in this repository -- no lexer
+///    token, no `PirExpr` variant, no backend intrinsic. The emitted call named a callee
+///    that cannot resolve, so a measurement inside `reversible` would have produced PIR
+///    looking like it uncomputes and a module with no way to run it.
+/// 2. **The qubit operand was invented.** On the fallback branch -- which is the branch a
+///    measurement with no operand argument takes -- the "qubit" was the literal `0`. That is
+///    an integer standing in for a quantum pointer. It is not a fabrication that fails; it
+///    is one that produces valid-looking PIR.
+///
+/// # Why refusing is the correct answer and not a retreat
+///
+/// Measurement is not invertible. Uncomputing it requires a classically-controlled
+/// re-preparation: record the outcome, and on `|1>` apply X to return the qubit to `|0>`.
+/// That is a real algorithm, and its correct implementation needs an outcome register the
+/// current representation cannot carry -- see the module banner on `PirModule` having no
+/// inverse carrier. An ancilla does not fix this by being named: the module's previous
+/// response was to append the string `"measurement_ancilla"` to a list, which allocates
+/// nothing.
+///
+/// Claiming otherwise is worse than refusing. `unmeasure` is exactly the shape of the
+/// original defect this construct was fixed for -- a forward pass and no uncomputation,
+/// wearing the name of an uncomputation.
 fn generate_measurement_uncompute(
-    _name: &str,
-    args: &[PirExpr],
-    _stmt_id: StmtId,
-) -> Result<InverseOperation, LoweringError> {
-    // Measurement is not invertible - requires ancilla qubit to record outcome
-    // The uncompute would need to reverse the measurement basis
-    let qubit = args.first().cloned().unwrap_or(PirExpr::IntLit(0));
-
-    Ok(InverseOperation {
-        expr: PirExpr::Call {
-            name: "unmeasure".to_string(),
-            args: vec![qubit],
-        },
-        schedule_map: None,
-        is_adjoint: false,
-        required_ancilla: vec!["measurement_ancilla".to_string()],
-    })
-}
-
-/// Generate uncompute for RNG (requires ancilla to store entropy)
-fn generate_rng_uncompute(
-    _name: &str,
+    name: &str,
     _args: &[PirExpr],
-    _stmt_id: StmtId,
+    stmt_id: StmtId,
 ) -> Result<InverseOperation, LoweringError> {
-    // RNG is not invertible - requires ancilla to store random bits
-    Ok(InverseOperation {
-        expr: PirExpr::Call {
-            name: "unrng".to_string(),
-            args: vec![],
-        },
-        schedule_map: None,
-        is_adjoint: false,
-        required_ancilla: vec!["rng_ancilla".to_string()],
-    })
+    Err(LoweringError::NonReversibleOp(format!(
+        "`{name}` on statement {stmt_id:?} is a MEASUREMENT, and measurement is not \
+         invertible, so there is no adjoint to emit. Uncomputing it is not 'undoing' a call: \
+         it is a classically-controlled re-preparation, which needs the classical outcome to \
+         be carried to a conditional branch. The PIR has no inverse carrier for that, so \
+         this is refused rather than emitted as a call to a function that does not exist. \
+         Naming an ancilla does not supply the outcome register either."
+    )))
 }
 
-/// Generate inverse for arithmetic operations
+/// RNG uncomputation. REFUSED, because the previous version fabricated it.
+///
+/// It returned `Ok(InverseOperation { expr: Call { name: "unrng", args: vec![] } })`. As
+/// with `unmeasure`, `unrng` is not a function anywhere in this repository -- and it takes no
+/// arguments at all, so even if it existed it could not recover the entropy it was supposed
+/// to uncompute.
+///
+/// RNG is genuinely non-invertible: recovering a discarded random value is a search, not a
+/// computation. A `reversible` block containing one cannot be uncomputed, and the honest
+/// result is a refusal naming the cause.
+fn generate_rng_uncompute(
+    name: &str,
+    _args: &[PirExpr],
+    stmt_id: StmtId,
+) -> Result<InverseOperation, LoweringError> {
+    Err(LoweringError::NonReversibleOp(format!(
+        "`{name}` on statement {stmt_id:?} draws randomness, which cannot be uncomputed: \
+         recovering a discarded random value is a search, not a computation. No amount of \
+         ancilla makes it invertible, so this is refused rather than emitted as a call to an \
+         `unrng` function that does not exist."
+    )))
+}
+
+/// Arithmetic inversion. REFUSED, because the previous version computed a WRONG inverse.
+///
+/// # The defect this replaces
+///
+/// It mapped `Mul -> Div` and `Div -> Mul`, with the comment "This is simplified - real
+/// implementation would track which operand is the output". The mapping is not a
+/// simplification, it is wrong in both directions:
+///
+/// - `a * b` is inverted by **dividing the RESULT by the other operand**, not by rewriting
+///   `a * b` to `a / b`. The inverse of `x = a*b` is `x/b = a`, and the code emitted `a / b`,
+///   which is a different number.
+/// - `a / b` is not inverted by `a * b` under any reading. Recovering `b` from `a / b` needs
+///   division, and recovering `a` needs multiplication; which one is meant depends on which
+///   operand the statement actually binds, and the function was not told.
+///
+/// It also had a `_ => BinaryOp::Add` default, so `Less`, `And`, `Shl`, comparisons -- every
+/// non-arithmetic binary op -- silently got an "inverse" that was an addition.
+///
+/// # Why this is refused rather than fixed here
+///
+/// A correct implementation needs to know which operand the statement BINDS, and that is
+/// `find_def_expr`'s job, not this function's -- it is called with only the two operand
+/// expressions and the statement id. Inventing the missing information here would be the
+/// same fabrication in a new place. The refusal names the actual missing capability.
 fn generate_arithmetic_inverse(
     op: crate::ir::BinaryOp,
-    left: &PirExpr,
-    right: &PirExpr,
-    _stmt_id: StmtId,
+    _left: &PirExpr,
+    _right: &PirExpr,
+    stmt_id: StmtId,
 ) -> Result<InverseOperation, LoweringError> {
-    // For reversible arithmetic: a + b = c, inverse is c - b = a or c - a = b
-    // This is simplified - real implementation would track which operand is the output
-    let inv_op = match op {
-        crate::ir::BinaryOp::Add => crate::ir::BinaryOp::Sub,
-        crate::ir::BinaryOp::Sub => crate::ir::BinaryOp::Add,
-        crate::ir::BinaryOp::Mul => crate::ir::BinaryOp::Div,
-        crate::ir::BinaryOp::Div => crate::ir::BinaryOp::Mul,
-        crate::ir::BinaryOp::Xor => crate::ir::BinaryOp::Xor, // Self-inverse
-        _ => crate::ir::BinaryOp::Add,                        // Default
-    };
-
-    Ok(InverseOperation {
-        expr: PirExpr::Binary {
-            op: inv_op,
-            left: Box::new(left.clone()),
-            right: Box::new(right.clone()),
-        },
-        schedule_map: None,
-        is_adjoint: false,
-        required_ancilla: Vec::new(),
-    })
+    Err(LoweringError::Unsupported(format!(
+        "the arithmetic operator `{op:?}` on statement {stmt_id:?} is not uncomputed here. \
+         Its inverse is not a rewrite of the operator: the inverse of `x = a*b` is `x/b`, \
+         which needs to know WHICH OPERAND the statement binds, and the inverse of `x = a/b` \
+         is not `a*b` at all. This pass is not told which operand is the result, so it will \
+         not guess -- `Mul`/`Div` were previously mapped to each other, which computes a \
+         different number rather than undoing one."
+    )))
 }
 
-/// Generate inverse for assignment (reversible copy/uncompute)
+/// Assignment inversion. REFUSED, because the previous version emitted a call to `discard`.
+///
+/// `discard` is not a function in this repository. The previous version emitted
+/// `Call { name: "discard", args: vec![value] }` with the comment "For `let x = y`, inverse
+/// is just discarding x".
+///
+/// That comment is wrong about what it describes, and it is worth being precise about why,
+/// because "just discard it" is the shape of every linear-type bug this language exists to
+/// prevent. A `[1]`-quantity binding cannot be discarded: dropping it is a soundness hole,
+/// which is why the source language has no `discard`. What uncomputation actually needs is
+/// to restore the value that was overwritten, and for a linear resource that means applying
+/// the inverse of whatever wrote it -- which is this module's job, not a primitive named
+/// `discard`.
+///
+/// # Note on `[0]`
+///
+/// A `[0]`-quantity temporary needs no runtime uncompute at all: it is erased at compile
+/// time and never allocated (Rule 2 -- a `$[0]$-use variable must not reach the backend).
+/// That case is already handled upstream, by `DataflowDAG` recording it in
+/// `zero_qty_temps` and `generate_inverse_operations` skipping it. A temp reaching THIS
+/// function is a `[1]` temp, so the erasure path is not the answer for it.
 fn generate_assignment_inverse(
-    value: &PirExpr,
-    _stmt_id: StmtId,
+    _value: &PirExpr,
+    stmt_id: StmtId,
 ) -> Result<InverseOperation, LoweringError> {
-    // For `let x = y`, inverse is just discarding x (if y is still live)
-    // or copying back if needed
-    Ok(InverseOperation {
-        expr: PirExpr::Call {
-            name: "discard".to_string(),
-            args: vec![value.clone()],
-        },
-        schedule_map: None,
-        is_adjoint: false,
-        required_ancilla: Vec::new(),
-    })
+    Err(LoweringError::NonReversibleOp(format!(
+        "an assignment on statement {stmt_id:?} is not uncomputed by discarding its value. \
+         A [1]-quantity binding cannot be dropped -- that is a soundness hole, not an undo -- \
+         so there is no `discard` to call. Uncomputation here has to apply the inverse of \
+         whatever wrote the value, and this pass does not yet know what that is. A [0] \
+         temporary needs none of this: it is erased at compile time and never allocated."
+    )))
 }
 
-/// Generate inverse using affine map inversion
+/// The fallback for an expression with no inverse rule. REFUSED.
+///
+/// The previous version returned `Ok(InverseOperation { expr: Call { name: "affine_inverse",
+/// args: vec![expr.clone()] } })`, with the comment "Try to extract affine map from
+/// expression and invert it / This is a simplified version".
+///
+/// Three fabrications in one function:
+///
+/// 1. **`affine_inverse` is not a function.** Nothing in this repository defines it, so the
+///    emitted call named a callee that cannot resolve.
+/// 2. **Nothing was extracted.** The function ignores its `expr` argument entirely and
+///    passes it straight through. The comment says it extracts and inverts an affine map; the
+///    code does neither.
+/// 3. **The inverse of an affine map is not in general affine.** Inverting `x -> A*x + b`
+///    requires `A` to be invertible, and gives `x -> A^-1*(x - b)` with an inverse that is
+///    generally rational. Presenting that as "the affine inverse" is exactly the claim that
+///    fails silently for a singular `A`.
+///
+/// This is also the arm every unrecognised expression reached, so it was the module's
+/// universal "yes, I can uncompute this" answer.
 fn generate_affine_inverse(
-    expr: &PirExpr,
-    _stmt_id: StmtId,
+    _expr: &PirExpr,
+    stmt_id: StmtId,
 ) -> Result<InverseOperation, LoweringError> {
-    // Try to extract affine map from expression and invert it
-    // This is a simplified version
-    Ok(InverseOperation {
-        expr: PirExpr::Call {
-            name: "affine_inverse".to_string(),
-            args: vec![expr.clone()],
-        },
-        schedule_map: None,
-        is_adjoint: false,
-        required_ancilla: Vec::new(),
-    })
+    Err(LoweringError::Unsupported(format!(
+        "the expression on statement {stmt_id:?} has no inverse rule, and it is not \
+         uncomputed by passing it to a function called `affine_inverse` -- no such function \
+         exists, and nothing was extracted from it anyway. Inverting an affine map also \
+         requires the matrix to be invertible and generally yields a rational map, so \
+         'the affine inverse' is not a thing that can be assumed. Refused rather than \
+         emitted as a call to a callee that cannot resolve."
+    )))
 }
 
 /// Find the defining expression for a temporary
@@ -724,34 +929,56 @@ fn allocate_ancilla_and_verify(
     }
 
     // Verify all ancillas can be zeroed (no leftover entanglement)
-    verify_ancilla_zeroing(&requirements, dag)?;
+    verify_ancilla_zeroing(&requirements, dag, inverse_ops)?;
 
     Ok(requirements)
 }
 
-/// Verify that all ancilla qubits can be returned to |0⟩ state
+/// Verify that every quantum ancilla actually HAS an inverse to zero it with.
+///
+/// # The defect this replaces
+///
+/// It checked `node.inverse_op.is_none()` -- a field on `DAGNode` that was initialised to
+/// `None` at both construction sites and NEVER assigned anywhere in the module. The
+/// inverses live in a separate `HashMap<String, InverseOperation>` returned by
+/// `generate_inverse_operations`, and nothing ever copied them onto the node.
+///
+/// So the predicate was a constant. For a requirement with `is_quantum` set it was
+/// unconditionally true, and every quantum ancilla produced
+/// `NonReversibleOp("No inverse operation for quantum ancilla ...")`. A check that cannot
+/// pass is not a check: it is a second, differently-worded refusal wearing the costume of a
+/// verification, and it would have "caught" a missing inverse whether or not one was
+/// missing.
+///
+/// # What it checks now
+///
+/// The map that actually holds the inverses. An ancilla with no entry in it has nothing to
+/// zero it with, which is the real condition worth reporting. This does not make the module
+/// correct -- it makes the diagnostic mean what it says.
 fn verify_ancilla_zeroing(
     requirements: &[AncillaRequirement],
     dag: &DataflowDAG,
+    inverse_ops: &HashMap<String, InverseOperation>,
 ) -> Result<(), LoweringError> {
     for req in requirements {
-        if req.is_quantum {
-            // Check that there's an inverse operation that zeros this ancilla
-            let node = dag.nodes.get(&req.name);
-            if node.is_none() {
-                return Err(LoweringError::NonReversibleOp(format!(
-                    "Quantum ancilla {} not found in DAG",
-                    req.name
-                )));
-            }
-
-            // The ancilla must have an inverse operation
-            if node.unwrap().inverse_op.is_none() {
-                return Err(LoweringError::NonReversibleOp(format!(
-                    "No inverse operation for quantum ancilla {}",
-                    req.name
-                )));
-            }
+        if !req.is_quantum {
+            continue;
+        }
+        if !dag.nodes.contains_key(&req.name) {
+            return Err(LoweringError::NonReversibleOp(format!(
+                "quantum ancilla `{}` is not a node in the dataflow DAG, so there is no record \
+                 of where it was allocated",
+                req.name
+            )));
+        }
+        // The ancilla must have a REAL inverse operation, from the map that holds them.
+        if !inverse_ops.contains_key(&req.name) {
+            return Err(LoweringError::NonReversibleOp(format!(
+                "quantum ancilla `{}` has no inverse operation, so nothing zeroes it. An \
+                 ancilla left entangled at the end of a `reversible` block is exactly the \
+                 garbage the block existed to erase",
+                req.name
+            )));
         }
     }
     Ok(())
@@ -889,87 +1116,198 @@ mod tests {
         Span::new(0, 0, 1, 1)
     }
 
+    /// Every arithmetic operator is REFUSED, including the self-inverse ones.
+    ///
+    /// `Xor` genuinely is its own inverse, so a test that only checked `Add` would still be
+    /// asserting the fabrication. The point is not that some operators lack an inverse; it
+    /// is that this function cannot tell which operand the statement BINDS, and without that
+    /// it cannot write the inverse of ANY of them. `Mul -> Div` computed a different number
+    /// rather than undoing one, and a self-inverse `Xor` is not worth special-casing while
+    /// `Add` beside it is wrong.
     #[test]
-    fn test_quantum_adjoint_generation() {
-        // Test H gate (self-adjoint)
-        let inv = generate_quantum_adjoint("H", &[], StmtId(0)).unwrap();
-        assert_eq!(
-            inv.expr,
-            PirExpr::Call {
-                name: "H".to_string(),
-                args: vec![]
-            }
-        );
-        assert!(inv.is_adjoint);
-
-        // Test S gate (adjoint is S†)
-        let inv = generate_quantum_adjoint("S", &[], StmtId(0)).unwrap();
-        assert_eq!(
-            inv.expr,
-            PirExpr::Call {
-                name: "S†".to_string(),
-                args: vec![]
-            }
-        );
-
-        // Test RX gate (angle negation)
-        let angle_expr = PirExpr::Var("theta".to_string());
-        let args = vec![PirExpr::Call {
-            name: "RX".to_string(),
-            args: vec![angle_expr.clone()],
-        }];
-        let inv = generate_quantum_adjoint("RX", &args, StmtId(0)).unwrap();
-        if let PirExpr::Call { name, args } = inv.expr {
-            assert_eq!(name, "RX†");
-            assert_eq!(args.len(), 1);
-            // Check angle is negated
-            if let PirExpr::Unary {
-                op: crate::ir::UnaryOp::Neg,
-                expr,
-            } = &args[0]
-            {
-                if let PirExpr::Var(v) = expr.as_ref() {
-                    assert_eq!(v, "theta");
-                }
-            } else {
-                panic!("Expected negated angle");
-            }
-        } else {
-            panic!("Expected call");
-        }
-    }
-
-    #[test]
-    fn test_arithmetic_inverse() {
+    fn every_arithmetic_operator_is_refused_rather_than_guessed() {
+        use crate::ir::BinaryOp::*;
         let left = PirExpr::Var("a".to_string());
         let right = PirExpr::Var("b".to_string());
 
-        // Addition -> Subtraction
-        let inv = generate_arithmetic_inverse(crate::ir::BinaryOp::Add, &left, &right, StmtId(0))
-            .unwrap();
-        if let PirExpr::Binary { op, .. } = inv.expr {
-            assert_eq!(op, crate::ir::BinaryOp::Sub);
-        } else {
-            panic!("Expected binary op");
+        for op in [Add, Sub, Mul, Div, Xor, And, Or, Shl, Shr, Lt, Gt, Eq] {
+            let err = generate_arithmetic_inverse(op, &left, &right, StmtId(7)).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("WHICH OPERAND"),
+                "`{op:?}` must be refused naming the missing information: {msg}"
+            );
         }
+    }
 
-        // Multiplication -> Division
-        let inv = generate_arithmetic_inverse(crate::ir::BinaryOp::Mul, &left, &right, StmtId(0))
-            .unwrap();
-        if let PirExpr::Binary { op, .. } = inv.expr {
-            assert_eq!(op, crate::ir::BinaryOp::Div);
-        } else {
-            panic!("Expected binary op");
+    /// The adjoint comes from the ONE verified table, not a hand-written string.
+    ///
+    /// The old implementation returned the name `"S†"` (U+2020), which is not a gate, not a
+    /// function, and cannot be lowered by any backend. This asserts on the quantum relation
+    /// instead: `S` inverts to `Sdg`, `T` to `Tdg`, and the self-inverse gates to themselves.
+    ///
+    /// `Sdg` and not `S` is the specific defect that table was written to make
+    /// unrepresentable, so it is asserted directly rather than inferred.
+    #[test]
+    fn the_adjoint_of_a_gate_is_computed_from_the_verified_table() {
+        for (gate, expected) in [
+            ("H", "H"),
+            ("X", "X"),
+            ("Z", "Z"),
+            ("S", "Sdg"),
+            ("T", "Tdg"),
+            ("Sdg", "S"),
+            ("Tdg", "T"),
+            ("CX", "CX"),
+            ("CZ", "CZ"),
+            ("CCX", "CCX"),
+        ] {
+            let inv = generate_quantum_adjoint(gate, &[], StmtId(0))
+                .unwrap_or_else(|e| panic!("`{gate}` has a known adjoint, so it must invert: {e}"));
+            match inv.expr {
+                PirExpr::Call { name, .. } => assert_eq!(
+                    name, expected,
+                    "the inverse of `{gate}` must come from naso-gates::inverse_of, not a \
+                     hand-written table"
+                ),
+                other => panic!("expected a call, got {other:?}"),
+            }
+            assert!(inv.is_adjoint, "`{gate}`'s inverse is an adjoint");
         }
+    }
 
-        // XOR is self-inverse
-        let inv = generate_arithmetic_inverse(crate::ir::BinaryOp::Xor, &left, &right, StmtId(0))
-            .unwrap();
-        if let PirExpr::Binary { op, .. } = inv.expr {
-            assert_eq!(op, crate::ir::BinaryOp::Xor);
-        } else {
-            panic!("Expected binary op");
+    /// The adjoint NAME must be one a backend can resolve.
+    ///
+    /// Every name `generate_quantum_adjoint` emits is asserted against the gate set the
+    /// compiler actually knows. A name outside it -- `"S†"`, `"UNKNOWN"` -- is a call no
+    /// backend can resolve, which is how the previous version's output was unusable while
+    /// every one of its own tests still passed.
+    #[test]
+    fn every_emitted_adjoint_name_is_a_gate_the_compiler_knows() {
+        let known = [
+            "H", "X", "Y", "Z", "S", "Sdg", "T", "Tdg", "CX", "CY", "CZ", "CCX", "SWAP", "RX",
+            "RY", "RZ",
+        ];
+        for gate in ["H", "S", "T", "CX", "CCX"] {
+            let inv = generate_quantum_adjoint(gate, &[], StmtId(0)).unwrap();
+            if let PirExpr::Call { name, .. } = &inv.expr {
+                assert!(
+                    known.contains(&name.as_str()),
+                    "the adjoint of `{gate}` was emitted as `{name}`, which is not a gate the \
+                     compiler knows. A callee no backend can resolve is the fabrication this \
+                     function used to produce."
+                );
+            }
         }
+    }
+
+    /// An unrecognised gate is REFUSED, not mapped to a placeholder name.
+    ///
+    /// It used to return `Ok` with the name `"UNKNOWN"` -- a callee that is not a gate, not a
+    /// function, and not an error. Assuming self-inverse would be wrong for `S`, `T` and
+    /// every rotation, so there is no safe default.
+    #[test]
+    fn an_unrecognised_gate_is_refused_rather_than_assumed_self_inverse() {
+        for gate in ["Custom", "ccz", "iswap", "not_a_gate", ""] {
+            let err = generate_quantum_adjoint(gate, &[], StmtId(3)).unwrap_err();
+            assert!(
+                err.to_string().contains("self-inverse"),
+                "`{gate}` must be refused naming why guessing is wrong: {err}"
+            );
+        }
+    }
+
+    /// A rotation with NO angle is refused: there is nothing to negate.
+    ///
+    /// `RX` and `RX(1.1)` lower to the same operation name, so the angle has to come from the
+    /// arguments. Emitting the un-negated angle would apply `Rz(theta)` twice instead of
+    /// undoing it -- an inverse that is the identity on no state at all.
+    #[test]
+    fn a_rotation_with_no_angle_is_refused_rather_than_emitted_unchanged() {
+        for gate in ["RX", "RY", "RZ"] {
+            let err = generate_quantum_adjoint(gate, &[], StmtId(4)).unwrap_err();
+            assert!(
+                err.to_string().contains("no angle"),
+                "`{gate}` with no angle must say so: {err}"
+            );
+        }
+    }
+
+    /// A rotation's angle IS negated, and its qubit is NOT.
+    ///
+    /// `RZ(angle, qubit)`: the angle is the first argument. Negating every argument -- which
+    /// the previous implementation did, matching on any argument that was itself a call --
+    /// would negate the qubit.
+    #[test]
+    fn a_rotation_negates_its_angle_and_leaves_its_qubit_alone() {
+        let inv = generate_quantum_adjoint(
+            "RZ",
+            &[PirExpr::FloatLit("1.1".into()), PirExpr::Var("q".into())],
+            StmtId(0),
+        )
+        .unwrap();
+
+        match &inv.expr {
+            PirExpr::Call { name, args } => {
+                assert_eq!(name, "RZ", "RZ is its own inverse up to the angle");
+                assert_eq!(args.len(), 2, "both operands must survive");
+                match &args[0] {
+                    PirExpr::Unary {
+                        op: crate::ir::UnaryOp::Neg,
+                        expr,
+                    } => assert!(
+                        matches!(**expr, PirExpr::FloatLit(ref s) if s == "1.1"),
+                        "the ANGLE must be negated"
+                    ),
+                    other => panic!("the angle must be negated, got {other:?}"),
+                }
+                assert!(
+                    matches!(args[1], PirExpr::Var(ref v) if v == "q"),
+                    "the QUBIT must be passed through unchanged, not negated"
+                );
+            }
+            other => panic!("expected a call, got {other:?}"),
+        }
+    }
+
+    /// An assignment is REFUSED, and the refusal says why `discard` is not the answer.
+    ///
+    /// The old implementation emitted `Call { name: "discard", ... }` -- a function that does
+    /// not exist -- on the reasoning that "the inverse is just discarding x". For a `[1]`
+    /// binding that is not an undo, it is the soundness hole this language exists to prevent,
+    /// so the refusal has to name that rather than just report an error.
+    #[test]
+    fn an_assignment_is_refused_and_discard_is_not_presented_as_an_undo() {
+        let err = generate_assignment_inverse(&PirExpr::Var("x".into()), StmtId(5)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("discard"),
+            "the refusal must address the `discard` idea directly: {msg}"
+        );
+        assert!(
+            msg.contains("soundness hole"),
+            "and say why dropping a [1] binding is not an undo: {msg}"
+        );
+    }
+
+    /// The no-rule fallback is REFUSED, not a call to `affine_inverse`.
+    ///
+    /// That function ignored its `expr` argument entirely and passed it through to a callee
+    /// that does not exist, under a comment claiming it extracted and inverted an affine map.
+    /// It did neither. It is also the arm every unrecognised expression reached, so it was
+    /// this module's universal "yes" answer.
+    #[test]
+    fn an_expression_with_no_inverse_rule_is_refused_not_passed_to_affine_inverse() {
+        let err = generate_affine_inverse(&PirExpr::IntLit(7), StmtId(6)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("affine_inverse"),
+            "the refusal must name the fabricated callee it replaces: {msg}"
+        );
+        assert!(
+            msg.contains("invertible"),
+            "and say why 'the affine inverse' cannot be assumed: {msg}"
+        );
     }
 
     #[test]
@@ -1243,19 +1581,50 @@ mod tests {
         assert!(matches!(pair.inverse.root, ScheduleNode::Empty));
     }
 
+    /// Measurement uncomputation is REFUSED -- and specifically not `unmeasure`.
+    ///
+    /// The old version returned `Ok` with a call named `unmeasure`, a function that exists
+    /// nowhere in this repository, whose operand fell back to the literal `0` when no qubit
+    /// argument was supplied. An integer standing in for a quantum pointer is not a
+    /// fabrication that fails; it is one that produces valid-looking PIR.
+    ///
+    /// Every operand shape is tested, because the fallback branch -- the one that invented
+    /// the `0` -- is the one a single-argument test would miss.
     #[test]
-    fn test_measurement_uncompute_requires_ancilla() {
-        let inv = generate_measurement_uncompute("measure", &[], StmtId(0)).unwrap();
-        assert!(!inv.is_adjoint);
-        assert!(!inv.required_ancilla.is_empty());
-        assert_eq!(inv.required_ancilla[0], "measurement_ancilla");
+    fn measurement_uncomputation_is_refused_and_invents_no_qubit_operand() {
+        for args in [
+            vec![],
+            vec![PirExpr::Var("q".to_string())],
+            vec![PirExpr::IntLit(0)],
+        ] {
+            let err = generate_measurement_uncompute("measure", &args, StmtId(8)).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("MEASUREMENT"),
+                "the refusal must name the non-invertibility: {msg}"
+            );
+            assert!(
+                msg.contains("outcome"),
+                "and say what is actually required -- carrying the classical outcome: {msg}"
+            );
+        }
     }
 
+    /// RNG uncomputation is REFUSED -- and specifically not `unrng`.
+    ///
+    /// The old version returned `Ok` with a call named `unrng` taking NO arguments, so even
+    /// if the callee existed it could not have recovered the entropy it claimed to uncompute.
     #[test]
-    fn test_rng_uncompute_requires_ancilla() {
-        let inv = generate_rng_uncompute("rng", &[], StmtId(0)).unwrap();
-        assert!(!inv.is_adjoint);
-        assert!(!inv.required_ancilla.is_empty());
-        assert_eq!(inv.required_ancilla[0], "rng_ancilla");
+    fn rng_uncomputation_is_refused_rather_than_emitting_an_unrng_call() {
+        let err = generate_rng_uncompute("rng", &[], StmtId(9)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("search, not a computation"),
+            "the refusal must say why randomness cannot be undone: {msg}"
+        );
+        assert!(
+            msg.contains("unrng"),
+            "and name the fabricated callee it replaces: {msg}"
+        );
     }
 }

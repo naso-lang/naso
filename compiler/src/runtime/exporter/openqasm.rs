@@ -348,7 +348,7 @@ impl OpenQASMExporter {
                 // A gate that is not self-inverse, exported through here, would emit its own
                 // forward application where an inverse belonged, and the resulting circuit
                 // would compute a different function with no diagnostic. That is the same
-                // fabrication class already fixed in the QIR classifier, which used to map
+                // fabrication class already fixed in a now-deleted QIR gate table, which used to map
                 // every unknown gate onto `qir.h`.
                 None => {
                     return Err(ExporterError::UnsupportedOperation(format!(
@@ -716,7 +716,7 @@ mod adjoint_tests {
     /// did not mention was its own inverse. For a gate that is not self-inverse, that emits
     /// the forward application where an inverse belonged, and the circuit computes a
     /// different function with no diagnostic -- the same fabrication class the QIR
-    /// classifier had, where every unknown gate became a Hadamard.
+    /// a deleted QIR gate table had, where every unknown gate became a Hadamard.
     #[test]
     fn an_unmodelled_gate_has_no_adjoint_rather_than_being_its_own() {
         let e = OpenQASMExporter::new();

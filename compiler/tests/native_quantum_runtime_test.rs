@@ -283,7 +283,7 @@ fn a_bell_pair_always_agrees() {
 /// rewritten against the real one.
 ///
 /// This is written as a documentation test because the gap is the point: it is easy to read
-/// `qir_intrinsic_name` in the QIR backend and conclude the language supports those gates.
+/// the QIR backend's intrinsic mapping and conclude the language supports those gates.
 #[test]
 fn the_source_language_offers_only_the_four_quantum_builtins() {
     let source = "fn main() -> i64 {\n    \

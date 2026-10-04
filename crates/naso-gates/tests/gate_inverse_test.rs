@@ -116,7 +116,7 @@ fn the_inverse_of_an_inverse_is_the_gate() {
 
 /// `S`-dagger is NOT `S`, and both map `|1>` differently.
 ///
-/// The specific defect this table exists to prevent: an earlier classifier emitted `S` where
+/// The specific defect this table exists to prevent: an earlier gate table emitted `S` where
 /// it meant `S`-dagger. Asserting the two are distinct, and that each is the other's
 /// inverse, means that mistake cannot be reintroduced through the table.
 #[test]

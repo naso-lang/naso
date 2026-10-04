@@ -93,7 +93,7 @@ fn z_negates_only_the_one_amplitude() {
 
 /// `S` maps `|1>` to `i|1>`, and `Sdg` to `-i|1>`.
 ///
-/// This is the pair the QIR classifier got wrong. Asserted numerically here so the
+/// This is the pair a QIR gate table got wrong. Asserted numerically here so the
 /// distinction cannot be reintroduced anywhere: `S` and `Sdg` differ, and neither is the
 /// other's inverse by accident.
 #[test]

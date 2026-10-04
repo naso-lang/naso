@@ -278,6 +278,16 @@ jobs:
       - name: QIR gate emission gap
         run: cargo test --features llvm --test qir_gate_emission_gap_test
 
+      # The QIR backend carried a SECOND, undeclared gate-name table in
+      # `qir/classifier.rs` (330 lines) alongside `qir/ancilla_emission.rs` (352) -- 682
+      # lines with no `mod` declaration, reachable only from their own tests, including a
+      # 61-arm table that would drift from the live one. Deleted. The live invariant is now
+      # a unit test inside the lib: every operation `qir_intrinsic_for` resolves must name a
+      # DECLARED intrinsic, and an unmapped one must be refused rather than defaulted.
+      # This step runs the lib so that test cannot silently stop running.
+      - name: QIR intrinsic mapping resolves only to declared intrinsics
+        run: cargo test --features llvm -p naso-compiler --lib codegen::qir
+
       # `codegen_tests` carries the assertion that a fixture cannot express a SHARED qubit,
       # which is what pins the "valid QIR that is not the source program" defect. Without it
       # running, that failure mode could regress silently.

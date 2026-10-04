@@ -213,9 +213,18 @@ Documented in `docs/content/LIMITATIONS.md`.
    it is a different claim, and it is the USEFUL one, provided the boundary is stated rather
    than assumed. Refusing all float reasoning discharges no quantisation bound at all, and
    that is an absence of a property, not a soundness one.
-3. Wire a real `naso verify` subcommand with defined semantics, exit codes, honest
-   reporting of unsupported obligations, and end-to-end tests.
-4. Make a malformed SMT script a loud failure rather than a silent `sat`. This is the
+3. ~~Wire a real `naso verify` subcommand~~ -- DONE, as the `naso-verify` binary, NOT a
+   subcommand. `naso-verify` depends on `naso-compiler`, so the compiler cannot depend on it
+   back; Cargo rejects the cycle. Exit codes: 0 discharged, 1 refuted, 2 UNDECIDED, 3 usage,
+   4 input, 5 internal, 6 nothing-discharged-under-`--require-obligations`. Code 2 is the load
+   bearing one -- "I could not look at it" must never be a green build. Modes:
+   `all`, `uncomputation`, `linearity`, `obligations`. `custom` was DELETED rather than wired:
+   `prove_custom_vc` returned an empty diagnostic list, which is indistinguishable from a pass.
+4. Prove something about the tensor kernels themselves -- currently the error bound is proved
+   about an UNINTERPRETED tensor function, so nothing ties it to the packed `i4` layout that
+   actually executes. That link is the missing piece between "proof-carrying quantisation" and
+   "proof-carrying quantisation that means anything".
+5. Make a malformed SMT script a loud failure rather than a silent `sat`. This is the
    highest-value remaining fix: today it degrades "proved" into "refuted" quietly.
 
 Lower priority: `u4` distinct storage, `i2`, `release` builtin, runtime-valued `rz`.

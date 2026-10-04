@@ -57,6 +57,7 @@ pub fn verify_default(program: &Program) -> Result<VerifyResult, VerifyError> {
 /// Re-export CLI types for compiler integration
 #[cfg(feature = "z3")]
 pub use cli::{VerifyCliConfig, VerifyMode, parse_verify_args};
+pub use output::OutputFormat;
 
 // The gate matrices, the adjoint relation, and the CPU state-vector simulator live in
 // `naso-gates`, a leaf crate with no dependencies.

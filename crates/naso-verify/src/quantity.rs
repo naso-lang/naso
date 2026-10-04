@@ -269,11 +269,27 @@ pub fn encode_quantity_expr(
     let mut constraints = Vec::new();
 
     match &expr.kind {
-        ExprKind::Var(_name) => {
-            // Variable reference - quantity checking requires type info
-            // which is available via expr.ty in typed AST
-            // For now, we skip direct var checking since we track via Let bindings
+        ExprKind::Var(name) => {
+            // Referring to a linear value IS its consumption.
+            //
+            // This arm used to be empty, with the comment "we skip direct var checking since
+            // we track via Let bindings". That comment described a mechanism that does not
+            // exist for the cases that matter: `output[i] = v` is a use of `output`, not a
+            // `let` binding, so nothing was recorded. The consequence was a FALSE POSITIVE --
+            // `naso-verify` reported `kernels/scale_clamp_f32` as leaking both its linear
+            // tensors while `naso check` accepted the same file. A verifier that reports
+            // correct programs as broken is worse than one that reports nothing, because it
+            // teaches you to ignore it.
+            //
+            // This now matches the compiler's own rule: `TypeEnv::check_use` records a use of
+            // a `[1]` value on every reference. The two tools must agree, or one of them is
+            // wrong, and they are tested against the same programs.
+            for id in tracker.linear_ids_by_name(&name.name) {
+                tracker.consume_linear(&id, 0, expr.span);
+            }
         }
+        // A literal cannot hold or consume a linear resource.
+        ExprKind::Literal(_) => {}
         ExprKind::Call(func, args) => {
             if let ExprKind::Var(fname) = &func.kind {
                 match fname.name.as_str() {
@@ -292,18 +308,21 @@ pub fn encode_quantity_expr(
                         }
                     }
                     "linear_free" | "qfree" | "free" | "consume" | "discard" => {
-                        // A consuming builtin discharges every linear resource
-                        // bound to the name it is handed. Previously this loop
-                        // body was empty, so `linear_free(x)` recorded no
-                        // consumption at all and every [1] resource was later
-                        // reported as leaked.
-                        for arg in args {
-                            if let ExprKind::Var(name) = &arg.kind {
-                                for id in tracker.linear_ids_by_name(&name.name) {
-                                    tracker.consume_linear(&id, 0, expr.span);
-                                }
-                            }
-                        }
+                        // A consuming builtin discharges every linear resource bound to the
+                        // name it is handed.
+                        //
+                        // Note there is deliberately NO explicit `consume_linear` here. The
+                        // generic argument walk at the bottom of this arm visits the same
+                        // `Var` and consumes it, and an earlier version did both -- so
+                        // `linear_free(x)` counted as TWO consumptions and the prover
+                        // reported a valid consume-once function as a double use. One place
+                        // per use is the invariant.
+                        //
+                        // The dedicated loop that used to be here was itself a fix for a
+                        // different gap: with an empty body, `linear_free(x)` recorded
+                        // nothing at all and every [1] resource looked leaked. That gap is
+                        // now closed by the `Var` arm consuming on every reference, so the
+                        // duplication is no longer needed.
                     }
                     _ => {}
                 }
@@ -408,12 +427,152 @@ pub fn encode_quantity_expr(
         ExprKind::Projection(_) => {
             // MVS handled separately in mvs.rs
         }
-        _ => {
-            // Other expression types - no special quantity handling needed
+        // Return/break carry an expression whose consumption is real: `return t` moves a
+        // linear resource out of the function.
+        ExprKind::Return(Some(e)) | ExprKind::Break(Some(e)) => {
+            constraints.extend(encode_quantity_expr(e, tracker)?);
         }
+        ExprKind::Return(None) | ExprKind::Break(None) | ExprKind::Continue => {}
+        // Positional forms: walk the children, which can only carry uses, never new bindings.
+        ExprKind::Tuple(items) | ExprKind::Array(items) => {
+            for item in items {
+                constraints.extend(encode_quantity_expr(item, tracker)?);
+            }
+        }
+        ExprKind::Field(base, _) => {
+            constraints.extend(encode_quantity_expr(base, tracker)?);
+        }
+        ExprKind::Ascribe(e, _) => {
+            constraints.extend(encode_quantity_expr(e, tracker)?);
+        }
+        ExprKind::While(cond, body) => {
+            constraints.extend(encode_quantity_expr(cond, tracker)?);
+            constraints.extend(encode_quantity_expr(body, tracker)?);
+        }
+        ExprKind::Match(scrutinee, arms) => {
+            constraints.extend(encode_quantity_expr(scrutinee, tracker)?);
+            for arm in arms {
+                constraints.extend(encode_quantity_expr(&arm.body, tracker)?);
+            }
+        }
+        // A quantified proposition in EXPRESSION position. Its body is a proposition, not
+        // runtime code, so -- like a `proof` block -- it must not be counted as consuming.
+        // It is walked only so that its subterms are not mistaken for runtime uses.
+        ExprKind::Quantified(loop_) => {
+            constraints.extend(encode_quantity_block(&loop_.body, tracker)?);
+        }
+        // REFUSED, not walked.
+        //
+        // A closure captures its environment, a `reversible` block is erased before codegen,
+        // and an aggregate literal can move fields in ways this tracker does not model.
+        // Walking them optimistically is exactly how a false "no leak" gets reported, so the
+        // function is refused instead and surfaces as `undecided`.
+        ExprKind::Lambda(_)
+        | ExprKind::Reversible(_)
+        | ExprKind::Struct(..)
+        | ExprKind::Variant(..)
+        | ExprKind::Error => {
+            return Err(VerifyError::Config(format!(
+                "quantity analysis refuses `{}`: it can move a linear resource in a way this \
+                 tracker does not model, so the function cannot be linearity-checked soundly",
+                describe_expr_kind(expr)
+            )));
+        }
+        // COMPOUND EXPRESSIONS MUST BE WALKED, NOT SKIPPED.
+        //
+        // The catch-all that used to sit here said "other expression types - no special
+        // quantity handling needed". That was false, and the false comment hid a real bug: a
+        // `forall i { output[i] = ... }` loop is exactly where a linear resource gets
+        // consumed, so skipping it made `naso-verify` report `kernels/scale_clamp_f32` as
+        // leaking BOTH of its linear tensors -- a function that demonstrably reads one and
+        // writes the other. `naso check` accepted the same file. The verifier was crying
+        // wolf on correct code, which is the fastest way to get a proof tool ignored.
+        ExprKind::Forall(loop_) => {
+            constraints.extend(encode_quantity_block(&loop_.body, tracker)?);
+        }
+        ExprKind::For(loop_) => {
+            constraints.extend(encode_quantity_block(&loop_.body, tracker)?);
+        }
+        ExprKind::Index(base, index) => {
+            constraints.extend(encode_quantity_expr(base, tracker)?);
+            constraints.extend(encode_quantity_expr(index, tracker)?);
+        }
+        ExprKind::Assign(lhs, rhs) => {
+            constraints.extend(encode_quantity_expr(rhs, tracker)?);
+            // The target is walked, which is what records the write. It is usually an INDEX
+            // (`output[i] = ..`), not a bare `Var`, so the consumption is found by descending to
+            // the base -- which is exactly why an earlier name-matching shortcut here silently
+            // found nothing and reported a false leak.
+            constraints.extend(encode_quantity_expr(lhs, tracker)?);
+        } // NO CATCH-ALL ARM, ON PURPOSE.
+          //
+          // The arm that used to sit here said every unrecognised expression had "no special
+          // quantity handling needed". That is how a `forall` loop -- the one place a loop body
+          // actually consumes a linear tensor -- came to be skipped, and why `naso-verify`
+          // reported correct programs as leaking. With every `ExprKind` variant now matched
+          // explicitly, a future variant is a COMPILE ERROR rather than a silent skip. The
+          // variants this prover cannot model soundly are refused BY NAME in the arms above,
+          // which is a decision; a catch-all would have been the absence of one.
     }
 
     Ok(constraints)
+}
+
+/// Encode every statement of a block, plus its tail expression.
+fn encode_quantity_block(
+    block: &naso_compiler::ast::Block,
+    tracker: &mut QuantityTracker,
+) -> Result<Vec<Term>, VerifyError> {
+    let mut constraints = Vec::new();
+    for stmt in &block.stmts {
+        constraints.extend(encode_quantity_stmt(stmt, tracker)?);
+    }
+    if let Some(tail) = &block.expr {
+        constraints.extend(encode_quantity_expr(tail, tracker)?);
+    }
+    Ok(constraints)
+}
+
+/// A short human name for an expression form, used in the refusal message above.
+fn describe_expr_kind(expr: &naso_compiler::ast::Expr) -> &'static str {
+    // EXHAUSTIVE ON PURPOSE. There is no catch-all arm here, so adding a new `ExprKind`
+    // variant makes this function fail to compile rather than quietly reporting "construct"
+    // and letting an unanalysable form pass as clean. That is the whole point: a silent arm
+    // here would reintroduce the exact bug this function exists to describe.
+    match &expr.kind {
+        ExprKind::Literal(_) => "literal",
+        ExprKind::Var(_) => "variable",
+        ExprKind::Binary(..) => "binary operator",
+        ExprKind::Unary(..) => "unary operator",
+        ExprKind::Call(..) => "call",
+        ExprKind::MethodCall(..) => "method call",
+        ExprKind::Field(..) => "field access",
+        ExprKind::Index(..) => "index",
+        ExprKind::Struct(..) => "struct literal",
+        ExprKind::Variant(..) => "enum variant",
+        ExprKind::Tuple(..) => "tuple",
+        ExprKind::Array(..) => "array literal",
+        ExprKind::Block(..) => "block",
+        ExprKind::If(..) => "if",
+        ExprKind::Match(..) => "match",
+        ExprKind::Let(..) => "let expression",
+        ExprKind::LetInOut(..) => "inout let",
+        ExprKind::LetConsume(..) => "consume let",
+        ExprKind::Reversible(..) => "reversible block",
+        ExprKind::Lambda(..) => "lambda",
+        ExprKind::For(..) => "for loop",
+        ExprKind::Forall(..) => "forall loop",
+        ExprKind::Quantified(..) => "quantified proposition",
+        ExprKind::While(..) => "while loop",
+        ExprKind::Return(..) => "return",
+        ExprKind::Break(..) => "break",
+        ExprKind::Continue => "continue",
+        ExprKind::Assign(..) => "assignment",
+        ExprKind::Projection(..) => "projection",
+        ExprKind::QuantumOp(..) => "quantum operation",
+        ExprKind::Ascribe(..) => "ascription",
+        ExprKind::Error => "parse-error node",
+    }
 }
 
 /// Encode quantity constraints for a statement.

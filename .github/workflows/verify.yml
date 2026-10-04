@@ -269,6 +269,25 @@ jobs:
       # suite also contains many "expected proof" cases. Running it alone makes a silent
       # regression -- the pass finding nothing, which looks exactly like success -- visible
       # as a failing step rather than as a slightly lower count in a wall of numbers.
+      # The CLI exit-code contract. Named explicitly because it is the only thing standing
+      # between this repo and a verification step that reports success without checking
+      # anything: if `undecided` ever collapses back into exit 0, CI stays green while the
+      # prover quietly proves nothing.
+      - name: Test the verify CLI exit-code contract
+        run: cargo test -p naso-verify --test verify_cli_test
+        working-directory: .
+
+      # The shipped quantisation error bound, verified THROUGH THE BINARY, not just as a
+      # library call: this is the run that proves the exit status a real user sees is 0.
+      - name: Verify the shipped quantisation kernel through the binary
+        run: |
+          # `cargo run` rather than a hardcoded `./target/debug/...`: the target directory is
+          # relocatable, and a step that only works at one path is a step that breaks silently
+          # on someone else's machine.
+          cargo run -q -p naso-verify --bin naso-verify -- \
+            --mode obligations --require-obligations kernels/quant_error_bound.naso
+        working-directory: .
+
       # The shipped quantisation error bound. Named separately because the whole point of
       # this file is that a KERNEL is discharged, not that a prover can prove hand-written
       # snippets: a prover regression could leave the kernel reporting a warning and this

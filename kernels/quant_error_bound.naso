@@ -52,6 +52,22 @@
 ///
 /// PROVED over exact reals. See the file header for what that does and does not
 /// license.
+// NOTE ON THE TENSOR SIGNATURE
+//
+// `t` and `q` are deliberately NOT declared `[1]` here. They were, and both `naso check` and
+// `naso-verify` correctly reported them as unused linear leaks: this function states a bound
+// about its arguments and never consumes them, so `[1]` -- which asserts "consumed exactly
+// once" -- was a false claim about the function's own body. A specification does not own its
+// inputs.
+//
+// This was worth fixing rather than working around. The two tools agreed, which is the point:
+// the compiler's typechecker and the verifier's prover were written independently and reached
+// the same verdict on a real leak.
+//
+// Repeatedly referencing a genuinely `[1]` value inside a proposition is still supported and
+// still exercised; see `a_quantified_proposition_may_repeat_a_linear_value` in
+// `compiler/tests/requires_precondition_test.rs`. What is NOT supported -- and now correctly
+// rejected -- is a `[1]` value that nothing at runtime consumes.
 fn dequantise_half_step(
     x: f32,
     q: f32,
@@ -81,8 +97,8 @@ fn dequantise_half_step(
 /// holds for all elements of an unconstrained tensor -- including the ones a
 /// naive "every element fits" axiom would have excluded.
 fn dequantise_tensor_half_step(
-    t: [1] Tensor[f32, 256],
-    q: [1] Tensor[f32, 256],
+    t: Tensor[f32, 256],
+    q: Tensor[f32, 256],
     s: f32
 )
     requires {

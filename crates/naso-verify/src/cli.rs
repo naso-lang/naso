@@ -25,8 +25,12 @@ pub enum VerifyMode {
     Uncomputation,
     /// Run only [1]-quantity linearity prover
     Linearity,
-    /// Run custom verification condition (requires --vc-name)
-    Custom,
+    /// Run only the proof-obligation prover: the `assert`s in `proof { .. }`, the
+    /// `requires { .. }` preconditions, and every call site.
+    ///
+    /// This is the mode that discharges a quantisation bound, so it is a first-class choice
+    /// rather than something reachable only through `all`.
+    Obligations,
 }
 
 impl VerifyMode {
@@ -36,9 +40,9 @@ impl VerifyMode {
             "all" => Ok(VerifyMode::All),
             "uncomputation" => Ok(VerifyMode::Uncomputation),
             "linearity" => Ok(VerifyMode::Linearity),
-            "custom" => Ok(VerifyMode::Custom),
+            "obligations" | "proof" => Ok(VerifyMode::Obligations),
             other => Err(format!(
-                "Unknown verification mode: {}. Use all, uncomputation, linearity, or custom",
+                "Unknown verification mode: {}. Use all, uncomputation, linearity, or obligations",
                 other
             )),
         }
@@ -57,8 +61,12 @@ pub struct VerifyCliConfig {
     pub format: OutputFormat,
     /// Solver configuration
     pub solver_config: SolverConfig,
-    /// Custom VC name (for --mode=custom)
-    pub vc_name: Option<String>,
+    /// Fail if no obligations were discharged at all.
+    ///
+    /// Without this, a file whose `proof` block has a typo produces zero obligations and the
+    /// verifier exits 0 -- indistinguishable from having proved everything. This turns
+    /// "nothing to check" into an explicit failure.
+    pub require_obligations: bool,
     /// Whether to use incremental cache
     pub use_cache: bool,
     /// Cache directory override
@@ -81,7 +89,7 @@ impl Default for VerifyCliConfig {
             mode: VerifyMode::All,
             format: OutputFormat::Human,
             solver_config: SolverConfig::default(),
-            vc_name: None,
+            require_obligations: false,
             use_cache: true,
             cache_dir: None,
             jobs: 0,
@@ -106,7 +114,7 @@ pub fn parse_verify_args(args: &[String]) -> Result<VerifyCliConfig, String> {
             Arg::new("mode")
                 .long("mode")
                 .short('m')
-                .help("Verification mode: all, uncomputation, linearity, custom")
+                .help("Verification mode: all, uncomputation, linearity, obligations")
                 .default_value("all")
                 .value_name("MODE"),
             Arg::new("format")
@@ -132,6 +140,12 @@ pub fn parse_verify_args(args: &[String]) -> Result<VerifyCliConfig, String> {
                 .help("SMT logic: QF_UFLIA, AUFLIA, QF_BV")
                 .default_value("QF_UFLIA")
                 .value_name("LOGIC"),
+            Arg::new("require-obligations")
+                .long("require-obligations")
+                .help(
+                    "Fail if no obligations were discharged (guards against a typo'd proof block)",
+                )
+                .action(ArgAction::SetTrue),
             Arg::new("no-cache")
                 .long("no-cache")
                 .help("Disable incremental verification cache")
@@ -140,10 +154,6 @@ pub fn parse_verify_args(args: &[String]) -> Result<VerifyCliConfig, String> {
                 .long("cache-dir")
                 .help("Override cache directory")
                 .value_name("DIR"),
-            Arg::new("vc-name")
-                .long("vc-name")
-                .help("Custom verification condition name (for --mode=custom)")
-                .value_name("NAME"),
             Arg::new("verbose")
                 .long("verbose")
                 .short('v')
@@ -212,6 +222,7 @@ pub fn parse_verify_args(args: &[String]) -> Result<VerifyCliConfig, String> {
     }
 
     // Parse flags
+    config.require_obligations = matches.get_flag("require-obligations");
     config.use_cache = !matches.get_flag("no-cache");
     config.verbose = matches.get_flag("verbose");
     config.quiet = matches.get_flag("quiet");
@@ -221,10 +232,6 @@ pub fn parse_verify_args(args: &[String]) -> Result<VerifyCliConfig, String> {
     if let Some(cache_dir) = matches.get_one::<String>("cache-dir") {
         config.cache_dir = Some(PathBuf::from(cache_dir));
     }
-    if let Some(vc_name) = matches.get_one::<String>("vc-name") {
-        config.vc_name = Some(vc_name.clone());
-    }
-
     // Configure solver threads
     if config.jobs > 0 {
         config.solver_config.threads = config.jobs;
@@ -243,7 +250,8 @@ pub fn print_verify_usage() {
     eprintln!("                              all          - Run all provers");
     eprintln!("                              uncomputation - Quantum uncomputation safety");
     eprintln!("                              linearity    - [1]-quantity leak detection");
-    eprintln!("                              custom       - Custom verification condition");
+    eprintln!("                              obligations  - proof-block asserts, preconditions,");
+    eprintln!("                                             call sites");
     eprintln!("  -f, --format <FORMAT>     Output format (default: human)");
     eprintln!("                              human  - Colored human-readable output");
     eprintln!("                              json   - Structured JSON for CI/CD");
@@ -252,9 +260,9 @@ pub fn print_verify_usage() {
     eprintln!("  -t, --timeout <MS>        Solver timeout in milliseconds (default: 30000)");
     eprintln!("      --logic <LOGIC>       SMT logic (default: QF_UFLIA)");
     eprintln!("                              QF_UFLIA, AUFLIA, QF_BV");
+    eprintln!("      --require-obligations  Fail if nothing was discharged (exit 6)");
     eprintln!("      --no-cache            Disable incremental verification cache");
     eprintln!("      --cache-dir <DIR>     Override cache directory");
-    eprintln!("      --vc-name <NAME>      Custom VC name (for --mode=custom)");
     eprintln!("  -v, --verbose             Enable verbose output");
     eprintln!("  -q, --quiet               Suppress non-error output");
     eprintln!("      --list-codes          List all diagnostic codes and exit");
@@ -263,5 +271,5 @@ pub fn print_verify_usage() {
     eprintln!("  naso verify program.naso");
     eprintln!("  naso verify --mode=uncomputation --format=json src/");
     eprintln!("  naso verify --mode=linearity --jobs=4 --timeout=60000 program.naso");
-    eprintln!("  naso verify --format=sarif --output=results.sarif program.naso");
+    eprintln!("  naso verify --format=sarif program.naso > results.sarif");
 }

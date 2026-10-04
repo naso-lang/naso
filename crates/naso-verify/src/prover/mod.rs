@@ -65,25 +65,51 @@ pub fn run_linearity_prover(program: &Program) -> Result<Vec<VerifyDiagnostic>, 
 }
 
 /// Prove a custom verification condition.
+///
+/// # REFUSED
+///
+/// This used to run the `predicate`, finalise the context, discard the result, and return
+/// `Ok(Vec::new())` -- an empty diagnostic list, which every caller reads as "no problems
+/// found". `naso verify --mode custom` would therefore have reported a clean bill of health
+/// on a verification condition that was never checked, and the CLI help advertised exactly
+/// that. A stub that reports success is the most dangerous shape a stub can take: it is
+/// indistinguishable from a proof.
+///
+/// It now refuses. The lowering machinery is left in place so an implementation has
+/// somewhere to start, but nothing pretends the end-to-end path works.
 #[cfg(feature = "z3")]
 pub fn prove_custom_vc(
     _program: &Program,
-    _vc_name: &str,
-    predicate: impl FnOnce(&mut LoweringContext) -> Result<(), VerifyError>,
+    vc_name: &str,
+    _predicate: impl FnOnce(&mut LoweringContext) -> Result<(), VerifyError>,
 ) -> Result<Vec<VerifyDiagnostic>, VerifyError> {
-    let mut ctx = LoweringContext::new();
-    predicate(&mut ctx)?;
-    ctx.finalize()?;
-    // In real implementation, would run solver and extract diagnostics
-    Ok(Vec::new())
+    Err(VerifyError::Config(format!(
+        "custom verification condition `{vc_name}` is not implemented: this prover builds a \
+         lowering context and then discards it, returning an empty diagnostic list, which a \
+         caller cannot distinguish from a clean result. Refusing rather than reporting an \
+         unperformed check as passed."
+    )))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use naso_compiler::parser::parse_program;
 
+    /// The custom-VC prover must REFUSE, not return an empty diagnostic list.
+    ///
+    /// The old test in this module had the body `// Smoke test` and asserted nothing, so
+    /// `prove_custom_vc` returning `Ok(vec![])` for every input was never noticed. This
+    /// pins the refusal, because the difference between "no diagnostics" and "not checked"
+    /// is invisible to everything downstream.
     #[test]
-    fn test_prover_module_compiles() {
-        // Smoke test
+    fn a_custom_verification_condition_is_refused_rather_than_reported_as_passing() {
+        let program = parse_program("fn f(n: int) -> bool { return true; }").expect("parse");
+        let result = prove_custom_vc(&program, "my_vc", |_ctx| Ok(()));
+        let err = result.expect_err("must not report an empty diagnostic list as success");
+        assert!(
+            err.to_string().contains("not implemented"),
+            "the refusal must say the check was not performed, got: {err}"
+        );
     }
 }

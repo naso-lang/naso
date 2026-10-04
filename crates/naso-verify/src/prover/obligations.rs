@@ -31,6 +31,16 @@ use naso_compiler::ast::{
 };
 use std::collections::HashMap;
 
+/// An obligation was DISCHARGED.
+///
+/// Informational, not a finding. The prover used to say nothing when a goal held, so a
+/// caller could not distinguish "proved and quiet" from "never looked at". That mattered:
+/// a verification tool reporting nothing is ambiguous, and the ambiguity is indistinguishable
+/// from a clean run. The CLI counts these to report how much was actually proved, and
+/// `--require-obligations` fails a file that produces none, so a typo in a `proof` block
+/// cannot silently pass.
+pub const OBL_DISCHARGED: &str = "NASO-OBL-000";
+
 /// Diagnostic code for an obligation Z3 refuted (assertion is FALSE).
 pub const OBL_FALSE: &str = "NASO-OBL-001";
 /// Diagnostic code for an obligation stated over an unsupported sort.
@@ -829,7 +839,18 @@ fn prove_obligation(
 
             match crate::solver::verify(&smt_text, Default::default())? {
                 crate::solver::VerifyResult::Unsat(_) => {
-                    // No counterexample exists: the obligation holds.
+                    // No counterexample exists: the obligation holds. Recorded explicitly,
+                    // because silence is not a proof report.
+                    diagnostics.push(VerifyDiagnostic {
+                        code: OBL_DISCHARGED.to_string(),
+                        message: format!(
+                            "obligation in `{func_name}` discharged: no counterexample exists"
+                        ),
+                        span,
+                        severity: DiagnosticSeverity::Info,
+                        related: Vec::new(),
+                        fix: None,
+                    });
                 }
                 crate::solver::VerifyResult::Sat(_) => {
                     if std::env::var("NASO_DUMP_SMT").is_ok() {
@@ -1497,10 +1518,7 @@ mod tests {
             "fn check(x: int) -> bool requires { assert(x <= 10); } { return true; }\n\
              fn use10(x: int) -> bool requires { assert(x <= 10); } { return check(x); }",
         );
-        assert!(
-            diags.is_empty(),
-            "expected the call to be accepted, got {diags:?}"
-        );
+        assert_all_discharged(&diags, 1);
     }
 
     /// The same call with no supporting premise is REFUSED.
@@ -1531,10 +1549,7 @@ mod tests {
             "fn check(x: int) -> bool requires { assert(x <= 10); } { return true; }\n\
              fn use_literal() -> bool { return check(5); }",
         );
-        assert!(
-            diags.is_empty(),
-            "expected a literal argument to discharge, got {diags:?}"
-        );
+        assert_all_discharged(&diags, 1);
     }
 
     /// ...and refused when it does not. `11` is a constant, so no premise can rescue it.
@@ -1573,10 +1588,7 @@ mod tests {
             "fn check(x: int) -> bool requires { assert(x <= 10); } { return true; }\n\
              fn use_strong(x: int) -> bool requires { assert(x <= 0); } { return check(x); }",
         );
-        assert!(
-            strong.is_empty(),
-            "a stronger premise must discharge, got {strong:?}"
-        );
+        assert_all_discharged(&strong, 1);
     }
 
     /// A callee precondition over a TENSOR is instantiated at the call site.
@@ -1591,10 +1603,7 @@ mod tests {
             "fn use_small(t: [1] Tensor[i8, 16]) -> bool ",
             "requires { forall i in 0..16 { assert(t[i] <= 10); } } { return all_small(t); }",
         ));
-        assert!(
-            ok.is_empty(),
-            "a matching tensor premise must discharge, got {ok:?}"
-        );
+        assert_all_discharged(&ok, 1);
 
         let bad = obligations_for(concat!(
             "fn all_small(t: [1] Tensor[i8, 16]) -> bool ",
@@ -1620,10 +1629,9 @@ mod tests {
             "fn plain(x: int) -> bool { return true; }\n\
              fn caller(x: int) -> bool { return plain(x); }",
         );
-        assert!(
-            diags.is_empty(),
-            "expected no call-site obligation, got {diags:?}"
-        );
+        // Nothing to discharge AND nothing to complain about: a call to a function with no
+        // preconditions generates no call-site obligation at all.
+        assert_all_discharged(&diags, 0);
     }
 
     /// Each call is checked in its own right.
@@ -1744,10 +1752,7 @@ mod tests {
             "             assert(x >= (q - 0.5) * s); }\n",
             "{ proof { assert(x <= (q + 0.5) * s); } return true; }",
         );
-        assert!(
-            obligations_for(src).is_empty(),
-            "the bound must be provable"
-        );
+        assert_all_discharged(&obligations_for(src), 1);
     }
 
     /// The FALSE control for the bound above: a TIGHTER bound is not derivable.
@@ -1775,10 +1780,7 @@ mod tests {
 
         // ...and the wider bound IS implied, which is exactly why the first draft was wrong.
         let wider = src.replace("(q + 0.25)", "(q + 1.0)");
-        assert!(
-            obligations_for(&wider).is_empty(),
-            "a wider bound follows from a positive scale and must be accepted"
-        );
+        assert_all_discharged(&obligations_for(&wider), 1);
     }
 
     /// A scale that is not positive cannot carry a step bound.
@@ -1795,10 +1797,7 @@ mod tests {
         );
         // Still provable -- the goal is one of the premises. The point of the negative
         // control is the NEXT test; this one pins that a bare float premise is accepted.
-        assert!(
-            obligations_for(src).is_empty(),
-            "a float premise is a valid premise"
-        );
+        assert_all_discharged(&obligations_for(src), 1);
 
         // Without ANY premise, nothing constrains `s` at all.
         let bare = concat!(
@@ -1824,10 +1823,7 @@ mod tests {
             "  requires { assert(s > 0.0); }\n",
             "{ proof { assert(0.5 * s == s / 2.0); } return true; }",
         );
-        assert!(
-            obligations_for(src).is_empty(),
-            "0.5 must be exactly one half"
-        );
+        assert_all_discharged(&obligations_for(src), 1);
     }
 
     /// Integer division must NOT become real division.
@@ -1839,10 +1835,7 @@ mod tests {
     #[test]
     fn integer_division_still_truncates() {
         let ok = "fn f(n: int) -> bool { proof { assert(6 / 2 == 3); } return true; }";
-        assert!(
-            obligations_for(ok).is_empty(),
-            "exact integer division must hold"
-        );
+        assert_all_discharged(&obligations_for(ok), 1);
 
         // `div 7 2` is 3. The control has to be the value it is NOT.
         let bad = "fn f(n: int) -> bool { proof { assert(7 / 2 == 4); } return true; }";
@@ -1927,10 +1920,7 @@ mod tests {
     #[test]
     fn a_float_literal_is_the_exact_binary_value_not_the_printed_one() {
         let exact_half = "fn f() -> bool { proof { assert(0.5 * 2.0 == 1.0); } return true; }";
-        assert!(
-            obligations_for(exact_half).is_empty(),
-            "one half is exactly representable, so the identity must hold"
-        );
+        assert_all_discharged(&obligations_for(exact_half), 1);
 
         let inexact_tenth = "fn f() -> bool { proof { assert(0.1 * 10.0 == 1.0); } return true; }";
         let diags = obligations_for(inexact_tenth);
@@ -2044,10 +2034,9 @@ mod tests {
     #[test]
     fn the_shipped_quantisation_error_bound_kernel_is_fully_discharged() {
         let diags = obligations_for(&quant_error_bound_kernel());
-        assert!(
-            diags.is_empty(),
-            "the shipped error-bound kernel must discharge every obligation, got {diags:?}"
-        );
+        // Exactly two proof obligations: one per function in the kernel. Named rather than
+        // "none", so a kernel that silently stopped proving anything would fail here.
+        assert_all_discharged(&diags, 2);
     }
 
     /// ...and the kernel's central claim is not vacuous.
@@ -2081,10 +2070,7 @@ mod tests {
 
         // And the shipped kernel, which HAS the premise, must not be refuted. Together these
         // two are the whole claim: the bound is provable with the premise and false without.
-        assert!(
-            obligations_for(&quant_error_bound_kernel()).is_empty(),
-            "the shipped kernel carries the premise and must discharge"
-        );
+        assert_all_discharged(&obligations_for(&quant_error_bound_kernel()), 2);
     }
 
     /// EVERY assertion in a quantified body is checked, not just the last.
@@ -2118,11 +2104,8 @@ mod tests {
             "{ proof { forall i in 0..16 { assert(t[i] == t[i]); assert(t[i] >= t[i]); } } ",
             "return true; }",
         );
-        assert!(
-            obligations_for(both_true).is_empty(),
-            "two true conjuncts must both discharge: {:?}",
-            obligations_for(both_true)
-        );
+        // TWO obligations, not one: the whole point is that each conjunct is checked.
+        assert_all_discharged(&obligations_for(both_true), 2);
     }
 
     /// Every assertion in a quantified PREMISE is used, not just the last.
@@ -2143,10 +2126,7 @@ mod tests {
             "{ proof { forall i in 0..16 { assert(t[i] <= (q[i] + 0.5) * s); } }\n",
             "  return true; }",
         );
-        assert!(
-            obligations_for(premise_first_matters).is_empty(),
-            "a goal matching the FIRST conjunct of a two-conjunct premise must discharge"
-        );
+        assert_all_discharged(&obligations_for(premise_first_matters), 1);
     }
 
     /// The shipped error-bound kernel, read from disk.
@@ -2168,11 +2148,38 @@ mod tests {
         let program = parse_program(src).expect("parse");
         prove_obligations(&program).expect("prove")
     }
+
+    /// Assert that `diags` consists of exactly `expected` DISCHARGED obligations and
+    /// nothing else -- no refutation, no undecidable obligation, no error.
+    ///
+    /// This replaces `assert!(diags.is_empty())`, which was a strictly weaker and actively
+    /// misleading assertion: an empty list is what the prover returned both when it proved
+    /// the goal and when it was never asked anything, so the test could not tell a proof
+    /// from a silence. Naming the count also pins that the expected number of obligations
+    /// was actually discharged.
+    #[track_caller]
+    fn assert_all_discharged(diags: &[VerifyDiagnostic], expected: usize) {
+        let discharged = diags.iter().filter(|d| d.code == OBL_DISCHARGED).count();
+        let problems: Vec<String> = diags
+            .iter()
+            .filter(|d| d.code != OBL_DISCHARGED)
+            .map(|d| format!("{:?}[{}]", d.severity, d.code))
+            .collect();
+        assert!(
+            problems.is_empty(),
+            "expected only discharged obligations, but found: {}",
+            problems.join(", ")
+        );
+        assert_eq!(
+            discharged, expected,
+            "expected {expected} discharged obligation(s), got {discharged}"
+        );
+    }
     #[test]
     fn test_true_integer_obligation_is_proved() {
         let diags =
             obligations_for("fn f(n: int) -> bool { proof { assert(n + 0 == n); } return true; }");
-        assert!(diags.is_empty(), "expected proof, got {diags:?}");
+        assert_all_discharged(&diags, 1);
     }
 
     /// A false obligation must be reported as an error. This is the test that
@@ -2192,7 +2199,7 @@ mod tests {
         let diags = obligations_for(
             "fn f(n: int) -> bool { proof { assert(forall i in 0..10 { i <= 9 }); } return true; }",
         );
-        assert!(diags.is_empty(), "expected proof, got {diags:?}");
+        assert_all_discharged(&diags, 1);
     }
 
     // -----------------------------------------------------------------
@@ -2224,10 +2231,7 @@ mod tests {
                    requires { forall i in 0..16 { assert(t[i] <= 127); } } { \
                    proof { forall i in 0..16 { assert(t[i] <= 127); } } return true; }";
         let diags = obligations_for(src);
-        assert!(
-            diags.is_empty(),
-            "the premise should discharge the goal, got {diags:?}"
-        );
+        assert_all_discharged(&diags, 1);
     }
 
     /// The precondition must be no STRONGER than the goal, or the prover is unsound in the
@@ -2254,7 +2258,7 @@ mod tests {
         let src = "fn q(n: int) requires { assert(n <= 0); } { \
                    proof { assert(n <= 10); } return true; }";
         let diags = obligations_for(src);
-        assert!(diags.is_empty(), "got {diags:?}");
+        assert_all_discharged(&diags, 1);
         // And a goal the premise does NOT imply must still be refuted.
         let src2 = "fn q(n: int) requires { assert(n <= 0); } { \
                     proof { assert(n >= 10); } return true; }";
@@ -2287,10 +2291,7 @@ mod tests {
                    requires { forall i in 0..16 { assert(t[i] <= 0); } } { \
                    proof { forall i in 0..16 { assert(t[i] <= 10); } } return true; }";
         let diags = obligations_for(src);
-        assert!(
-            diags.is_empty(),
-            "a premise stronger than the goal must discharge it, got {diags:?}"
-        );
+        assert_all_discharged(&diags, 1);
     }
 
     /// A precondition that cannot be encoded must REFUSE the obligation.
@@ -2376,10 +2377,7 @@ mod tests {
             "fn q(t: Tensor[i8, 16]) -> bool { \
                proof { forall i in 0..16 { assert(t[0] == t[0]); } } return true; }",
         );
-        assert!(
-            identical.is_empty(),
-            "t[0] == t[0] must be PROVED (identical terms); got {identical:?}"
-        );
+        assert_all_discharged(&identical, 1);
 
         let diff = obligations_for(
             "fn q(t: Tensor[i8, 16]) -> bool { \
@@ -2405,7 +2403,7 @@ mod tests {
             "fn q(t: Tensor[i8, 16]) -> bool { \
                proof { forall i in 0..16 { assert(t[i] + 0 == t[i]); } } return true; }",
         );
-        assert!(diags.is_empty(), "expected proof, got {diags:?}");
+        assert_all_discharged(&diags, 1);
     }
 
     /// The same obligation with a FALSE bound must be refuted.
@@ -2433,7 +2431,7 @@ mod tests {
             "fn q(t: Tensor[i8, 16], n: int) -> bool { \
                proof { forall i in 0..16 { assert(t[i] - t[i] == 0); } } return true; }",
         );
-        assert!(diags.is_empty(), "expected proof, got {diags:?}");
+        assert_all_discharged(&diags, 1);
     }
 
     /// A bound relating two indices is NOT provable, and must not be.
@@ -2503,10 +2501,7 @@ mod tests {
             "  requires { forall i in 0..16 { assert(t[i] <= 1); } }\n",
             "{ proof { forall i in 0..16 { assert(t[i] <= 1); } } return true; }",
         );
-        assert!(
-            obligations_for(with_premise).is_empty(),
-            "a matching float tensor premise must discharge"
-        );
+        assert_all_discharged(&obligations_for(with_premise), 1);
     }
 
     /// A `Bool` element tensor is refused too: `(Int) Bool` admits no arithmetic.
@@ -2583,7 +2578,7 @@ mod tests {
         let diags = obligations_for(
             "fn f() -> bool { proof { assert(forall i in 0..10 { i <= 9 }); } return true; }",
         );
-        assert!(diags.is_empty(), "domain not encoded, got {diags:?}");
+        assert_all_discharged(&diags, 1);
     }
 
     /// And the domain genuinely constrains: an obligation that is false only
@@ -2624,10 +2619,7 @@ mod tests {
             "  requires { assert(x <= 127.0); }\n",
             "{ proof { assert(x <= 127.0); } return true; }",
         );
-        assert!(
-            obligations_for(ok).is_empty(),
-            "a matching float premise must discharge"
-        );
+        assert_all_discharged(&obligations_for(ok), 1);
     }
 
     /// Tensor indexing is not modelled, so such an obligation is reported
@@ -2644,16 +2636,14 @@ mod tests {
         let diags = obligations_for(
             "fn f(t: [1] Tensor[int, 4]) -> bool { proof { assert(t[0] == t[0]); } return true; }",
         );
-        assert!(
-            diags.is_empty(),
-            "tensor indexing is now modelled, got {diags:?}"
-        );
+        assert_all_discharged(&diags, 1);
     }
 
     /// No proof block means no obligations and no diagnostics.
     #[test]
     fn test_function_without_proof_block_has_no_obligations() {
         let diags = obligations_for("fn f(n: int) -> bool { return n == n; }");
-        assert!(diags.is_empty(), "got {diags:?}");
+        // Zero: no `proof` block means nothing to discharge, and nothing may be invented.
+        assert_all_discharged(&diags, 0);
     }
 }

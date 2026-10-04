@@ -257,6 +257,52 @@ bytes untouched after the kernel runs.
   erased regions is reported as an **unused linear leak**, because nothing at runtime touches
   it. An earlier version excused it; that let a linear tensor be declared, proved about, and
   silently dropped, which is the failure this compiler exists to make impossible.
+- **`naso verify` is not a subcommand of `naso`; it is the `naso-verify` binary.**
+  `naso-verify` depends on `naso-compiler` (it parses and lowers the AST), so the compiler
+  crate cannot depend on `naso-verify` to implement a subcommand -- that is a dependency cycle,
+  which Cargo rejects. The verifier therefore ships as its own binary. This is a real
+  constraint, not a preference, and it is why `naso verify` does not exist.
+
+### Exit codes, and what "undecided" means
+
+`naso-verify` distinguishes states that all look like "no output" if collapsed into one:
+
+| code | meaning |
+|------|---------|
+| 0 | every obligation was DISCHARGED |
+| 1 | at least one obligation was REFUTED -- a claim proven false |
+| 2 | at least one obligation was LEFT UNDECIDED -- neither confirmed nor refuted |
+| 3 | usage error (bad arguments) |
+| 4 | input error (file missing, or the program did not parse) |
+| 5 | internal verifier failure (solver error, malformed SMT) |
+| 6 | no obligations found, and `--require-obligations` was given |
+
+**Code 2 is the one that matters.** Some constructs have no encoding yet and are reported as
+unsupported. A tool that returned 0 for both "I proved it" and "I could not look at it" would
+have a green build that carries no information. Undecidable is not passing.
+
+`--require-obligations` closes the other hole: without it, a file whose `proof` block has a
+typo produces zero obligations and exits 0, indistinguishable from having proved everything.
+
+### The verifier refused three things rather than guess
+
+- `--mode custom` is gone. `prove_custom_vc` built a lowering context, discarded it, and
+  returned `Ok(Vec::new())` -- an empty diagnostic list, which every caller reads as "no
+  problems found", so `--mode custom` reported a clean bill of health on a verification
+  condition that was never checked. It now returns an error, and `--vc-name` is no longer
+  accepted.
+- The quantity walker's catch-all claimed unrecognised expressions had "no special quantity
+  handling needed". That is how `forall i { output[i] = .. }` came to be skipped -- the one
+  place a loop body consumes a linear tensor -- and why `naso-verify` reported
+  `kernels/scale_clamp_f32` as leaking both its linear tensors while `naso check` accepted the
+  same file. Every `ExprKind` is now matched explicitly, so a future variant is a compile
+  error; forms the tracker cannot model soundly (closures, `reversible` blocks, aggregates) are
+  refused by name.
+- A reference to a linear value now counts as its consumption, matching the compiler's rule in
+  `TypeEnv::check_use`. A bare variable reference previously recorded nothing at all.
+  `naso check` and `naso-verify` now agree on both double-use and leak, including on the
+  program used as the original fixture for this bug: both rejected it, for the same reason.
+
 - **A proved obligation is still not "this works for all inputs."** It means no countermodel
   exists within the supported fragment. Unsupported operators, unresolved callees and
   unsatisfiable caller premises are all outside what that sentence covers.

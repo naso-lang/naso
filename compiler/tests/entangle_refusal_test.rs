@@ -293,11 +293,34 @@ fn every_gate_name_both_producers_can_emit_is_accepted() {
 
 /// Rotations are refused, because a QIR rotation takes an ANGLE the lowering does not supply.
 ///
-/// `RX`, `RY` and `RZ` reach the quantum arm as a bare name with no argument, while
-/// `qir.rz(double, ptr)` needs one. Emitting the call anyway would either fail to type-check or --
-/// worse -- declare a zero-argument function and compute a rotation by an angle of zero, which is
-/// the identity and silently not a rotation. Refused, which is the honest outcome until the
-/// argument is plumbed through.
+/// `qir.rz(double, ptr)` takes an angle; this lowering emits the bare name `RZ` with no angle
+/// operand. Emitting the call anyway would either fail to type-check or -- worse -- declare a
+/// zero-argument function and compute a rotation by an angle of zero, which is the identity and
+/// silently not a rotation. Refused, which is the honest outcome until the angle is plumbed
+/// through.
+///
+/// # What is actually true about rotations, which the earlier version of this comment got wrong
+///
+/// This test previously claimed `RX`/`RY`/`RZ` "reach the quantum arm as a bare name". They do
+/// not. They cannot, and the distinction matters because it changes what would have to happen
+/// to lift the refusal:
+///
+/// - The lexer has exactly four quantum keywords: `entangle`, `hadamard`, `reset`, `cnot`.
+/// - The parser builds `QuantumOp::ApplyGate` only for `GateKind::H`, `GateKind::CX` and
+///   `GateKind::Reset`.
+/// - `GateKind::RX/RY/RZ` are therefore only ever MATCHED -- in `Display`, in `gate_arity`, and
+///   in `naso-verify`'s transition table -- and never CONSTRUCTED anywhere in the repository.
+///
+/// So writing `rz(0.5, a)` does not reach any rotation check at all: `rz` is not a keyword, so it
+/// lexes as an ordinary identifier and is reported as an undefined variable. The rotation refusal
+/// is real and worth keeping -- a future keyword would hit it -- but it is guarding a path that no
+/// source program can currently take.
+///
+/// That is why the assertion below is on the NAME TABLE rather than on a compiled program: there
+/// is no source program that can reach a rotation, so a source-level test could only ever assert
+/// that `rz` is an undefined variable, which is a fact about the lexer and says nothing about
+/// rotations.
+///
 #[test]
 fn rotations_are_refused_until_their_angle_is_supplied() {
     for name in ["RX", "RY", "RZ", "rx", "ry", "rz"] {
@@ -307,6 +330,95 @@ fn rotations_are_refused_until_their_angle_is_supplied() {
              rather than emitted as a zero-angle rotation"
         );
     }
+}
+
+/// No rotation can be written in source, so the rotation refusal guards an unreachable path.
+///
+/// # The companion to `rotations_are_refused_until_their_angle_is_supplied`
+///
+/// That test asserts the backend table refuses `RX`/`RY`/`RZ`. This one asserts WHY that
+/// refusal is currently unreachable from source, and it exists so the two facts cannot drift:
+/// the moment a rotation keyword is added, this fails and points at the angle plumbing that
+/// then has to work.
+///
+/// # What is asserted, and why each part
+///
+/// 1. The lexer has no rotation keyword -- read from the live source, so a new keyword shows
+///    up here instead of silently making this test wrong.
+/// 2. The parser constructs `ApplyGate` only for `H`, `CX` and `Reset` -- likewise read from
+///    the live source, so a new `ApplyGate(GateKind::RZ, ..)` is caught.
+/// 3. A program that writes `rz(0.5, a)` is refused as an UNDEFINED VARIABLE, not as a
+///    rotation -- proving the claim end to end rather than by inspection.
+///
+/// Point 3 is the load-bearing one. The other two are structural greps that could both be
+/// satisfied while some other path still built a rotation; compiling an actual program closes
+/// that.
+#[test]
+fn rotations_cannot_be_written_in_source() {
+    let parser = include_str!("../src/parser/expr.rs");
+    let lexer = include_str!("../src/lexer/token.rs");
+
+    // 1. No rotation keyword in the lexer's token enum.
+    for kw in ["Hadamard", "CNot", "Reset", "Entangle"] {
+        assert!(
+            lexer.contains(&format!("{kw},")),
+            "the four quantum keywords are expected in the token enum; if a fifth -- a \
+             rotation -- has been added, this test must be revisited, because the rotation \
+             refusal would then be reachable and its angle plumbing would have to work"
+        );
+    }
+    for kw in ["Rx", "Rz", "Ry"] {
+        assert!(
+            !lexer.contains(&format!("{kw},")),
+            "`{kw}` now appears to be a lexer token. A rotation is therefore constructible, \
+             so the angle must be plumbed through before the backend admits it -- otherwise a \
+             rotation would be emitted with an angle of zero, which is the identity."
+        );
+    }
+
+    // 2. The parser builds ApplyGate only for H, CX and Reset.
+    for gate in ["GateKind::H", "GateKind::CX", "GateKind::Reset"] {
+        assert!(
+            parser.contains(&format!("ApplyGate({gate},")),
+            "expected the parser to still construct {gate}"
+        );
+    }
+    for gate in ["GateKind::RX", "GateKind::RY", "GateKind::RZ"] {
+        assert!(
+            !parser.contains(&format!("ApplyGate({gate},")),
+            "the parser now constructs {gate}, so a rotation IS reachable from source. The \
+             angle is discarded by `lower_quantum_op` (which sets `args: vec![]`), so it would \
+             be emitted as a zero-angle rotation -- the identity, silently not a rotation. \
+             Plumb the angle through before admitting it in the backend table."
+        );
+    }
+
+    // 3. End to end: writing `rz(theta, q)` is an undefined variable, not a rotation.
+    let src = "fn f() {\n    let [1] a: Qubit = qalloc(1);\n    rz(0.5, a);\n}\n";
+    let Ok(mut parsed) = naso_compiler::parser::parse_program(src) else {
+        panic!(
+            "a program naming an undefined identifier must still PARSE -- it is a name lookup \
+             failure, not a syntax error"
+        );
+    };
+    let checked = naso_compiler::typecheck::check_program(&mut parsed);
+    assert!(
+        !checked.errors.is_empty(),
+        "`rz` is not a keyword, so it lexes as an ordinary identifier and must not typecheck \
+         as a rotation. An empty error list means a rotation became constructible without the \
+         lexer or parser changing, which would defeat the refusal entirely."
+    );
+    let all = checked
+        .errors
+        .iter()
+        .map(|e| format!("{e:?}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    assert!(
+        all.contains("rz"),
+        "the diagnostic must name `rz`, so an author can tell an unknown gate from a real one. \
+         Got: {all}"
+    );
 }
 
 /// `reset` and `entangle` stay refused, even though both are reachable from source.

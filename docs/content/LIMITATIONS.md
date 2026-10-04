@@ -201,8 +201,23 @@ Kept deliberately, and refused rather than approximated:
   - Rotations. The adjoint of a rotation is the rotation by the *negated* angle, and the
     lowering never supplies the angle, so it is refused rather than emitted un-negated —
     which would apply a rotation by zero.
+
   - Empty blocks, and blocks nested in control flow, where the surrounding branch decides
     whether the forward pass ran at all.
+
+  A note on that rotation refusal, because the two halves of it are usually conflated. The
+  backend refuses `RX`/`RY`/`RZ`, and separately the compiler **cannot construct a rotation at
+  all**: the lexer has exactly four quantum keywords (`hadamard`, `cnot`, `reset`, `entangle`),
+  the parser builds `ApplyGate` only for `H`/`CX`/`Reset`, and `GateKind::RX/RY/RZ` are only
+  ever *matched* — in `Display`, in `gate_arity`, and in `naso-verify`'s transition table —
+  never constructed. Writing `rz(0.5, a)` does not reach a rotation check at all: `rz` is not
+  a keyword, so it lexes as an ordinary identifier and is reported as an undefined variable.
+
+  So the table refusal guards a path no source program currently reaches. It is still correct
+  and worth keeping — a future keyword would hit it — but lifting it is not a one-line change
+  to the table. The angle has to be plumbed through `lower_quantum_op`, which today sets
+  `args: vec![]` for every `ApplyGate` and so discards it. `tests/entangle_refusal_test.rs`
+  asserts both halves, so they cannot drift apart.
 
   So `compiler/src/lowering/reversible_lowering.rs` — the TEMPORARY-VALUE path, with its ancilla
   bookkeeping — remains **unwired and refused**. What is wired is a narrower pass,

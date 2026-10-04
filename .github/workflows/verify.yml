@@ -249,7 +249,11 @@ jobs:
       - name: Verify emitted QIR numerically
         run: |
           cargo build --features llvm --bin naso
-          cargo test -p naso-verify --test qir_numeric_verification_test
+          # `--features naso-verify/llvm` is REQUIRED, not optional. Without it the compiler-running
+          # tests are compiled out and the suite reports `ok. 2 passed` -- a green CI run in which
+          # four of the six checks never executed, which is worse than a visible failure.
+          cargo test -p naso-verify --features naso-verify/llvm \
+            --test qir_numeric_verification_test
         working-directory: .
 
       - name: QIR gate emission gap

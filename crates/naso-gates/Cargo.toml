@@ -17,3 +17,10 @@ repository = "https://github.com/naso-lang/naso"
 # failing. One definition, reachable from every layer.
 
 [dependencies]
+
+[lib]
+# A `staticlib` as well as an `rlib`. The compiler emits calls to `qir.h`, `qir.cx`, `qir.mz` and
+# friends; inside an rlib those symbols are Rust-only, so a compiled Naso program cannot be linked
+# against anything. The staticlib is what makes `.naso` -> LLVM IR -> object -> native execution
+# work for quantum code rather than stopping at an undefined symbol.
+crate-type = ["staticlib", "rlib"]

@@ -261,6 +261,20 @@ jobs:
             --test qir_numeric_verification_test
         working-directory: .
 
+      # A compiled `.naso` file, linked against the QIR runtime, EXECUTED. This is the only
+      # check that covers the seam between what the compiler emits and what the runtime defines --
+      # the place the previous state was broken, since `llc` produced a valid object whose `qir.h`
+      # was undefined and the only symptom was a link error nobody was watching for.
+      #
+      # The RELEASE staticlib is REQUIRED, not optional: the harness links
+      # `libnaso_gates.a` from the release directory, and a debug-only build makes every test in
+      # the suite skip on a missing file -- green, having verified nothing.
+      - name: Native execution of a compiled quantum program
+        run: |
+          cargo build --release -p naso-gates
+          cargo build --features llvm --bin naso
+          cargo test --features llvm --test native_quantum_runtime_test
+
       - name: QIR gate emission gap
         run: cargo test --features llvm --test qir_gate_emission_gap_test
 

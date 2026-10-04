@@ -353,6 +353,22 @@ impl StateVector {
         }
     }
 
+    /// The Y matrix.
+    ///
+    /// Feeds the controlled-Y, the same way `x_matrix` and `z_matrix` feed the controlled-X and
+    /// controlled-Z: `apply_pair` applies this to the TARGET whenever the CONTROL reads 1, so a
+    /// controlled-Y is the controlled-X-shaped call with Y in place of X. There is deliberately
+    /// no separate four-by-four `cy_matrix` -- one 2x2 per gate, one place a controlled gate can
+    /// get its meaning from.
+    pub fn y_matrix() -> [Complex; 4] {
+        [
+            Complex::new(0.0, 0.0),
+            Complex::new(0.0, -1.0),
+            Complex::new(0.0, 1.0),
+            Complex::new(0.0, 0.0),
+        ]
+    }
+
     /// The largest absolute difference between two states, amplitude by amplitude.
     ///
     /// Compared up to a GLOBAL PHASE as well as directly: `U` and `-U` are the same

@@ -107,9 +107,33 @@ is not:** the emitted text is parsed back into a gate sequence and replayed on t
 state-vector simulator in `naso-gates`, compared against states derived by hand — the Bell
 pair, a single Hadamard, and a controlled gate with its control both set and clear. That
 verifies operand identity, gate order, and gate completeness on the emitted artifact. It does
-**not** verify that a real QIR runtime interprets `qir.*` the same way: no such runtime has
-executed any of this. `qir_entry` also carries no `ENTRYPOINT` marker, because emitting one
-needs an LLVM attribute registration inkwell's named-enum path does not provide.
+**not** verify that a real QIR runtime interprets `qir.*` the same way: is not a claim about Microsoft's own tooling: no QIR conformance suite has been run against any
+of this. `qir_entry` also carries no `ENTRYPOINT` marker, because emitting one needs an LLVM
+attribute registration inkwell's named-enum path does not provide.
+
+## A Naso quantum program now executes on the CPU
+
+`crates/naso-gates/src/runtime.rs` defines the `qir.*` symbols as a CPU state-vector simulator, so
+a `.naso` file compiles all the way to a native process: `naso build --target llvm` -> `llc` -> `cc`
+-> run, with no undefined reference left at the end. `compiler/tests/native_quantum_runtime_test.rs`
+drives that whole pipeline and asserts on what the process prints.
+
+Getting there required fixing the **ABI**, which was wrong in three ways. `qir.qalloc` returned
+`void`, so no handle was ever produced. A qubit lowered to `alloca i1` plus a classical
+`store i1 false`, so it was not a qubit. And `qir.measure` returned `void`, so **every measurement
+a Naso program performed was discarded**. LLVM now uses the pointer-based ABI the QIR backend
+already declared correctly in `qir::primitives::QIR_INTRINSICS`, through one shared mapping instead
+of two divergent copies.
+
+What is real: gates act on real handles, and measurement samples the actual amplitude, collapses
+the state, and renormalises it. Two unentangled qubits agree about half the time; a Bell pair
+agrees every time. Both facts are asserted as **distributions across processes**, never as a fixed
+outcome -- a constant-answer runtime passes the Bell check and fails the coin-flip one.
+
+What is **not** claimed: no quantum hardware, no noise model, exponential cost, and no QIR
+conformance suite. The source language still offers only four quantum builtins -- `qalloc`,
+`hadamard`, `cnot`, `measure` -- so `qir.x`, `qir.cy` and the rest are reachable only through the
+QIR text backend or the verifier, not by writing a Naso program.
 
 The gate matrices and their inverses are separately verified in `naso-gates` against the same
 CPU simulator, and the bridge refuses any `qir.*` call it does not model rather than skipping

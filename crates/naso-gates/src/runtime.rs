@@ -147,7 +147,7 @@ impl Registers {
 // ---- allocation ----------------------------------------------------------
 
 /// Allocate one qubit in |0> and return its handle.
-#[unsafe(no_mangle)]
+#[unsafe(export_name = "qir.qubit_alloc")]
 pub extern "C" fn qir_qubit_alloc() -> QirQubit {
     REGISTERS.with(|r| {
         let mut r = r.borrow_mut();
@@ -175,7 +175,7 @@ pub extern "C" fn qir_qubit_alloc() -> QirQubit {
 ///
 /// It does not uncompute anything: the caller owns the state. That is exactly why a release is a
 /// poor substitute for a `reset`, which must return the SAME qubit to |0>.
-#[unsafe(no_mangle)]
+#[unsafe(export_name = "qir.qubit_release")]
 pub extern "C" fn qir_qubit_release(qubit: QirQubit) {
     REGISTERS.with(|r| {
         let mut r = r.borrow_mut();
@@ -192,7 +192,7 @@ pub extern "C" fn qir_qubit_release(qubit: QirQubit) {
 // ---- gates ---------------------------------------------------------------
 
 /// Apply a single-qubit gate.
-#[unsafe(no_mangle)]
+#[unsafe(export_name = "qir.apply1")]
 pub extern "C" fn qir_apply1(qubit: QirQubit, gate: u8) {
     REGISTERS.with(|r| {
         let mut r = r.borrow_mut();
@@ -214,7 +214,7 @@ pub extern "C" fn qir_apply1(qubit: QirQubit, gate: u8) {
 /// controlled form is how the first version of this function ended up refusing the very gate
 /// that makes a Bell pair, with the message "X is not a two-qubit gate". The two-qubit gate set
 /// is named, not indexed, so a caller cannot ask for a combination that does not exist.
-#[unsafe(no_mangle)]
+#[unsafe(export_name = "qir.apply2")]
 pub extern "C" fn qir_apply2(a: QirQubit, b: QirQubit, two_qubit_gate: u8) {
     REGISTERS.with(|r| {
         let mut r = r.borrow_mut();
@@ -226,10 +226,11 @@ pub extern "C" fn qir_apply2(a: QirQubit, b: QirQubit, two_qubit_gate: u8) {
         let next = match two_qubit_gate {
             TWO_QUBIT_CX => base.apply_pair(i, j, x_matrix()),
             TWO_QUBIT_CZ => base.apply_pair(i, j, z_matrix()),
+            TWO_QUBIT_CY => base.apply_pair(i, j, StateVector::y_matrix()),
             TWO_QUBIT_SWAP => base.apply_swap(i, j),
             other => {
                 misuse(format!(
-                    "two-qubit gate index {other} is not one of CX, CZ, SWAP"
+                    "two-qubit gate index {other} is not one of CX, CZ, CY, SWAP"
                 ));
                 return;
             }
@@ -239,7 +240,7 @@ pub extern "C" fn qir_apply2(a: QirQubit, b: QirQubit, two_qubit_gate: u8) {
 }
 
 /// Apply a Toffoli: flip `target` when both controls are set.
-#[unsafe(no_mangle)]
+#[unsafe(export_name = "qir.apply3")]
 pub extern "C" fn qir_apply3(control_a: QirQubit, control_b: QirQubit, target: QirQubit) {
     REGISTERS.with(|r| {
         let mut r = r.borrow_mut();
@@ -262,7 +263,7 @@ pub extern "C" fn qir_apply3(control_a: QirQubit, control_b: QirQubit, target: Q
 /// Samples with a fresh draw each call, so two measurements of the same entangled qubit are
 /// correlated as physics requires: a Bell pair gives the same answer twice. Returning the stored
 /// bit instead would agree on that one test while getting the marginals wrong.
-#[unsafe(no_mangle)]
+#[unsafe(export_name = "qir.mz")]
 pub extern "C" fn qir_mz(qubit: QirQubit) -> bool {
     REGISTERS.with(|r| {
         let mut r = r.borrow_mut();
@@ -314,7 +315,7 @@ pub extern "C" fn qir_mz(qubit: QirQubit) -> bool {
 
 /// Number of live qubits. For tests and diagnostics; not part of the base profile.
 #[doc(hidden)]
-#[unsafe(no_mangle)]
+#[unsafe(export_name = "qir.live_qubit_count")]
 pub extern "C" fn qir_live_qubit_count() -> i64 {
     REGISTERS.with(|r| r.borrow().live.len() as i64)
 }
@@ -324,7 +325,7 @@ pub extern "C" fn qir_live_qubit_count() -> i64 {
 /// This is what lets a test assert an entanglement claim numerically instead of by sampling:
 /// both qubits of a Bell pair must read 0.5, which two independent qubits in |0> never do.
 #[doc(hidden)]
-#[unsafe(no_mangle)]
+#[unsafe(export_name = "qir.probability_of_one")]
 pub extern "C" fn qir_probability_of_one(qubit: QirQubit) -> f64 {
     REGISTERS.with(|r| {
         let r = r.borrow();
@@ -396,28 +397,12 @@ fn expand_with_zero_qubit(state: &StateVector) -> Vec<Complex> {
     out
 }
 
-/// A deterministic pseudo-random draw in `[0, 1)`.
+/// The matrices for the gates that are not members of `Gate`.
 ///
-/// A real measurement is stochastic, but this crate must not depend on a Rust RNG being linked,
-/// and a test wanting a reproducible outcome needs a seed it controls. Successive draws differ,
-/// which is what makes entanglement observable rather than accidentally deterministic.
-fn pseudo_random() -> f64 {
-    thread_local! {
-        static SEED: Cell<u64> = const { Cell::new(0x2545_F491_4F6C_DD1D) };
-    }
-    SEED.with(|s| {
-        let mut x = s.get();
-        // xorshift64: cheap, and adequate for a simulator that is not claiming cryptographic
-        // quality. The exact sequence is irrelevant to correctness; only its uniformity is used.
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        s.set(x);
-        // Top 53 bits, which is exactly what an f64 mantissa holds.
-        (x >> 11) as f64 / (1u64 << 53) as f64
-    })
-}
-
+/// `Gate` carries the 19 gates a state vector applies directly. A controlled gate is not a member
+/// because it is a two-qubit operation: `apply_pair` applies one of these 2x2 matrices to the
+/// TARGET whenever the CONTROL reads 1. So the controlled-X and controlled-Z reuse X and Z, and
+/// the controlled-Y uses Y -- which is why there is no separate `cy_matrix` to keep in step.
 fn x_matrix() -> [Complex; 4] {
     [
         Complex::new(0.0, 0.0),
@@ -438,8 +423,9 @@ fn z_matrix() -> [Complex; 4] {
 
 /// The [`Gate`] for a runtime gate index.
 ///
-/// One table, defined here and nowhere else, so the ABI mapping cannot drift between the
-/// compiler side and this side. Index 0 is `H` so a zero-initialised ABI is not silently a no-op.
+/// One table, defined here and nowhere else, so the ABI mapping cannot drift between the compiler
+/// side and this side. Index 0 is `H` rather than a no-op, so a zero-initialised ABI argument is a
+/// Hadamard and therefore VISIBLE, instead of silently doing nothing.
 pub fn gate_from_index(index: usize) -> Option<Gate> {
     Some(match index {
         0 => Gate::H,
@@ -450,9 +436,6 @@ pub fn gate_from_index(index: usize) -> Option<Gate> {
         5 => Gate::Sdg,
         6 => Gate::T,
         7 => Gate::Tdg,
-        8 => Gate::Rx(0.0),
-        9 => Gate::Ry(0.0),
-        10 => Gate::Rz(0.0),
         _ => {
             misuse(format!("gate index {index} is not defined by this runtime"));
             return None;
@@ -461,9 +444,13 @@ pub fn gate_from_index(index: usize) -> Option<Gate> {
 }
 
 /// The two-qubit gate selectors. Named, so a caller cannot invent a combination.
+///
+/// `CY` was added because the compiler emits `qir.cy` and it had no definition: a gate the
+/// backend declares but nothing implements is an undefined reference at link time.
 pub const TWO_QUBIT_CX: u8 = 0;
 pub const TWO_QUBIT_CZ: u8 = 1;
-pub const TWO_QUBIT_SWAP: u8 = 2;
+pub const TWO_QUBIT_CY: u8 = 2;
+pub const TWO_QUBIT_SWAP: u8 = 3;
 
 /// Named single-qubit gate indices, so a caller does not have to memorise the numbers above.
 pub mod gate_index {
@@ -475,4 +462,133 @@ pub mod gate_index {
     pub const SDG: u8 = 5;
     pub const T: u8 = 6;
     pub const TDG: u8 = 7;
+}
+
+/// A pseudo-random draw in `[0, 1)`, seeded from the process clock.
+///
+/// # Why this is not seeded by a constant
+///
+/// An earlier version used a fixed xorshift seed. Every process then drew the SAME first value,
+/// so a program that measured one Hadamard qubit and printed the bit returned the same answer on
+/// every run -- and, worse, returned the WRONG one on half of them. A test asserting that two
+/// entangled qubits agree passed perfectly under that seed, and so would a test asserting they
+/// disagree. Only a distribution check across independent processes exposed it.
+///
+/// So the seed comes from the clock, which is what makes this a genuine random draw. The
+/// generator itself stays a plain xorshift64: this is a simulator and claims no cryptographic
+/// quality, only uniformity.
+///
+/// # What a test should therefore assert
+///
+/// Never assert a particular outcome -- it is a coin flip. Assert the DISTRIBUTION over enough
+/// runs, or assert something that holds for every outcome, such as two entangled qubits always
+/// agreeing. `tests/runtime_native_test.rs` does exactly that, and re-seeds per process so the
+/// check is reproducible in aggregate rather than per-run.
+fn pseudo_random() -> f64 {
+    thread_local! {
+        static SEED: Cell<u64> = const { Cell::new(0) };
+    }
+    SEED.with(|s| {
+        let mut x = if s.get() == 0 {
+            // Mix two independent-ish sources so two processes started in the same nanosecond
+            // still differ. `SplitMix64` is the standard finaliser for exactly this.
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x9E37_79B9_7F4A_7C15);
+            let addr = &nanos as *const u64 as u64;
+            let mut z = nanos.wrapping_add(addr).wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        } else {
+            s.get()
+        };
+        // xorshift64: cheap, and adequate for a simulator that is not claiming cryptographic
+        // quality. The exact sequence is irrelevant to correctness; only its uniformity is used.
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        s.set(x);
+        // Top 53 bits, which is exactly what an f64 mantissa holds.
+        (x >> 11) as f64 / (1u64 << 53) as f64
+    })
+}
+
+// ---------------------------------------------------------------------------------------
+// The named intrinsics the compiler actually emits.
+//
+// `expr_lowering.rs` declares `qir.h`, `qir.cx`, `qir.mz` and the rest by name, so these -- not
+// the indexed `qir.applyN` -- are the symbols a compiled program resolves against. Without them a
+// `.naso` file compiles to a module whose only fault is an undefined reference at link time,
+// which is precisely the state this suite was written to end.
+//
+// They are thin wrappers. One place decides what a gate MEANS; these only decide which handle and
+// which matrix reach it, so the named ABI and the indexed ABI cannot drift apart.
+// ---------------------------------------------------------------------------------------
+
+/// `#pragma qir` target entrypoint `qir.h`.
+#[unsafe(export_name = "qir.h")]
+pub extern "C" fn qir_h(qubit: QirQubit) {
+    qir_apply1(qubit, gate_index::H);
+}
+
+/// `#pragma qir` target entrypoint `qir.x`.
+#[unsafe(export_name = "qir.x")]
+pub extern "C" fn qir_x(qubit: QirQubit) {
+    qir_apply1(qubit, gate_index::X);
+}
+
+/// `#pragma qir` target entrypoint `qir.y`.
+#[unsafe(export_name = "qir.y")]
+pub extern "C" fn qir_y(qubit: QirQubit) {
+    qir_apply1(qubit, gate_index::Y);
+}
+
+/// `#pragma qir` target entrypoint `qir.z`.
+#[unsafe(export_name = "qir.z")]
+pub extern "C" fn qir_z(qubit: QirQubit) {
+    qir_apply1(qubit, gate_index::Z);
+}
+
+/// `#pragma qir` target entrypoint `qir.s`.
+#[unsafe(export_name = "qir.s")]
+pub extern "C" fn qir_s(qubit: QirQubit) {
+    qir_apply1(qubit, gate_index::S);
+}
+
+/// `#pragma qir` target entrypoint `qir.t`.
+#[unsafe(export_name = "qir.t")]
+pub extern "C" fn qir_t(qubit: QirQubit) {
+    qir_apply1(qubit, gate_index::T);
+}
+
+/// `#pragma qir` target entrypoint `qir.cx`.
+#[unsafe(export_name = "qir.cx")]
+pub extern "C" fn qir_cx(control: QirQubit, target: QirQubit) {
+    qir_apply2(control, target, TWO_QUBIT_CX);
+}
+
+/// `#pragma qir` target entrypoint `qir.cy`.
+#[unsafe(export_name = "qir.cy")]
+pub extern "C" fn qir_cy(control: QirQubit, target: QirQubit) {
+    qir_apply2(control, target, TWO_QUBIT_CY);
+}
+
+/// `#pragma qir` target entrypoint `qir.cz`.
+#[unsafe(export_name = "qir.cz")]
+pub extern "C" fn qir_cz(control: QirQubit, target: QirQubit) {
+    qir_apply2(control, target, TWO_QUBIT_CZ);
+}
+
+/// `#pragma qir` target entrypoint `qir.swap`.
+#[unsafe(export_name = "qir.swap")]
+pub extern "C" fn qir_swap(a: QirQubit, b: QirQubit) {
+    qir_apply2(a, b, TWO_QUBIT_SWAP);
+}
+
+/// `#pragma qir` target entrypoint `qir.ccx`.
+#[unsafe(export_name = "qir.ccx")]
+pub extern "C" fn qir_ccx(control_a: QirQubit, control_b: QirQubit, target: QirQubit) {
+    qir_apply3(control_a, control_b, target);
 }

@@ -29,4 +29,5 @@
 //! obligations.
 
 pub mod gate_inverse;
+pub mod runtime;
 pub mod statevector;

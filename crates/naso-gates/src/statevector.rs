@@ -320,6 +320,39 @@ impl StateVector {
         }
     }
 
+    /// Exchange two qubits unconditionally.
+    ///
+    /// Needed because [`Self::apply_pair`] is strictly CONTROLLED: it acts only where the first
+    /// qubit is set, so a swap expressed through it would leave the state alone whenever the
+    /// control happens to be |0>. That is not a swap, and it fails on the input that should be
+    /// easiest -- both qubits in |0> is a no-op under a controlled swap and the identity under a
+    /// real one. So a genuine permutation, in the same destination-scatter form the other
+    /// permutation gates use.
+    pub fn apply_swap(&self, a: usize, b: usize) -> Self {
+        assert!(a != b, "a swap needs two distinct qubits");
+        let abit = 1usize << a;
+        let bbit = 1usize << b;
+        let source = self.amplitudes();
+        let mut out = vec![Complex::ZERO; source.len()];
+        for (index, amplitude) in source.iter().enumerate() {
+            // Exchange the two bits: a set on `a` moves to `b` and vice versa.
+            let a_set = (index & abit) != 0;
+            let b_set = (index & bbit) != 0;
+            let mut destination = index & !(abit | bbit);
+            if a_set {
+                destination |= bbit;
+            }
+            if b_set {
+                destination |= abit;
+            }
+            out[destination] = *amplitude;
+        }
+        Self {
+            amplitudes: out,
+            qubits: self.qubits,
+        }
+    }
+
     /// The largest absolute difference between two states, amplitude by amplitude.
     ///
     /// Compared up to a GLOBAL PHASE as well as directly: `U` and `-U` are the same

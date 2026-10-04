@@ -237,8 +237,8 @@ fn a_cnot_over_the_same_two_qubits_still_emits() {
     assert!(ok, "a CNOT must still emit:\n{text}");
     let ir = std::fs::read_to_string(&out).expect("read emitted IR");
     assert!(
-        ir.contains("qir.CX"),
-        "the CNOT should appear in the emitted module:\n{ir}"
+        ir.contains("qir.cx"),
+        "the CNOT should appear in the emitted module under its QIR name:\n{ir}"
     );
     assert!(
         !ir.contains("entangle"),
@@ -254,34 +254,57 @@ fn a_cnot_over_the_same_two_qubits_still_emits() {
 /// "`h` has no LLVM quantum intrinsic". The gate set is shared, so a name missing from either
 /// spelling is a real refusal rather than a cosmetic mismatch.
 ///
-/// The names are written out as literals in BOTH lists rather than read from `GateKind`, for two
-/// reasons: `Literal` is not publicly re-exported so a rotation variant cannot be constructed
-/// here, and a test that re-derives its expectations from the same table it is checking proves
-/// nothing about names it never looks at. A name this test has never heard of is exactly the one
-/// that would be refused at runtime.
+/// Every gate name either producer can emit is accepted, in BOTH spellings.
+///
+/// This is an anti-drift guard written after the allowlist was wrong twice. `GateKind`'s `Display`
+/// emits `H` and `CX`; the structural fixture parser in `codegen_tests.rs` emits `h` and `cx` for
+/// the same gates. A table carrying only one set silently broke five fixture suites with
+/// "`h` has no LLVM quantum intrinsic". The gate set is shared, so a name missing from either
+/// spelling is a real refusal rather than a cosmetic mismatch.
+///
+/// The names are written out as literals rather than read from `GateKind`, because `Literal` is
+/// not publicly re-exported so a rotation cannot be constructed here, and because a test that
+/// re-derives its expectations from the table it is checking proves nothing about names it never
+/// looks at. A name this test has never heard of is exactly the one that would be refused.
+///
+/// These have no source spelling, so they are checked against the mapping directly rather than by
+/// compiling a program. `hadamard` and `cnot` ARE source spellings -- the lowerer maps them to
+/// `H` and `CX` -- and are covered end to end by `gates_with_a_source_spelling_still_compile`.
 #[test]
 fn every_gate_name_both_producers_can_emit_is_accepted() {
-    // As `GateKind::Display` spells it -- what the real lowerer emits. These have no source
-    // spelling, so they are checked against the allowlist itself rather than through a program.
-    for name in [
-        "H", "X", "Y", "Z", "S", "T", "CX", "CY", "CZ", "RX", "RY", "RZ",
-    ] {
+    // As `GateKind::Display` spells it -- what the real lowerer emits.
+    for name in ["H", "X", "Y", "Z", "S", "T", "CX", "CY", "CZ"] {
         assert!(
             backend_accepts(name),
             "`{name}` is what `GateKind::Display` produces, so the backend must accept it"
         );
     }
-    // `hadamard` and `cnot` are SOURCE spellings, and the lowerer maps them to `H` and `CX` --
-    // so they are deliberately NOT in this table and are covered end to end by
-    // `gates_with_a_source_spelling_still_compile` instead.
-    // As `tests/codegen_tests.rs::gate_name` spells it -- covered by `codegen_tests.rs`, and
-    // pinned here by name so removing one from the allowlist is visible as this failure.
+    // As `tests/codegen_tests.rs::gate_name` spells it -- also covered by `codegen_tests.rs`, and
+    // pinned here by name so removing one from the mapping shows up as this failure.
     for name in [
-        "h", "x", "y", "z", "s", "t", "cx", "cy", "cz", "rx", "ry", "rz", "ccx", "swap", "mz",
+        "h", "x", "y", "z", "s", "t", "cx", "cy", "cz", "ccx", "swap", "mz",
     ] {
         assert!(
             backend_accepts(name),
             "`{name}` is what the fixture parser produces, so the backend must accept it"
+        );
+    }
+}
+
+/// Rotations are refused, because a QIR rotation takes an ANGLE the lowering does not supply.
+///
+/// `RX`, `RY` and `RZ` reach the quantum arm as a bare name with no argument, while
+/// `qir.rz(double, ptr)` needs one. Emitting the call anyway would either fail to type-check or --
+/// worse -- declare a zero-argument function and compute a rotation by an angle of zero, which is
+/// the identity and silently not a rotation. Refused, which is the honest outcome until the
+/// argument is plumbed through.
+#[test]
+fn rotations_are_refused_until_their_angle_is_supplied() {
+    for name in ["RX", "RY", "RZ", "rx", "ry", "rz"] {
+        assert!(
+            !backend_accepts(name),
+            "`{name}` needs an angle argument this lowering does not pass, so it must be refused \
+             rather than emitted as a zero-angle rotation"
         );
     }
 }
@@ -308,7 +331,7 @@ fn reset_and_entangle_stay_refused() {
 /// them. Testing coverage through source programs therefore skips exactly the spellings most at
 /// risk of drifting, which is how the allowlist lost the fixture spellings once already.
 fn backend_accepts(op: &str) -> bool {
-    naso_compiler::codegen::llvm::expr_lowering::quantum_intrinsic_name(op).is_some()
+    naso_compiler::codegen::llvm::expr_lowering::quantum_intrinsic_for(op).is_some()
 }
 
 /// A gate spelled the way source spells it still compiles end to end.

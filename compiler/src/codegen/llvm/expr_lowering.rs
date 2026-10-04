@@ -189,47 +189,75 @@ pub struct LoopTargets<'ctx> {
     pub affine_band: bool,
 }
 
-/// The LLVM intrinsic for a quantum operation, or `None` if this backend has none.
+/// The QIR intrinsic a quantum operation lowers to, or `None` if none exists.
 ///
-/// # Why an allowlist rather than `format!("qir.{op}")`
+/// # One ABI, not two
 ///
-/// Every `qir.*` name below is emitted as a `declare` with no `define`. That is deliberate and
-/// separate: the QIR runtime does not exist here, so a module containing one will not link.
-/// This function does not change that. What it stops is the backend silently INVENTING a name
-/// for an operation it does not model, which produced a plausible-looking module and then a
-/// link error about a symbol the user never wrote.
+/// The QIR backend already declares a complete, correct base-profile ABI in
+/// `codegen::qir::primitives::QIR_INTRINSICS`: qubits are opaque `ptr` handles, `qubit_alloc`
+/// returns one, gates take them, and measurement returns `i1`. This function looks the name up
+/// THERE rather than formatting a string.
 ///
-/// # Where the names come from
+/// That matters because the previous version did `format!("qir.{op}")` and inferred every
+/// signature from the argument values it happened to have. The result was an ABI that was not
+/// merely unlinkable but wrong on its own terms:
 ///
-/// Two producers, and they SPELL DIFFERENTLY -- getting this wrong is not theoretical:
+/// ```text
+/// call void @qir.qalloc()          ; returns VOID -- no handle is ever produced
+/// %a = alloca i1, align 1
+/// store i1 false, ptr %a, align 1  ; a qubit lowered to a CLASSICAL BOOL
+/// call void @qir.measure(i1 %a4)   ; returns VOID -- the result is DISCARDED
+/// ```
 ///
-/// - `GateKind`'s `Display`, used by the real lowerer: `H`, `CX`, `RX`, and `reset`.
-/// - The structural fixture parser in `compiler/tests/codegen_tests.rs`, whose `gate_name`
-///   lowercases and shortens: `h`, `cx`, `ccx`, `mz`, `swap`.
+/// So every measurement computed in a Naso program was thrown away, and the "qubit" was a bit
+/// that nothing could act on. No runtime could have made that ABI meaningful.
 ///
-/// So the set carries both, plus the three non-gate operations. Adding a name here is not free:
-/// it asserts that this backend can emit the call, which is true of neither today.
+/// # Which operations are refused
 ///
-/// `entangle` and `reset` are deliberately ABSENT. The QIR base profile declares no intrinsic
-/// for either, and a substitute computes something else: a release is not a `reset`, which
-/// returns the SAME qubit to |0> and leaves the binding usable; a CNOT is not an `entangle`,
-/// which leaves any qubit past the second unentangled while looking correct in the text.
+/// Anything with no entry in the QIR table. That includes `entangle` and `reset`, which have no
+/// base-profile intrinsic: approximating `entangle` by a CNOT over the first two qubits would
+/// leave any further qubit unentangled while looking correct in the emitted text, and a release
+/// is not a `reset`, which returns the SAME qubit to |0> and leaves the binding usable.
 ///
-/// Public so the backend's gate coverage is TESTABLE rather than only observable. A private
-/// allowlist can only be checked by compiling a program that happens to mention each name, and
-/// most of these names have no source spelling at all -- `H` and `CX` are what `GateKind`'s
-/// `Display` emits internally, and no `.naso` file can say them. Testing coverage through source
-/// programs therefore misses exactly the spellings most at risk of drifting.
-pub fn quantum_intrinsic_name(op: &str) -> Option<String> {
-    const KNOWN: &[&str] = &[
+/// The source-level spelling differs from the intrinsic name -- `hadamard` lowers to `H`, `cnot`
+/// to `CX` -- so the mapping is explicit here rather than assumed.
+pub fn quantum_intrinsic_for(op: &str) -> Option<&'static str> {
+    Some(match op {
         // `GateKind::Display`, as the real lowerer spells it.
-        "H", "X", "Y", "Z", "S", "T", "CX", "CY", "CZ", "RX", "RY", "RZ",
-        // The same gates as `tests/codegen_tests.rs::gate_name` spells them.
-        "h", "x", "y", "z", "s", "t", "cx", "cy", "cz", "rx", "ry", "rz", "ccx", "swap", "mz",
-        // Non-gate quantum operations from `QuantumOp`.
-        "qalloc", "measure", "phase",
-    ];
-    KNOWN.contains(&op).then(|| format!("qir.{op}"))
+        "H" => "qir.h",
+        "X" => "qir.x",
+        "Y" => "qir.y",
+        "Z" => "qir.z",
+        "S" => "qir.s",
+        "T" => "qir.t",
+        "CX" => "qir.cx",
+        "CY" => "qir.cy",
+        "CZ" => "qir.cz",
+        // Non-gate quantum operations.
+        "qalloc" => "qir.qubit_alloc",
+        "measure" => "qir.mz",
+        // `phase` is deliberately ABSENT, as are `RZ`/`RX`/`RY`: the QIR rotations take an angle
+        // (`qir.r1(double, ptr)`) and this lowering supplies none, so emitting the call would
+        // compute a rotation by an angle of zero -- the identity, silently not a rotation. They
+        // fall through to `None` and are refused with a diagnostic naming the missing argument.
+        //
+        // The same gates as `tests/codegen_tests.rs::gate_name` spells them. Two producers,
+        // different spellings, one shared gate set -- an earlier table carried only the first
+        // and silently broke five fixture suites.
+        "h" => "qir.h",
+        "x" => "qir.x",
+        "y" => "qir.y",
+        "z" => "qir.z",
+        "s" => "qir.s",
+        "t" => "qir.t",
+        "cx" => "qir.cx",
+        "cy" => "qir.cy",
+        "cz" => "qir.cz",
+        "ccx" => "qir.ccx",
+        "swap" => "qir.swap",
+        "mz" => "qir.mz",
+        _ => return None,
+    })
 }
 
 impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
@@ -1317,14 +1345,20 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 // a DECLARATION and nothing else, so `llc` accepts it and the failure surfaces
                 // later as a link error naming an internal function the user never wrote. That
                 // is how `entangle` came to be reported as compiled.
-                let intrinsic_name = quantum_intrinsic_name(op).ok_or_else(|| {
+                let intrinsic_name = quantum_intrinsic_for(op).ok_or_else(|| {
                     CodegenError::UnsupportedFeature(format!(
-                        "`{op}` has no LLVM quantum intrinsic, so this backend cannot emit it. \
-                         The remaining quantum operations have declarations but no definitions \
-                         either, so none of them can be linked yet; refusing here makes that \
-                         visible at compile time instead of at link time."
+                        "`{op}` has no QIR intrinsic in the base profile, so this backend cannot \
+                         emit it. Approximating it would compute something other than the source \
+                         says -- a CNOT is not an `entangle`, a release is not a `reset` -- so it \
+                         is refused rather than substituted."
                     ))
                 })?;
+
+                // `qubit_alloc` RETURNS a qubit handle, so its signature must say so.
+                // Inferring every signature from the argument values made `qalloc`
+                // void-returning, which is why `let [1] a = qalloc(1)` bound no qubit at all and
+                // the program went on to emit a classical `i1`.
+                let returns_qubit = op == "qalloc";
 
                 let arg_values: CodegenResult<Vec<BasicValueEnum<'ctx>>> = args
                     .iter()
@@ -1342,15 +1376,25 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
 
                 // Declare the intrinsic on first use so the module is complete
                 // even when no `extern_functions` entry mentioned it.
-                let func = match self.module.get_function(&intrinsic_name) {
+                // Measurement RETURNS its result. Declaring `qir.mz` as void-returning is how
+                // every measurement a Naso program performed came to be discarded: the call had
+                // no result to bind, so `let m = measure(a)` bound nothing.
+                let ret_type: Option<BasicTypeEnum<'ctx>> = if returns_qubit {
+                    Some(self.value_builder.type_lowering().qubit_type().into())
+                } else if op == "measure" || op == "mz" {
+                    Some(self.value_builder.type_lowering().result_type().into())
+                } else {
+                    None
+                };
+                let func = match self.module.get_function(intrinsic_name) {
                     Some(f) => f,
                     None => {
                         let fn_type = self.value_builder.type_lowering().fn_type(
-                            None,
+                            ret_type,
                             &param_types,
                             /* is_var_args */ false,
                         );
-                        self.module.add_function(&intrinsic_name, fn_type, None)
+                        self.module.add_function(intrinsic_name, fn_type, None)
                     }
                 };
 

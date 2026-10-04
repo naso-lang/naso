@@ -23,6 +23,7 @@ use crate::codegen::llvm::{
     type_lowering::LlvmTypeLowering,
     value_builder::LlvmValueBuilder,
 };
+use crate::ir::pir_types::ElemType;
 use crate::ir::pir_types::ParamKind;
 use crate::ir::{
     access_relation::AccessRelations,
@@ -174,6 +175,10 @@ pub fn lower_schedule_tree_into<'ctx>(
                         elem: elem_ty,
                         shape: shape.clone(),
                         len,
+                        // Declared sub-byte element => packed storage. Recorded here,
+                        // where the `ElemType` is still known; downstream the i8 storage
+                        // makes an i8 tensor and a packed i4 tensor look alike.
+                        sub_byte: elem == ElemType::I4,
                     },
                 );
             }
@@ -196,6 +201,7 @@ pub fn lower_schedule_tree_into<'ctx>(
                         // A `QRegister` occupies ONE argument, not the `(ptr, len)`
                         // pair a tensor does, so there is no length to forward.
                         len: None,
+                        sub_byte: false,
                     },
                 );
             }
@@ -357,6 +363,12 @@ fn scalar_slot_type<'ctx>(
     let tl = value_builder.type_lowering();
     match elem {
         ElemType::F64 => tl.float_type(FloatWidth::F64).into(),
+        // SUB-BYTE storage: an `i4` element occupies half a byte, but the byte is the
+        // addressable unit, so the SLOT is `i8`. Two elements share it and
+        // `TensorBinding::sub_byte` says so; without that flag this tensor and an
+        // `i8` one would be indistinguishable, which is the ambiguity a widening bug
+        // hides in.
+        ElemType::I4 => tl.int_type(IntWidth::I8).into(),
         ElemType::I8 => tl.int_type(IntWidth::I8).into(),
         ElemType::I16 => tl.int_type(IntWidth::I16).into(),
         ElemType::I32 => tl.int_type(IntWidth::I32).into(),

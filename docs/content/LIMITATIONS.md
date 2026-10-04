@@ -62,6 +62,8 @@ construct, and neither is a placeholder value, a shader comment, or an exit stat
 | scalar parameters | **emits** | <!-- construct:scalar parameters --> |
 | tensor parameters | **emits** | caller-supplied pointer plus a length <!-- construct:tensor parameters --> |
 | 2-D tensors | **emits** | row-major <!-- construct:2-D tensors --> |
+| sub-byte i4 tensors | **emits** | PACKED: 8 values in 4 bytes, two per byte, low nibble first. Proven by execution in `sub_byte_i4_execution_test.rs`, which asserts the byte count, not just the IR shape <!-- construct:sub-byte i4 tensors --> |
+| scalar i4 | **refused** | no neighbour to share a byte with, so a scalar i4 would have to be a byte and the sub-byte claim would be fiction. Refused rather than silently widened <!-- construct:scalar i4 --> |
 | quantum parameters | **emits** | `Qubit` and `QRegister` both map to the pointer ABI <!-- construct:quantum parameters --> |
 | symbolic loop bounds | **emits** | affine schedule bands <!-- construct:symbolic loop bounds --> |
 | `reversible { ... }` | **refused** | gate sequences uncompute, rotations included; arithmetic, measurement, empty and nested blocks still refused <!-- construct:`reversible { ... }` --> |
@@ -181,6 +183,46 @@ Stated precisely, because the distinction matters:
   proofs.
 - Pointer ABI guards validate the supplied lengths. They cannot prove non-nullness,
   memory safety, lifetime, provenance, or allocation shape.
+
+## Sub-byte `i4` storage
+
+`i4` and `u4` are real types with real packed storage, not names for a byte. `Tensor[i4, N]`
+occupies `N / 2` bytes: two values per byte, low nibble first. This is the load-bearing step
+toward a miniature model, and it is measured rather than asserted —
+`compiler/tests/sub_byte_i4_execution_test.rs` compiles a quantizer, RUNS it, and checks that
+16 values write exactly 8 bytes and that a pre-filled 16-byte buffer still has its last 8
+bytes untouched after the kernel runs.
+
+**What is implemented**
+
+- `i4` as two's complement over `-8..7`, decoded arithmetically with no branch and no
+  `select`: the sign bit is shifted into bit 7 and multiplied by 8.
+- Read-modify-write stores. A plain store would clobber the neighbour, and the tensor would
+  still occupy the right number of bytes — so the compression ratio would check out while
+  the data was garbage. A dedicated test writes one element and asserts the other half of
+  that byte survived.
+- `as i4` narrowing, which saturates through the source-level `clamp`. Values outside the
+  range clamp; they do not wrap.
+- Scalar `i4` is **refused**, not widened. A scalar has no neighbour to share a byte with, so
+  admitting it would mean a one-byte `i4`, which is the fiction this feature exists to
+  eliminate.
+
+**What is not implemented, and is refused or absent rather than faked**
+
+- **`u4` is lexed and parsed but has no distinct storage.** It reuses the signed nibble path,
+  so `u4` currently behaves as `i4`. Treat it as unimplemented until a test distinguishes
+  them.
+- **No `i2`.** The addressing math generalizes, but nothing has been built or measured.
+- **No tensor indexing in the prover.** `ExprKind::Index` has no encoding arm, so a bound on
+  `input[i] / scale` cannot be discharged. The quantization *arithmetic* is verified by
+  execution; the quantization *bounds* are not machine-checked.
+- **No float reasoning in the prover.** Scale and zero-point error bounds still need an
+  interval or rational abstraction. Claiming otherwise would be the exact dishonesty this
+  page exists to prevent.
+- **No `naso verify` subcommand.** The verifier is a real library with passing tests, but the
+  CLI does not expose it, so no source-level verification workflow exists yet.
+- **Shape must have an even extent.** `Tensor[i4, 15]` is a partial trailing byte whose
+  handling is unspecified; it is not rejected either, so do not rely on it.
 
 ## Not implemented
 

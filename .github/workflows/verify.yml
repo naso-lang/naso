@@ -323,6 +323,21 @@ jobs:
       - name: QIR codegen cannot emit a wrong circuit
         run: cargo test --features llvm --test codegen_tests
 
+      # Sub-byte `i4`: 16 values MUST occupy 8 bytes. This is the compression claim, so the
+      # suite asserts the BYTE COUNT by running a real executable and checking which bytes of a
+      # pre-filled 16-byte buffer the kernel actually touched -- an IR-shape check would pass
+      # against a compiler that quietly gave `i4` a whole byte each, which is precisely the
+      # dishonesty this feature must not ship with. It also kills the mutations that drop the
+      # nibble shift, the store merge, or the sign step.
+      - name: sub-byte i4 packs two values per byte
+        run: cargo test --features llvm -p naso-compiler --test sub_byte_i4_execution_test
+
+      # `capability_matrix_test` cross-checks the published matrix and LIMITATIONS.md against
+      # what the backends actually do. It is what caught `Tensor[i4, 8]` failing LLVM
+      # verification on a literal index, so it must run rather than being assumed.
+      - name: capability matrix matches reality
+        run: cargo test --features llvm -p naso-compiler --test capability_matrix_test
+
       - name: Gate inverse table and state-vector simulator
         run: |
           cargo test -p naso-gates --test gate_inverse_test

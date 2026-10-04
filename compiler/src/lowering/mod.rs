@@ -107,6 +107,9 @@ fn elem_kind(ty: &crate::ast::Type) -> Option<crate::ir::pir_types::ElemType> {
         crate::ast::ty::TypeKind::Int
         | crate::ast::ty::TypeKind::UInt
         | crate::ast::ty::TypeKind::Nat => match ty.int_width {
+            // Sub-byte. Carried distinctly so a backend must either pack it or refuse
+            // it; see `ElemType::I4` for why substituting `I8` is not acceptable.
+            Some(4) => ElemType::I4,
             Some(8) => ElemType::I8,
             Some(16) => ElemType::I16,
             Some(32) => ElemType::I32,

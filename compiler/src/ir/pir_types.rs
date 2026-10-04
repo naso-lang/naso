@@ -255,6 +255,24 @@ pub enum UnaryOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ElemType {
     F64,
+    /// SUB-BYTE signed storage: two 4-bit values per byte.
+    ///
+    /// # Why this is its own variant and not `I8`
+    ///
+    /// LLVM has no 4-bit storage type, so a backend cannot simply emit `i4`.
+    /// Two honest options exist and one dishonest one:
+    ///
+    ///  * store each element in its own `i8` byte -- simple, but the tensor is
+    ///    then no smaller than an i8 one and the compression ratio is fiction;
+    ///  * PACK two elements per byte -- real 2x compression, at the cost of
+    ///    needing shift/mask on every access.
+    ///
+    /// Mapping `i4` onto `ElemType::I8` would take the first option silently. A
+    /// quantizer would then report 8x compression over f32 while achieving 4x,
+    /// which is exactly the kind of plausible-but-wrong output this compiler
+    /// refuses elsewhere. So `I4` is distinct all the way through, and a backend
+    /// that has not implemented packing must REFUSE it rather than substitute.
+    I4,
     I8,
     I16,
     I32,

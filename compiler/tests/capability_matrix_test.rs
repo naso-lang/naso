@@ -173,6 +173,22 @@ fn matrix() -> Vec<Row> {
             note: "row-major",
         },
         Row {
+            construct: "sub-byte i4 tensors",
+            src: "fn f(x: Tensor[i4, 8]) -> i8 { x[0] as i8 }",
+            llvm: Outcome::Emits,
+            note: "PACKED: 8 values in 4 bytes, two per byte, low nibble first. Proven by \
+                   execution in `sub_byte_i4_execution_test.rs`, which asserts the byte \
+                   count, not just the IR shape",
+        },
+        Row {
+            construct: "scalar i4",
+            src: "fn f(a: i4) -> i4 { a }",
+            llvm: Outcome::Refused,
+            note: "no neighbour to share a byte with, so a scalar i4 would have to be a \
+                   byte and the sub-byte claim would be fiction. Refused rather than \
+                   silently widened",
+        },
+        Row {
             construct: "quantum parameters",
             src: "fn f(q: Qubit) -> i64 { 0 }",
             llvm: Outcome::Emits,

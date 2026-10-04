@@ -182,6 +182,14 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Type::new(TypeKind::Bool, Quantity::Many, Span::default())
             }
+            Some(TK::Int4) => {
+                let span = self.peek_token().map(token_span).unwrap_or_default();
+                self.bump();
+                // SUB-BYTE. Retained as width 4 for the same reason `i8` is: a
+                // quantizer must be able to tell 4-bit storage from 8-bit, or the
+                // compression ratio it reports is fiction.
+                Type::int_width(4, span)
+            }
             Some(TK::Int8) => {
                 let span = self.peek_token().map(token_span).unwrap_or_default();
                 self.bump();
@@ -216,6 +224,11 @@ impl<'a> Parser<'a> {
                 // The width is kept. It used to be discarded, which made
                 // `Tensor[i8, N]` indistinguishable from `Tensor[i32, N]`.
                 Type::int_width(64, span)
+            }
+            Some(TK::UInt4) => {
+                let span = self.peek_token().map(token_span).unwrap_or_default();
+                self.bump();
+                Type::uint_width(4, span)
             }
             Some(TK::UInt8) => {
                 let span = self.peek_token().map(token_span).unwrap_or_default();

@@ -247,6 +247,20 @@ fn param_slot<'ctx>(
                 ElemType::F64 => type_lowering
                     .float_type(crate::codegen::abi::FloatWidth::F64)
                     .into(),
+                // A SCALAR `i4` has no byte to live in. Packing is defined for a
+                // tensor element, where the index says which nibble; a bare `i4` value
+                // has no such context, so there is no honest slot for it. Returning an
+                // `i8` here would widen silently -- the kernel would report 4-bit
+                // quantization while running at 8 bits.
+                ElemType::I4 => {
+                    return Err(CodegenError::UnsupportedFeature(
+                        "a scalar `i4` parameter has no storage: sub-byte values are defined \
+                         only as TENSOR elements, where the index selects the nibble within \
+                         a shared byte. A scalar `i4` is refused rather than widened to `i8`, \
+                         which would report a compression ratio the code does not achieve"
+                            .to_string(),
+                    ));
+                }
                 ElemType::I8 => type_lowering
                     .int_type(crate::codegen::abi::IntWidth::I8)
                     .into(),
@@ -313,6 +327,16 @@ pub fn function_return_type<'ctx>(
     Ok(Some(match &func.return_type {
         FnReturn::Void => return Ok(None),
         FnReturn::Scalar(ElemType::F64) => type_lowering.float_type(FloatWidth::F64).into(),
+        // As with a scalar parameter: a returned `i4` has no byte to pack into, so it is
+        // refused rather than widened. See the scalar-parameter arm for the reasoning.
+        FnReturn::Scalar(ElemType::I4) => {
+            return Err(CodegenError::UnsupportedFeature(
+                "a scalar `i4` return has no storage: sub-byte values are defined only as \
+                 TENSOR elements. Widening it to `i8` would report 4-bit quantization while \
+                 running at 8 bits"
+                    .to_string(),
+            ));
+        }
         FnReturn::Scalar(ElemType::I8) => type_lowering.int_type(IntWidth::I8).into(),
         FnReturn::Scalar(ElemType::I16) => type_lowering.int_type(IntWidth::I16).into(),
         FnReturn::Scalar(ElemType::I32) => type_lowering.int_type(IntWidth::I32).into(),

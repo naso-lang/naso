@@ -147,6 +147,13 @@ pub enum TokenKind {
     As,
     #[regex("[iI]8", priority = 3)]
     Int8,
+    // SUB-BYTE widths. `i4` is the workhorse of weight quantization: two signed
+    // nibbles per byte, so a 32-bit word holds eight weights instead of four.
+    // These are REAL types in the AST (`Type::int_width(4, _)`), not an alias
+    // for `i8` -- a quantizer that silently widened to i8 would report a
+    // compression ratio it does not achieve.
+    #[regex("[iI]4", priority = 3)]
+    Int4,
     #[regex("[iI]16", priority = 3)]
     Int16,
     #[regex("[iI]32", priority = 3)]
@@ -157,6 +164,10 @@ pub enum TokenKind {
     ISize,
     #[regex("[uU]8", priority = 3)]
     UInt8,
+    // Unsigned 4-bit: the usual storage format for quantized weights, since a
+    // symmetric quantizer maps its range onto 0..15 rather than -8..7.
+    #[regex("[uU]4", priority = 3)]
+    UInt4,
     #[regex("[uU]16", priority = 3)]
     UInt16,
     #[regex("[uU]32", priority = 3)]
@@ -351,11 +362,13 @@ impl TokenKind {
             TokenKind::Proof => "'proof'",
             TokenKind::As => "'as'",
             TokenKind::Mut => "'mut'",
+            TokenKind::Int4 => "'i4'",
             TokenKind::Int8 => "'i8'",
             TokenKind::Int16 => "'i16'",
             TokenKind::Int32 => "'i32'",
             TokenKind::Int64 => "'i64'",
             TokenKind::ISize => "'isize'",
+            TokenKind::UInt4 => "'u4'",
             TokenKind::UInt8 => "'u8'",
             TokenKind::UInt16 => "'u16'",
             TokenKind::UInt32 => "'u32'",

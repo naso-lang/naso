@@ -31,6 +31,7 @@
 //!   and nothing downstream can recover it.
 
 use crate::ast::Quantity;
+use crate::codegen::abi::IntWidth;
 use crate::codegen::error::{CodegenError, CodegenResult};
 use crate::codegen::llvm::value_builder::LlvmValueBuilder;
 use crate::ir::pir_types::{BinaryOp, ParamKind, PirExpr, UnaryOp};
@@ -1141,6 +1142,18 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 // bit count has no LLVM spelling here, so refuse rather than guess
                 // a nearby width.
                 let target_ty = self.value_builder.type_lowering().int_type(match target_w {
+                    // SUB-BYTE: LLVM has no 4-bit integer, so a narrowing cast to `i4`
+                    // becomes a narrowing cast to `i8`. That is EXACT rather than an
+                    // approximation ONLY because the value being stored has already been
+                    // clamped to the 4-bit range by the kernel -- `i8` holds -8..7 and the
+                    // clamp guarantees the value is inside it. The narrowing itself cannot
+                    // lose information the type could represent.
+                    //
+                    // What this cast does NOT do is choose the byte. Placing the narrowed
+                    // value into its nibble is the STORE's job; see `sub_byte_store`. If the
+                    // two were conflated here, an `i4` tensor would hold one value per byte
+                    // and the compression ratio would be a fiction.
+                    4 => crate::codegen::abi::IntWidth::I8,
                     1 => crate::codegen::abi::IntWidth::I1,
                     8 => crate::codegen::abi::IntWidth::I8,
                     16 => crate::codegen::abi::IntWidth::I16,
@@ -1216,6 +1229,7 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 // a bound tensor. Anything else is refused by name. An indexed target
                 // resolves to an element ADDRESS rather than the value currently stored
                 // there, which is what makes `output[i] = ...` a real store.
+                let mut sub_byte_done = false;
                 let store_target: (inkwell::values::PointerValue<'ctx>, BasicTypeEnum<'ctx>) =
                     match target.as_ref() {
                         PirExpr::Var(name) => self.value_builder.variable(name).ok_or_else(|| {
@@ -1232,7 +1246,26 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                                 .iter()
                                 .map(|i| self.build_expr(i, quantities))
                                 .collect();
-                            let gep = self.tensor_gep(&tensor, &idx?, "elem")?;
+                            let idx = idx?;
+
+                            // SUB-BYTE store. `tensor_gep` addressed the shared BYTE, so a
+                            // plain store would drop the value on top of its neighbour and
+                            // corrupt the other element. This is deferred to `sub_byte_store`,
+                            // which does the read-modify-write; the pointer and pointee
+                            // returned here are the byte, which is what it needs.
+                            let gep = self.tensor_gep(&tensor, &idx, "elem")?;
+
+                            // SUB-BYTE store. `tensor_gep` addressed the shared BYTE, so a
+                            // plain store would overwrite the neighbouring element. Merged
+                            // in here rather than stored: `tensor_gep` is already the byte
+                            // pointer the merge needs.
+                            if tensor.sub_byte {
+                                let flat = self.linearize_index(&tensor, &idx, "i4_flat")?;
+                                self.sub_byte_store(gep, flat, value)?;
+                                // Reported as handled below, past the type check, since the
+                                // nibble merge is the whole store.
+                                sub_byte_done = true;
+                            }
                             (gep, tensor.elem)
                         }
                         other => {
@@ -1245,22 +1278,24 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                         }
                     };
 
-                let (ptr, pointee) = store_target;
+                if !sub_byte_done {
+                    let (ptr, pointee) = store_target;
 
-                let value_ty = value.get_type();
-                if value_ty != pointee {
-                    return Err(CodegenError::UnsupportedFeature(format!(
-                        "assignment through `{}`: storing {value_ty:?} into a slot of type \
-                         {pointee:?}. Widening or narrowing here would be a silent \
-                         wrong-answer bug, so it is refused.",
-                        describe_index_base(target)
-                    )));
+                    let value_ty = value.get_type();
+                    if value_ty != pointee {
+                        return Err(CodegenError::UnsupportedFeature(format!(
+                            "assignment through `{}`: storing {value_ty:?} into a slot of type \
+                             {pointee:?}. Widening or narrowing here would be a silent \
+                             wrong-answer bug, so it is refused.",
+                            describe_index_base(target)
+                        )));
+                    }
+
+                    self.value_builder
+                        .builder()
+                        .build_store(ptr, value)
+                        .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
                 }
-
-                self.value_builder
-                    .builder()
-                    .build_store(ptr, value)
-                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
                 Ok(value)
             }
             // A statement sequence yields no value.
@@ -1479,6 +1514,37 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
         name: &str,
     ) -> CodegenResult<inkwell::values::PointerValue<'ctx>> {
         let flat = self.linearize_index(tensor, indices, name)?;
+
+        // SUB-BYTE: `i4` is stored two per byte, so a plain `getelementptr i4` is not
+        // available (LLVM has no 4-bit type) and a `getelementptr i8, i` would address
+        // byte `i` -- twice too far, since element `i` lives in byte `i / 2`.
+        //
+        // The address is therefore built explicitly as
+        //
+        //     byte_offset = i >> 1
+        //     bit_offset  = (i & 1) * 4
+        //
+        // and the result is a pointer to the BYTE. The caller then reads or writes that
+        // byte and masks out its nibble; see `sub_byte_load` / `sub_byte_store`.
+        //
+        // The alternative -- one element per byte, i.e. `getelementptr i8, i` -- is
+        // simpler and is exactly what a silent widening to `ElemType::I8` would give. It
+        // is rejected here because it makes the compression ratio a fiction, and the
+        // whole point of a sub-byte type is that the bytes are shared.
+        if tensor.sub_byte {
+            // Bound before the borrow: `int_const` also takes `&mut self`, so nesting it
+            // inside another `&mut self` call would borrow twice.
+            let one = self.int_const(IntWidth::I64, 1, "i4_one");
+            let byte_offset = self
+                .value_builder
+                .build_right_shift(flat, one, false, "i4_byte")?
+                .into();
+            let i8_ty = self.value_builder.type_lowering().int_type(IntWidth::I8);
+            return self
+                .value_builder
+                .build_gep(i8_ty.into(), tensor.base, &[byte_offset], name);
+        }
+
         self.value_builder
             .build_gep(tensor.elem, tensor.base, &[flat.into()], name)
     }
@@ -1568,11 +1634,161 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
         tensor: &crate::codegen::llvm::value_builder::TensorBinding<'ctx>,
         indices: &[BasicValueEnum<'ctx>],
     ) -> CodegenResult<BasicValueEnum<'ctx>> {
+        let flat = self.linearize_index(tensor, indices, "i4_flat")?;
         let gep = self.tensor_gep(tensor, indices, "elem_addr")?;
+
+        // SUB-BYTE read. `tensor_gep` returned the address of the BYTE holding this
+        // element, so the nibble has to be extracted:
+        //
+        //     shift = (i & 1) * 4
+        //     nibble = (byte >> shift) & 0xF
+        //     value  = sext(nibble, 8) - 8      // two's-complement 4-bit
+        //
+        // The sign step is arithmetic, not a type: `i4` holds -8..7, so a raw 0..15
+        // nibble must be mapped to -8..7 or every negative quantized weight reads back
+        // as a large positive one -- a quantizer that round-trips to the wrong sign is
+        // worse than one that refuses.
+        if tensor.sub_byte {
+            return self.sub_byte_load(gep, flat);
+        }
+
         self.value_builder
             .builder()
             .build_load(tensor.elem, gep, "elem")
             .map_err(|e| CodegenError::InstructionError(e.to_string()))
+    }
+
+    /// An integer constant of the given width.
+    fn int_const(&mut self, width: IntWidth, value: u64, name: &str) -> IntValue<'ctx> {
+        let ty = self.value_builder.type_lowering().int_type(width);
+        self.value_builder.build_int_constant(ty, value, name)
+    }
+
+    /// Extract the low or high nibble of the byte at `byte_ptr` as a signed `i8`.
+    ///
+    /// `flat` is the same linearised element index `tensor_gep` used to compute
+    /// `byte_ptr`, so the nibble position is `flat & 1`.
+    fn sub_byte_load(
+        &mut self,
+        byte_ptr: inkwell::values::PointerValue<'ctx>,
+        flat: IntValue<'ctx>,
+    ) -> CodegenResult<BasicValueEnum<'ctx>> {
+        let byte = self
+            .value_builder
+            .build_load(byte_ptr, "i4_byte")?
+            .into_int_value();
+
+        // shift = (flat & 1) * 4 -- 0 for the low nibble, 4 for the high one.
+        let odd = self.int_const(IntWidth::I64, 1, "i4_odd");
+        let two = self.int_const(IntWidth::I64, 2, "i4_two");
+        let is_odd = self.value_builder.build_and(flat, odd, "i4_odd_v")?;
+        let shift = self
+            .value_builder
+            .build_left_shift(is_odd, two, "i4_shift")?;
+
+        // The index arrives in its own width (an `i64` loop counter in practice), but
+        // `byte` is `i8` and LLVM requires both operands of a shift to match. Narrow the
+        // shift amount rather than widening the byte: widening would make the masking and
+        // the sign step below operate on the wrong width.
+        let i8_ty = self.value_builder.type_lowering().int_type(IntWidth::I8);
+        let shift8 = self
+            .value_builder
+            .builder()
+            .build_int_cast(shift, i8_ty, "i4_shift8")
+            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+        let shifted = self
+            .value_builder
+            .build_right_shift(byte, shift8, false, "i4_shifted")?;
+        let mask = self.int_const(IntWidth::I8, 0xF, "i4_mask");
+        let masked = self.value_builder.build_and(shifted, mask, "i4_nib")?;
+
+        // `i4` is two's complement over -8..7, so a raw 0..15 nibble needs a sign step.
+        // Done with arithmetic rather than a `select`, so there is no branch and no
+        // predicate: the sign bit is arithmetically shifted into bit 7 and multiplied by
+        // 8, which is exactly `nibble >= 8 ? nibble - 8 : nibble`.
+        //
+        // Getting this wrong is not a rounding error. Without it every negative
+        // quantized weight reads back as a large positive one, so the model still runs
+        // and produces confident nonsense -- the worst failure mode a quantizer has.
+        let three = self.int_const(IntWidth::I8, 3, "i4_three");
+        let eight = self.int_const(IntWidth::I8, 8, "i4_eight");
+        let sign_shifted =
+            self.value_builder
+                .build_right_shift(masked, three, false, "i4_sign_shift")?;
+        let bias = self
+            .value_builder
+            .build_int_mul(sign_shifted, eight, "i4_bias")?;
+
+        Ok(self
+            .value_builder
+            .build_int_sub(masked, bias, "i4_signed")?
+            .into())
+    }
+
+    /// Merge `value` into one nibble of the byte at `byte_ptr`, preserving the other.
+    ///
+    /// The read-modify-write half of sub-byte storage. A plain store would clobber the
+    /// neighbouring element -- the specific corruption a packed layout invites: `out[0] = 1`
+    /// then `out[1] = 2` would leave BOTH equal to 2, and the tensor would still occupy the
+    /// right number of bytes, so the compression ratio would check out while the data was
+    /// garbage.
+    ///
+    /// ```text
+    /// clear  = 0xF0 >> shift          (the OTHER nibble)
+    /// placed = (value & 0xF) << shift
+    /// merged = (byte & clear) | placed
+    /// ```
+    ///
+    /// All arithmetic is in the byte's own `i8` width, so no cast can drop the high bit of
+    /// the shifted nibble. Every constant is bound before the `&mut self` call that uses it,
+    /// since `int_const` borrows self too and nesting them would borrow twice.
+    fn sub_byte_store(
+        &mut self,
+        byte_ptr: inkwell::values::PointerValue<'ctx>,
+        flat: IntValue<'ctx>,
+        value: BasicValueEnum<'ctx>,
+    ) -> CodegenResult<()> {
+        let value = value.into_int_value();
+
+        let c_odd = self.int_const(IntWidth::I64, 1, "i4s_odd");
+        let c_two = self.int_const(IntWidth::I64, 2, "i4s_two");
+        let c_nib = self.int_const(IntWidth::I8, 0xF, "i4s_nib");
+        let c_f0 = self.int_const(IntWidth::I8, 0xF0, "i4s_f0");
+
+        // shift = (flat & 1) * 4, in the index's i64 width then narrowed to the byte.
+        let is_odd = self.value_builder.build_and(flat, c_odd, "i4s_odd_v")?;
+        let shift64 = self
+            .value_builder
+            .build_left_shift(is_odd, c_two, "i4s_shift")?;
+        let i8_ty = self.value_builder.type_lowering().int_type(IntWidth::I8);
+        let shift = self
+            .value_builder
+            .builder()
+            .build_int_cast(shift64, i8_ty, "i4s_shift8")
+            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+
+        // `value` is already the narrowed `i8` from the `as i4` cast; masking keeps a stray
+        // high bit out of the neighbouring slot.
+        let nib = self.value_builder.build_and(value, c_nib, "i4s_val_nib")?;
+        let placed = self
+            .value_builder
+            .build_left_shift(nib, shift, "i4s_placed")?;
+
+        // clear = 0xF0 >> shift, which is `~mask & 0xFF` with no NOT opcode: shifting 0xF0
+        // right by 0 leaves 0xF0 (keep the high nibble), and by 4 leaves 0x0F (keep the low).
+        let clear = self
+            .value_builder
+            .build_right_shift(c_f0, shift, false, "i4s_clear")?;
+
+        let byte = self
+            .value_builder
+            .build_load(byte_ptr, "i4s_byte")?
+            .into_int_value();
+        let kept = self.value_builder.build_and(byte, clear, "i4s_kept")?;
+        let merged = self.value_builder.build_or(kept, placed, "i4s_merged")?;
+
+        self.value_builder.build_store(byte_ptr, merged.into())?;
+        Ok(())
     }
 
     /// Emit a prelude math intrinsic, or return `None` if `name` is not one.

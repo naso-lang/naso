@@ -87,6 +87,20 @@ pub struct TensorBinding<'ctx> {
     /// module built before the ABI carried lengths), and for a symbolic extent. A call
     /// passing such a tensor is REFUSED rather than given a length of zero.
     pub len: Option<IntValue<'ctx>>,
+    /// True when one LOGICAL element is narrower than its storage byte, i.e. two
+    /// `i4` values share each byte.
+    ///
+    /// # Why this is a flag and not something derived from `elem`
+    ///
+    /// A packed `i4` tensor has `elem == i8`, because that is genuinely what one index
+    /// step lands on. So "is this sub-byte?" cannot be read off `elem` -- an `i8`
+    /// tensor and a packed `i4` tensor are indistinguishable there, which is exactly
+    /// the ambiguity that would let a widening bug hide.
+    ///
+    /// It also cannot be read off the byte width, since the storage IS one byte wide
+    /// in both cases. So the binding records it explicitly, at the point where the
+    /// declared `ElemType::I4` is still known.
+    pub sub_byte: bool,
 }
 
 impl<'ctx> LlvmValueBuilder<'ctx> {

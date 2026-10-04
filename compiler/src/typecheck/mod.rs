@@ -218,6 +218,10 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
                 attributes: Vec::new(),
                 is_reversible: self.is_reversible,
                 quantity: self.quantity,
+                // A prelude intrinsic is not a NASO source function and cannot carry a
+                // `requires` clause. Saying so explicitly beats a default that might later
+                // start meaning something.
+                requires: Vec::new(),
             };
             env.insert_function(func.clone());
             // Also bind as a variable so it can be used as a callee

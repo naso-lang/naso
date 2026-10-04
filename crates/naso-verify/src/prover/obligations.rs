@@ -24,7 +24,7 @@
 
 use crate::error::VerifyError;
 use crate::model::{DiagnosticSeverity, RelatedInfo, VerifyDiagnostic};
-use crate::smtlib::{Script, Sort, Term};
+use crate::smtlib::{Script, Sort, Term, builder};
 use naso_compiler::ast::{
     BinOp, Expr, ExprKind, Function, Item, Literal, Program, Span, Stmt, StmtKind, UnOp,
 };
@@ -79,6 +79,11 @@ fn prove_function_obligations(func: &Function) -> Result<Vec<VerifyDiagnostic>, 
         if let StmtKind::Proof(block) = &stmt.kind {
             let mut found = Vec::new();
             collect_asserts(&block.body.stmts, &mut found);
+            // Preconditions become axioms for THIS function's obligations. They are not
+            // discharged here -- a caller must satisfy them, which is a different claim in a
+            // different place. Keeping them separate is what stops a function from
+            // discharging its obligations by assuming them.
+            let preconditions: Vec<&Expr> = func.requires.iter().collect();
             for (pred, span) in found {
                 diagnostics.extend(prove_obligation(
                     &func.name.name,
@@ -86,6 +91,7 @@ fn prove_function_obligations(func: &Function) -> Result<Vec<VerifyDiagnostic>, 
                     span,
                     &params,
                     &declarations,
+                    &preconditions,
                 )?);
             }
         }
@@ -222,6 +228,7 @@ fn prove_obligation(
     span: naso_compiler::ast::Span,
     params: &[(String, String, Sort)],
     declarations: &[(String, Sort)],
+    preconditions: &[&Expr],
 ) -> Result<Vec<VerifyDiagnostic>, VerifyError> {
     let mut diagnostics = Vec::new();
 
@@ -285,7 +292,66 @@ fn prove_obligation(
                 }
                 Encoded::Bool(term) => negate(term),
             };
-            script.assert(negated);
+
+            // Preconditions are ASSUMED, so the check asks for a counterexample to
+            // `pre_1 AND .. AND pre_n => goal`, i.e. a model satisfying every precondition
+            // and violating the goal.
+            //
+            // A precondition that cannot be encoded must REFUSE the obligation rather than
+            // be dropped. Silently ignoring it would prove the goal from a WEAKER context
+            // than the author wrote, and report the proof as sound -- the precise failure
+            // this whole mechanism exists to make impossible.
+            let mut to_assert = negated;
+            let mut skipped: Vec<String> = Vec::new();
+            for pre in preconditions {
+                match encode_predicate(pre, &mut scope.clone()) {
+                    // A counterexample to `P => G` is a model where P HOLDS and G FAILS, so
+                    // the precondition is asserted POSITIVELY and conjoined with `and`.
+                    //
+                    // An earlier version negated the precondition and conjoined with `or`,
+                    // which asks whether `P => G` is false rather than whether it holds, and
+                    // is satisfied by the uninteresting case where P is false. Z3 then finds
+                    // that trivially, and a claim with a strong premise was reported
+                    // REFUTED. De Morgan is the whole difference:
+                    //
+                    //     not (not P or G)  ==  P and not G     <- counterexample
+                    //     not P or not G    ==  not (P and G)    <- something else entirely
+                    Ok(Encoded::Bool(term)) => {
+                        to_assert = builder::and(vec![to_assert, term]);
+                    }
+                    Ok(Encoded::Forall(bindings, term)) => {
+                        to_assert = builder::and(vec![
+                            to_assert,
+                            Term::Forall(bindings.clone(), Box::new(term)),
+                        ]);
+                    }
+                    Err(EncodeErr::Unsupported { reason, .. }) => {
+                        skipped.push(reason);
+                    }
+                    Err(EncodeErr::Malformed(msg)) => {
+                        skipped.push(msg);
+                    }
+                }
+            }
+            if !skipped.is_empty() {
+                diagnostics.push(VerifyDiagnostic {
+                    code: OBL_UNSUPPORTED.to_string(),
+                    message: format!(
+                        "obligation in `{func_name}` not discharged: a precondition could \
+                         not be encoded ({}). Assuming it anyway would prove the goal from \
+                         a weaker context than was written, so it is refused. The \
+                         obligation has NOT been proved.",
+                        skipped.join("; ")
+                    ),
+                    span,
+                    severity: DiagnosticSeverity::Warning,
+                    related: Vec::new(),
+                    fix: None,
+                });
+                return Ok(diagnostics);
+            }
+
+            script.assert(to_assert);
             script.check_sat();
             script.exit();
             let smt_text = script.to_string();
@@ -753,6 +819,113 @@ mod tests {
     // uninterpreted function that Z3 can satisfy by fiat would discharge
     // anything at all, so the refutation is what gives the proof its meaning.
     // -----------------------------------------------------------------
+
+    /// A PRECONDITION turns a refuted bound into a proved one.
+    ///
+    /// This is the whole point of `requires`. Without it, `t[i] <= 127` is refuted, because
+    /// an unconstrained tensor may hold any value. With `requires { forall i in 0..16 {
+    /// assert(t[i] <= 127); } }`, the claim becomes a premise rather than a conclusion and
+    /// the prover can discharge it.
+    ///
+    /// It is a genuine discharge, not a tautology: the check asks Z3 for a counterexample to
+    /// `pre => goal` and requires that none exists.
+    #[test]
+    fn a_precondition_makes_a_bound_provable() {
+        let src = "fn q(t: [1] Tensor[i8, 16]) \
+                   requires { forall i in 0..16 { assert(t[i] <= 127); } } { \
+                   proof { forall i in 0..16 { assert(t[i] <= 127); } } return true; }";
+        let diags = obligations_for(src);
+        assert!(
+            diags.is_empty(),
+            "the premise should discharge the goal, got {diags:?}"
+        );
+    }
+
+    /// The precondition must be no STRONGER than the goal, or the prover is unsound in the
+    /// other direction. Here the premise bounds elements above and nothing bounds them below,
+    /// so the goal must still be refuted.
+    #[test]
+    fn a_precondition_does_not_prove_a_stronger_goal() {
+        let src = "fn q(t: [1] Tensor[i8, 16]) \
+                   requires { forall i in 0..16 { assert(t[i] <= 127); } } { \
+                   proof { forall i in 0..16 { assert(t[i] >= -128); } } return true; }";
+        let diags = obligations_for(src);
+        assert_eq!(
+            diags.len(),
+            1,
+            "the premise bounds above only, so the goal must be REFUTED. Got {diags:?}"
+        );
+        assert_eq!(diags[0].code, OBL_FALSE, "got {diags:?}");
+    }
+
+    /// A SCALAR precondition (no quantifier) exercises the `Bool` arm of the
+    /// precondition loop, which the tensor tests never reach.
+    #[test]
+    fn a_scalar_precondition_proves_a_dependent_goal() {
+        let src = "fn q(n: int) requires { assert(n <= 0); } { \
+                   proof { assert(n <= 10); } return true; }";
+        let diags = obligations_for(src);
+        assert!(diags.is_empty(), "got {diags:?}");
+        // And a goal the premise does NOT imply must still be refuted.
+        let src2 = "fn q(n: int) requires { assert(n <= 0); } { \
+                    proof { assert(n >= 10); } return true; }";
+        let diags2 = obligations_for(src2);
+        assert_eq!(diags2.len(), 1, "got {diags2:?}");
+        assert_eq!(diags2[0].code, OBL_FALSE, "got {diags2:?}");
+    }
+
+    /// THE PRECONDITION MUST BE CONJUNCTIONED POSITIVELY.
+    ///
+    /// Regression against the exact bug this code originally shipped: a counterexample to
+    /// `P => G` is `P and not G`, but the implementation emitted `not P or not G`. The two
+    /// differ whenever P is satisfiable, and in a way Z3 exploits trivially -- `not P` is
+    /// satisfiable whenever there is ANY tensor violating the premise, so the solver finds a
+    /// countermodel for a claim that is in fact true.
+    ///
+    /// The existing precondition test cannot see this. It uses a premise IDENTICAL to the
+    /// goal, and for that pair both spellings happen to be unsatisfiable. What separates
+    /// them is a premise that a real tensor can VIOLATE, where the goal still follows:
+    ///
+    ///     requires { forall i. t[i] <= 0 }
+    ///     proof    { forall i. t[i] <= 10 }
+    ///
+    /// The premise is stronger than the goal, so `P => G` holds and the obligation is
+    /// PROVED. Under the broken `not P or not G` spelling, a tensor of all 1s satisfies
+    /// `not P`, so the query is SAT and a true claim is reported REFUTED.
+    #[test]
+    fn a_strong_precondition_proves_a_weaker_goal() {
+        let src = "fn q(t: [1] Tensor[i8, 16]) \
+                   requires { forall i in 0..16 { assert(t[i] <= 0); } } { \
+                   proof { forall i in 0..16 { assert(t[i] <= 10); } } return true; }";
+        let diags = obligations_for(src);
+        assert!(
+            diags.is_empty(),
+            "a premise stronger than the goal must discharge it, got {diags:?}"
+        );
+    }
+
+    /// A precondition that cannot be encoded must REFUSE the obligation.
+    ///
+    /// Dropping it would prove the goal from a weaker context than written and report the
+    /// proof as sound -- the exact failure `requires` must not have.
+    ///
+    /// `&&` is the unencodable operand: it short-circuits, so it is not `and`, and the
+    /// prover refuses rather than silently strengthening the premise.
+    #[test]
+    fn an_unencodable_precondition_refuses_rather_than_assuming() {
+        let src = "fn q(t: [1] Tensor[i8, 16], n: int) \
+                   requires { assert(t[0] <= 127 && n > 0); } { \
+                   proof { forall i in 0..16 { assert(t[i] <= 127); } } return true; }";
+        let diags = obligations_for(src);
+        assert!(
+            diags.iter().any(|d| d.code == OBL_UNSUPPORTED),
+            "an unencodable precondition must be reported, got {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|d| d.code == OBL_FALSE),
+            "a refusal must not masquerade as a refutation: {diags:?}"
+        );
+    }
 
     /// NO bound on an unconstrained tensor element is provable -- and that is correct.
     ///

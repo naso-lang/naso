@@ -517,6 +517,17 @@ impl<'a> Parser<'a> {
             None
         };
         debug_log(&format!("parse_fn: after ret_ty, peek={:?}", self.peek()));
+
+        // `requires { .. }` sits between the signature and the body. It is parsed as an
+        // ordinary block and then reduced to its `assert(..)` calls, so a precondition is
+        // written exactly like an obligation and cannot silently mean something else.
+        let requires = if self.at(TK::Requires) {
+            self.parse_requires_block()
+        } else {
+            Vec::new()
+        };
+        debug_log(&format!("parse_fn: after requires, peek={:?}", self.peek()));
+
         let body = self.parse_block();
         debug_log(&format!("parse_fn: after body, peek={:?}", self.peek()));
         let span = self.span_from(start);
@@ -531,6 +542,7 @@ impl<'a> Parser<'a> {
             attributes: Vec::new(),
             is_reversible,
             quantity,
+            requires,
         }
     }
 

@@ -256,6 +256,14 @@ jobs:
         run: cargo test -p naso-verify --lib
         working-directory: .
 
+      # `requires { .. }` parsing. Separate from the prover because the precondition is
+      # collected here and only USED there: a parser that silently dropped a precondition
+      # would leave the prover reasoning from a weaker context than the author wrote,
+      # with every prover test still green.
+      - name: Test precondition parsing
+        run: cargo test -p naso-compiler --test requires_precondition_test
+        working-directory: .
+
       # The compiler's emitted QIR, checked NUMERICALLY against hand-derived states.
       #
       # Needs `--features llvm` because the suite runs the real `naso` binary and parses what

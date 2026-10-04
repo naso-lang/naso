@@ -340,6 +340,59 @@ impl<'a> Parser<'a> {
         let span = self.span_from(start);
         ProofBlock { body, span }
     }
+
+    /// Parse `requires { assert(..); .. }` into the list of preconditions.
+    ///
+    /// Only `assert` statements are accepted. Anything else is a parse error rather than a
+    /// silently dropped statement: a `requires` block that quietly ignored a line would let
+    /// a precondition be written, not registered, and the body would then be proved under a
+    /// weaker context than the author believes -- the exact kind of gap that makes a proof
+    /// mean less than it appears to.
+    pub(crate) fn parse_requires_block(&mut self) -> Vec<Expr> {
+        self.expect(TK::Requires);
+        let block = self.parse_block();
+        let mut requires = Vec::new();
+        for stmt in &block.stmts {
+            let expr = match &stmt.kind {
+                StmtKind::Expr(e) => e,
+                _ => {
+                    let msg =
+                        "a `requires` block may only contain `assert(..);` statements".to_string();
+                    self.fail::<crate::lexer::Token>(msg, stmt.span);
+                    return requires;
+                }
+            };
+            match &expr.kind {
+                ExprKind::Call(callee, args) if is_assert_callee(callee) => {
+                    let Some(first) = args.first() else {
+                        self.fail::<crate::lexer::Token>(
+                            "`assert` requires one argument".to_string(),
+                            stmt.span,
+                        );
+                        return requires;
+                    };
+                    requires.push(first.clone());
+                }
+                // A quantified precondition is exactly the shape a quantizer needs, and it
+                // is kept WHOLE -- binding and domain included. Flattening it to its inner
+                // `assert` would drop the index domain, and the premise would silently
+                // become weaker than the one the author wrote.
+                ExprKind::Forall(_) | ExprKind::Quantified(_) => requires.push(expr.clone()),
+                _ => {
+                    let msg =
+                        "a `requires` block may only contain `assert(..);` statements".to_string();
+                    self.fail::<crate::lexer::Token>(msg, stmt.span);
+                    return requires;
+                }
+            }
+        }
+        requires
+    }
+}
+
+/// Whether an expression is a call to the pseudo-function `assert`.
+pub(crate) fn is_assert_callee(callee: &Expr) -> bool {
+    matches!(&callee.kind, ExprKind::Var(ident) if ident.name == "assert")
 }
 
 /// Whether an expression is a self-delimiting BLOCK, `{ .. }`.

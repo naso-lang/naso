@@ -140,6 +140,13 @@ pub enum TokenKind {
     // naso-verify. Not reachable by codegen.
     #[regex("[pP][rR][oO][oO][fF]", priority = 3)]
     Proof,
+    // `requires` introduces a PRECONDITION on a function: claims the caller must
+    // satisfy, which the prover may then assume when discharging the body's proof
+    // block. It is deliberately not sugar for an assertion -- a precondition is not
+    // something the function proves about itself, and conflating the two would let a
+    // function discharge its obligations by assuming them.
+    #[regex("[rR][eE][qQ][uU][iI][rR][eE][sS]", priority = 3)]
+    Requires,
     // `as` introduces a numeric cast: `expr as i8`. Numeric types only --
     // the typechecker rejects casts to tensor, qubit or pointer-shaped types,
     // so this is not a general reinterpret-cast operator.
@@ -360,6 +367,7 @@ impl TokenKind {
             TokenKind::Import => "'import'",
             TokenKind::Const => "'const'",
             TokenKind::Proof => "'proof'",
+            TokenKind::Requires => "'requires'",
             TokenKind::As => "'as'",
             TokenKind::Mut => "'mut'",
             TokenKind::Int4 => "'i4'",

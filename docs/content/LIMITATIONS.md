@@ -213,12 +213,17 @@ bytes untouched after the kernel runs.
   so `u4` currently behaves as `i4`. Treat it as unimplemented until a test distinguishes
   them.
 - **No `i2`.** The addressing math generalizes, but nothing has been built or measured.
-- **Tensor element bounds are modelled; range bounds are not.** A tensor parameter is encoded
-  as an *uninterpreted function* from index to element, so an obligation about `t[i]` is
-  checked for every possible tensor. The consequence is deliberate and worth stating plainly:
-  a bound like `t[i] <= 127` is **refuted**, because a constant tensor with a huge element is a
-  legitimate countermodel. That is the honest answer, and it means an input range bound must
-  come from somewhere real — a parameter's range is not a proposition about its values.
+- **Tensor element bounds are modelled; range bounds are not — use `requires`.** A tensor
+  parameter is encoded as an *uninterpreted function* from index to element, so an obligation
+  about `t[i]` is checked for every possible tensor. The consequence is deliberate and worth
+  stating plainly: a bound like `t[i] <= 127` is **refuted** with no premise, because a
+  constant tensor with a huge element is a legitimate countermodel.
+- **Preconditions (`requires { .. }`) are assumed, never discharged.** The prover checks
+  `pre_1 ∧ .. ∧ pre_n ⇒ goal`, and reports *proved* when no countermodel exists. A
+  precondition is the CALLER's obligation — nothing in the compiler currently checks it at a
+  call site, so writing one is a promise, not a guarantee. Until call-site checking exists, a
+  function with an unsatisfiable `requires` is a function that can never be called correctly.
+  Do not read a proved obligation as "this works for all inputs".
 - **A malformed SMT script is now a loud error, but detection is structural, not semantic.**
   Z3's `Solver::from_string` returns `()` and *discards* its error code, so an unparseable
   script used to be dropped silently and answered `sat` for a solver holding no assertions —

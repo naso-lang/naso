@@ -185,6 +185,14 @@ pub struct Function {
     pub attributes: Vec<Attribute>,
     pub is_reversible: bool,
     pub quantity: Quantity,
+    /// Claims the CALLER must satisfy, written `requires { assert(..); .. }`.
+    ///
+    /// These are axioms the prover may assume while discharging the body's proof block,
+    /// and they are never themselves discharged as obligations of this function -- a
+    /// precondition is not something the function proves about itself. Keeping the two
+    /// lists separate is what stops a function from discharging its obligations by
+    /// assuming them.
+    pub requires: Vec<Expr>,
 }
 
 /// Generic type parameter

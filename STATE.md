@@ -157,9 +157,18 @@ Documented in `docs/content/LIMITATIONS.md`.
 - **`u4` is not distinct.** Lexed and parsed, but reuses the signed nibble path, so it
   currently behaves as `i4`. Treat as unimplemented until a test distinguishes them.
 - **No `i2`.** The addressing math generalizes; nothing is built or measured.
-- **No tensor indexing in the prover.** `ExprKind::Index` has no encoding arm, so a bound
-  on `input[i] / scale` cannot be discharged. Quantization *arithmetic* is verified by
-  execution; quantization *bounds* are not machine-checked.
+- **Tensor element bounds ARE discharged now** (`b6e11b2`). A tensor parameter is an
+  uninterpreted function `Int -> scalar`, so an obligation holds for every tensor. The
+  consequence is deliberate: `t[i] <= 127` is **REFUTED**, since an unconstrained tensor
+  has no range. That is honest, and it means an input-range bound must come from real
+  evidence, not from the element type.
+- **The prover cannot detect its own malformed SMT scripts.** `Solver::from_string`
+  SILENTLY DISCARDS a script it cannot parse, then reports `sat` for a solver holding no
+  assertions. Two emitter bugs hid this way (`declare-const` with a function sort; a
+  dropped closing paren). Function-sort declarations and paren balance are now pinned by
+  tests in `crates/naso-verify/src/smtlib.rs`. A future emitter change can still hit this.
+- **`&&`/`||` are REFUSED**, not encoded as `and`/`or`. They short-circuit, so they are a
+  different proposition when an operand is undefined. Split the assertion instead.
 - **No float reasoning in the prover.** Scale/zero-point error bounds need an interval
   or rational abstraction. Do not pretend the integer prover handles floats.
 - **No `naso verify` CLI subcommand.** The verifier is a real library with passing
@@ -177,14 +186,19 @@ Documented in `docs/content/LIMITATIONS.md`.
 
 ## Recommended next step
 
-**Proof-carrying quantization.** The blocker is concrete: `ExprKind::Index` has no
-prover encoding arm in `crates/naso-verify/src/prover/obligations.rs`.
+**Proof-carrying quantization.** `ExprKind::Index` is DONE (`b6e11b2`). What remains:
 
-1. Add an `Index` encoding arm so `input[i] / scale` bounds can be discharged.
+1. Give the prover a way to state an input range, so a clamp bound becomes provable
+   instead of refuted. An uninterpreted function cannot carry a range axiom safely;
+   the honest options are a precondition on the function, or quantifier-restricted
+   reasoning. Do NOT add a "fits in i8" axiom to make the test pass — that proves a
+   claim about tensors the axiom admits and reports it for the one that breaks.
 2. Design a sound float abstraction (interval or rational) for scale/zero-point error
    bounds. Do not extend the integer prover and hope.
 3. Wire a real `naso verify` subcommand with defined semantics, exit codes, honest
    reporting of unsupported obligations, and end-to-end tests.
+4. Make a malformed SMT script a loud failure rather than a silent `sat`. This is the
+   highest-value remaining fix: today it degrades "proved" into "refuted" quietly.
 
 Lower priority: `u4` distinct storage, `i2`, `release` builtin, runtime-valued `rz`.
 

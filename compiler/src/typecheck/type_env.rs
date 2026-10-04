@@ -28,6 +28,16 @@ pub struct VarInfo {
     pub moved: bool,
     /// Whether this variable is erased (quantity 0)
     pub erased: bool,
+    /// Referenced only from an ERASED construct (a `proof` or `requires` block).
+    ///
+    /// Such a reference is real -- the obligation or precondition is about the value -- but
+    /// it consumes nothing at runtime. It must therefore satisfy "a `[1]` value is used
+    /// exactly once" WITHOUT counting against `used_at`.
+    ///
+    /// A synthetic entry in `used_at` would have been the obvious implementation and it is
+    /// wrong: `used_at` is both the double-use detector (`Quantity::One`) and the budget for
+    /// `Quantity::Bounded(n)`, so a fake span turns an erased reference into a real one.
+    pub referenced_in_erased: bool,
 }
 
 /// The use-state of a single variable, snapshotted across a proof block.
@@ -40,6 +50,7 @@ pub struct VarInfo {
 pub struct VarUseState {
     used_at: Vec<Span>,
     moved: bool,
+    referenced_in_erased: bool,
 }
 
 impl VarUseState {
@@ -47,15 +58,39 @@ impl VarUseState {
         Self {
             used_at: info.used_at.clone(),
             moved: info.moved,
+            referenced_in_erased: info.referenced_in_erased,
         }
     }
 
+    /// Overwrite `info`'s use-state with this snapshot's, discarding anything recorded since.
+    ///
+    /// Used when a use must be *replaced* outright -- for example restoring a `[1]` value
+    /// that a `consume` binding spent. It is NOT the right operation for an erased block:
+    /// rewind `used_at` to empty and a value referenced only there looks untouched again, so
+    /// see [`Self::erase_uses_since_inner`] for that case.
     fn apply_to(&self, info: &mut VarInfo) {
         info.used_at = self.used_at.clone();
         info.moved = self.moved;
+        info.referenced_in_erased = self.referenced_in_erased;
     }
 
-    /// Whether a `[1]` value has already been spent at this program point.
+    /// Drop uses recorded since the snapshot, recording instead that the value was
+    /// referenced from an erased construct.
+    ///
+    /// This is the erasure semantics for a `proof { .. }` or `requires { .. }` block: the
+    /// references are observable but consume nothing, so they must not spend a `[1]` value
+    /// nor draw from a `[n]` budget.
+    pub fn erase_uses_since_inner(&self, info: &mut VarInfo) {
+        // Did the erased construct reference this value at all?
+        let referenced = !info.used_at.is_empty();
+        info.used_at = self.used_at.clone();
+        info.moved = self.moved;
+        // Record it on the dedicated flag rather than as a synthetic span: `used_at` is the
+        // double-use detector for `[1]` and the budget for `[n]`, so a fake entry would make
+        // an erased reference look like a real one.
+        info.referenced_in_erased |= referenced;
+    }
+
     ///
     /// A linear value is spent by being moved (`let consume y = x;`) or by being
     /// used, since `can_use` admits a `[1]` value only when it is neither moved
@@ -69,6 +104,7 @@ impl VarUseState {
         Self {
             used_at: vec![span],
             moved: true,
+            referenced_in_erased: false,
         }
     }
 }
@@ -98,6 +134,7 @@ impl VarInfo {
             used_at: Vec::new(),
             moved: false,
             erased: quantity == Quantity::Zero,
+            referenced_in_erased: false,
         }
     }
 
@@ -109,14 +146,34 @@ impl VarInfo {
         }
     }
 
-    /// Check if this variable can be used again
+    /// Whether this value can be referenced at this program point.
+    ///
+    /// UNUSED by the checking path, and deliberately not wired in. The real checks are
+    /// separate and for good reasons:
+    ///
+    ///   * `[1]` double use -- enforced in `check_use` BEFORE recording the use, so the
+    ///     error can report both the first and the second span.
+    ///   * `[n]` budget    -- enforced in `check_use` AFTER recording, because the count
+    ///     must include the use being admitted.
+    ///
+    /// This function had one caller, `Quantity::Many && !can_use()`, and it could never fire:
+    /// `can_use` returns `true` unconditionally for `Many`, and `&&` short-circuits for every
+    /// other quantity. Mutation confirmed the vacuity -- replacing the `[1]` arm with `false`
+    /// passed the entire compiler suite. The dead call site has been removed.
+    ///
+    /// Kept, and documented as unused, because it states the availability rule in one place.
+    /// A reader looking for "why is this not used" should find that answer here rather than
+    /// have to re-derive it.
+    #[allow(dead_code)]
     pub fn can_use(&self) -> bool {
         if self.moved {
             return false;
         }
         match self.quantity {
             Quantity::Zero => false, // Erased variables cannot be used at runtime
-            Quantity::One => !self.moved && self.used_at.is_empty(), // Exactly once - can use if not moved and not used yet
+            // Exactly once. A reference from an erased block does not count: it observes the
+            // value without consuming it, so the real use is still available.
+            Quantity::One => !self.moved && self.used_at.is_empty(),
             Quantity::Bounded(n) => (self.used_at.len() as u32) < n,
             Quantity::Many => true,
         }
@@ -279,15 +336,20 @@ impl TypeEnv {
             .collect()
     }
 
-    /// Restore use-state captured by [`Self::snapshot_uses`].
+    /// Erase the uses recorded since [`Self::snapshot_uses`].
     ///
-    /// Only use-state is restored, not bindings: variables bound inside the
-    /// proof block leave with its scope, and restoring those would leak them
-    /// into the enclosing code.
-    pub fn restore_uses(&mut self, snapshot: &HashMap<Ident, VarUseState>) {
+    /// Only use-state is affected, not bindings: variables bound inside the block leave with
+    /// its scope, and touching those would leak them into the enclosing code.
+    ///
+    /// There is deliberately no "rewind" counterpart. Rewinding `used_at` was the original
+    /// behaviour and it was wrong twice over: a value referenced ONLY inside an erased block
+    /// came back looking untouched and was then reported as an unused linear leak, and the
+    /// rewind was easy to reach on an error path. Erasure is the only correct operation, so
+    /// the misleading one is gone rather than left as an unused alternative.
+    pub fn erase_uses_since(&mut self, snapshot: &HashMap<Ident, VarUseState>) {
         for (name, state) in snapshot {
             if let Some(info) = self.vars.get_mut(name) {
-                state.apply_to(info);
+                state.erase_uses_since_inner(info);
             }
         }
     }
@@ -433,15 +495,6 @@ impl TypeEnv {
                         span,
                     });
                 }
-            }
-
-            // Check quantity limits for many quantities (should always pass)
-            if matches!(info.quantity, Quantity::Many) && !info.can_use() {
-                return Err(TypeError::VariableNotAvailable {
-                    name: name.clone(),
-                    reason: "quantity exhausted".to_string(),
-                    span,
-                });
             }
         }
         Ok(())
@@ -612,6 +665,7 @@ impl TypeEnv {
             // Skip inout bindings - they are borrowed for the scope duration
             if info.quantity == Quantity::One
                 && info.used_at.is_empty()
+                && !info.referenced_in_erased
                 && !info.moved
                 && info.mutability != Mutability::Consume
                 && info.mutability != Mutability::InOut

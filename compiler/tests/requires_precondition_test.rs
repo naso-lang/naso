@@ -152,3 +152,126 @@ fn a_quantified_precondition_survives_parsing() {
         funcs[0].requires
     );
 }
+
+// ---------------------------------------------------------------------------
+// Typechecking: a precondition that does not typecheck proves nothing.
+// ---------------------------------------------------------------------------
+
+fn typecheck(src: &str) -> Vec<String> {
+    let mut program = parse_program(src).expect("parse");
+    naso_compiler::typecheck::check_program(&mut program)
+        .errors
+        .iter()
+        .map(|e| e.to_string())
+        .collect()
+}
+
+/// An undefined name in a precondition must be caught by the TYPECHECKER.
+///
+/// Without this, the only place the mistake surfaced was the prover, reporting a missing
+/// symbol in generated SMT -- far from the source line that wrote it. A precondition that
+/// does not typecheck is a precondition nobody proved anything about.
+#[test]
+fn an_undefined_name_in_a_precondition_is_a_type_error() {
+    let src = "fn q(n: int) requires { assert(undefined_thing > 0); } { return true; }";
+    let errors = typecheck(src);
+    assert!(
+        !errors.is_empty(),
+        "an undefined variable in `requires` must not typecheck"
+    );
+}
+
+/// A precondition must type as a proposition. `assert(3)` is not a claim about anything, and
+/// letting it through would put a non-proposition into the solver's context.
+#[test]
+fn a_non_boolean_precondition_is_a_type_error() {
+    let src = "fn q(n: int) requires { assert(3); } { return true; }";
+    let errors = typecheck(src);
+    assert!(
+        !errors.is_empty(),
+        "a non-boolean precondition must not typecheck, got {errors:?}"
+    );
+}
+
+/// A precondition may reference the parameters it constrains -- that is the whole point.
+#[test]
+fn a_precondition_over_a_parameter_typechecks() {
+    let src = "fn q(n: int, t: [1] Tensor[i8, 16]) \
+               requires { assert(n > 0); forall i in 0..16 { assert(t[i] <= 127); } } { \
+               return true; }";
+    let errors = typecheck(src);
+    assert!(
+        errors.is_empty(),
+        "a well-typed precondition must typecheck, got {errors:?}"
+    );
+}
+
+/// A precondition is ERASED, so referencing a `[1]` linear parameter must not consume it.
+///
+/// If it did, the reference here and the use in the body would be a double use, and the
+/// function would be rejected for a claim that never touches a value at runtime.
+#[test]
+fn a_precondition_does_not_consume_a_linear_parameter() {
+    // The body consumes `t` via a `let consume` binding, which is the real consumption
+    // form; `consume t;` is not a statement in this language.
+    let src = "fn q(t: [1] Tensor[i8, 16]) \
+               requires { forall i in 0..16 { assert(t[i] <= 127); } } { \
+               let consume u = t; }";
+    let errors = typecheck(src);
+    assert!(
+        errors.is_empty(),
+        "a precondition observes its parameters and must not consume them, got {errors:?}"
+    );
+}
+
+/// An erased reference must not count against a `[n]` BUDGETED quantity.
+///
+/// `used_at` is both the `[1]` double-use detector and the `[n]` budget. An erased reference
+/// therefore has two ways to go wrong, and this pins the second: if it is recorded normally,
+/// `can_use` refuses the remaining uses and a function using a `[3]` value three times is
+/// rejected after two references inside an erased block.
+///
+/// This is the test that could distinguish erase-on-error-path from rewind: an
+/// `erase_uses_since_inner` that simply rewound `used_at` would still consume budget, while
+/// this implementation records the reference on a dedicated flag and consumes none.
+#[test]
+fn an_erased_reference_consumes_no_bounded_budget() {
+    // Three real reads in the body. `let consume` would require exactly `[1]`, so the budget
+    // is spent by indexing instead.
+    let src = "fn q(t: [3] Tensor[i8, 16]) -> i8 { \
+                 proof { forall i in 0..16 { assert(t[i] <= 127); } } \
+                 let a = t[0]; let b = t[1]; let c = t[2]; \
+                 return a + b + c; }";
+    let errors = typecheck(src);
+    assert!(
+        errors.is_empty(),
+        "an erased reference must consume none of the `[3]` budget, got {errors:?}"
+    );
+}
+
+/// A `[1]` value referenced ONLY in an erased block is used, not leaked.
+///
+/// The other direction: erase too much and a genuinely unused linear value goes unreported,
+/// which is a linearity hole reported as silence.
+#[test]
+fn an_only_erased_reference_is_not_an_unused_linear_leak() {
+    let src = "fn q(t: [1] Tensor[i8, 16]) { \
+                 proof { forall i in 0..16 { assert(t[i] <= 127); } } }";
+    let errors = typecheck(src);
+    assert!(
+        errors.is_empty(),
+        "`t` is referenced by the obligation, so it is not leaked: got {errors:?}"
+    );
+}
+
+/// A `[1]` value referenced NOWHERE at all is still reported. The erasure must not have
+/// silenced the check for everyone.
+#[test]
+fn a_truly_unused_linear_value_is_still_reported() {
+    let src = "fn q(t: [1] Tensor[i8, 16]) { }";
+    let errors = typecheck(src);
+    assert!(
+        !errors.is_empty(),
+        "an unreferenced `[1]` value must still be reported as unused"
+    );
+}

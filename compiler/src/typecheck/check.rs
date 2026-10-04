@@ -386,13 +386,23 @@ fn check_proof(checker: &mut TypeChecker, block: &ProofBlock) -> Result<(), Type
     // Without this, a quantified obligation about a `[1]` linear parameter
     // would consume it and make the runtime loop report a double use.
     let uses = checker.env.snapshot_uses();
-    for stmt in &block.body.stmts {
-        check_stmt(checker, stmt)?;
-    }
-    checker.env.restore_uses(&uses);
+    let outcome = (|| {
+        for stmt in &block.body.stmts {
+            check_stmt(checker, stmt)?;
+        }
+        Ok(())
+    })();
+    // Erase, do not rewind. `restore_uses` rewinds `used_at` to its previous value, so a `[1]`
+    // parameter referenced ONLY inside a proof block comes back looking untouched and is
+    // then reported as an unused linear variable -- a leak reported as an omission.
+    //
+    // The erase must also run on the ERROR path: a proof block that fails has already
+    // recorded uses, and leaving them in place makes the next error blame the proof block
+    // for a double use instead of reporting the real fault.
+    checker.env.erase_uses_since(&uses);
     checker.in_proof = prev_proof;
     checker.env.exit_scope(guard)?;
-    Ok(())
+    outcome
 }
 
 /// Check that a statement is pure (no I/O, measurement, etc.)
@@ -482,11 +492,136 @@ pub fn check_function(checker: &mut TypeChecker, func: &Function) -> Result<(), 
         validate_binding_quantity_mutability(&param.name, param_qty, param.mutability, param.span)?;
     }
 
+    // Check preconditions, once the parameters they talk about are in scope.
+    //
+    // Without this, a `requires` block is never typechecked, so a precondition could name an
+    // undefined variable and the only place that surfaced would be the prover -- reporting a
+    // missing symbol in generated SMT, far from the source that wrote it. A precondition that
+    // does not typecheck is a precondition nobody proved anything about.
+    if !func.requires.is_empty() {
+        let prev_proof = checker.in_proof;
+        checker.in_proof = true;
+        // Like a proof block, a precondition is ERASED: it observes values without
+        // consuming them, so a `[1]` linear parameter referenced in `requires` is not
+        // reported as used up here and again in the body.
+        let uses = checker.env.snapshot_uses();
+        for pred in &func.requires {
+            // `ExprKind::Forall` is the LOOP form and infers to `()`; `ExprKind::Quantified`
+            // is the PROPOSITION form and infers to `Bool`, with the body's tail checked
+            // against `bool`. A precondition is a proposition, so a quantified premise must
+            // go through the latter.
+            //
+            // Calling `check_expr` on the `Forall` form instead rejected every quantified
+            // precondition with "expected `()`, found `Bool`" once the statement-level
+            // expectation was applied -- the loop and the proposition genuinely have
+            // different types, and only one of them is a claim.
+            // The restore must run on the ERROR path too. A precondition that fails to
+            // typecheck has already recorded a use of whatever it referenced, and returning
+            // early with that use still in place makes the NEXT error report it as a
+            // double use -- pointing at the precondition rather than at the real problem.
+            let outcome = match &pred.kind {
+                ExprKind::Forall(loop_) => check_precondition_quantifier(checker, loop_, pred.span),
+                _ => {
+                    let bool_ty = Type::new(TypeKind::Bool, Quantity::Many, pred.span);
+                    checker.check_expr(pred, &bool_ty)
+                }
+            };
+            checker.env.erase_uses_since(&uses);
+            outcome?;
+        }
+        checker.env.erase_uses_since(&uses);
+        checker.in_proof = prev_proof;
+    }
+
     // Check function body
     check_block(checker, &func.body)?;
 
     checker.env.exit_scope(guard)?;
     checker.current_fn_ret = prev_ret;
+    Ok(())
+}
+
+/// Check a `forall` appearing in a `requires` block.
+///
+/// `infer_quantified` handles the EXPRESSION shape, where the proposition is the body's tail
+/// expression: `forall i in a..b { t[i] <= 10 }`. The source form used for obligations puts
+/// the claim in STATEMENT position instead -- `forall i in a..b { assert(t[i] <= 10); }` --
+/// so the block has no tail and `infer_quantified` rejects it with "a quantified proposition
+/// must have a boolean body".
+///
+/// Both shapes are accepted here, and a block whose last statement is the `assert` is checked
+/// against that assert's ARGUMENT. Requiring a tail instead would reject exactly the form
+/// every existing obligation and kernel uses, and would push authors toward a weaker spelling
+/// that happens to parse.
+fn check_precondition_quantifier(
+    checker: &mut TypeChecker,
+    quant: &ForallLoop,
+    span: Span,
+) -> Result<(), TypeError> {
+    let bool_ty = Type::new(TypeKind::Bool, Quantity::Many, span);
+    if let Some(tail) = &quant.body.expr {
+        // Expression form: the tail IS the proposition.
+        let pred_ty = infer_expr(checker, tail)?;
+        unify::unify_types(checker, &pred_ty, &bool_ty)?;
+        return Ok(());
+    }
+
+    // Statement form: the last `assert(..)` supplies the proposition.
+    let Some(last) = quant.body.stmts.last() else {
+        return Err(TypeError::QuantifiedBodyNotBool {
+            span: quant.body.span,
+        });
+    };
+    let StmtKind::Expr(expr) = &last.kind else {
+        return Err(TypeError::QuantifiedBodyNotBool {
+            span: quant.body.span,
+        });
+    };
+    let ExprKind::Call(_, args) = &expr.kind else {
+        return Err(TypeError::QuantifiedBodyNotBool {
+            span: quant.body.span,
+        });
+    };
+    let Some(predicate) = args.first() else {
+        return Err(TypeError::QuantifiedBodyNotBool {
+            span: quant.body.span,
+        });
+    };
+
+    infer_quantified_with_body(checker, quant, predicate, span)
+}
+
+/// Infer a quantified proposition whose body ends in an explicit predicate expression.
+fn infer_quantified_with_body(
+    checker: &mut TypeChecker,
+    quant: &ForallLoop,
+    predicate: &Expr,
+    span: Span,
+) -> Result<(), TypeError> {
+    let guard = checker.env.enter_scope();
+    for (var, lower, upper) in &quant.bindings {
+        let _ = infer_expr(checker, lower)?;
+        let _ = infer_expr(checker, upper)?;
+        checker.env.bind_var(
+            var.clone(),
+            Type::new(TypeKind::Int, Quantity::Many, span),
+            Quantity::Many,
+            Mutability::Immutable,
+        );
+    }
+    // Every statement is checked EXCEPT the trailing `assert`, whose argument is `predicate`.
+    // Checking it as a statement and then inferring `predicate` separately records the same
+    // use of a linear variable twice, and the second one is reported as a double use at the
+    // same span -- an error the author cannot act on.
+    let stmts = &quant.body.stmts;
+    let body_stmts = stmts.len().saturating_sub(1);
+    for stmt in stmts.iter().take(body_stmts) {
+        check_stmt(checker, stmt)?;
+    }
+    let bool_ty = Type::new(TypeKind::Bool, Quantity::Many, span);
+    let pred_ty = infer_expr(checker, predicate)?;
+    unify::unify_types(checker, &pred_ty, &bool_ty)?;
+    checker.env.exit_scope(guard)?;
     Ok(())
 }
 

@@ -218,12 +218,13 @@ bytes untouched after the kernel runs.
   about `t[i]` is checked for every possible tensor. The consequence is deliberate and worth
   stating plainly: a bound like `t[i] <= 127` is **refuted** with no premise, because a
   constant tensor with a huge element is a legitimate countermodel.
-- **Preconditions (`requires { .. }`) are assumed, never discharged.** The prover checks
-  `pre_1 ∧ .. ∧ pre_n ⇒ goal`, and reports *proved* when no countermodel exists. A
-  precondition is the CALLER's obligation — nothing in the compiler currently checks it at a
-  call site, so writing one is a promise, not a guarantee. Until call-site checking exists, a
-  function with an unsatisfiable `requires` is a function that can never be called correctly.
-  Do not read a proved obligation as "this works for all inputs".
+- **Preconditions (`requires { .. }`) are assumed, never discharged at a call site.** The
+  prover checks `pre_1 ∧ .. ∧ pre_n ⇒ goal` and reports *proved* when no countermodel exists.
+  Preconditions ARE typechecked — an undefined name or a non-boolean premise is a compile
+  error — but **nothing checks them where the function is called**. So writing one is a
+  promise, not a guarantee: a function with an unsatisfiable `requires` is a function nobody
+  can call correctly, and the compiler will not say so. Do not read a proved obligation as
+  "this works for all inputs".
 - **A malformed SMT script is now a loud error, but detection is structural, not semantic.**
   Z3's `Solver::from_string` returns `()` and *discards* its error code, so an unparseable
   script used to be dropped silently and answered `sat` for a solver holding no assertions —

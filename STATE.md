@@ -190,11 +190,12 @@ Documented in `docs/content/LIMITATIONS.md`.
 **Proof-carrying quantization.** `ExprKind::Index` is DONE (`b6e11b2`). What remains:
 
 1. ~~Give the prover a way to state an input range~~ -- DONE via `requires { .. }`.
-   The prover now checks `pre_1 ∧ .. ∧ pre_n ⇒ goal`. A range premise makes a clamp bound
-   provable without weakening the encoding. REMAINING: **call sites do not check
-   `requires`**. Writing one is a promise, not a guarantee, so a function with an
-   unsatisfiable precondition is a function nobody can call correctly. That is the next
-   thing to build, and it is the difference between a precondition and a verified one.
+   The prover checks `pre_1 ∧ .. AND pre_n ⇒ goal`. A range premise makes a clamp bound
+   provable without weakening the encoding. Preconditions are TYPECHECKED (undefined name or
+   non-bool premise is a compile error). REMAINING: **call sites do not check `requires`**.
+   Writing one is a promise, not a guarantee, so a function with an unsatisfiable
+   precondition is a function nobody can call correctly. That is the next thing to build,
+   and it is the difference between a precondition and a verified one.
    Do NOT add a "fits in i8" axiom instead — that proves a claim about the tensors the
    axiom admits and reports it for the one that breaks.
 2. Design a sound float abstraction (interval or rational) for scale/zero-point error

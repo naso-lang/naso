@@ -12,6 +12,11 @@
 
 ---
 
+> **Working on this codebase?** Read [`STATE.md`](STATE.md) first. It records the build
+> environment, what is done and verified, the known gaps, and the reasoning behind the
+> load-bearing design decisions. It is the handoff document — see it before changing
+> anything.
+
 ## Overview
 
 **Naso** is a next-generation systems programming language designed for **quantum computing**, **high-assurance systems**, and **formally verified software**. It unifies **Quantitative Type Theory (QTT)** with automatic uncomputation, mutable value semantics, and polyhedral cross-hardware compilation into a single, unshakeable toolchain.

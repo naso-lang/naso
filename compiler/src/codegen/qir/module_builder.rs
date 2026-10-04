@@ -1148,6 +1148,39 @@ mod tests {
             );
         }
 
+        // NO DUPLICATE NAMES in the declaration table.
+        //
+        // `qir.r1` was declared TWICE here -- once already present, once added again when the
+        // rotation angle was plumbed through, because the new entry was not checked against
+        // the existing list. LLVM does not reject a repeated declaration of the same symbol;
+        // it renames the second to `qir.r1.1` and emits it. So the module declared
+        //
+        //     declare void @qir.r1(double, ptr)
+        //     declare void @qir.r1.1(double, ptr)
+        //
+        // and `qir.r1.1` names a function no runtime defines. Every assertion above still
+        // passed, and the emitted text looked plausible on a glance: it had the right
+        // intrinsic, with the right signature, on the right qubit.
+        //
+        // Uniqueness is checked rather than left to review because the failure is invisible to
+        // the existing invariants -- each of them asks whether a RESOLVED name is present, and
+        // `qir.r1` is present twice, so both questions pass. It also does not surface as a
+        // link error in normal use, because nothing links QIR text output; it surfaces only as
+        // a bogus symbol in the emitted module.
+        let mut seen = std::collections::HashSet::new();
+        for intrinsic in QIR_INTRINSICS {
+            assert!(
+                seen.insert(intrinsic.name),
+                "`{}` is declared more than once in QIR_INTRINSICS. LLVM renames the repeat to \
+                 `{}.1` and emits it, so the module would declare a symbol no runtime defines. \
+                 Two entries for one intrinsic means one of them was added without checking the \
+                 list -- if the second has the same signature, it is pure duplication; if it \
+                 differs, the table is ambiguous about what the intrinsic actually is.",
+                intrinsic.name,
+                intrinsic.name
+            );
+        }
+
         // The two refusals, asserted individually. `entangle` approximated by a CNOT and
         // `reset` approximated by a release both compile into a circuit computing
         // something else, which is the fabrication class this mapping must not have.

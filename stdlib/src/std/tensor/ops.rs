@@ -248,9 +248,7 @@ where
         .zip(rhs.iter())
         .map(|(a, b)| if a >= b { a.clone() } else { b.clone() })
         .collect();
-    // Need to construct tensor - use From trait or similar
-    // This is a placeholder - actual implementation would need more infrastructure
-    unimplemented!("maximum needs concrete Q1/QStar impl")
+    Tensor::<Q, D, T, L>::from_quantity_vec(result, lhs.shape().clone())
 }
 
 /// Element-wise minimum
@@ -269,7 +267,7 @@ where
         .zip(rhs.iter())
         .map(|(a, b)| if a <= b { a.clone() } else { b.clone() })
         .collect();
-    unimplemented!("minimum needs concrete Q1/QStar impl")
+    Tensor::<Q, D, T, L>::from_quantity_vec(result, lhs.shape().clone())
 }
 
 /// ReLU activation
@@ -289,7 +287,7 @@ where
             }
         })
         .collect();
-    unimplemented!("relu needs concrete Q1/QStar impl")
+    Tensor::<Q, D, T, L>::from_quantity_vec(result, tensor.shape().clone())
 }
 
 /// Sigmoid activation
@@ -305,7 +303,7 @@ where
         .iter()
         .map(|a| T::one() / (T::one() + (-a.clone()).exp()))
         .collect();
-    unimplemented!("sigmoid needs concrete Q1/QStar impl")
+    Tensor::<Q, D, T, L>::from_quantity_vec(result, tensor.shape().clone())
 }
 
 /// Float operations trait for sigmoid

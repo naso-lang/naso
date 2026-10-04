@@ -338,6 +338,15 @@ jobs:
       - name: capability matrix matches reality
         run: cargo test --features llvm -p naso-compiler --test capability_matrix_test
 
+      # The stdlib element-wise ops (`maximum`, `minimum`, `relu`, `sigmoid`) each
+      # computed the right answer into a local Vec and then called `unimplemented!()` --
+      # the work done and thrown away, and the caller got a panic instead of a number.
+      # That survived because the stdlib had NO tests at all, so nothing could notice.
+      # These assert computed VALUES, not merely that the call returns; a "does not
+      # panic" test would pass against an implementation returning zeros.
+      - name: stdlib element-wise ops compute real values
+        run: cargo test -p naso_std --test tensor_elementwise_ops_test
+
       - name: Gate inverse table and state-vector simulator
         run: |
           cargo test -p naso-gates --test gate_inverse_test

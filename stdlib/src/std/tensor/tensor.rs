@@ -99,6 +99,53 @@ impl<Q: QttQty, D: Dims, T, L: Layout + Default> Tensor<Q, D, T, L> {
         self.num_elements() == 0
     }
 
+    /// Build a tensor from a vector, choosing the storage the QUANTITY demands.
+    ///
+    /// This exists because `Q1::from_vec` and `QStar::from_vec` were the only
+    /// constructors, so any function generic over `Q` had no way to build its result.
+    /// Four element-wise ops (`maximum`, `minimum`, `relu`, `sigmoid`) computed the
+    /// correct answer into a local `Vec` and then hit `unimplemented!`, which is the worst
+    /// of both worlds: the work is done and thrown away, and the caller gets a panic
+    /// instead of a number.
+    ///
+    /// The quantity decides the storage rather than a default:
+    ///
+    /// * `Q0` has no runtime value, so it must have no elements. A non-empty vector here
+    ///   is a `[0]`-use violation and is refused rather than silently stored.
+    /// * `Q1` owns a unique mutable buffer -- one owner, as QTT requires.
+    /// * `QStar` shares an `Arc`, which is what makes `[1]`-use semantics expressible.
+    ///
+    /// Choosing by quantity rather than by convention is the point. Defaulting everything
+    /// to `Linear` would let a `QStar` tensor claim exclusive ownership, and the aliasing
+    /// that follows is invisible at the type level.
+    pub fn from_quantity_vec(vec: Vec<T>, shape: ConcreteShape) -> Self {
+        assert_eq!(
+            vec.len(),
+            shape.num_elements(),
+            "Data length must match shape"
+        );
+        let data = match Q::QTY {
+            Quantity::Zero => {
+                assert!(
+                    vec.is_empty(),
+                    "a Q0 tensor is erased before runtime and must carry no elements, \
+                     but {} were supplied",
+                    vec.len()
+                );
+                TensorStorage::Zero(PhantomData)
+            }
+            Quantity::Linear => TensorStorage::Linear(vec.into_boxed_slice()),
+            Quantity::Heap => TensorStorage::Heap(vec.into_boxed_slice().into()),
+        };
+        Tensor {
+            data,
+            shape,
+            layout: L::default(),
+            _dims: PhantomData,
+            _qty: PhantomData,
+        }
+    }
+
     /// Reshape the tensor
     pub fn reshape<D2: Dims>(self, new_shape: ConcreteShape) -> Tensor<Q, D2, T, L> {
         assert_eq!(self.shape.num_elements(), new_shape.num_elements());

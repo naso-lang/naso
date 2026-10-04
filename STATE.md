@@ -122,6 +122,34 @@ survivor claim.
 
 ---
 
+## Slop audit (2026-10-04)
+
+Asked directly whether the tree contained placeholder work. It did:
+
+- **`crates/naso-verify/src/qir_circuit.rs.bak`** — a tracked 384-line near-duplicate of
+  `qir_circuit.rs`, differing only in one comment. Deleted. A stale copy is worse than no
+  copy: it drifts and reads as authoritative.
+- **Four stdlib functions that computed the answer and threw it away.**
+  `maximum`, `minimum`, `relu` and `sigmoid` in `stdlib/src/std/tensor/ops.rs` each built
+  the correct `Vec` and then called `unimplemented!()`. The caller's panic was the only
+  observable behaviour, and the computation was dead code.
+
+  They survived because **the stdlib had no `tests/` directory at all**. A suite that never
+  runs cannot notice a function that panics.
+
+  Fixed by adding `Tensor::from_quantity_vec`, a constructor generic over `Q` that picks
+  storage from the quantity: `Zero` for Q0 (refusing a non-empty vector, since a `[0]`-use
+  value must not reach runtime), `Linear` for Q1, `Heap`/`Arc` for QStar. Defaulting
+  everything to `Linear` would let a `QStar` tensor claim exclusive ownership QTT forbids.
+
+  `stdlib/tests/tensor_elementwise_ops_test.rs` — 20 tests asserting computed VALUES.
+  6 mutants, all killed, no survivors: maximum→min (3/20), relu→identity (3/20),
+  sigmoid `exp(-x)`→`exp(+x)` (3/20), QStar given Linear storage (2/20), shape assert
+  removed (2/20), Q0 element guard removed (1/20).
+
+**The general lesson:** absence of tests is what let this survive. When adding a feature,
+check whether the crate it lands in has a test harness at all.
+
 ## Known gaps (honest — do not paper over)
 
 Documented in `docs/content/LIMITATIONS.md`.

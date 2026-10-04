@@ -236,10 +236,25 @@ pub fn quantum_intrinsic_for(op: &str) -> Option<&'static str> {
         // Non-gate quantum operations.
         "qalloc" => "qir.qubit_alloc",
         "measure" => "qir.mz",
-        // `phase` is deliberately ABSENT, as are `RZ`/`RX`/`RY`: the QIR rotations take an angle
-        // (`qir.r1(double, ptr)`) and this lowering supplies none, so emitting the call would
-        // compute a rotation by an angle of zero -- the identity, silently not a rotation. They
-        // fall through to `None` and are refused with a diagnostic naming the missing argument.
+        // The parameterized single-qubit gate: a rotation about Z, by a SUPPLIED angle.
+        //
+        // This mapping is the second half of why rotations used to be refused. The first half
+        // was that `qir.r1` was not declared in `QIR_INTRINSICS`; the second was that no
+        // angle reached here. Both are now real: the intrinsic is declared with a `Double`
+        // first parameter, and `lower_quantum_op` puts the angle in `args`, which the
+        // QuantumOp arm above appends BEFORE the qubits -- matching `qir.r1(double, ptr)`.
+        //
+        // Only `RZ` is mapped. `RX` and `RY` are real gates in the simulator and are
+        // deliberately still refused: the QIR base profile has no `rx`/`ry` entry point, so
+        // admitting them would mean declaring an entry point this runtime does not export.
+        // One rotation that works beats three that lie.
+        "RZ" | "rz" => "qir.r1",
+        // `phase` and `RX`/`RY` are deliberately ABSENT. `qir.r1` is the base profile's one
+        // parameterized single-qubit gate and there is no `qir.rx` or `qir.ry`, so those would
+        // have to name entry points this runtime does not export; they fall through to `None`
+        // and are refused. `RZ` IS mapped above, because its angle now reaches here through
+        // `args` rather than being discarded -- which is the difference between a rotation and
+        // the identity.
         //
         // The same gates as `tests/codegen_tests.rs::gate_name` spells them. Two producers,
         // different spellings, one shared gate set -- an earlier table carried only the first

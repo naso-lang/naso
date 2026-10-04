@@ -276,16 +276,25 @@ fn a_bell_pair_always_agrees() {
 
 /// The prelude, not the whole gate set, is what a Naso program can actually say.
 ///
-/// `qalloc`, `hadamard`, `cnot` and `measure` are the only quantum builtins the typechecker
-/// registers. `qir.x`, `qir.cy` and the rest are reachable only through the QIR text backend, so
-/// a test asserting a compiled `pauli_x` program runs would be asserting a capability the language
-/// does not have -- and when `pauli_x` is eventually added, this test must fail so it can be
-/// rewritten against the real one.
+/// The prelude is `qalloc`, `hadamard`, `cnot`, `measure` and `rz` -- and nothing else.
 ///
-/// This is written as a documentation test because the gap is the point: it is easy to read
-/// the QIR backend's intrinsic mapping and conclude the language supports those gates.
+/// # `rz` was added, and the list is short on purpose
+///
+/// `rz` is the one gate whose angle the QIR base profile has an entry point for
+/// (`qir.r1(double, ptr)`). `qir.x`, `qir.cy`, `qir.rx` and the rest are reachable only through
+/// the QIR text backend, so a test asserting a compiled `pauli_x` program runs would be
+/// asserting a capability the language does not have.
+///
+/// Adding `rz` did not mean adding the other gates. Each needs its own base-profile entry
+/// point, and admitting one that the runtime does not export produces a module that compiles
+/// and then fails to LINK -- which is the failure mode this file exists to prevent.
+///
+/// This is a documentation test because the boundary is the point: it is easy to read the
+/// backend's intrinsic mapping and conclude the language supports every gate in it.
+///
+/// If a new builtin is added, this test must fail so the list is rewritten against the real one.
 #[test]
-fn the_source_language_offers_only_the_four_quantum_builtins() {
+fn the_source_language_offers_only_its_five_quantum_builtins() {
     let source = "fn main() -> i64 {\n    \
         let [1] a: Qubit = qalloc(1);\n    \
         hadamard(a);\n    \
@@ -303,7 +312,7 @@ fn the_source_language_offers_only_the_four_quantum_builtins() {
         .expect("naso binary must run");
     assert!(
         built.status.success(),
-        "the four prelude builtins must compile:\n{}",
+        "the prelude builtins must compile:\n{}",
         String::from_utf8_lossy(&built.stderr)
     );
     let emitted = std::fs::read_to_string(&ll).expect("read emitted IR");

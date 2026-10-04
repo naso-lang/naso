@@ -64,7 +64,7 @@ construct, and neither is a placeholder value, a shader comment, or an exit stat
 | 2-D tensors | **emits** | row-major <!-- construct:2-D tensors --> |
 | quantum parameters | **emits** | `Qubit` and `QRegister` both map to the pointer ABI <!-- construct:quantum parameters --> |
 | symbolic loop bounds | **emits** | affine schedule bands <!-- construct:symbolic loop bounds --> |
-| `reversible { ... }` | **refused** | gate sequences uncompute; arithmetic, measurement, rotations, empty and nested blocks still refused <!-- construct:`reversible { ... }` --> |
+| `reversible { ... }` | **refused** | gate sequences uncompute, rotations included; arithmetic, measurement, empty and nested blocks still refused <!-- construct:`reversible { ... }` --> |
 | nested tensors | **refused** | one ptr per tensor has a single stride <!-- construct:nested tensors --> |
 | tensor with a zero extent | **refused** | no elements to index <!-- construct:tensor with a zero extent --> |
 | quantity used as a type | **refused** | `Many` is a quantity; write `[1] Qubit` <!-- construct:quantity used as a type --> |
@@ -198,26 +198,35 @@ Kept deliberately, and refused rather than approximated:
     which computes a different number rather than undoing one; all six of those fabrications
     are fixed and now refuse by name.
   - Measurement, and `qalloc` inside a block.
-  - Rotations. The adjoint of a rotation is the rotation by the *negated* angle, and the
-    lowering never supplies the angle, so it is refused rather than emitted un-negated —
-    which would apply a rotation by zero.
-
   - Empty blocks, and blocks nested in control flow, where the surrounding branch decides
     whether the forward pass ran at all.
 
-  A note on that rotation refusal, because the two halves of it are usually conflated. The
-  backend refuses `RX`/`RY`/`RZ`, and separately the compiler **cannot construct a rotation at
-  all**: the lexer has exactly four quantum keywords (`hadamard`, `cnot`, `reset`, `entangle`),
-  the parser builds `ApplyGate` only for `H`/`CX`/`Reset`, and `GateKind::RX/RY/RZ` are only
-  ever *matched* — in `Display`, in `gate_arity`, and in `naso-verify`'s transition table —
-  never constructed. Writing `rz(0.5, a)` does not reach a rotation check at all: `rz` is not
-  a keyword, so it lexes as an ordinary identifier and is reported as an undefined variable.
+  **Rotations are now implemented for `rz`.** `rz(theta, q)` is a keyword, the angle is
+  required, and it reaches the runtime as a real `f64` operand on `qir.r1(double, ptr)` — the
+  QIR base profile's one parameterized single-qubit gate. So a rotation is emitted rather than
+  refused, and inside a `reversible` block it is uncomputed by negating the angle. Verified
+  natively: `H; rz(0)` measures 0 every run, `H; rz(pi/2); H` measures ~50/50, and
+  `H; rz(pi); H` measures 1 every run, so the angle demonstrably reaches the hardware.
 
-  So the table refusal guards a path no source program currently reaches. It is still correct
-  and worth keeping — a future keyword would hit it — but lifting it is not a one-line change
-  to the table. The angle has to be plumbed through `lower_quantum_op`, which today sets
-  `args: vec![]` for every `ApplyGate` and so discards it. `tests/entangle_refusal_test.rs`
-  asserts both halves, so they cannot drift apart.
+  What is still refused, and why:
+
+  - **`rx` and `ry`.** Real gates in the simulator, but the base profile has no `qir.rx` or
+    `qir.ry`, so admitting them would declare entry points this runtime does not export — a
+    module that compiles and then fails to LINK. One rotation that works beats three that lie.
+  - **A non-literal angle.** `rz(theta, q)` requires a literal. A QIR rotation takes its angle
+    as a call-site operand, so a runtime angle expression is not yet plumbed through.
+  - **A missing angle.** `rz(q)` is a parse error, because a rotation by an angle of zero is the
+    identity — a call that looks like it rotates and does nothing.
+
+  One limit is worth stating plainly: **`rz` cannot be observed by any measurement**, so its
+  uncomputation is verified structurally (on the emitted IR, that the two `qir.r1` calls carry
+  `+theta` and `-theta`) and at the runtime level, where the amplitude is readable. Three
+  separate attempts to test it by measurement distribution failed, because `rz` is a global
+  phase and leaves the probability of measuring 1 unchanged for every angle — each would have
+  passed against a build with the rotation dropped entirely. Linearity blocks the obvious fix:
+  every `[1]` qubit must be consumed, and `measure` is the only consuming operation, so the
+  phase is always collapsed before a compiled program could read it. Adding a `release` builtin
+  is what would make a native test possible, and that needs its own linear-type argument.
 
   So `compiler/src/lowering/reversible_lowering.rs` — the TEMPORARY-VALUE path, with its ancilla
   bookkeeping — remains **unwired and refused**. What is wired is a narrower pass,

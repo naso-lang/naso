@@ -195,8 +195,8 @@ fn matrix() -> Vec<Row> {
             // would overstate what works.
             src: "fn f(a: i64) -> i64 { reversible { let b = a + 1; b } }",
             llvm: Outcome::Refused,
-            note: "gate sequences uncompute; arithmetic, measurement, rotations, empty and \
-                   nested blocks still refused",
+            note: "gate sequences uncompute, rotations included; arithmetic, measurement, \
+                   empty and nested blocks still refused",
         },
         Row {
             construct: "nested tensors",

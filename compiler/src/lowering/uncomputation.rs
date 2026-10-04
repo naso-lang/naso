@@ -91,6 +91,12 @@ struct GateApplication {
     /// The qubits it acts on, in order. Order is significant: `cx(a, b)` and `cx(b, a)` are
     /// different unitaries, and the adjoint of a controlled gate swaps the roles.
     qubits: Vec<PirExpr>,
+    /// The rotation angle, for a gate that takes one. `None` for every fixed gate.
+    ///
+    /// Carried as the lowered `PirExpr` rather than an `f64`, so the value the backend
+    /// eventually materialises is the SAME expression the forward pass emitted -- the
+    /// uncomputation cannot drift from the forward pass by re-parsing a number.
+    angle: Option<PirExpr>,
     /// Where it came from, for diagnostics.
     stmt: StmtId,
 }
@@ -118,19 +124,31 @@ impl GateApplication {
 
         let inverse = inverse_of(forward);
 
-        // A rotation's adjoint is the negated rotation. This pass is given the gate NAME and
-        // its qubits, never an angle -- the lowering discards the angle, which is why the
-        // QIR backend refuses `RX`/`RY`/`RZ` at all. So a rotation is refused here too,
-        // rather than emitted with no angle, which would apply a rotation by zero.
+        // A rotation's adjoint is the rotation by the NEGATED angle, and the angle is now
+        // available here -- `lower_quantum_op` puts it in `args` instead of discarding it.
+        //
+        // This is the payoff of plumbing the angle through: before, a rotation had to be
+        // refused because there was nothing to negate, and negating nothing is a rotation by
+        // zero, which is the identity. Refusing was correct then and would have been a
+        // permanent limitation; it is no longer one.
+        //
+        // The negation is built from the SAME `PirExpr` the forward pass emitted, so the two
+        // cannot drift apart by re-parsing the number differently.
         if matches!(forward, Gate::Rx(_) | Gate::Ry(_) | Gate::Rz(_)) {
-            return Err(LoweringError::NonReversibleOp(format!(
-                "`{}` on statement {} is a rotation, whose adjoint is the rotation by the \
-                 NEGATED angle. This pass is given the gate and its qubits but never the \
-                 angle -- the lowering discards it -- so the negation cannot be emitted. \
-                 Emitting the un-negated rotation would apply it twice instead of undoing \
-                 it, so it is refused.",
-                self.op, self.stmt
-            )));
+            let angle = self.angle.as_ref().ok_or_else(|| {
+                LoweringError::NonReversibleOp(format!(
+                    "`{}` on statement {} is a rotation with no angle to negate. The adjoint \
+                     of a rotation by theta is the rotation by -theta, and emitting the \
+                     un-negated rotation would apply it twice instead of undoing it.",
+                    self.op, self.stmt
+                ))
+            })?;
+            return Ok(GateApplication {
+                op: self.op.clone(),
+                qubits: self.qubits.clone(),
+                angle: Some(negate_angle(angle, &self.op, self.stmt)?),
+                stmt: self.stmt,
+            });
         }
 
         let (name, qubits) = match inverse {
@@ -155,8 +173,47 @@ impl GateApplication {
         Ok(GateApplication {
             op: name,
             qubits,
+            // No fixed gate takes an angle. This is not an omission: `S` and `T` are phase
+            // gates, but their phase is PI/2 and PI/4 respectively -- part of the gate's
+            // definition, not a parameter. Their adjoints are `Sdg`/`Tdg`, handled above.
+            angle: None,
             stmt: self.stmt,
         })
+    }
+}
+
+/// The negation of a rotation's angle, as the backend will materialise it.
+///
+/// # Why the angle is negated as a NUMBER
+///
+/// `lower_quantum_op` admits only a float LITERAL as a rotation angle -- a runtime angle
+/// expression is not yet plumbed through -- so the negation is exact arithmetic on that
+/// literal rather than an expression the backend would have to evaluate.
+///
+/// This is the one place where restricting angles to literals costs nothing: the inverse of a
+/// rotation by a literal is a rotation by a literal. If runtime angles are ever admitted, this
+/// function has to grow an expression form, and the guard below is what will notice, because
+/// it refuses anything that is not a literal rather than silently emitting zero.
+fn negate_angle(angle: &PirExpr, op: &str, stmt: StmtId) -> Result<PirExpr, LoweringError> {
+    match angle {
+        PirExpr::FloatLit(text) => {
+            let value: f64 = text.parse().map_err(|_| {
+                LoweringError::NonReversibleOp(format!(
+                    "`{op}` on statement {stmt} has angle `{text}`, which is not a number, so \
+                     it cannot be negated. Refused rather than treated as zero."
+                ))
+            })?;
+            // `-0.0` and `0.0` compare equal but print differently, so normalise the zero case
+            // to keep the emitted IR from depending on which sign the source happened to write.
+            let negated = if value == 0.0 { 0.0 } else { -value };
+            Ok(PirExpr::FloatLit(format!("{negated:?}")))
+        }
+        other => Err(LoweringError::NonReversibleOp(format!(
+            "`{op}` on statement {stmt} has angle `{other:?}`, which is not a float literal. \
+             Only literal angles are admitted by the lowering, so this cannot have come from a \
+             source program -- and emitting an un-negated rotation would apply it twice \
+             instead of undoing it."
+        ))),
     }
 }
 
@@ -240,15 +297,43 @@ fn collect_gates(forward: &[PirStatement]) -> Result<Vec<GateApplication>, Lower
                         stmt.id
                     )));
                 }
-                if !args.is_empty() {
-                    return Err(LoweringError::NonReversibleOp(format!(
-                        "`{op}` on statement {} carries {} value argument(s). This pass \
-                         uncomputes GATE applications, and an argument it cannot see the \
-                         value of is an operation whose adjoint it cannot form.",
-                        stmt.id,
-                        args.len()
-                    )));
-                }
+                // A rotation's argument is its ANGLE, which is inverted by negating it -- so
+                // it is carried, not refused. Any other operation's arguments are operands
+                // this pass cannot see the value of, so they are refused.
+                let is_rotation = matches!(op.as_str(), "RZ" | "RX" | "RY" | "rz" | "rx" | "ry");
+                let angle = if is_rotation {
+                    match args.as_slice() {
+                        [a] => Some(a.clone()),
+                        [] => {
+                            return Err(LoweringError::NonReversibleOp(format!(
+                                "`{op}` on statement {} is a rotation with NO angle. The \
+                                 adjoint of a rotation by theta is the rotation by -theta, \
+                                 and with no angle there is nothing to negate -- emitting it \
+                                 anyway would apply a rotation by zero, which is the identity.",
+                                stmt.id
+                            )));
+                        }
+                        _ => {
+                            return Err(LoweringError::NonReversibleOp(format!(
+                                "`{op}` on statement {} carries {} arguments; a rotation \
+                                 carries exactly one angle.",
+                                stmt.id,
+                                args.len()
+                            )));
+                        }
+                    }
+                } else {
+                    if !args.is_empty() {
+                        return Err(LoweringError::NonReversibleOp(format!(
+                            "`{op}` on statement {} carries {} value argument(s). This pass \
+                             uncomputes GATE applications, and an argument it cannot see the \
+                             value of is an operation whose adjoint it cannot form.",
+                            stmt.id,
+                            args.len()
+                        )));
+                    }
+                    None
+                };
                 if gate_of_name(op).is_none() {
                     return Err(LoweringError::NonReversibleOp(format!(
                         "`{op}` on statement {} is not a gate this pass knows the adjoint of, \
@@ -261,6 +346,7 @@ fn collect_gates(forward: &[PirStatement]) -> Result<Vec<GateApplication>, Lower
                 gates.push(GateApplication {
                     op: op.clone(),
                     qubits: qubits.clone(),
+                    angle,
                     stmt: stmt.id,
                 });
             }
@@ -338,7 +424,13 @@ pub fn uncompute_statements(
             domain: AffineDomain::universe(0, 0),
             body: PirExpr::QuantumOp {
                 op: adj.op,
-                args: Vec::new(),
+                // The NEGATED angle, for a rotation. This must not be `Vec::new()`: an
+                // operation with a name and no angle is a rotation by zero, which is the
+                // identity -- so an uncomputation that dropped the angle here would emit
+                // `rz(0)` and leave the forward rotation in place, looking correct and
+                // undoing nothing. The forward pass and this line are the only two places
+                // that put an angle in `args`, so both must carry one.
+                args: adj.angle.into_iter().collect(),
                 qubits: adj.qubits,
             },
             // A gate's inverse is an operation on the same linear resource, so it carries the

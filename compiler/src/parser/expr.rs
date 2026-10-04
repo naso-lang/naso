@@ -241,6 +241,7 @@ impl<'a> Parser<'a> {
             Some(TK::Hadamard) => self.parse_hadamard(),
             Some(TK::Reset) => self.parse_reset(),
             Some(TK::CNot) => self.parse_cnot(),
+            Some(TK::Rz) => self.parse_rz(),
             Some(TK::Int(_)) | Some(TK::Float(_)) | Some(TK::Bool(_)) | Some(TK::Str(_))
             | Some(TK::Char(_)) => self.parse_literal(),
             // `{` may be a trailing block on an expression, or the body of a
@@ -733,6 +734,60 @@ impl<'a> Parser<'a> {
         // cnot takes 2 qubit arguments (control, target)
         Expr::new(
             ExprKind::QuantumOp(QuantumOp::ApplyGate(GateKind::CX, args)),
+            span,
+            next_id(),
+        )
+    }
+
+    /// `rz(theta, q)` -- rotate qubit `q` about Z by angle `theta`.
+    ///
+    /// The angle is the FIRST argument and lands in `GateKind::RZ`, which is where
+    /// `GateKind`'s own definition says a rotation's angle belongs -- NOT in the `args` list,
+    /// which for every other gate is all qubits. `gate_arity` documents the same split.
+    ///
+    /// Getting this backwards is the bug this shape exists to prevent: `lower_quantum_op`
+    /// lowers every element of `args` as a qubit, so an angle placed there would be emitted
+    /// into a QUBIT SLOT. That is a type error at best and, at worst, a pointer where a
+    /// double belongs.
+    ///
+    /// Both arguments are required. `rz(q)` would be a rotation by an angle of zero, which is
+    /// the identity -- a call that looks like it rotates and does nothing.
+    fn parse_rz(&mut self) -> Expr {
+        let start = self.pos;
+        self.expect(TK::Rz);
+        self.expect(TK::LParen);
+        let args = self.parse_args_until(TK::RParen);
+        self.expect(TK::RParen);
+        let span = self.span_from(start);
+
+        if args.len() != 2 {
+            // `fail` RECORDS the error and returns a sentinel -- it does not unwind. So the
+            // indexes below must not run: `rz(q)` has one argument, and `args[1]` panicked
+            // with an out-of-bounds index instead of reporting the arity mistake. The early
+            // return is what turns a compiler crash on bad input into a diagnostic.
+            self.fail::<crate::lexer::Token>(
+                format!(
+                    "`rz` takes an angle and a qubit, so exactly 2 arguments; got {}. A \
+                     rotation with no angle is the identity, so the angle is required rather \
+                     than defaulted to zero.",
+                    args.len()
+                ),
+                self.error_span(),
+            );
+            return Expr::new(
+                ExprKind::Literal(crate::ast::Literal::Int(0)),
+                span,
+                next_id(),
+            );
+        }
+        let angle = args[0].clone();
+        let qubit = args[1].clone();
+
+        Expr::new(
+            ExprKind::QuantumOp(QuantumOp::ApplyGate(
+                GateKind::RZ(Box::new(angle)),
+                vec![qubit],
+            )),
             span,
             next_id(),
         )

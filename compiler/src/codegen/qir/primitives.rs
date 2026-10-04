@@ -187,6 +187,20 @@ pub const QIR_INTRINSICS: &[QirIntrinsic] = &[
         param_types: &[QirIntrinsicParamType::Qubit],
         is_var_args: false,
     },
+    // The one PARAMETERIZED single-qubit gate in the QIR base profile: a rotation about Z by
+    // a supplied angle.
+    //
+    // The `Double` parameter is the whole reason rotations were refused before. Every other
+    // entry point here takes a qubit and nothing else, so a rotation had nowhere to put its
+    // angle -- and emitting `qir.rz` with no argument would have declared a zero-argument
+    // function, computing a rotation by zero, which is the identity and silently not a
+    // rotation.
+    QirIntrinsic {
+        name: "qir.r1",
+        ret_type: QirIntrinsicRetType::Void,
+        param_types: &[QirIntrinsicParamType::Double, QirIntrinsicParamType::Qubit],
+        is_var_args: false,
+    },
     QirIntrinsic {
         name: "qir.y",
         ret_type: QirIntrinsicRetType::Void,

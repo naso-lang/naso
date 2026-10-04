@@ -197,6 +197,19 @@ pub enum TokenKind {
     Reset,
     #[regex("[cC][nN][oO][tT]", priority = 3)]
     CNot,
+    // `rz(theta, q)` -- a rotation about Z by a supplied angle.
+    //
+    // The ONE rotation this front end exposes, and the choice is not arbitrary. It is the
+    // only parameterized single-qubit gate in the QIR base profile (`qir.r1(double, ptr)`),
+    // so it is the only rotation that needs no new entry point. `rx` and `ry` are real gates
+    // in the simulator and are deliberately NOT keywords: admitting them would require an
+    // ABI entry point that does not exist, and the honest move is to expose one rotation
+    // that works rather than three that lie.
+    //
+    // The angle is a REQUIRED first argument. A rotation with no angle is the identity, so an
+    // optional angle would be a silent no-op at the default.
+    #[regex("[rR][zZ]", priority = 3)]
+    Rz,
     #[regex("[qQ][aA][lL][lL][oO][cC]", priority = 3)]
     QAlloc,
     #[regex("[nN][aA][tT]", priority = 3)]
@@ -358,6 +371,7 @@ impl TokenKind {
             TokenKind::Hadamard => "'hadamard'",
             TokenKind::Reset => "'reset'",
             TokenKind::CNot => "'cnot'",
+            TokenKind::Rz => "'rz'",
             TokenKind::QAlloc => "'qalloc'",
             TokenKind::Nat => "'nat'",
             TokenKind::FloatKw => "'float'",

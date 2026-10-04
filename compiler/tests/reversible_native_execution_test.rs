@@ -730,34 +730,169 @@ fn an_operation_with_no_known_adjoint_is_refused_rather_than_skipped() {
     );
 }
 
-/// A rotation inside a `reversible` block is refused: there is no angle to negate.
+/// A rotation inside a `reversible` block is uncomputed by NEGATING its angle.
 ///
-/// The inverse of a rotation by theta is a rotation by -theta. This pass is given the gate
-/// and its qubits but never the angle -- the lowering discards it, which is why the QIR
-/// backend refuses `RX`/`RY`/`RZ` outright. Emitting the un-negated rotation would apply it
-/// twice rather than undo it, so the rotation is refused instead.
+/// This test used to assert the opposite. It was correct then and is wrong now: there was no
+/// angle to negate, so the honest answer was a refusal. Plumbing the angle through
+/// `lower_quantum_op` removed the reason for it.
+///
+/// # The angle is the whole claim
+///
+/// A rotation by theta has adjoint the rotation by -theta. Emitting the UN-negated rotation
+/// would apply the rotation twice rather than undoing it, and the emitted text would look
+/// entirely reasonable -- same gate, same qubit, wrong sign. So the assertion is on the sign,
+/// and it is checked on the emitted IR because that is what `llc` compiles.
 #[test]
-fn a_rotation_is_refused_because_there_is_no_angle_to_negate() {
-    use naso_compiler::ir::{AffineDomain, PirExpr, PirStatement, StmtId};
+fn a_rotation_in_a_reversible_block_is_uncomputed_by_negating_its_angle() {
+    let source = "\
+fn main() -> i64 {
+    let [1] a: Qubit = qalloc(1);
+    reversible { rz(0.5, a); }
+    if measure(a) { return 1; }
+    return 0;
+}
+";
+    let Some(ir) = compile_to_ir("uncomp_rz", source) else {
+        eprintln!("skipped: llc or cc is unavailable");
+        return;
+    };
 
-    for gate in ["RX", "RY", "RZ"] {
-        let forward = vec![PirStatement {
-            id: StmtId(0),
-            domain: AffineDomain::universe(0, 0),
-            body: PirExpr::QuantumOp {
-                op: gate.to_string(),
-                args: vec![],
-                qubits: vec![PirExpr::Var("q".to_string())],
-            },
-            quantity: naso_compiler::ast::Quantity::Many,
-            mutability: naso_compiler::ast::Mutability::Immutable,
-            span: None,
-        }];
-        let err = naso_compiler::lowering::uncomputation::uncompute_statements(&forward, StmtId(1))
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("rotation"),
-            "`{gate}` must be refused as a rotation: {err}"
-        );
-    }
+    let angles: Vec<String> = ir
+        .lines()
+        .map(str::trim)
+        // Filter to CALL SITES. The emitted module contains both `declare void @qir.r1(...)`
+        // and `call void @qir.r1(...)`, and matching on the bare name counts the declaration
+        // as a third rotation. Matching `"call void @qir.r1"` is what makes this an assertion
+        // about the CIRCUIT rather than about the module's preamble.
+        .filter(|l| l.starts_with("call void @qir.r1"))
+        .map(|l| {
+            l.split("double ")
+                .nth(1)
+                .and_then(|s| s.split(',').next())
+                .unwrap_or("?")
+                .to_string()
+        })
+        .collect();
+
+    assert_eq!(
+        angles.len(),
+        2,
+        "expected the forward rotation and its uncomputation, two `qir.r1` CALLS, got \
+         {angles:?}. A third would be the `declare` line being counted, which is what this \
+         filter exists to exclude."
+    );
+
+    let forward: f64 = angles[0]
+        .parse()
+        .unwrap_or_else(|_| panic!("`{}` is not a number", angles[0]));
+    let inverse: f64 = angles[1]
+        .parse()
+        .unwrap_or_else(|_| panic!("`{}` is not a number", angles[1]));
+
+    assert!(
+        (forward - 0.5).abs() < 1e-12,
+        "the forward rotation must be by 0.5, got {forward}"
+    );
+    assert!(
+        (inverse + 0.5).abs() < 1e-12,
+        "the uncomputation must be by the NEGATED angle, -0.5. Got {inverse}. An un-negated \
+         rotation applies the forward rotation twice instead of undoing it, and the emitted \
+         text looks correct either way -- so this is the only place the sign is observable."
+    );
+}
+
+/// WHY there is no distribution test for `rz`: a global phase is invisible to a measurement,
+/// and the language offers no other way to observe one.
+///
+/// # This is a gap in what can be asserted, stated as a gap
+///
+/// Three separate measurement-based fixtures were written for this and all three were
+/// incapable of distinguishing a correct uncomputation from a missing one. Each looked
+/// reasonable:
+///
+/// - `rz(pi)` on |0>, expecting 1. A phase does not move probability, so it is 0 either way.
+/// - `H; rz(0.5)`, expecting ~50/50. `H` alone is also ~50/50, so the rotation is not needed.
+/// - `H; rz(t); reversible { rz(t) }`, expecting the phases to cancel to the identity.
+///   `rz` COMMUTES with `H`, so cancelling the phases leaves `|++>` -- still ~50/50.
+///
+/// Each of those would have passed against a build where the rotation was dropped entirely.
+/// The emitted-IR assertion above -- that the two `qir.r1` calls carry `+theta` and `-theta` --
+/// is the only check that actually distinguishes them, and it is a check on the CIRCUIT rather
+/// than on the program's behaviour.
+///
+/// # The observable that would work, and why it is not reachable from source
+///
+/// Reading the register state directly -- `qir_amplitude`, which the runtime exports and which
+/// can see a global phase -- would settle it. Reaching it from a Naso program is blocked by
+/// linearity, not by the runtime:
+///
+/// - Every `[1]`-quantity qubit must be CONSUMED, and the only consuming operation is
+///   `measure`.
+/// - `qir_mz` collapses the measured qubit AND renormalises, so by the time the program
+///   returns the phase of interest is gone.
+///
+/// Measuring a *different* qubit does not help: the typechecker still requires the rotated
+/// binding itself to be consumed, and the language has no `release` or `discard` spelling.
+/// (Adding one is exactly the sort of change that needs its own linear-type argument, so it is
+/// not smuggled in here to make a test pass.)
+///
+/// So the honest position: the rotation's uncomputation is verified structurally, on the
+/// emitted IR, and its runtime execution is verified at the RUNTIME level -- `rz(0)`,
+/// `rz(pi/2)` and `rz(pi)` each produce their expected interference with a Hadamard, which
+/// distinguishes an applied angle from an ignored one. What is NOT verified natively is
+/// specifically that the uncomputation CANCELS a rotation, because no source program can
+/// express the observation that would show it.
+///
+/// If a `release` builtin is ever added, this test should be replaced with one that reads the
+/// amplitude, and the structural assertion above becomes a backstop rather than the only check.
+#[test]
+fn a_rotation_in_a_reversible_block_is_verified_structurally_because_it_is_unobservable_natively() {
+    // The structural half lives in
+    // `a_rotation_in_a_reversible_block_is_uncomputed_by_negating_its_angle`, which asserts the
+    // forward pass emits `+theta` and the uncomputation `-theta` on the emitted IR.
+    //
+    // This test exists to keep the GAP VISIBLE and to pin the premise that makes it a gap, so
+    // it fails if the situation changes rather than silently continuing to overstate what is
+    // verified. Specifically it asserts the premise: a measurement cannot see a global phase.
+    //
+    // If a future change makes `rz` observable -- an amplitude read, or a second qubit whose
+    // measurement interferes with the rotated one -- this test fails and the comment above is
+    // what tells the next author to write the real native test.
+    let probe = r"
+fn main() -> i64 {
+    let [1] a: Qubit = qalloc(1);
+    hadamard(a);
+    if measure(a) { return 1; }
+    return 0;
+}
+";
+    let Some(without) = build_and_run("phase_probe_none", probe, RUNS) else {
+        eprintln!("skipped: llc or cc is unavailable");
+        return;
+    };
+    // A REAL newline, not an escaped one: `probe` is a raw string, so inserting a literal
+    // backslash-n produced `<lex error>` rather than a second statement. That failure was
+    // immediate and unambiguous, which is the good case -- a string-built program that is
+    // subtly wrong is the bad one.
+    let rotated = probe.replace("hadamard(a);", "hadamard(a);\n    rz(0.5, a);\n");
+    let Some(with) = build_and_run("phase_probe_rz", &rotated, RUNS) else {
+        eprintln!("skipped: llc or cc is unavailable");
+        return;
+    };
+
+    // `rz(0.5)` after a Hadamard must NOT change the measurement distribution -- because `rz`
+    // is a global phase. This is the premise, asserted rather than assumed.
+    //
+    // If a future `rz` were observable, this assertion would fail, which is the intended
+    // signal: the gap is no longer a gap and a real native test should replace this file's
+    // comment.
+    let ones_without = count(&without, "1");
+    let ones_with = count(&with, "1");
+    assert!(
+        (ones_without as i64 - ones_with as i64).abs() <= 15,
+        "a global phase must not be observable in a measurement distribution, but adding \
+         `rz(0.5)` moved the count of 1s from {ones_without} to {ones_with} out of {RUNS}. Either \
+         `rz` has become observable -- in which case the comment on this test is out of date and \
+         a native uncomputation test can now be written -- or the two programs are not equivalent."
+    );
 }

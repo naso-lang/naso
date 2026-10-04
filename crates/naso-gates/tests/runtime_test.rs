@@ -29,8 +29,8 @@
 use naso_gates::gate_inverse::inverse_of;
 use naso_gates::runtime::{
     TWO_QUBIT_CX, TWO_QUBIT_SWAP, fault_pending, gate_from_index, gate_index, qir_amplitude,
-    qir_apply1, qir_apply2, qir_apply3, qir_live_qubit_count, qir_mz, qir_probability_of_one,
-    qir_qubit_alloc, qir_qubit_release, reset_for_test,
+    qir_apply_rotation, qir_apply1, qir_apply2, qir_apply3, qir_live_qubit_count, qir_mz,
+    qir_probability_of_one, qir_qubit_alloc, qir_qubit_release, qir_r1, reset_for_test,
 };
 use naso_gates::statevector::{Complex, Gate};
 
@@ -438,4 +438,152 @@ fn inverse_index(gate: Gate) -> u8 {
              so an uncompute could not be executed"
         ),
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Rotations
+// ---------------------------------------------------------------------------------------
+
+/// A rotation applies ITS OWN angle, not some fixed one.
+///
+/// # The test that was missing, and why it had to be added here
+///
+/// `qir_r1` accepts an `f64` angle. A mutation that made the runtime IGNORE it -- rotating by a
+/// fixed zero, or by the wrong axis -- was not caught by any compiler-level test, because a
+/// compiled Naso program cannot observe a global phase: `rz` is `diag(exp(-it/2), exp(it/2))`,
+/// which leaves the probability of measuring 1 unchanged for every angle. The compiler tests
+/// prove the right angle is PASSED; nothing proved the runtime USES it.
+///
+/// This is the only layer that can close that gap. It reads the amplitude directly, which is
+/// what a measurement cannot see, and the runtime is the only place a global phase is
+/// observable at all.
+///
+/// The assertions are on the CLOSED FORM, so a fixed or wrong angle cannot pass:
+/// `rz(theta)` on |0> gives `exp(-i*theta/2)`, so the real part is `cos(theta/2)` and the
+/// imaginary part `-sin(theta/2)`.
+#[test]
+fn a_rotation_applies_its_own_angle() {
+    // `std::f64::consts::PI`, not a literal: clippy rejects an approximate PI, and the
+    // assertion below compares to 1e-12, which a 15-digit truncation could not reliably meet.
+    for theta in [0.0f64, 0.5, 1.0, std::f64::consts::PI, -0.75] {
+        fresh();
+        let a = qir_qubit_alloc();
+        qir_r1(theta, a);
+
+        let got = amplitude(0);
+        let expected_re = (theta / 2.0).cos();
+        let expected_im = -(theta / 2.0).sin();
+        assert!(
+            (got.re - expected_re).abs() < 1e-12 && (got.im - expected_im).abs() < 1e-12,
+            "rz({theta}) on |0> must give exp(-i*{theta}/2) = {expected_re}{expected_im}i, got \
+             {}{}i. A runtime that ignored the angle, or used the wrong axis, would land \
+             elsewhere on this curve.",
+            got.re,
+            got.im
+        );
+
+        // And the probability really is unchanged -- which is WHY no measurement-based test
+        // can catch a wrong angle. Asserted so that reasoning is checked rather than assumed.
+        assert!(
+            qir_probability_of_one(a).abs() < 1e-12,
+            "a global phase must not change the probability of measuring 1, got {}",
+            qir_probability_of_one(a)
+        );
+    }
+}
+
+/// A rotation and its negation cancel, which is what makes a rotation uncomputable.
+///
+/// This is the property the compiler's uncomputation pass relies on, checked here at the layer
+/// where it is actually observable: `rz(t)` then `rz(-t)` is the identity on the amplitude.
+#[test]
+fn a_rotation_and_its_negation_compose_to_the_identity() {
+    for theta in [0.5f64, 1.0, 2.5, std::f64::consts::PI] {
+        fresh();
+        let a = qir_qubit_alloc();
+        qir_r1(theta, a);
+        qir_r1(-theta, a);
+
+        let got = amplitude(0);
+        assert!(
+            (got.re - 1.0).abs() < 1e-12 && got.im.abs() < 1e-12,
+            "rz({theta}) then rz(-{theta}) must be the identity, so |0> must read back as 1+0i. \
+             Got {}{}i.",
+            got.re,
+            got.im
+        );
+    }
+}
+
+/// The rotation axis is honoured: X and Z are different gates at the same angle.
+///
+/// `rz` is the only axis the base profile exposes, so this checks the shared
+/// `qir_apply_rotation` helper rather than a new entry point. It matters because a runtime
+/// that ignored its axis argument would pass every `rz` test while being wrong for any future
+/// axis.
+#[test]
+fn the_rotation_axis_is_honoured() {
+    fresh();
+    let a = qir_qubit_alloc();
+    // Rx(pi) on |0> is -i|1>: it moves PROBABILITY, unlike Rz. That asymmetry is what makes the
+    // axis observable at all.
+    qir_apply_rotation(
+        a,
+        naso_gates::runtime::ROTATION_AXIS_X,
+        std::f64::consts::PI,
+    );
+
+    let p_one = qir_probability_of_one(a);
+    assert!(
+        (p_one - 1.0).abs() < 1e-12,
+        "Rx(pi) must take |0> to |1>, so the probability of 1 must be 1, got {p_one}. An Rx that \
+         behaved like Rz would leave this at 0, since a Z rotation is a global phase."
+    );
+
+    // And the angle is still honoured on the X axis.
+    fresh();
+    let b = qir_qubit_alloc();
+    qir_apply_rotation(b, naso_gates::runtime::ROTATION_AXIS_X, 0.0);
+    assert!(
+        qir_probability_of_one(b).abs() < 1e-12,
+        "Rx(0) is the identity, so the probability of 1 must stay 0"
+    );
+}
+
+/// A non-finite angle is refused rather than poisoning every downstream amplitude.
+///
+/// A NaN that entered the state vector would propagate through every subsequent gate and make
+/// every later probability NaN -- including the check in `qir_mz` that the state is normalised,
+/// which is a confusing place to discover it. Refusing at the boundary names the real cause.
+#[test]
+fn a_non_finite_rotation_angle_is_refused() {
+    fresh();
+    let a = qir_qubit_alloc();
+    qir_r1(f64::NAN, a);
+    let fault =
+        fault_pending().expect("a NaN angle must raise a fault rather than enter the state");
+    assert!(
+        fault.contains("finite"),
+        "the fault must name the actual problem -- a non-finite angle -- and not something \
+         incidental. Got: {fault}"
+    );
+
+    // The state must still be usable -- a refused rotation leaves it untouched.
+    fresh();
+    let b = qir_qubit_alloc();
+    qir_apply1(b, gate_index::H);
+    qir_r1(f64::INFINITY, b);
+    assert!(
+        fault_pending().is_some(),
+        "an infinite angle must also raise a fault"
+    );
+
+    fresh();
+    let c = qir_qubit_alloc();
+    qir_r1(std::f64::consts::PI, c);
+    assert_eq!(
+        fault_pending(),
+        None,
+        "a finite angle must not raise a fault, or the refusals above prove nothing"
+    );
 }

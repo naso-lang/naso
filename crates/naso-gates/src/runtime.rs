@@ -563,6 +563,72 @@ pub extern "C" fn qir_t(qubit: QirQubit) {
     qir_apply1(qubit, gate_index::T);
 }
 
+/// Apply a single-qubit rotation about a named axis by a supplied angle.
+///
+/// # Why this cannot go through `qir_apply1`
+///
+/// `qir_apply1` takes a `u8` GATE INDEX, and the index table holds fixed gates -- `H`, `X`,
+/// `S`. A rotation is not a fixed gate: `Rx(0.1)` and `Rx(2.9)` are different unitaries and
+/// both are real. Indexing them would mean inventing indices for angles that are not in the
+/// table, and the entry for "no index" would be a rotation by angle ZERO -- the identity,
+/// silently not a rotation.
+///
+/// So the angle is a real `f64` parameter here, and the gate is named by an explicit AXIS
+/// constant rather than by a magic number a caller could pass. `qir.r1` below is the named
+/// ABI form, matching the real QIR base profile.
+pub extern "C" fn qir_apply_rotation(qubit: QirQubit, axis: u8, angle: f64) {
+    REGISTERS.with(|r| {
+        let mut r = r.borrow_mut();
+        if blocked() || !r.require_live(qubit) {
+            return;
+        }
+        // A NaN angle would poison every amplitude downstream and there is no sensible
+        // quantum meaning for it, so it is refused rather than propagated.
+        if !angle.is_finite() {
+            misuse(format!(
+                "qir.apply_rotation: angle must be finite, got {angle}"
+            ));
+            return;
+        }
+        let gate = match axis {
+            ROTATION_AXIS_X => Gate::Rx(angle),
+            ROTATION_AXIS_Y => Gate::Ry(angle),
+            ROTATION_AXIS_Z => Gate::Rz(angle),
+            other => {
+                misuse(format!(
+                    "qir.apply_rotation: axis {other} is not X, Y or Z (expected {}, {} or {})",
+                    ROTATION_AXIS_X, ROTATION_AXIS_Y, ROTATION_AXIS_Z
+                ));
+                return;
+            }
+        };
+        let Some(base) = r.state() else { return };
+        let next = gate.apply(base, qubit.index(), None);
+        r.state = Some(next);
+    })
+}
+
+/// Rotation axis selectors, named so a caller cannot pass a magic number.
+///
+/// X is 0 deliberately: a zero-initialised axis argument is a rotation about X, which is
+/// VISIBLE rather than silently doing nothing. The same reasoning as the gate index table.
+pub const ROTATION_AXIS_X: u8 = 0;
+pub const ROTATION_AXIS_Y: u8 = 1;
+pub const ROTATION_AXIS_Z: u8 = 2;
+
+/// `#pragma qir` target entrypoint `qir.r1(double, ptr)`.
+///
+/// A rotation about the Z axis, the QIR base profile's single parameterized one-qubit gate.
+///
+/// `rz(theta, q)` rotates by `theta` about Z. It is NOT the same as `qir.s`, and the
+/// distinction matters: `S` is `Rz(pi/2)`, so a program that means `S` and emits `r1(pi/2)` is
+/// computing the same state, while a program that means a general rotation and emits `qir.s`
+/// is computing the identity on half the inputs.
+#[unsafe(export_name = "qir.r1")]
+pub extern "C" fn qir_r1(theta: f64, qubit: QirQubit) {
+    qir_apply_rotation(qubit, ROTATION_AXIS_Z, theta);
+}
+
 /// `#pragma qir` target entrypoint `qir.cx`.
 #[unsafe(export_name = "qir.cx")]
 pub extern "C" fn qir_cx(control: QirQubit, target: QirQubit) {

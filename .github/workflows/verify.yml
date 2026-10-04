@@ -292,8 +292,22 @@ jobs:
       # block must now lower, and arithmetic / measurement / empty / nested blocks must still
       # refuse BY NAME. Also asserts the four former structural blockers are resolved and that
       # the TEMPORARY-VALUE module stayed unwired.
+      # The rotation boundary: `rz` is accepted in both spellings, `rx`/`ry` stay refused for
+      # want of a base-profile entry point, a missing angle is a parse error rather than a
+      # no-op, and `rz` is a keyword while `rx`/`ry` are not.
+      - name: rotation capability boundary
+        run: cargo test --features llvm -p naso-compiler --test entangle_refusal_test
+
       - name: reversible capability boundary and resolved blockers
         run: cargo test --features llvm -p naso-compiler --test reversible_refusal_test
+
+      # `rz(theta, q)` -- a rotation whose angle reaches the runtime as a real `f64` operand on
+      # `qir.r1(double, ptr)`. These are RUNTIME-level rather than compiler-level because `rz` is
+      # a global phase: no measurement can observe it, so only the amplitude can. A mutation that
+      # makes the runtime ignore the angle, hardcode zero, or use the wrong axis is killed here
+      # and by nothing else.
+      - name: rotations apply their own angle
+        run: cargo test -p naso-gates --test runtime_test
 
       # `reversible { ... }` is now wired for gate sequences: forward pass AND uncomputation.
       # The suite that matters here builds real executables (naso -> LLVM IR -> llc -> cc ->

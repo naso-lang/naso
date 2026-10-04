@@ -1975,6 +1975,42 @@ impl LoweringContext {
     // Statement-position `reversible` never used it -- `lower_stmt` emits those
     // bodies directly, which is why that form still works.
 
+    /// Lower a rotation's angle, requiring it to be a compile-time float.
+    ///
+    /// # Why only literals are accepted
+    ///
+    /// A QIR rotation takes the angle as an `f64` OPERAND at the call site, so the angle has
+    /// to be a value the backend can materialise. Accepting a runtime expression would mean
+    /// either inventing an SSA value and threading it through the call, or -- what a looser
+    /// version of this would do -- evaluating nothing and emitting zero.
+    ///
+    /// A float LITERAL is unambiguous and correct. An integer literal is accepted and
+    /// converted, because `rz(1, q)` is unambiguous too: `1` as an angle is `1.0`.
+    ///
+    /// Anything else is refused BY NAME, saying what is missing, rather than emitting a
+    /// rotation by an angle of zero.
+    fn lower_rotation_angle(
+        &mut self,
+        angle: &crate::ast::expr::Expr,
+    ) -> Result<crate::ir::PirExpr, LoweringError> {
+        use crate::ast::expr::ExprKind;
+        use crate::ir::PirExpr;
+        match &angle.kind {
+            ExprKind::Literal(crate::ast::Literal::Float(f)) => {
+                Ok(PirExpr::FloatLit(f.to_string()))
+            }
+            ExprKind::Literal(crate::ast::Literal::Int(i)) => {
+                Ok(PirExpr::FloatLit(format!("{i}.0")))
+            }
+            other => Err(LoweringError::Unsupported(format!(
+                "a rotation's angle must be a float literal. This one is `{other:?}`, and a \
+                 QIR rotation takes its angle as an `f64` operand at the call site, so a \
+                 runtime expression is not yet plumbed through. Refused rather than emitted \
+                 with an angle of zero, which is the identity."
+            ))),
+        }
+    }
+
     fn lower_quantum_op(
         &mut self,
         qop: &crate::ast::expr::QuantumOp,
@@ -1992,16 +2028,38 @@ impl LoweringContext {
                 })
             }
             QuantumOp::ApplyGate(gate, args) => {
+                use crate::ast::expr::GateKind;
                 // Quantum gates like H, CNOT, etc.
                 let qubits = args
                     .iter()
                     .map(|a| self.lower_expr(a))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(PirExpr::QuantumOp {
-                    op: gate.to_string(),
-                    args: vec![],
-                    qubits,
-                })
+
+                // A rotation carries its angle in the GATE, not in `args` -- `args` is all
+                // qubits for every gate, which is why lowering it into `qubits` above is
+                // correct. The angle has to be recovered here and put in `args`, or it is
+                // DISCARDED and the backend receives a bare `RZ` with nothing to rotate by.
+                //
+                // Discarding it is not a crash: the backend would emit a rotation by an angle
+                // of zero, which is the identity -- a call that looks like a rotation and is
+                // not one. That is why this arm refuses rather than emitting a bare name.
+                let (op, args) = match gate {
+                    GateKind::RX(angle) => {
+                        let a = self.lower_rotation_angle(angle)?;
+                        ("RX".to_string(), vec![a])
+                    }
+                    GateKind::RY(angle) => {
+                        let a = self.lower_rotation_angle(angle)?;
+                        ("RY".to_string(), vec![a])
+                    }
+                    GateKind::RZ(angle) => {
+                        let a = self.lower_rotation_angle(angle)?;
+                        ("RZ".to_string(), vec![a])
+                    }
+                    other => (other.to_string(), vec![]),
+                };
+
+                Ok(PirExpr::QuantumOp { op, args, qubits })
             }
             QuantumOp::Measure(target) => {
                 let t = self.lower_expr(target)?;

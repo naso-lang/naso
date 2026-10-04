@@ -92,21 +92,27 @@ for them: QIR emits one void quantum operation and has no scalar arithmetic at a
 refusing `a + b` is not a worse LLVM. Recording these in the same table as the LLVM rows
 would imply otherwise, so they are separate.
 
-**Two rows below are genuine gaps rather than design.** LLVM accepts both programs, so the
-source language and one backend support them:
+**Both of these gaps are fixed.** They used to make the QIR backend emit no gate sequence at
+all, which left nothing to verify numerically:
 
-- `qalloc` lowers to a quantum operation whose name has no entry in the QIR intrinsic table,
-  so a circuit cannot even be allocated. LLVM's quantum arm declares whatever intrinsic a
-  name implies; QIR has a fixed declared set and refuses anything outside it.
-- A gate operand is *borrowed*, not consumed, but the QIR gate arm re-checks quantity on
-  each operand. So `hadamard(a)` followed by `measure(a)` — a correct program that uses the
-  linear qubit once in each of two different senses — is reported as using `a` twice.
+- `qalloc` lowering is now in the QIR intrinsic table, so a circuit can be allocated.
+- A gate operand is *borrowed*, not consumed, and the QIR gate arm now treats it that way. So
+  `hadamard(a)` followed by `measure(a)` — a correct program that uses the linear qubit once in
+  each of two different senses — compiles.
 
-Until both are fixed, the QIR backend emits no gate sequence at all. That is what blocks
-end-to-end numerical verification of compiler-emitted circuits: there is no gate list to
-hand a simulator. The gate matrices and their inverses are themselves verified in
-`naso-gates` against a CPU state-vector simulator; what is missing is the link from
-compiled output into that check.
+The QIR backend now emits one ordered entry function, so a gate acts on the qubit the source
+named rather than on a fresh allocation per statement. **What that is checked by, and what it
+is not:** the emitted text is parsed back into a gate sequence and replayed on the CPU
+state-vector simulator in `naso-gates`, compared against states derived by hand — the Bell
+pair, a single Hadamard, and a controlled gate with its control both set and clear. That
+verifies operand identity, gate order, and gate completeness on the emitted artifact. It does
+**not** verify that a real QIR runtime interprets `qir.*` the same way: no such runtime has
+executed any of this. `qir_entry` also carries no `ENTRYPOINT` marker, because emitting one
+needs an LLVM attribute registration inkwell's named-enum path does not provide.
+
+The gate matrices and their inverses are separately verified in `naso-gates` against the same
+CPU simulator, and the bridge refuses any `qir.*` call it does not model rather than skipping
+it — skipping would verify a circuit *smaller* than the one emitted.
 
 | Construct | QIR | WGSL straight-line | WGSL compute | Note |
 |---|---|---|---|---|

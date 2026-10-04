@@ -9,6 +9,11 @@ repository = "https://github.com/naso-lang/naso"
 [features]
 default = ["z3"]
 z3 = ["dep:z3", "dep:z3-sys"]
+# Passthrough to the compiler. The QIR numerical suite runs the real `naso` binary and checks
+# what it EMITS, so it needs the compiler built with LLVM. Gating the suite on a feature that
+# does not exist would compile the test file to nothing and report `ok. 0 passed` -- which looks
+# like a pass. This makes the dependency explicit instead.
+llvm = ["naso-compiler/llvm"]
 
 [dependencies]
 # Core Naso compiler types

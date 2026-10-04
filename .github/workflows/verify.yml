@@ -242,6 +242,16 @@ jobs:
       - name: Test the early-exit domain transformation
         run: cargo test --features llvm --test early_exit_domain_test
 
+      # The compiler's emitted QIR, checked NUMERICALLY against hand-derived states.
+      #
+      # Needs `--features llvm` because the suite runs the real `naso` binary and parses what
+      # it emits, so this proves the compiler output itself rather than a hand-written fixture.
+      - name: Verify emitted QIR numerically
+        run: |
+          cargo build --features llvm --bin naso
+          cargo test -p naso-verify --test qir_numeric_verification_test
+        working-directory: .
+
       - name: QIR gate emission gap
         run: cargo test --features llvm --test qir_gate_emission_gap_test
 

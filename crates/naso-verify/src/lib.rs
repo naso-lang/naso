@@ -81,3 +81,10 @@ mod tests {
         }
     }
 }
+
+/// Turn compiler-emitted QIR text back into a gate sequence, and check it numerically.
+///
+/// QIR is structural text, not execution: no QPU or simulator has run any of it. This
+/// module establishes the weaker claim that the emitted IR names the right operations, in the
+/// right order, on the right qubits.
+pub mod qir_circuit;

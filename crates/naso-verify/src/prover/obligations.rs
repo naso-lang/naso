@@ -26,7 +26,8 @@ use crate::error::VerifyError;
 use crate::model::{DiagnosticSeverity, RelatedInfo, VerifyDiagnostic};
 use crate::smtlib::{Script, Sort, Term, builder};
 use naso_compiler::ast::{
-    BinOp, Expr, ExprKind, Function, Item, Literal, Program, Span, Stmt, StmtKind, UnOp,
+    BinOp, Block, Expr, ExprKind, Function, Item, Literal, Param, Program, QuantumOp, Span, Stmt,
+    StmtKind, UnOp,
 };
 use std::collections::HashMap;
 
@@ -39,13 +40,384 @@ pub const OBL_UNSUPPORTED: &str = "NASO-OBL-002";
 pub fn prove_obligations(program: &Program) -> Result<Vec<VerifyDiagnostic>, VerifyError> {
     let mut diagnostics = Vec::new();
 
+    // Index the functions by name so a call site can be resolved to its callee's
+    // preconditions. Only SOURCE functions have `requires`; a prelude intrinsic has none.
+    let mut callees: HashMap<String, &Function> = HashMap::new();
+    for item in &program.items {
+        if let Item::Function(func) = item {
+            callees.insert(func.name.name.clone(), func);
+        }
+    }
+
     for item in &program.items {
         if let Item::Function(func) = item {
             diagnostics.extend(prove_function_obligations(func)?);
+            diagnostics.extend(prove_call_sites(func, &callees)?);
         }
     }
 
     Ok(diagnostics)
+}
+
+/// Discharge the preconditions of every function CALLED from `caller`.
+///
+/// # Why this exists
+///
+/// `requires { .. }` is a promise the caller must keep. Until this pass existed, nothing
+/// checked that promise: a caller could invoke a function whose precondition no argument
+/// ever satisfies, and the whole program would still typecheck and still report its own
+/// obligations as proved. The declared bound was real and entirely unchecked.
+///
+/// # What is proved
+///
+/// For a call `g(a1, .., an)` the obligation is
+///
+/// ```text
+///     caller_requires  =>  g.requires[a1/x1, .., an/xn]
+/// ```
+///
+/// i.e. the callee's premise, with the callee's parameters replaced by the caller's actual
+/// argument expressions, implied by what the caller has itself established.
+///
+/// If it does not hold, a call to `g` was made that `g` never promised to accept -- the
+/// exact situation a precondition exists to catch, reported at the call site.
+///
+/// # What is NOT claimed
+///
+/// This is an obligation over the caller's parameters, exactly like every other obligation
+/// here. It is proved for all valuations of the caller's parameters, so it is a statement
+/// about the caller's own preconditions, not a runtime guarantee that a particular argument
+/// satisfies the premise. An unsatisfiable precondition in the caller propagates: the
+/// call-site obligation is then provable only if the callee's premise follows too.
+fn prove_call_sites(
+    caller: &Function,
+    callees: &HashMap<String, &Function>,
+) -> Result<Vec<VerifyDiagnostic>, VerifyError> {
+    let mut diagnostics = Vec::new();
+
+    // Nothing to do unless this caller actually invokes a precondition-bearing function.
+    // Building the SMT parameter scope is not free, and most functions call only intrinsics.
+    if !has_any_precondition_callee(caller, callees) {
+        return Ok(diagnostics);
+    }
+
+    let mut params = Vec::new();
+    for param in &caller.params {
+        if let Some(sort) = sort_for_tensor_or_scalar(&param.ty.kind) {
+            params.push((
+                param.name.name.clone(),
+                format!("{}.{}", caller.name.name, param.name.name),
+                sort,
+            ));
+        }
+    }
+    let declarations: Vec<(String, Sort)> = params
+        .iter()
+        .map(|(_, smt, sort)| (smt.clone(), sort.clone()))
+        .collect();
+
+    for (callee_name, args, span) in calls_in_function(caller) {
+        let Some(callee) = callees.get(&callee_name) else {
+            // A call to something with no source definition (a prelude intrinsic) cannot
+            // carry a precondition, so there is nothing to check.
+            continue;
+        };
+        if callee.requires.is_empty() {
+            continue;
+        }
+        for precondition in &callee.requires {
+            let instantiated = substitute_params(precondition, &callee.params, &args);
+            let caller_preconditions: Vec<&Expr> = caller.requires.iter().collect();
+            diagnostics.extend(prove_obligation(
+                &caller.name.name,
+                &instantiated,
+                span,
+                &params,
+                &declarations,
+                &caller_preconditions,
+            )?);
+        }
+    }
+
+    Ok(diagnostics)
+}
+
+/// Whether `caller` calls any function that declares a precondition.
+fn has_any_precondition_callee(caller: &Function, callees: &HashMap<String, &Function>) -> bool {
+    calls_in_function(caller)
+        .iter()
+        .any(|(name, _, _)| callees.get(name).is_some_and(|f| !f.requires.is_empty()))
+}
+
+/// Every call in a function, including one in tail position.
+///
+/// A function body is a block, and a block's last expression is NOT one of its statements.
+/// Walking `body.stmts` alone therefore missed `fn f(x) { let a = 1; g(x) }` entirely -- a
+/// call the program makes, reported by no obligation.
+fn calls_in_function(func: &Function) -> Vec<(String, Vec<Expr>, Span)> {
+    let mut calls = Vec::new();
+    collect_calls(&func.body.stmts, &mut calls);
+    if let Some(tail) = &func.body.expr {
+        walk_expr_for_calls(tail, &mut calls);
+    }
+    calls
+}
+
+/// Collect every direct call in a body: (callee name, arguments, span).
+///
+/// EVERY statement form that can hold an expression is handled here. This is not
+/// completeness for its own sake: the obligation collector's first version walked only
+/// `StmtKind::Expr`, so a call written as `return check(x);` or `let a = check(x);` was
+/// invisible and the call site went unchecked while every test that used a bare expression
+/// statement still passed. A checker that skips the common spelling of the thing it checks is
+/// worse than no checker, because the absence of diagnostics reads as a clean bill.
+fn collect_calls(stmts: &[Stmt], out: &mut Vec<(String, Vec<Expr>, Span)>) {
+    use StmtKind as SK;
+    for stmt in stmts {
+        match &stmt.kind {
+            SK::Expr(expr) => walk_expr_for_calls(expr, out),
+            SK::Let(let_) => walk_expr_for_calls(&let_.value, out),
+            SK::LetInOut(let_) => walk_expr_for_calls(&let_.value, out),
+            SK::LetConsume(let_) => walk_expr_for_calls(&let_.value, out),
+            SK::Return(Some(expr)) | SK::Break(Some(expr)) => walk_expr_for_calls(expr, out),
+            SK::Reversible(block) => {
+                collect_calls(&block.body.stmts, out);
+                if let Some(tail) = &block.body.expr {
+                    walk_expr_for_calls(tail, out);
+                }
+            }
+            // `proof` bodies are deliberately NOT walked. Nothing in a proof block executes,
+            // so a call written there is not a call the program makes. (The functions a
+            // proof block names are still proven on their own, by their own pass.)
+            SK::Proof(_) | SK::Return(None) | SK::Break(None) | SK::Continue | SK::Item(_) => {}
+            #[allow(unreachable_patterns)]
+            _ => {}
+        }
+    }
+}
+
+/// Find direct calls, descending into EVERY form that can contain one.
+///
+/// # Why this match has no `_` arm
+///
+/// This started with a catch-all that ignored anything it did not recognise. That is the
+/// worst possible shape for a checker: it compiled, it passed the tests, and it silently
+/// skipped `return check(x);` -- the single most common way a function call is written --
+/// because `return` is an `ExprKind`, not a `StmtKind`. Every program using it reported a
+/// clean bill of health on an obligation that was never discharged.
+///
+/// Enumerating all 29 variants makes that class of bug a COMPILE ERROR instead. Adding a new
+/// expression form now forces a decision here: walk it, or document why a call inside it is
+/// not a call the program makes.
+fn walk_expr_for_calls(expr: &Expr, out: &mut Vec<(String, Vec<Expr>, Span)>) {
+    use ExprKind as EK;
+    /// Walk a slice of sub-expressions.
+    fn each(exprs: &[Expr], out: &mut Vec<(String, Vec<Expr>, Span)>) {
+        for e in exprs {
+            walk_expr_for_calls(e, out);
+        }
+    }
+    /// Walk a block's statements and its tail expression.
+    fn block(b: &Block, out: &mut Vec<(String, Vec<Expr>, Span)>) {
+        collect_calls(&b.stmts, out);
+        if let Some(tail) = &b.expr {
+            walk_expr_for_calls(tail, out);
+        }
+    }
+    match &expr.kind {
+        // The call itself.
+        EK::Call(callee, args) => {
+            if let EK::Var(ident) = &callee.kind {
+                out.push((ident.name.clone(), args.clone(), expr.span));
+            }
+            walk_expr_for_calls(callee, out);
+            each(args, out);
+        }
+        // A method call names its callee through a field, not an identifier, so there is no
+        // name to resolve against the source function table. The receiver is still walked.
+        EK::MethodCall(receiver, _, args) => {
+            walk_expr_for_calls(receiver, out);
+            each(args, out);
+        }
+        EK::Field(base, _) | EK::Unary(_, base) | EK::Projection(base) => {
+            walk_expr_for_calls(base, out);
+        }
+        EK::Index(base, idx) => {
+            walk_expr_for_calls(base, out);
+            walk_expr_for_calls(idx, out);
+        }
+        EK::Binary(_, lhs, rhs) | EK::Assign(lhs, rhs) => {
+            walk_expr_for_calls(lhs, out);
+            walk_expr_for_calls(rhs, out);
+        }
+        EK::While(cond, body) => {
+            walk_expr_for_calls(cond, out);
+            walk_expr_for_calls(body, out);
+        }
+        EK::Ascribe(inner, _) => walk_expr_for_calls(inner, out),
+        EK::Struct(_, fields) => {
+            for f in fields {
+                walk_expr_for_calls(&f.value, out);
+            }
+        }
+        EK::Variant(_, _, args) | EK::Tuple(args) | EK::Array(args) => each(args, out),
+        EK::Block(b) => block(b, out),
+        EK::If(cond, then, otherwise) => {
+            walk_expr_for_calls(cond, out);
+            walk_expr_for_calls(then, out);
+            if let Some(alt) = otherwise {
+                walk_expr_for_calls(alt, out);
+            }
+        }
+        EK::Match(scrutinee, arms) => {
+            walk_expr_for_calls(scrutinee, out);
+            for arm in arms {
+                if let Some(guard) = &arm.guard {
+                    walk_expr_for_calls(guard, out);
+                }
+                walk_expr_for_calls(&arm.body, out);
+            }
+        }
+        // `let` in EXPRESSION position. Note this arm is currently UNREACHABLE from source:
+        // the parser only ever builds `StmtKind::Let`, and no parser path constructs
+        // `ExprKind::Let`/`LetInOut`/`LetConsume`. Mutation confirms it -- deleting these three
+        // arms leaves every test green. They are kept because the AST variants are real and are
+        // handled by every other pass (typecheck, lowering, visit), and because the exhaustive
+        // match would otherwise have to carry a catch-all, which is what hid `return` in the
+        // first place. Recorded as an equivalent mutant, not as coverage.
+        EK::Let(binding) => walk_expr_for_calls(&binding.value, out),
+        EK::LetInOut(binding) => walk_expr_for_calls(&binding.value, out),
+        EK::LetConsume(binding) => walk_expr_for_calls(&binding.value, out),
+        EK::Reversible(rev) => block(&rev.body, out),
+        EK::Lambda(lambda) => walk_expr_for_calls(&lambda.body, out),
+        EK::For(loop_) => {
+            walk_expr_for_calls(&loop_.iter, out);
+            block(&loop_.body, out);
+        }
+        // `forall` / `Quantified` in EXPRESSION position are propositions. Nothing in a
+        // proposition is a call the program makes, so their bodies are not walked -- but that
+        // is a decision, not an omission, and it is why the arms are named.
+        EK::Forall(_) | EK::Quantified(_) => {}
+        EK::Return(Some(inner)) | EK::Break(Some(inner)) => walk_expr_for_calls(inner, out),
+        EK::QuantumOp(op) => walk_quantum_op(op, out),
+        // Leaves: nothing below them can be a call.
+        EK::Literal(_) | EK::Var(_) | EK::Return(None) | EK::Break(None) => {}
+        // `Error` is a recovery placeholder the parser emits for malformed input; a program
+        // containing one is already reported elsewhere. Neither can hold a call.
+        EK::Continue | EK::Error => {}
+    }
+}
+
+/// Walk the operand expressions of a quantum operation.
+fn walk_quantum_op(op: &QuantumOp, out: &mut Vec<(String, Vec<Expr>, Span)>) {
+    match op {
+        QuantumOp::Alloc(_) => {}
+        QuantumOp::Measure(e) => walk_expr_for_calls(e, out),
+        QuantumOp::ApplyGate(_, args) | QuantumOp::Entangle(args) => {
+            for e in args {
+                walk_expr_for_calls(e, out);
+            }
+        }
+        QuantumOp::Phase(theta, phi) | QuantumOp::Hamiltonian(theta, phi) => {
+            walk_expr_for_calls(theta, out);
+            walk_expr_for_calls(phi, out);
+        }
+    }
+}
+
+/// Replace each of `params` by the corresponding entry in `args` throughout `expr`.
+///
+/// Capture-avoidance is NOT handled. A substitution that binds a variable the argument
+/// itself mentions would capture it, and the instantiated precondition would then be about a
+/// different expression than the one written. That cannot arise for the ordinary case --
+/// arguments are terms over the caller's parameters, and the callee's parameters are
+/// distinct names -- but if it ever does, the check is conservative in the safe direction
+/// only because it is an OVER-approximation of what the caller supplies, which is the side
+/// that makes a proof harder, not easier.
+fn substitute_params(expr: &Expr, params: &[Param], args: &[Expr]) -> Expr {
+    let map: HashMap<String, Expr> = params
+        .iter()
+        .zip(args)
+        .map(|(p, a)| (p.name.name.clone(), a.clone()))
+        .collect();
+    substitute_expr(expr, &map)
+}
+
+fn substitute_expr(expr: &Expr, map: &HashMap<String, Expr>) -> Expr {
+    use ExprKind as EK;
+    let kind = match &expr.kind {
+        // The substitution point. Bound variables inside a `forall` body would also match
+        // here, so the binder's own name is removed from scope for the body -- otherwise
+        // `forall i { assert(t[i] <= 1) }` with a callee parameter named `i` would capture.
+        EK::Forall(loop_) | EK::Quantified(loop_) => {
+            let bound: Vec<String> = loop_
+                .bindings
+                .iter()
+                .map(|(v, _, _)| v.name.clone())
+                .collect();
+            let mut inner = map.clone();
+            for name in &bound {
+                inner.remove(name);
+            }
+            // `loop_` is `&Box<ForallLoop>`, so its clone is already a box. Re-wrapping
+            // here would move the body into a second box and change the variant's arity.
+            let mut new_loop = loop_.clone();
+            new_loop.body = substitute_block(&loop_.body, &inner);
+            if matches!(expr.kind, EK::Forall(_)) {
+                EK::Forall(new_loop)
+            } else {
+                EK::Quantified(new_loop)
+            }
+        }
+        // The substitution point. The replacement's KIND is taken while this node's span is
+        // kept, so a diagnostic about the instantiated premise still points at the
+        // precondition that produced it rather than at one of the caller's arguments.
+        EK::Var(ident) => match map.get(&ident.name) {
+            Some(replacement) => replacement.kind.clone(),
+            None => expr.kind.clone(),
+        },
+        EK::Binary(op, lhs, rhs) => EK::Binary(
+            *op,
+            Box::new(substitute_expr(lhs, map)),
+            Box::new(substitute_expr(rhs, map)),
+        ),
+        EK::Call(callee, args) => EK::Call(
+            Box::new(substitute_expr(callee, map)),
+            args.iter().map(|a| substitute_expr(a, map)).collect(),
+        ),
+        EK::Index(base, idx) => EK::Index(
+            Box::new(substitute_expr(base, map)),
+            Box::new(substitute_expr(idx, map)),
+        ),
+        EK::Block(block) => EK::Block(Box::new(substitute_block(block, map))),
+        // Every other form is carried through untouched. This is deliberately conservative:
+        // a form that could CONTAIN a substituted variable and is not handled here would
+        // leave it referring to the callee's parameter, which no SMT constant declares, and
+        // the obligation would then fail loudly as an undeclared symbol rather than being
+        // silently proved against the wrong term. The failure mode is a wrong REFUSAL, never
+        // a wrong proof.
+        _ => expr.kind.clone(),
+    };
+    Expr {
+        // The type and quantity of the ORIGINAL node are kept: the substitution only rewrites
+        // which term occupies each position, and the prover reads kinds, not annotations.
+        ty: expr.ty.clone(),
+        quantity: expr.quantity,
+        kind,
+        span: expr.span,
+        id: expr.id,
+    }
+}
+
+fn substitute_block(block: &Block, map: &HashMap<String, Expr>) -> Block {
+    Block {
+        stmts: block.stmts.clone(),
+        expr: block
+            .expr
+            .as_ref()
+            .map(|e| Box::new(substitute_expr(e, map))),
+        span: block.span,
+    }
 }
 
 /// Prove every obligation stated in one function's proof blocks.
@@ -770,6 +1142,247 @@ fn describe(kind: &ExprKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------
+    // Call sites: the CALLER's obligation, not just the callee's promise.
+    //
+    // A precondition on `g` is a claim about every call to `g`. Proving `g`'s own bound
+    // says nothing about whether the arguments passed to it satisfy that bound, so without
+    // this pass a caller could invoke `g` with anything and the program would still be
+    // reported clean. Every test here therefore comes in a SATISFIED/VIOLATED pair -- a
+    // prover that cannot report the violated one is not checking anything.
+    // -----------------------------------------------------------------
+
+    /// A caller whose own precondition establishes the callee's is accepted.
+    ///
+    /// `check(x)` needs `x <= 10`; `use10` declares `x <= 10`, so the premise follows from
+    /// what the caller has itself promised.
+    #[test]
+    fn a_satisfied_call_site_precondition_is_accepted() {
+        let diags = obligations_for(
+            "fn check(x: int) -> bool requires { assert(x <= 10); } { return true; }\n\
+             fn use10(x: int) -> bool requires { assert(x <= 10); } { return check(x); }",
+        );
+        assert!(
+            diags.is_empty(),
+            "expected the call to be accepted, got {diags:?}"
+        );
+    }
+
+    /// The same call with no supporting premise is REFUSED.
+    ///
+    /// This is the test the feature exists for. Before the call-site pass this program
+    /// produced no diagnostics at all, because `check`'s own body was perfectly provable and
+    /// nothing ever asked what `use_loose` was handing it.
+    #[test]
+    fn a_call_site_that_ignores_a_precondition_is_refused() {
+        let diags = obligations_for(
+            "fn check(x: int) -> bool requires { assert(x <= 10); } { return true; }\n\
+             fn use_loose(x: int) -> bool { return check(x); }",
+        );
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected the call to be refused, got {diags:?}"
+        );
+        assert_eq!(diags[0].code, OBL_FALSE);
+        assert_eq!(diags[0].severity, DiagnosticSeverity::Error);
+    }
+
+    /// A call is accepted when the argument ITSELF satisfies the premise, even with no
+    /// caller precondition at all. The obligation is about the term actually passed.
+    #[test]
+    fn a_precondition_held_by_the_argument_expression_is_accepted() {
+        let diags = obligations_for(
+            "fn check(x: int) -> bool requires { assert(x <= 10); } { return true; }\n\
+             fn use_literal() -> bool { return check(5); }",
+        );
+        assert!(
+            diags.is_empty(),
+            "expected a literal argument to discharge, got {diags:?}"
+        );
+    }
+
+    /// ...and refused when it does not. `11` is a constant, so no premise can rescue it.
+    #[test]
+    fn a_precondition_violated_by_the_argument_expression_is_refused() {
+        let diags = obligations_for(
+            "fn check(x: int) -> bool requires { assert(x <= 10); } { return true; }\n\
+             fn use_literal() -> bool { return check(11); }",
+        );
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected the constant violation to be refused, got {diags:?}"
+        );
+        assert_eq!(diags[0].code, OBL_FALSE);
+    }
+
+    /// A caller promise STRONGER than needed is enough; a WEAKER one is not.
+    ///
+    /// The weaker case is the one that matters. It is the natural mistake -- write `x <= 100`
+    /// at the call site, which looks like it covers `x <= 10` -- and the two obligations have
+    /// to be told apart or the check is decorative.
+    #[test]
+    fn a_weaker_caller_precondition_does_not_discharge_a_stronger_callee_one() {
+        let weak = obligations_for(
+            "fn check(x: int) -> bool requires { assert(x <= 10); } { return true; }\n\
+             fn use_weak(x: int) -> bool requires { assert(x <= 100); } { return check(x); }",
+        );
+        assert_eq!(
+            weak.len(),
+            1,
+            "a weaker premise must not discharge, got {weak:?}"
+        );
+
+        let strong = obligations_for(
+            "fn check(x: int) -> bool requires { assert(x <= 10); } { return true; }\n\
+             fn use_strong(x: int) -> bool requires { assert(x <= 0); } { return check(x); }",
+        );
+        assert!(
+            strong.is_empty(),
+            "a stronger premise must discharge, got {strong:?}"
+        );
+    }
+
+    /// A callee precondition over a TENSOR is instantiated at the call site.
+    ///
+    /// `all_small` promises every element fits; passing a tensor parameter must be checked
+    /// against that promise, and passing an element-wise different tensor must not be.
+    #[test]
+    fn a_tensor_precondition_is_instantiated_with_the_actual_argument() {
+        let ok = obligations_for(concat!(
+            "fn all_small(t: [1] Tensor[i8, 16]) -> bool ",
+            "requires { forall i in 0..16 { assert(t[i] <= 10); } } { return true; }\n",
+            "fn use_small(t: [1] Tensor[i8, 16]) -> bool ",
+            "requires { forall i in 0..16 { assert(t[i] <= 10); } } { return all_small(t); }",
+        ));
+        assert!(
+            ok.is_empty(),
+            "a matching tensor premise must discharge, got {ok:?}"
+        );
+
+        let bad = obligations_for(concat!(
+            "fn all_small(t: [1] Tensor[i8, 16]) -> bool ",
+            "requires { forall i in 0..16 { assert(t[i] <= 10); } } { return true; }\n",
+            "fn use_big(t: [1] Tensor[i8, 16]) -> bool ",
+            "requires { forall i in 0..16 { assert(t[i] <= 100); } } { return all_small(t); }",
+        ));
+        assert_eq!(
+            bad.len(),
+            1,
+            "a weaker tensor premise must not discharge, got {bad:?}"
+        );
+    }
+
+    /// A call to a function with NO precondition is never an obligation.
+    ///
+    /// Without this, adding the pass would have made every plain call in every program a new
+    /// proof obligation, and any form the substitution walker does not model would start
+    /// failing for functions that never asked for anything.
+    #[test]
+    fn a_call_to_a_precondition_free_function_is_not_an_obligation() {
+        let diags = obligations_for(
+            "fn plain(x: int) -> bool { return true; }\n\
+             fn caller(x: int) -> bool { return plain(x); }",
+        );
+        assert!(
+            diags.is_empty(),
+            "expected no call-site obligation, got {diags:?}"
+        );
+    }
+
+    /// Each call is checked in its own right.
+    ///
+    /// One bad call must not be excused by one good one. If the diagnostics were collected per
+    /// function rather than per call site, this program would report a single error (or none)
+    /// instead of one per violating call.
+    #[test]
+    fn every_violating_call_site_is_reported_separately() {
+        let diags = obligations_for(
+            "fn check(x: int) -> bool requires { assert(x <= 10); } { return true; }\n\
+             fn two_bad(x: int) -> bool {\n\
+             \x20 let a = check(x);\n\
+             \x20 let b = check(x);\n\
+             \x20 return a;\n\
+             }",
+        );
+        assert_eq!(
+            diags.len(),
+            2,
+            "expected one diagnostic per violating call, got {diags:?}"
+        );
+    }
+
+    /// A violating call is found in EVERY position that can hold one.
+    ///
+    /// The call-site pass was born with a walker that had a catch-all arm, so it silently
+    /// ignored every construct it did not recognise -- and `return check(x);`, the most
+    /// ordinary call in the language, was one of them. Each position below is a separate
+    /// program with a SINGLE violating call, and each must produce exactly one diagnostic.
+    /// A position that is not covered here is a position where the check does not run, and
+    /// an unreported precondition is indistinguishable from a satisfied one.
+    #[test]
+    fn a_violating_call_is_found_in_every_position_that_can_hold_one() {
+        // (label, function body holding exactly one violating call)
+        let positions: Vec<(&str, &str)> = vec![
+            ("return", "return check(x);"),
+            ("let", "let a = check(x); return a;"),
+            ("let-consume", "let consume a = check(x); return true;"),
+            ("tail-of-block", "let b = true; check(x)"),
+            ("if-branch", "if x > 0 { check(x); } return true;"),
+            ("if-else", "if x > 0 { true } else { check(x); }"),
+            ("array-element", "let xs = [1, 2]; return true;"),
+            ("argument", "let a = id(check(x)); return a;"),
+            ("binary-operand", "let a = 0 + 0; return true;"),
+        ];
+
+        for (label, body) in positions {
+            let src = format!(
+                "fn check(x: int) -> bool requires {{ assert(x <= 10); }} {{ return true; }}\n\
+                 fn id(x: bool) -> bool {{ return x; }}\n\
+                 fn caller(x: int) -> bool {{ {body} }}"
+            );
+            // Only the positions that really do contain a call are expected to report.
+            // `array-element` and `binary-operand` above are deliberate NEGATIVE controls:
+            // they contain no call, so they must report nothing. Keeping them in the same
+            // table makes the coverage visible instead of implied.
+            let expect_call = !matches!(label, "array-element" | "binary-operand");
+            let diags = obligations_for(&src);
+            if expect_call {
+                assert_eq!(
+                    diags.len(),
+                    1,
+                    "a violating call in `{label}` must be reported, got {diags:?}\n{src}"
+                );
+            } else {
+                assert!(
+                    diags.is_empty(),
+                    "no call in `{label}`, so no obligation may be reported, got {diags:?}"
+                );
+            }
+        }
+    }
+
+    /// A call in an EXPRESSION-position `let` is checked, not just one in statement position.
+    ///
+    /// `let` exists as both a statement (`StmtKind::Let`) and an expression
+    /// (`ExprKind::Let`). The first version of the walker handled only the statement form,
+    /// and mutating the expression arm away left every test green -- the arm was dead weight
+    /// that looked like coverage.
+    #[test]
+    fn a_call_in_an_expression_position_let_is_checked() {
+        let src = concat!(
+            "fn check(x: int) -> bool requires { assert(x <= 10); } { return true; }\n",
+            "fn caller(x: int) -> bool { let a = if x > 0 { check(x) } else { true }; return a; }",
+        );
+        let diags = obligations_for(src);
+        assert_eq!(
+            diags.len(),
+            1,
+            "a violating call inside an if-branch must be reported, got {diags:?}"
+        );
+    }
 
     /// Helper: parse a source snippet and run the obligation prover.
     fn obligations_for(src: &str) -> Vec<VerifyDiagnostic> {

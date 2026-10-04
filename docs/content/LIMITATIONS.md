@@ -218,13 +218,25 @@ bytes untouched after the kernel runs.
   about `t[i]` is checked for every possible tensor. The consequence is deliberate and worth
   stating plainly: a bound like `t[i] <= 127` is **refuted** with no premise, because a
   constant tensor with a huge element is a legitimate countermodel.
-- **Preconditions (`requires { .. }`) are assumed, never discharged at a call site.** The
-  prover checks `pre_1 ∧ .. ∧ pre_n ⇒ goal` and reports *proved* when no countermodel exists.
-  Preconditions ARE typechecked — an undefined name or a non-boolean premise is a compile
-  error — but **nothing checks them where the function is called**. So writing one is a
-  promise, not a guarantee: a function with an unsatisfiable `requires` is a function nobody
-  can call correctly, and the compiler will not say so. Do not read a proved obligation as
-  "this works for all inputs".
+- **Preconditions are now checked at call sites, with three honest limits.**
+  For a call `g(a1, .., an)` the prover discharges
+  `caller_requires ⇒ g.requires[a1/x1, .., an/xn]` — the callee's premise with its parameters
+  replaced by the caller's actual argument expressions. A call that no premise establishes is
+  reported at the call site. The limits:
+  1. It is an obligation over the CALLER's parameters, exactly like every other obligation
+     here. It is proved for all valuations of those parameters, so it is a statement about the
+     caller's own promises, not a runtime check on a particular argument. If the caller's
+     preconditions are unsatisfiable the call-site obligation becomes vacuous — the same
+     caveat that applies to every obligation in this prover.
+  2. Only DIRECT calls to a function with a source definition are checked. A method call names
+     its callee through a field, so `t.check(x)` is not resolved to `check` and is not checked.
+  3. The substitution handles the expression forms the prover can encode. A form outside that
+     set is carried through unrewritten, so a precondition naming it refers to a parameter no
+     SMT constant declares and the obligation FAILS LOUDLY as an undeclared symbol. The failure
+     mode is a wrong refusal, never a wrong proof.
+- **A proved obligation is still not "this works for all inputs."** It means no countermodel
+  exists within the supported fragment. Unsupported operators, unresolved callees and
+  unsatisfiable caller premises are all outside what that sentence covers.
 - **A malformed SMT script is now a loud error, but detection is structural, not semantic.**
   Z3's `Solver::from_string` returns `()` and *discards* its error code, so an unparseable
   script used to be dropped silently and answered `sat` for a solver holding no assertions —

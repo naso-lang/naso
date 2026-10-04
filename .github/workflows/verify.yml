@@ -264,6 +264,22 @@ jobs:
         run: cargo test -p naso-compiler --test requires_precondition_test
         working-directory: .
 
+      # Call-site precondition discharge. Named SEPARATELY from the prover suite above
+      # because it is the pass whose whole job is to produce a diagnostic, and the prover
+      # suite also contains many "expected proof" cases. Running it alone makes a silent
+      # regression -- the pass finding nothing, which looks exactly like success -- visible
+      # as a failing step rather than as a slightly lower count in a wall of numbers.
+      - name: Test call-site precondition discharge
+        run: >-
+          cargo test -p naso-verify --lib --
+          --exact
+          prover::obligations::tests::a_call_site_that_ignores_a_precondition_is_refused
+          prover::obligations::tests::a_precondition_violated_by_the_argument_expression_is_refused
+          prover::obligations::tests::a_weaker_caller_precondition_does_not_discharge_a_stronger_callee_one
+          prover::obligations::tests::a_violating_call_is_found_in_every_position_that_can_hold_one
+          prover::obligations::tests::a_call_in_an_expression_position_let_is_checked
+        working-directory: .
+
       # The compiler's emitted QIR, checked NUMERICALLY against hand-derived states.
       #
       # Needs `--features llvm` because the suite runs the real `naso` binary and parses what

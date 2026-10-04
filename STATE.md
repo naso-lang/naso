@@ -192,10 +192,13 @@ Documented in `docs/content/LIMITATIONS.md`.
 1. ~~Give the prover a way to state an input range~~ -- DONE via `requires { .. }`.
    The prover checks `pre_1 ∧ .. AND pre_n ⇒ goal`. A range premise makes a clamp bound
    provable without weakening the encoding. Preconditions are TYPECHECKED (undefined name or
-   non-bool premise is a compile error). REMAINING: **call sites do not check `requires`**.
-   Writing one is a promise, not a guarantee, so a function with an unsatisfiable
-   precondition is a function nobody can call correctly. That is the next thing to build,
-   and it is the difference between a precondition and a verified one.
+   non-bool premise is a compile error). **Call sites are now checked too**: for
+   `g(a1..an)` the prover discharges `caller_requires => g.requires[a1/x1..an/xn]`, so a
+   call no premise establishes is reported AT THE CALL SITE. Limits, all recorded in
+   LIMITATIONS.md: it is an obligation over the caller's parameters (so an unsatisfiable
+   caller premise makes it vacuous, like every other obligation here); only DIRECT calls are
+   resolved, so a method call is not; and an unencodable substituted form fails loudly as an
+   undeclared symbol -- a wrong refusal, never a wrong proof.
    Do NOT add a "fits in i8" axiom instead — that proves a claim about the tensors the
    axiom admits and reports it for the one that breaks.
 2. Design a sound float abstraction (interval or rational) for scale/zero-point error

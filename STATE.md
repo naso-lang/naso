@@ -85,9 +85,9 @@ The differentiator is *verified* compact quantization.
 
 Commits, newest first:
 
+- `16081fa` STATE.md: record the round-axiom and i4-bridge tranches
 - `59a43b2` bridge the prover's clamp theorem to live packed-i4 execution
 - `425d6bb` axiomatise `round` by its error bound; pin honestly in tests
-- `63ff0d9` define `abs`/`min`/`max`/`clamp` exactly; discharge the int8 quantiser
 - `bd01917` ship `naso-verify`: a real verifier with an honest exit status
 - `49a3902` prove a quantisation error bound over exact reals
 - `1b60643` prove callee preconditions at every call site
@@ -266,11 +266,26 @@ Documented in `docs/content/LIMITATIONS.md`.
    bearing one -- "I could not look at it" must never be a green build. Modes:
    `all`, `uncomputation`, `linearity`, `obligations`. `custom` was DELETED rather than wired:
    `prove_custom_vc` returned an empty diagnostic list, which is indistinguishable from a pass.
-4. `round` needs a universally quantified half-step axiom (`x - 0.5 <= round(x) <= x + 0.5`) for
-   an exact nearest-integer encoding. This is the next blocker on the quantiser: `abs`,
-   `min`, `max`, `clamp` are exact, but `round` is refused, so a stated range bounds the
-   DIVISION rather than the rounded quotient. Emitting the axiom needs the encoder to collect
-   axioms across a whole script rather than build one term, which is why it is separate work.
+4. `round` bounding axiom: DONE. `forall (x Real). (x - 0.5) <= round(x) <= (x + 0.5)` is
+   emitted as an assumption only when `term_uses_round` detects a real `round` application, and
+   it is now exercised by the SHIPPING kernel: `quant_int8.naso`'s proof blocks state that its
+   runtime `round(input[i]/scale)` step's error is bounded by a half unit, and these obligations
+   discharge (`425d6bb`, `59a43b2`). The bound is INCLUSIVE (`<=`, not `<`) deliberately: real
+   rounding hits the boundary (`round(0.5) = 1.0 = 0.5 + 0.5`), so a strict axiom is unsound.
+   **Mutation (verified, clean build): 5/5 axiom mutants killed, 0 survivors.** Four mutants
+   (blank either bound edge, drop axiom emission, break `term_uses_round`) are caught by the
+   discharge count pin in `the_shipped_int8_quantiser_kernel_discharges_completely` and by
+   `round_error_bounds_discharge_from_the_axiom`. The fifth -- swapping `<=` to `<` (strict) --
+   is caught structurally by `round_axiom_is_well_formed`, which asserts the axiom renders
+   `(<= ...)` exactly twice: strict `<` is unsound because real rounding attains the boundary
+   (`round(0.5) = 1.0 = 0.5 + 0.5`), and a structural guard is the only pin available, since no
+   semantic claim distinguishes the two (strict implies inclusive for a `<=` goal, and a tie
+   cannot be asserted as a theorem without choosing a convention the prover refuses to make).
+   Note on environment: an EARLIER full-suite run flaked (2 round tests hit the malformed-script
+   guard) because `/var/tmp/cargo-target` held 8 divergent, disk-pressure-corrupted `z3-sys`
+   builds; `cargo clean -p z3-sys` rebuilt a single clean z3, after which the suite ran 20/20
+   deterministic. The guard itself is correct -- it reported the corruption as a ParseError
+   rather than silently false-proving.
 5. Prove something about the tensor kernels themselves -- currently the error bound is proved
    about an UNINTERPRETED tensor function, so nothing ties it to the packed `i4` layout that
    actually executes. That link is the missing piece between "proof-carrying quantisation" and

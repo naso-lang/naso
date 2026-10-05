@@ -19,6 +19,14 @@
 // scope, and reaches the AST for the prover to read. `assert` is proof-only --
 // using it at runtime is a type error, so it can never be a silent no-op.
 //
+// The proof blocks here also exercise the prover's `round` bounding axiom
+// (forall (x Real). (x-0.5) <= round(x) <= (x+0.5)): `quantize_int8_symmetric`
+// pins that its runtime `round(input[i]/scale)` step's error is <= 0.5, and
+// `clamp_keeps_the_narrowing_in_range` proves the same on a scalar lane. Both
+// are discharged by the axiom, not assumed -- so a regression that drops the
+// axiom moves these from Discharged to Undecided and fails the kernel's pin.
+// Round is bounded, NOT exact: ties and refutations are honestly Undecided.
+//
 // LOWERING AND CODEGEN (as of this commit):
 //   The lowering pass gives each `forall` a real iteration domain and schedule
 //   band, and there is a WGSL COMPUTE backend:
@@ -140,6 +148,13 @@ fn quantize_int8_symmetric(
     proof {
         // The range follows from the premise, so this is discharged rather than assumed.
         forall i in 0..1024 { assert(abs(input[i] / scale) <= 127.0); }
+        // The rounding step's error is bounded by a half unit, NOT exact: this assertion is
+        // the precise claim the `round` bounding axiom exists for, and it is discharged by it.
+        // If the axiom were dropped, this would go Undecided -- so the kernel pins the
+        // rounding error that the runtime `round` step introduces.
+        forall i in 0..1024 {
+            assert(round(input[i] / scale) <= input[i] / scale + 0.5);
+        }
     }
 
     forall i in 0..1024 {
@@ -163,6 +178,11 @@ fn clamp_keeps_the_narrowing_in_range(v: f32) -> bool {
     proof {
         assert(clamp(v, -128.0, 127.0) <= 127.0);
         assert(clamp(v, -128.0, 127.0) >= -128.0);
+        // `round`'s bounding axiom, exercised on a scalar. Each bound is the matching edge
+        // of `x - 0.5 <= round(x) <= x + 0.5`; neither resolves a tie, so neither claims an
+        // exact quotient -- only the half-unit error bound the prover can actually support.
+        assert(round(v) <= v + 0.5);
+        assert(v - 0.5 <= round(v));
     }
     return true;
 }

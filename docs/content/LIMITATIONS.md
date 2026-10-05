@@ -281,9 +281,11 @@ bytes untouched after the kernel runs.
       forall x:Real. (x - 1/2) <= round(x) <= (x + 1/2)
 
   This is **sound for bounds**: an obligation like `round(x) <= x + 0.5` discharges (it is the
-  axiom's upper edge), and a claim that contradicts it refutes. `kernels/quant_int8.naso` does
-  not state a `round` obligation, so this is exercised only by the unit tests in
-  `crates/naso-verify/src/prover/obligations.rs`, not by the shipped kernel.
+  axiom's upper edge), and a claim that contradicts it refutes. As of `59a43b2` the shipped
+  kernel `kernels/quant_int8.naso` itself states the bound -- its proof blocks assert that the
+  runtime `round(input[i]/scale)` step's error is <= 1/2 -- so
+  `the_shipped_int8_quantiser_kernel_discharges_completely` pins the axiom path through the
+  real kernel, not only unit tests.
 
   The escape hatch is **incompleteness**, stated explicitly: the axiom is a bound, not an
   exact definition, so it does NOT resolve a tie. `round(0.5) == 1.0` is Undecided (both 0 and 1

@@ -97,6 +97,7 @@ The differentiator is *verified* compact quantization.
 
 Commits, newest first:
 
+- `2193a9c` Step 9: pin Real-typed `forall` at the typechecker -- `type_of_range_bound` now in `inference.rs::infer_forall`/`infer_quantified` (not only the precondition path), so `round(t)` typechecks with `t: Float` for float ranges; `check.rs::type_of_range_bound` relaxed to `pub(super)`. G5 mutation pin (`typecheck_forall_float_range_binds_float_var`). 563 tests green, 11/11 mutants, 10/10 determinism.
 - `34e7e34` docs: log Steps 5-8 in commit history
 - `d91a697` Step 8/9: Real-typed `forall` quantifier -- typecheck `type_of_range_bound` (now in BOTH `check.rs::check_precondition_quantifier` AND `inference.rs::infer_forall`/`infer_quantified`) infers bound var type (Float/Real) from range literals; encoder `sort_of_range_bound` infers Real sort; integer-value axiom retained (G4, load-bearing for bound discharge + G5, load-bearing for `round(t)` typecheck). Quantified round *equality* still timeouts (Z3 can't ground Real-interval witness; needs tranche-10 equality-axiom encoder). 99 lib + 64 integ + 12 compiler green; **11/11 mutants** (G1-G5).
 - `2a80692` docs: round mutation count 9/9 -> 10/10 (G4 integer-value axiom)
@@ -293,6 +294,17 @@ Documented in `docs/content/LIMITATIONS.md`.
    runtime `round(input[i]/scale)` step's error is bounded by a half unit, and these obligations
    discharge. The bound is INCLUSIVE (`<=`, not `<`) deliberately: real rounding hits the
    boundary (`round(0.5) = 1.0 = 0.5 + 0.5`), so a strict axiom is unsound.
+
+**Tranche-10 spike (REJECTED, uncommitted):** a piecewise `round` definition + identity axiom
+(`round(x)=x => x=to_int(x)`) was tested to refute `forall t in [0,1). round(t)=t`. Result:
+still a 30s Z3 Timeout under `UFLIA` — Z3 cannot e-match a Real-quantifier witness even with the
+extra axiom, and a `floor`/`frac`-based `round` definition needs `LRA` (integer-logic `UFLIA`
+rejects Real arithmetic like `to_int`/`floor`). Switching the SMT logic per-obligation to
+`LRA` is NOT done: it risks the G1-G4-pinned bound discharge (which relies on `UFLIA` +
+`to_int`). The quantified Real round *equality* is reachable and well-typed (G5) but remains
+**Undecided**; an equality-axiom encoder needs an LRA logic + a round-half convention, and the
+prover deliberately refuses to pick one. Scalar round-bounds and free-argument equality
+(`round(v) == 4.5`, `round(v) == v`) remain decidable by ground countermodel (<1s).
 
    Determinism hardening (this tranche):
    - **Grounded axiom instances.** For `round(t)` whose argument `t` is free (captures no

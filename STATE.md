@@ -97,6 +97,13 @@ The differentiator is *verified* compact quantization.
 
 Commits, newest first:
 
+- `d91a697` Step 8: Real-typed `forall` quantifier -- typecheck `type_of_range_bound` infers var type (Float/Real) from range literals; encoder already inferred Real sort; integer-value axiom retained (G4, load-bearing for bound discharge). Quantified round *equality* still timeouts (Z3 can't ground Real-interval witness; needs tranche-9 equality-axiom encoder). 99 lib + 64 integ green; 10/10 mutants.
+- `2a80692` docs: round mutation count 9/9 -> 10/10 (G4 integer-value axiom)
+- `e46324c` Step 7: encoder Real-typed `forall` sort inference + `round_integer_axiom` (`round(x)=to_int(round(x))`); 10/10 round mutants; `real_typed_forall_round_bound_discharges` pin
+- `ca3af2d` docs: round frontier -- free-argument equality is decidable, quantify-forall is an `other`-lowering gap
+- `47126dc` Step 5: symbolic-arg equality with concrete RHS is decidable; 9/9 mutants
+- `1a98bfc` test: pin int8 kernel discharge end-to-end via `naso-verify` CLI
+- `9ea4801` docs: round frontier -- free-argument equality decidable, quantify-forall is `other`-lowering gap
 - `8946f91` round axiom on the shipping kernel + strict-bound soundness guard + honest env note
 - `16081fa` STATE.md: record the round-axiom and i4-bridge tranches
 - `59a43b2` bridge the prover's clamp theorem to live packed-i4 execution

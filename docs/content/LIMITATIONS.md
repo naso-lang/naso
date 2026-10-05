@@ -314,12 +314,16 @@ bytes untouched after the kernel runs.
   query is well-sorted and reaches Z3, unlike the earlier Int-typing gap), and the
   integer-value axiom `round(x) = to_int(round(x))` pins round's range to integers --
   but Z3's quantifier engine cannot instantiate its way to a countermodel witness
-  `t` with `frac(t) != 0` over the continuous Real interval `[0, 1)`. Refuting it needs
-  a dedicated equality-axiom encoder: a `round` definition as a piecewise
-  floor/ceil expression (e.g. `round(x) = floor(x - frac(x) + ite(2*frac(x) >= 1, 1, 0))`)
-  plus SMT trigger annotations or a rational-witness sampler -- neither of which the
-  encoder currently emits. No claim is made that this discharged: exit status is 2
-  (Undecided), reported honestly. Free-argument round-equality (`round(v) == w`
+  `t` with `frac(t) != 0` over the continuous Real interval `[0, 1)`. This was investigated:
+  (1) an auxiliary axiom `round(x)=x => x=to_int(x)` still times out (Z3 cannot synthesize a
+  rational witness via e-matching); (2) a `forall`-axiom `round` definition is Sat but
+  inconclusive (Z3 leaves `round` uninterpreted in the model); (3) a `define-fun` / `floor` /
+  `frac` definition is rejected by the prover's `UFLIA` logic (sort mismatch and `floor`/`frac`
+  are not in UFLIA). Refuting quantified Real round equality needs switching the obligation's
+  SMTLIB logic to an LRA-capable theory (`AUFLIRA`/`ALL`) plus a sound half-DOWN `round`
+  `define-fun` definition (matching `round(0.5)=0`, the convention pinned by G1-G4) -- a
+  logic-selection refactor that risks the pinned bound discharge, so it is deferred. No claim
+  is made that this discharged: exit status is 2 (Undecided), reported honestly. Free-argument round-equality (`round(v) == w`
   with `v` free, including the tie `round(v) == v`) is decidable (refuted) by the ground
   bound. The consequence for the quantiser is unchanged: the stated
   range `abs(input[i] / scale) <= 127` constrains the **division**, the ideal scale, not the

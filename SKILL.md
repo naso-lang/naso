@@ -180,6 +180,7 @@ Accepted limitation (NOT a survivor gap): the quantified round-equality frontier
 `round(x) = to_int(round(x))` (retained, load-bearing as G4 for bound discharge) does
 not let Z3 ground a Real-interval witness. Refuting the equality needs a dedicated
 equality-axiom encoder (a `round` definition as piecewise floor/ceil + SMT triggers),
-the genuine tranche-9 equality-axiom encoder frontier. Bounds (`round(v) <= v + 0.5`) and free-argument
+the genuine tranche-10 equality-axiom encoder frontier (a `round` definition as piecewise
+floor/ceil + SMT triggers; requires switching from `UFLIA` to an LRA-capable logic). Bounds (`round(v) <= v + 0.5`) and free-argument
 equality (`round(v) == 4.5`, `round(v) == v`) are decidable; `as f32` casts + Real-typed
 `forall` round bounds DISCHARGE.

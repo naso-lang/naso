@@ -85,6 +85,7 @@ The differentiator is *verified* compact quantization.
 
 Commits, newest first:
 
+- `8946f91` round axiom on the shipping kernel + strict-bound soundness guard + honest env note
 - `16081fa` STATE.md: record the round-axiom and i4-bridge tranches
 - `59a43b2` bridge the prover's clamp theorem to live packed-i4 execution
 - `425d6bb` axiomatise `round` by its error bound; pin honestly in tests
@@ -99,7 +100,7 @@ Commits, newest first:
 - `eb56055` wire reversible uncomputation for gate sequences
 - `ea5582a` delete 682 dead lines, repair six fabricated inverses
 
-### Current matrix (all green at `59a43b2`)
+### Current matrix (all green at `8946f91`)
 
 - LLVM workspace (`--features llvm`): **1046 passed, 0 failed**, 1 ignored -- `59a43b2` added a packed-i4 execution bridge test
 - Default workspace: **637 passed, 0 failed**, 1 ignored -- `63ff0d9` was 634

@@ -874,6 +874,9 @@ fn prove_obligation(
                 if has_bound_var_round(&to_assert, &Vec::new()) {
                     script.assert(round_axiom());
                 }
+                if needs_round {
+                    script.assert(round_integer_axiom());
+                }
             }
 
             script.assert(to_assert);
@@ -1029,6 +1032,22 @@ fn sort_for_tensor_or_scalar(base: &naso_compiler::ast::TypeKind) -> Option<Sort
     })
 }
 
+/// Infer the SMT sort of a `forall` bound variable from its range literal bounds.
+/// Float bound -> Real (so `forall t in 0.0..1.0` binds a Real `t`, enabling a
+/// quantified round claim). Integer bounds -> Int (existing `forall i in 0..N`
+/// behavior). Non-literal bounds fall back to `Int` conservatively -- Int iteration
+/// over a symbolic domain is the only form the polyhedral lowering commits to, and a
+/// Real var with an unbound (non-literal) domain has no fixed meaning.
+fn sort_of_range_bound(lower: &Expr, upper: &Expr) -> Sort {
+    if matches!(&lower.kind, ExprKind::Literal(Literal::Float(_)))
+        || matches!(&upper.kind, ExprKind::Literal(Literal::Float(_)))
+    {
+        Sort::Real
+    } else {
+        Sort::Int
+    }
+}
+
 /// Encode a proposition to SMT.
 fn encode_predicate(pred: &Expr, scope: &mut HashMap<String, Term>) -> Result<Encoded, EncodeErr> {
     match &pred.kind {
@@ -1039,8 +1058,9 @@ fn encode_predicate(pred: &Expr, scope: &mut HashMap<String, Term>) -> Result<En
         // exactly the place it exists to be used.
         ExprKind::Forall(quant) | ExprKind::Quantified(quant) => {
             let mut bindings = Vec::new();
-            for (var, _, _) in &quant.bindings {
-                bindings.push((var.name.clone(), Sort::Int));
+            for (var, lower, upper) in &quant.bindings {
+                let sort = sort_of_range_bound(lower, upper);
+                bindings.push((var.name.clone(), sort));
             }
 
             // The predicate is the block's TAIL EXPRESSION -- but a `proof` body holds
@@ -1101,7 +1121,7 @@ fn encode_predicate(pred: &Expr, scope: &mut HashMap<String, Term>) -> Result<En
             for (var, lower, upper) in &quant.bindings {
                 let lo = encode_expr(lower, scope)?;
                 let hi = encode_expr(upper, scope)?;
-                let var_term = Term::Var(var.name.clone(), Sort::Int);
+                let var_term = Term::Var(var.name.clone(), sort_of_range_bound(lower, upper));
                 // lower <= var
                 domain_terms.push(Term::App("<=".to_string(), vec![lo, var_term.clone()]));
                 // var < upper
@@ -1455,6 +1475,25 @@ fn round_axiom() -> Term {
         vec![("round_ax_x".to_string(), Sort::Real)],
         round_bound_for(builder::var("round_ax_x", Sort::Real)),
     )
+}
+
+/// Round always returns an INTEGER, so pin its value to the integer sub-sort of Real.
+/// `forall x. round(x) = to_int(round(x))` -- sound because round's codomain is the
+/// integers. Needed so a Real-typed quantified round claim can discharge its BOUND
+/// obligations (`round(t) <= t + 0.5`) by grounding round's output to Int; without it the
+/// bound + a Real `t` leave round's value an unconstrained Real and Real-typed `forall`
+/// round bounds fail to discharge. It does NOT itself refute `forall t. round(t) = t`
+/// (that needs a dedicated equality-axiom encoder, tranche 8), but it is load-bearing for
+/// the bound path -- a mutation drop breaks the kernel's discharge (tested below).
+fn round_integer_axiom() -> Term {
+    use crate::smtlib::{Sort, builder};
+    let x = builder::var("round_int_x", Sort::Real);
+    let rt = builder::app("round", vec![x]);
+    let pinned = Term::App(
+        "=".to_string(),
+        vec![rt.clone(), Term::App("to_int".to_string(), vec![rt])],
+    );
+    builder::forall(vec![("round_int_x".to_string(), Sort::Real)], pinned)
 }
 
 /// Whether an encoded term mentions the uninterpreted `round` application, so the
@@ -3268,6 +3307,21 @@ mod tests {
         assert!(
             diags.iter().all(|d| d.code == "NASO-OBL-000"),
             "expected the cast+round obligation to discharge (OBL-000), got {diags:?}"
+        );
+    }
+
+    /// A Real-typed `forall` bound var (`forall t in 0.0..1.0`) now binds `t: Real`,
+    /// so `round(t)` is well-sorted and the upper bound `round(t) <= t + 0.5` DISCHARGES
+    /// under the universal + integer-value axioms. This pins both the Real-typed
+    /// quantifier fix (sort_of_range_bound) AND round_integer_axiom: a mutation dropping
+    /// the integer axiom breaks it (round's value becomes an unconstrained Real).
+    #[test]
+    fn real_typed_forall_round_bound_discharges() {
+        let src = "fn q() -> bool { proof { forall t in 0.0..1.0 { assert(round(t) <= t + 0.5); } } return true; }";
+        let diags = obligations_for(src);
+        assert!(
+            diags.iter().all(|d| d.code == "NASO-OBL-000"),
+            "expected the Real-typed forall round bound to discharge, got {diags:?}"
         );
     }
     /// scripts that do not use `round` still assert NO axiom. A false positive there would

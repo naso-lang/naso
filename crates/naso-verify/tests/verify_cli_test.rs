@@ -334,8 +334,7 @@ fn the_shipped_int8_quantiser_kernel_discharges_through_the_cli() {
     // End to end: the int8 quantiser kernel on disk, through the real binary.
     // Six obligations must all discharge -- pins the `to_real` cast lowering + the
     // gated round axiom against regressions a library-only test cannot observe.
-    let kernel =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../kernels/quant_int8.naso");
+    let kernel = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../kernels/quant_int8.naso");
     let out = Command::new(binary())
         .args(["--mode", "obligations", "--require-obligations"])
         .arg(&kernel)

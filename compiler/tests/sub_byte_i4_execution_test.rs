@@ -400,6 +400,60 @@ fn out_of_range_values_saturate_rather_than_wrap() {
 }
 
 // ---------------------------------------------------------------------------
+// BRIDGE: the prover's clamp theorem, realized over packed-i4 EXECUTION.
+// ---------------------------------------------------------------------------
+//
+// # What is bound here, and what is NOT
+//
+// `naso-verify` proves, over exact reals, that `clamp(v, -8.0, 7.0)` lies in
+// `[-8, 7]` for every real v (kernel `clamp_keeps_the_narrowing_in_range`). That is a
+// statement about the mathematical function the source names. This test turns it into a
+// statement about the nibble that lands in memory: feed a mix of in-range and far-out-of-
+// range inputs through the COMPILED kernel, and assert every emitted nibble decodes to a
+// value in `[-8, 7]`.
+//
+// This is the bridge the two halves share but neither proves alone:
+//   * the prover does not know about the nibble layout, and
+//   * the execution test does not read the SMT proof.
+// The shared contract is the clamp: if the runtime ever let a value escape the i4 range
+// (a dropped saturation, a wrap on store, a widened i8 slot), this fails -- and so would
+// the theorem, because they are the SAME claim at two levels.
+//
+// It is NOT a bit-exact IEEE-754 guarantee. Rounding of the division and of `round` is
+// still unmodelled (see LIMITATIONS); that gap is precisely why this asserts a RANGE,
+// not a specific nibble value.
+#[test]
+fn the_clamp_in_range_theorem_holds_over_packed_i4_execution() {
+    // Deliberately mixed inputs: in-range, far positive, far negative, and small signed,
+    // arranged so the buffer exercises saturation on some lanes and pass-through on others
+    // in the same run. With scale = 1.0, the kernel computes clamp(input[i], -8, 7) as i4.
+    let inputs: Vec<f64> = (0..N)
+        .map(|i| {
+            let v = i as f64;
+            match i % 4 {
+                0 => v,           // 0..15        -> saturates at 7 once i >= 8
+                1 => 1000.0 + v,  // far positive -> clamps to 7
+                2 => -1000.0 - v, // far negative -> clamps to -8
+                _ => 0.6 - v,     // small signed values, mostly in range
+            }
+        })
+        .collect();
+
+    let ir = build_ir(&quant_kernel(N));
+    let (code, stdout, stderr) = link_and_run(&ir, &driver(&inputs));
+    assert_eq!(code, Some(0), "driver failed:\n{stderr}");
+
+    let got = parse_nibs(&stdout);
+    assert_eq!(got.len(), N, "must decode one nibble per element: {got:?}");
+    for (i, v) in got.iter().enumerate() {
+        assert!(
+            (-8..=7).contains(v),
+            "nibble {i} = {v}, outside the i4 range [-8, 7] that the prover proved the              clamp keeps the narrowing in. If the runtime clamp, the pack, or the narrowing              let a value escape, this is the place it shows up: {got:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 4. Writing one element must not destroy its neighbour.
 // ---------------------------------------------------------------------------
 

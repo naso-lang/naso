@@ -111,6 +111,27 @@ jobs:
           cargo run --release -p naso-compiler -- check /tmp/test_linearity.naso
         working-directory: .
 
+  verify-prover:
+    name: Prover Tests (obligation + round axiom)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Force a clean z3-sys build, then run the prover suite
+        run: |
+          # z3-sys builds the official prebuilt in an OUT_DIR keyed by feature
+          # unification; divergent builds under disk contention can corrupt
+          # libz3, which makes the prover reject well-formed SMT scripts as
+          # ParseError (the parser reports "holds 0 assertions but the script
+          # declares N"). Force one clean build so CI's solver is sound and
+          # the obligation + round-axiom tests are deterministic.
+          cargo clean -p z3-sys
+          cargo test -p naso-verify
+        working-directory: .
+
   build-check:
     name: Build Check (All Crates)
     runs-on: ubuntu-latest

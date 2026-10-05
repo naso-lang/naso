@@ -16,8 +16,13 @@ Last updated: 2026-10-04, at commit `63ff0d9` (pushed, CI green: 1644 passed, 0 
    through the binary. `abs`/`min`/`max`/`clamp` have exact SMT definitions (real
    `ite`, `clamp` composed from them). `round` is axiomatised by its bounding property
    (inclusive `<=`); scalar obligations discharge via grounded instances, the kernel's
-   tensor obligation via the universal `forall` under the fixed seed -- see item 4. It is
-   not a closed-form definition, so tie-breaking (`round(0.5)`) is intentionally Undecided.
+   tensor obligation via the universal `forall` under the fixed seed -- see item 4. The
+   universal is now GATED: it is asserted only when a `round(t)` captures a quantified
+   variable, so free scalar `round`-equality refutes by ground SAT instead of timing out.
+   It is not a closed-form definition -- no single round-half convention is imposed -- so
+   scalar round-equality is REFUTED as a non-theorem (`round(4.5) == 4.5`; the integer tie
+   `round(0.5) == 1.0` is false under round-half-down) while only QUANTIFIED round-equality
+   (`forall t. round(t) = t`) remains Undecided (Z3 times out on the real quantifier).
 3. Floats are **exact reals**, not IEEE-754. Every proof about a quantiser here is a
    statement about the *mathematics* of quantisation. Nothing bounds runtime rounding.
 
@@ -285,8 +290,10 @@ Documented in `docs/content/LIMITATIONS.md`.
      by ground UNSAT instead of relying on Z3 to instantiate the universal `forall`. This removes
      Z3 quantifier e-matching from the common scalar case. The universal axiom is still asserted
      for `round(t)` whose `t` captures a quantifier (`forall i. round(input[i]/scale)` in the
-     kernel) -- that path stays instantiation-based, but is still sound and deterministic under
-     the fixed seed.
+     the kernel) -- that path stays instantiation-based, but is still sound and deterministic under
+     the fixed seed. The universal is now CONDITIONAL: `has_bound_var_round` asserts it only when
+     a `round(t)`'s argument captures a bound variable, so free scalar round-equality never touches
+     the quantifier and refutes by ground SAT (`round(4.5) == 4.5`, the integer tie `round(0.5) == 1.0`).
    - **`Z3_SERIALIZE` mutex.** `solver::verify` takes a process-global `Mutex<()>` around every
      solve. z3 0.19 (z3-sys 0.10, official 4.8.15) links a z3 C library NOT built with
      `Z3_THREAD_SAFE`, and `Context::thread_local()` reuses one context per thread; concurrent
@@ -300,7 +307,12 @@ Documented in `docs/content/LIMITATIONS.md`.
      after any disk-pressure `signal 7`/`signal 9` restores determinism. This tranche verified
      20/20 at default, 16, 8 and 1 test threads after a clean rebuild.
 
-   **Mutation (verified, clean build): 6/6 axiom mutants killed, 0 survivors.** The `<=`->`<`
+   **Mutation (verified, clean build): 8/8 round-axiom mutants killed, 0 survivors.** The 6 bound
+   mutants below (split `<=`->`<` per edge; blank either edge; drop axiom emission; walker miss)
+   plus two gate mutants on the universal-gating -- drop the gate (always assert) makes scalar
+   round-equality time out; invert the gate strips the universal from the tensor kernel, refuting
+   it -- are both killed: by `round_equality_refutations_are_decided_not_undecided` (scalar
+   refutation pin) and `the_shipped_int8_quantiser_kernel_discharges_completely` (tensor pin).
    mutant was split into per-edge mutants (lower and upper). Blanks (either edge), dropped axiom
    emission, and the `term_uses_round` walker break are caught by the discharge count pin and by
    the two discharge tests -- a break propagates through the grounded instances too, because a

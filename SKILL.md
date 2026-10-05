@@ -145,8 +145,10 @@ obligation it bounds, not just the tensor one.
 | D | lower bound strict (`<=` -> `<`) | **KILLED** | `round_axiom_is_well_formed` asserts the axiom renders `<= ` exactly twice; under `<` lower edge -> `(< `, count=1 -> panic |
 | D2 | upper bound strict (`<=` -> `<`) | **KILLED** | same structural check, upper edge |
 | E | drop round handling in `prove_obligation` | **KILLED** | round undeclared -> obligations fail; count pin + discharge tests fail |
+| G1 | drop the universal gate (always assert `forall`) | **KILLED** | scalar `round(4.5) == 4.5` / `round(0.5) == 1.0` hit the real quantifier -> 30s timeout -> Undecided -> `round_equality_refutations_are_decided_not_undecided` fails |
+| G2 | invert the universal gate (`!has_bound_var_round`) | **KILLED** | tensor kernel `forall i. round(input[i]/scale)` loses the universal -> refutes -> `the_shipped_int8_quantiser_kernel_discharges_completely` fails |
 
-**6/6 killed, 0 survivors, 0 invalid.**
+**8/8 killed, 0 survivors, 0 invalid.**
 
 Determinism: `solver::verify` holds a process-global `Mutex<()>` around every solve (z3
 0.19 / z3-sys 0.10 is NOT built `Z3_THREAD_SAFE`; `Context::thread_local()` is reused across

@@ -862,7 +862,17 @@ fn prove_obligation(
                 for arg in ground_args {
                     script.assert(round_bound_for(arg));
                 }
-                script.assert(round_axiom());
+                // The universal axiom is needed only for `round(t)` whose argument
+                // captures a quantified variable (e.g. `forall i. round(input[i]/scale)`),
+                // which has no free argument and therefore no ground instance. Obligations
+                // whose `round` applications all have free (concrete/scalar) arguments
+                // discharge on their ground instances alone; asserting the universal there
+                // would only hand Z3 an uninterpreted real quantifier that times out an
+                // otherwise-decidable (ground) check (see
+                // `round_concrete_equality_is_decided_not_undecided`).
+                if has_bound_var_round(&to_assert, &Vec::new()) {
+                    script.assert(round_axiom());
+                }
             }
 
             script.assert(to_assert);
@@ -1517,6 +1527,52 @@ fn free_round_args(term: &Term, bound: &[String]) -> Vec<Term> {
             out
         }
         Term::Annotated(body, _) => free_round_args(body, bound),
+    }
+}
+
+/// Whether `term` contains a `round(t)` whose argument `t` captures a variable bound
+/// by an enclosing `Forall`/`Exists`/`Let`/`Match`. Such a `round` (e.g. the kernel's
+/// `forall i. round(input[i]/scale)`) is NOT free and therefore cannot be discharged by a
+/// ground instance -- it is the sole case that still needs the universally-quantified
+/// bounding axiom. Every other `round` application has a free argument and is covered by
+/// its own ground instance, so asserting the universal there would only hand Z3 an
+/// uninterpreted real quantifier that times out an otherwise-decidable (ground) check.
+///
+/// This is the complement of `free_round_args`: a `round(t)` is "bound" exactly when
+/// `t` is NOT free. It walks the term with the same binder-threading (Forall/Exists/Let
+/// push names onto `bound`; Match cases inherit the outer `bound`) so the two helpers
+/// can never disagree about whether an argument grounds.
+fn has_bound_var_round(term: &Term, bound: &[String]) -> bool {
+    match term {
+        Term::Const(_) | Term::Var(_, _) => false,
+        Term::App(name, args) => {
+            if name == "round" && args.len() == 1 && term_captures_bound(&args[0], bound) {
+                return true;
+            }
+            args.iter().any(|a| has_bound_var_round(a, bound))
+        }
+        Term::Let(bindings, body) => {
+            let mut inner: Vec<String> = bound.to_vec();
+            for (n, _) in bindings {
+                inner.push(n.clone());
+            }
+            has_bound_var_round(body, &inner)
+                || bindings
+                    .iter()
+                    .any(|(_, value)| has_bound_var_round(value, bound))
+        }
+        Term::Forall(vars, body) | Term::Exists(vars, body) => {
+            let mut inner: Vec<String> = bound.to_vec();
+            for (n, _) in vars {
+                inner.push(n.clone());
+            }
+            has_bound_var_round(body, &inner)
+        }
+        Term::Match(scrutinee, cases) => {
+            has_bound_var_round(scrutinee, bound)
+                || cases.iter().any(|c| has_bound_var_round(&c.body, bound))
+        }
+        Term::Annotated(body, _) => has_bound_var_round(body, bound),
     }
 }
 
@@ -3113,6 +3169,39 @@ mod tests {
             axiom.matches("<=").count(),
             2,
             "the round axiom must bound inclusive (<=) at both edges; got: {axiom}"
+        );
+    }
+
+    /// Scalar round-equality claims whose argument is a CONCRETE real literal are
+    /// decided by the bounding axiom, not left Undecided by the 30s quantifier budget.
+    /// Two families are pinned here:
+    ///  - a NON-integer RHS (`round(4.5) == 4.5`): `round` never returns a non-integer, so
+    ///    the bound grounds `round(4.5)` to `[4, 5]` and `round(4.5) = 4` is a countermodel
+    ///    distinct from `4.5` -> refuted by ground SAT.
+    ///  - an INTEGER tie RHS (`round(0.5) == 1.0`): `1` is a valid `round-half-down` value
+    ///    of the argument region, so this claim is NOT a theorem (it is false under
+    ///    round-half-down) and is refuted -- soundly -- by the countermodel `round(0.5)=0`.
+    ///    The universal axiom is NOT asserted for these (the argument is free), so Z3
+    ///    decides them by ground SAT instead of timing out on the real quantifier.
+    /// The `quantized round-equality` (the kernel `forall i. round(input[i]/scale)` and
+    /// symbolic `round(v) == w`) stays Undecided -- that is the quantifier frontier (step 5),
+    /// not a regression of the conservative stance.
+    #[test]
+    fn round_equality_refutations_are_decided_not_undecided() {
+        let src = "fn q() -> bool { proof { assert(round(4.5) == 4.5); } return true; }";
+        let diags = obligations_for(src);
+        assert!(
+            diags.iter().any(|d| d.code == OBL_FALSE),
+            "concrete round equality `round(4.5) == 4.5` must be REFUTED (NASO-OBL-001), \
+             i.e. decided, not undecided. got {diags:?}"
+        );
+        let src = "fn q() -> bool { proof { assert(round(0.5) == 1.0); } return true; }";
+        let diags = obligations_for(src);
+        assert!(
+            diags.iter().any(|d| d.code == OBL_FALSE),
+            "integer-tie round equality `round(0.5) == 1.0` must be REFUTED (NASO-OBL-001): \
+             it is not a theorem (false under round-half-down), so it is refuted, not \
+             undecided. got {diags:?}"
         );
     }
 

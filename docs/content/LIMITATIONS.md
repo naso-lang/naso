@@ -300,12 +300,20 @@ bytes untouched after the kernel runs.
   unaffected. A corrupt `z3-sys` artifact makes z3 reject well-formed scripts as a
   `ParseError`, which is reported honestly rather than silently false-proved.)
 
-  The escape hatch is **incompleteness**, stated explicitly: the axiom is a bound, not an
-  exact definition, so it does NOT resolve a tie. `round(0.5) == 1.0` is Undecided (both 0 and 1
-  satisfy the bound), and because deciding it requires Z3 to find a *model* under a universally
-  quantified real axiom -- which does not resolve within the 30s solver budget -- such a query
-  is reported as Undecided (`OBL-002`, exit status 2), never as proved. That is the correct,
-  conservative answer, not a defect. The consequence for the quantiser is unchanged: the stated
+  Incompleteness remains, stated explicitly. The axiom is a bound, not an exact definition:
+  it does NOT resolve a tie *to one value*, so no single `round-half-up/down/even` convention
+  is imposed. What it DOES do: scalar round-equality is **refuted as a non-theorem**, not left
+  Undecided -- e.g. `round(4.5) == 4.5` (`4.5` is not a value `round` returns: the bound
+  grounds `round(4.5)` to `[4, 5]`, and `round(4.5) = 4` is a countermodel in that interval
+  distinct from `4.5`) and the integer tie `round(0.5) == 1.0` (false
+  under round-half-down) both refute by ground SAT, because the universal axiom is no longer
+  asserted for free scalar arguments (only for `round(t)` that captures a quantifier, e.g.
+  the kernel's `forall i. round(input[i]/scale)`). The genuinely **Undecided** case is
+  **quantified** round-equality (`round(v) == w` for a symbolic `v`, or `forall t. round(t)
+  = t`): Z3 must find a model under the universally quantified real axiom, which does not
+  resolve within the 30s solver budget, so such a query is reported as Undecided
+  (`OBL-002`, exit status 2), never as proved. That is the correct, conservative answer for
+  the quantifier frontier, not a defect. The consequence for the quantiser is unchanged: the stated
   range `abs(input[i] / scale) <= 127` constrains the **division**, the ideal scale, not the
   rounded quotient. A value of exactly 127.4 divided in and then rounded gives 127 and is fine,
   but that reasoning is not what the proof says. This is the same family of gap as the IEEE-754

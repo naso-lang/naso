@@ -3184,10 +3184,12 @@ mod tests {
     ///    round-half-down) and is refuted -- soundly -- by the countermodel `round(0.5)=0`.
     ///    The universal axiom is NOT asserted for these (the argument is free), so Z3
     ///    decides them by ground SAT instead of timing out on the real quantifier.
-    /// The genuinely-quantified `round(v) == w` with a SYMBOLIC `w` (e.g.
-    /// `forall t. round(t) == t`) stays Undecided -- Z3 times out on the real
-    /// quantifier; that is the remaining frontier. But `round(v) == <concrete w>`
-    /// (symbolic `v`, concrete RHS) is REFUTED by the ground bound -- see
+    /// Free-argument round-equality is decidable (refuted) for any RHS shape:
+    /// `round(v) == 4.5` (concrete RHS) and `round(v) == v` (symbolic RHS = v) both refute
+    /// by a ground countermodel. The only Undecided case is a quantified `forall` whose
+    /// body hits an expression-lowering gap (the `other` form, e.g. an `as f32` cast under
+    /// `forall`) -- not the round axiom's real quantifier. See
+    /// `free_argument_round_equality_refutes_even_when_symbolic` and
     /// `symbolic_round_equality_with_concrete_rhs_is_refuted`.
     #[test]
     fn round_equality_refutations_are_decided_not_undecided() {
@@ -3213,6 +3215,18 @@ mod tests {
     #[test]
     fn symbolic_round_equality_with_concrete_rhs_is_refuted() {
         let src = "fn q(v: f32) -> bool { proof { assert(round(v) == 4.5); } return true; }";
+        let diags = obligations_for(src);
+        assert!(diags.iter().any(|d| d.code == OBL_FALSE), "got {diags:?}");
+    }
+
+    /// A free argument makes `round(v) == v` refute too -- `round(v) = 0` (v = 0.5) is a
+    /// countermodel in `[v-0.5, v+0.5]` distinct from `v`. Free-argument round-equality is
+    /// decidable (refuted) for any RHS shape; the only Undecided case is a quantified `forall`
+    /// whose body hits an expression-lowering gap (the `other` form, e.g. an `as f32` cast),
+    /// not the round axiom's real quantifier.
+    #[test]
+    fn free_argument_round_equality_refutes_even_when_symbolic() {
+        let src = "fn q(v: f32) -> bool { proof { assert(round(v) == v); } return true; }";
         let diags = obligations_for(src);
         assert!(diags.iter().any(|d| d.code == OBL_FALSE), "got {diags:?}");
     }

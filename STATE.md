@@ -21,8 +21,9 @@ Last updated: 2026-10-04, at commit `63ff0d9` (pushed, CI green: 1644 passed, 0 
    variable, so free scalar `round`-equality refutes by ground SAT instead of timing out.
    It is not a closed-form definition -- no single round-half convention is imposed -- so
    scalar round-equality is REFUTED as a non-theorem (`round(4.5) == 4.5`; the integer tie
-   `round(0.5) == 1.0` is false under round-half-down) while only QUANTIFIED round-equality
-   (`forall t. round(t) = t`) remains Undecided (Z3 times out on the real quantifier).
+   `round(0.5) == 1.0` is false under round-half-down) while only a QUANTIFIED `forall`
+   remains Undecided -- an expression-lowering gap (the `other` form, e.g. an `as f32` cast
+   under `forall`), not a round-axiom timeout.
 3. Floats are **exact reals**, not IEEE-754. Every proof about a quantiser here is a
    statement about the *mathematics* of quantisation. Nothing bounds runtime rounding.
 

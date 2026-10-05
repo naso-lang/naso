@@ -308,12 +308,13 @@ bytes untouched after the kernel runs.
   distinct from `4.5`) and the integer tie `round(0.5) == 1.0` (false
   under round-half-down) both refute by ground SAT, because the universal axiom is no longer
   asserted for free scalar arguments (only for `round(t)` that captures a quantifier, e.g.
-  the kernel's `forall i. round(input[i]/scale)`). The genuinely **Undecided** case is
-  **quantified** round-equality (`round(v) == w` for a symbolic `v`, or `forall t. round(t)
-  = t`): Z3 must find a model under the universally quantified real axiom, which does not
-  resolve within the 30s solver budget, so such a query is reported as Undecided
-  (`OBL-002`, exit status 2), never as proved. That is the correct, conservative answer for
-  the quantifier frontier, not a defect. The consequence for the quantiser is unchanged: the stated
+  the kernel's `forall i. round(input[i]/scale)`). The genuinely **Undecided** case is a
+  **quantified** `forall` (e.g. `forall t. round(t) = t`): its body carries an expression
+  form (`other`, such as an `as f32` cast) the prover does not yet lower to SMT, so the query
+  is reported Undecided (`OBL-002`, exit status 2) before Z3's real quantifier is consulted --
+  a lowering gap, not a round-axiom timeout. Free-argument round-equality (`round(v) == w`
+  with `v` free, including the tie `round(v) == v`) is decidable (refuted) by the ground
+  bound. The consequence for the quantiser is unchanged: the stated
   range `abs(input[i] / scale) <= 127` constrains the **division**, the ideal scale, not the
   rounded quotient. A value of exactly 127.4 divided in and then rounded gives 127 and is fine,
   but that reasoning is not what the proof says. This is the same family of gap as the IEEE-754

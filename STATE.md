@@ -80,10 +80,13 @@ The differentiator is *verified* compact quantization.
 | Native quantum execution | `.naso` → LLVM IR → `llc` → `cc` → run, linked `libnaso_gates.a` |
 | `rz` rotation | Angle flows source → `qir.r1(double, ptr)` → runtime. Inverse negates it |
 | Reversible uncomputation | Gate sequences emit forward pass + uncomputation |
-| **Sub-byte `i4`** | **New.** Real packing: `Tensor[i4,16]` = 8 bytes, verified by execution |
+|| **Sub-byte `i4`** | **New.** Real packing: `Tensor[i4,16]` = 8 bytes, verified by execution ||
+|| **Prover/execution bridge** | **New.** `the_clamp_in_range_theorem_holds_over_packed_i4_execution`: the prover's `clamp(v,-8,7)` range theorem is realized over a compiled-and-run packed-i4 kernel across mixed in/out-of-range inputs ||
 
 Commits, newest first:
 
+- `59a43b2` bridge the prover's clamp theorem to live packed-i4 execution
+- `425d6bb` axiomatise `round` by its error bound; pin honestly in tests
 - `63ff0d9` define `abs`/`min`/`max`/`clamp` exactly; discharge the int8 quantiser
 - `bd01917` ship `naso-verify`: a real verifier with an honest exit status
 - `49a3902` prove a quantisation error bound over exact reals
@@ -96,9 +99,9 @@ Commits, newest first:
 - `eb56055` wire reversible uncomputation for gate sequences
 - `ea5582a` delete 682 dead lines, repair six fabricated inverses
 
-### Current matrix (all green at `425d6bb`)
+### Current matrix (all green at `59a43b2`)
 
-- LLVM workspace (`--features llvm`): **1045 passed, 0 failed**, 1 ignored -- `63ff0d9` was 1042, so this tranche's three net-new `round` tests sit in LLVM too
+- LLVM workspace (`--features llvm`): **1046 passed, 0 failed**, 1 ignored -- `59a43b2` added a packed-i4 execution bridge test
 - Default workspace: **637 passed, 0 failed**, 1 ignored -- `63ff0d9` was 634
 - Cranelift subsystem (`cranelift_honesty_test.rs`): **5 passed, 0 failed**, 1 ignored, unchanged; NOT a regression in this tranche
 - `cargo fmt --all --check`: clean

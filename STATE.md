@@ -22,8 +22,11 @@ Last updated: 2026-10-04, at commit `63ff0d9` (pushed, CI green: 1644 passed, 0 
    It is not a closed-form definition -- no single round-half convention is imposed -- so
    scalar round-equality is REFUTED as a non-theorem (`round(4.5) == 4.5`; the integer tie
    `round(0.5) == 1.0` is false under round-half-down) while only a QUANTIFIED `forall`
-   remains Undecided -- an expression-lowering gap (the `other` form, e.g. an `as f32` cast
-   under `forall`), not a round-axiom timeout.
+   remains Undecided -- its body needs a cross-script equality-axiom encoder (a
+   `to_real`/`to_int` bridge between round's Integer output and the Real input) that is
+   out of scope this tranche. Bounds (`round(v) <= v + 0.5`) and free-argument equality
+   (`round(4.5) == 4.5`, `round(v) == v`) are decidable; `as f32` casts now lower to SMT
+   `to_real`, so `forall i { round((i as f32)) <= (i as f32) + 0.5 }` DISCHARGES.
 3. Floats are **exact reals**, not IEEE-754. Every proof about a quantiser here is a
    statement about the *mathematics* of quantisation. Nothing bounds runtime rounding.
 

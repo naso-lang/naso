@@ -288,6 +288,23 @@ jobs:
             --mode obligations --require-obligations kernels/quant_error_bound.naso
         working-directory: .
 
+      # The int8 quantiser's obligations, including the unconditional clamp theorem. Named
+      # separately because `round` being REFUSED is load-bearing: if a future change made it
+      # uninterpreted instead, the suite would still pass while the prover quietly proved
+      # things about an arbitrary function. `round_is_refused_rather_than_left_uninterpreted`
+      # is the test that would catch it.
+      - name: Test the mathematical intrinsic definitions and the int8 kernel
+        run: >-
+          cargo test -p naso-verify --lib --
+          mathematical_intrinsics_have_exact_definitions_not_rubber_stamps
+          a_clamp_is_provably_within_its_bounds_for_every_input
+          min_and_max_are_defined_and_not_rubber_stamps
+          round_is_refused_rather_than_left_uninterpreted
+          a_quantiser_range_goal_is_refuted_but_discharges_as_a_premise
+          an_unknown_intrinsic_is_refused_with_a_reason_a_reader_can_act_on
+          the_shipped_int8_quantiser_kernel_discharges_completely
+        working-directory: .
+
       # The shipped quantisation error bound. Named separately because the whole point of
       # this file is that a KERNEL is discharged, not that a prover can prove hand-written
       # snippets: a prover regression could leave the kernel reporting a warning and this

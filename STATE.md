@@ -220,11 +220,16 @@ Documented in `docs/content/LIMITATIONS.md`.
    bearing one -- "I could not look at it" must never be a green build. Modes:
    `all`, `uncomputation`, `linearity`, `obligations`. `custom` was DELETED rather than wired:
    `prove_custom_vc` returned an empty diagnostic list, which is indistinguishable from a pass.
-4. Prove something about the tensor kernels themselves -- currently the error bound is proved
+4. `round` needs a universally quantified half-step axiom (`x - 0.5 <= round(x) <= x + 0.5`) for
+   an exact nearest-integer encoding. This is the next blocker on the quantiser: `abs`,
+   `min`, `max`, `clamp` are exact, but `round` is refused, so a stated range bounds the
+   DIVISION rather than the rounded quotient. Emitting the axiom needs the encoder to collect
+   axioms across a whole script rather than build one term, which is why it is separate work.
+5. Prove something about the tensor kernels themselves -- currently the error bound is proved
    about an UNINTERPRETED tensor function, so nothing ties it to the packed `i4` layout that
    actually executes. That link is the missing piece between "proof-carrying quantisation" and
    "proof-carrying quantisation that means anything".
-5. Make a malformed SMT script a loud failure rather than a silent `sat`. This is the
+6. Make a malformed SMT script a loud failure rather than a silent `sat`. This is the
    highest-value remaining fix: today it degrades "proved" into "refuted" quietly.
 
 Lower priority: `u4` distinct storage, `i2`, `release` builtin, runtime-valued `rz`.

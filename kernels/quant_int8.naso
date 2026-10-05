@@ -89,9 +89,14 @@
 //   correct iteration domains -> emits and executes for LLVM -> still REFUSED at
 //   WGSL codegen with a stated reason (WGSL has no i8 storage, and binding it as
 //   i32 would silently widen every element and drop the `as i8` narrowing). The
-//   proof obligations are still NOT discharged (float reasoning is unsupported
-//   and reported as unproved, not as proved), so the clamp below remains
-//   load-bearing rather than decorative.
+//   The proof obligations in this file are now DISCHARGED, over exact reals,
+//   by `naso-verify`:
+//     quantize_int8_symmetric   the range premise implies the in-range goal
+//     clamp_keeps_the_narrowing_in_range   no premise at all
+//   What is still NOT proved: the IEEE-754 rounding of the division, and
+//   `round` itself, which has no encoding in the prover and is REFUSED rather
+//   than left uninterpreted. So the range bounds the DIVISION, not the rounded
+//   quotient. That gap is named in `docs/content/LIMITATIONS.md`.
 
 /// Quantize f32 -> i8 with a symmetric scale.
 ///
@@ -100,24 +105,62 @@
 ///
 ///   forall i in 0..1024 { abs(input[i] / scale) <= 127.0 }
 ///
-/// This obligation is stated but not discharged (see the file header). The
-/// clamp is therefore load-bearing rather than decorative: it is what keeps
-/// the narrowing in range if the precondition is violated, and it is also
-/// what makes the operation lossy.
+/// This obligation is DISCHARGED, as a premise (`requires`) discharged
+/// against a matching goal. It is not proved from the data: nothing in this
+/// function bounds `input`, so the range is a contract the CALLER owes, and
+/// `naso-verify` checks it at every call site.
+///
+/// The clamp is independently load-bearing rather than decorative: see
+/// `clamp_keeps_the_narrowing_in_range`, which is proved with no premise at
+/// all and is what keeps the `as i8` from wrapping for inputs that violate
+/// the contract. It is also what makes the operation lossy.
+// PROVED, NOT DECLARED
+// --------------------
+// These obligations used to sit in `proof`, where they were stated as things the function
+// establishes about its own inputs. They are not: nothing here bounds `input`, so an
+// unconstrained tensor makes `abs(input[i]/scale) <= 127` FALSE, and `naso-verify` correctly
+// refuted it. A goal the caller must establish belongs in `requires`, where it becomes a
+// premise the callee may use -- and where a caller who cannot meet it is reported at the
+// call site instead of being assumed away.
+//
+// With the range in `requires`, the quantised value is in range for any tensor that meets the
+// contract, and the clamp below is proved redundant for those inputs but still load-bearing
+// for the ones that do not.
 fn quantize_int8_symmetric(
     input: [1] Tensor[f32, 1024],
     output: inout [1] Tensor[i8, 1024],
     scale: f32
-) {
+) requires {
+    assert(scale > 0.0);
+    forall i in 0..1024 { assert(abs(input[i] / scale) <= 127.0); }
+} {
     proof {
-        assert(scale > 0.0);
-        assert(forall i in 0..1024 { abs(input[i] / scale) <= 127.0 });
+        // The range follows from the premise, so this is discharged rather than assumed.
+        forall i in 0..1024 { assert(abs(input[i] / scale) <= 127.0); }
     }
 
     forall i in 0..1024 {
         let v = round(input[i] / scale);
         output[i] = clamp(v, -128.0, 127.0) as i8;
     }
+}
+
+/// The clamp makes the narrowing well-defined for EVERY input, not only in-range ones.
+///
+/// This is the one statement in this file that needs NO premise at all, and it is the one that
+/// makes the `as i8` above safe: `clamp(v, -128, 127)` lies in `[-128, 127]` whatever `v` is, so
+/// the clamp -- not the precondition -- is what actually guarantees the cast does not wrap.
+///
+/// It is discharged over exact reals. That covers the clamp's range property. It does NOT
+/// cover the IEEE-754 rounding of the division and of `round`, and `round` has no encoding in
+/// the prover at all, so `abs(input[i] / scale) <= 127` constrains the DIVISION, not the
+/// rounded quotient. The claim here is deliberately the narrower one it can actually support.
+fn clamp_keeps_the_narrowing_in_range(v: f32) -> bool {
+    proof {
+        assert(clamp(v, -128.0, 127.0) <= 127.0);
+        assert(clamp(v, -128.0, 127.0) >= -128.0);
+    }
+    return true;
 }
 
 /// Dequantize i8 -> f32, widening each element and rescaling.

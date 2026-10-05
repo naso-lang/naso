@@ -1236,9 +1236,98 @@ fn encode_expr(expr: &Expr, scope: &HashMap<String, Term>) -> Result<Term, Encod
             let offset = encode_expr(indices, scope)?;
             Ok(Term::App(ident_smt_name(func_term), vec![offset]))
         }
+        // A call to a MATHEMATICAL INTRINSIC, defined rather than left uninterpreted.
+        //
+        // These used to be refused outright, which is why `kernels/quant_int8.naso` -- the
+        // real int8 quantiser -- reported its own range precondition as UNDECIDED. The
+        // obligation `forall i { abs(input[i] / scale) <= 127.0 }` is exactly what a
+        // quantiser needs to establish, and it was unprovable only because `abs` had no
+        // definition. An uninterpreted `abs` would be worse than a refusal: Z3 would treat it
+        // as an arbitrary function, "prove" things about it that are false of the real one,
+        // and report success.
+        //
+        // Each definition below is the EXACT mathematical function, so anything proved using
+        // it is a true statement about `abs`/`min`/`max`/`clamp`/`round`.
+        ExprKind::Call(callee, args) => {
+            let ExprKind::Var(name) = &callee.kind else {
+                return Err(EncodeErr::Unsupported {
+                    reason: "call through a computed callee".to_string(),
+                    why: "an indirect callee cannot be resolved to an intrinsic here".to_string(),
+                });
+            };
+            let terms: Vec<Term> = args
+                .iter()
+                .map(|a| encode_expr(a, scope))
+                .collect::<Result<_, _>>()?;
+            encode_intrinsic(&name.name, &terms)
+        }
         _ => Err(EncodeErr::Unsupported {
             reason: format!("expression form `{}`", describe(&expr.kind)),
             why: "this expression form is not yet lowered to SMT".to_string(),
+        }),
+    }
+}
+
+/// Encode a call to a mathematical intrinsic as its EXACT definition.
+///
+/// # Why define rather than declare
+///
+/// An uninterpreted `abs` would let Z3 prove statements about an arbitrary function and report
+/// success, which is strictly worse than refusing. Every definition here is the real
+/// mathematical function, so a discharged obligation is a true statement about it.
+///
+/// # `round` needs an axiom, so it is REFUSED here
+///
+/// Nearest-integer rounding has no closed form over an exact real without a floor primitive,
+/// and SMT-LIB's `to_int` truncates toward zero. Encoding it as an uninterpreted function
+/// would let the solver "prove" things about an arbitrary `round`. Encoding it by its
+/// defining property (`x - 0.5 <= round(x) <= x + 0.5`) needs a universally quantified axiom to
+/// be sound, which this encoder has no way to emit from a single term. So `round` is refused,
+/// and that refusal is why `kernels/quant_int8.naso` still reports one undecided obligation.
+///
+/// The boundary is real: `abs`/`min`/`max`/`clamp` are DISCHARGED; `round` is NOT.
+fn encode_intrinsic(name: &str, args: &[Term]) -> Result<Term, EncodeErr> {
+    use crate::smtlib::builder::{ge, ite, le, sub};
+
+    let arity = |expected: usize| EncodeErr::Unsupported {
+        reason: format!("`{name}` with {} argument(s)", args.len()),
+        why: format!("`{name}` takes {expected}"),
+    };
+
+    match (name, args.len()) {
+        // |x| = x if x >= 0, else -x. Exact over the reals.
+        ("abs", 1) => {
+            let x = &args[0];
+            Ok(ite(
+                ge(x.clone(), builder::int(0)),
+                x.clone(),
+                sub(vec![builder::int(0), x.clone()]),
+            ))
+        }
+        // Both branches agree when a == b, so `ite` is unambiguous at the boundary.
+        ("min", 2) => Ok(ite(
+            le(args[0].clone(), args[1].clone()),
+            args[0].clone(),
+            args[1].clone(),
+        )),
+        ("max", 2) => Ok(ite(
+            ge(args[0].clone(), args[1].clone()),
+            args[0].clone(),
+            args[1].clone(),
+        )),
+        // clamp(v, lo, hi) = max(lo, min(v, hi)): composed from the two above, so it inherits
+        // their exactness instead of being special-cased.
+        ("clamp", 3) => {
+            let (v, lo, hi) = (&args[0], &args[1], &args[2]);
+            let mn = ite(le(v.clone(), hi.clone()), v.clone(), hi.clone());
+            Ok(ite(ge(lo.clone(), mn.clone()), lo.clone(), mn))
+        }
+        ("abs", n) | ("min", n) | ("max", n) | ("clamp", n) => Err(arity(n)),
+        _ => Err(EncodeErr::Unsupported {
+            reason: format!("call to `{name}`"),
+            why: "this intrinsic has no exact SMT definition, and leaving it uninterpreted \
+                  would let the solver prove things about an arbitrary function"
+                .to_string(),
         }),
     }
 }
@@ -2142,6 +2231,13 @@ mod tests {
         std::fs::read_to_string(path).unwrap_or_else(|e| panic!("`{path}` must be readable: {e}"))
     }
 
+    fn quant_int8_kernel() -> String {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernels/quant_int8.naso");
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("`{}` must be readable: {e}", path.display()))
+    }
+
     /// Helper: parse a source snippet and run the obligation prover.
     fn obligations_for(src: &str) -> Vec<VerifyDiagnostic> {
         use naso_compiler::parser::parse_program;
@@ -2645,5 +2741,192 @@ mod tests {
         let diags = obligations_for("fn f(n: int) -> bool { return n == n; }");
         // Zero: no `proof` block means nothing to discharge, and nothing may be invented.
         assert_all_discharged(&diags, 0);
+    }
+
+    /// `abs`, `min`, `max` and `clamp` are DEFINED, not left uninterpreted.
+    ///
+    /// These were refused outright, which is why `kernels/quant_int8.naso` -- the real int8
+    /// quantiser -- could not state the one obligation it most needs. The controls matter more
+    /// than the successes: an uninterpreted `abs` would let Z3 "prove" claims about an
+    /// arbitrary function, so each definition is paired with claims that must be REFUTED. If
+    /// any of those refutations ever passes, the definition has been weakened into a rubber
+    /// stamp and the successes above it mean nothing.
+    #[test]
+    fn mathematical_intrinsics_have_exact_definitions_not_rubber_stamps() {
+        // `abs(x) >= -5` is TRUE (abs is non-negative), so it must be discharged. This also
+        // shows the encoding is not merely refusing everything.
+        let true_abs = "fn q(x: f32) -> bool { proof { assert(abs(x) >= -5.0); } return true; }";
+        assert_all_discharged(&obligations_for(true_abs), 1);
+
+        // `abs(x) == x` is FALSE for negative x. If `abs` were uninterpreted, Z3 would happily
+        // "prove" it, so this is the control that matters most.
+        let false_abs = "fn q(x: f32) -> bool { proof { assert(abs(x) == x); } return true; }";
+        let diags = obligations_for(false_abs);
+        assert!(
+            diags.iter().any(|d| d.code == OBL_FALSE),
+            "abs(x) == x must be REFUTED, not discharged. got {diags:?}"
+        );
+
+        // The two-sided identity that actually defines abs.
+        // The two-sided identity that actually DEFINES abs, stated through premises because
+        // the language has no implication operator -- and this is the stronger form anyway:
+        // it shows the `ite` branches the right way round, rather than that some axiom holds.
+        assert_all_discharged(
+            &obligations_for(
+                "fn q(x: f32) requires { assert(x >= 0.0); } \
+                 { proof { assert(abs(x) == x); } return true; }",
+            ),
+            1,
+        );
+        assert_all_discharged(
+            &obligations_for(
+                "fn r(x: f32) requires { assert(x < 0.0); } \
+                 { proof { assert(abs(x) == -x); } return true; }",
+            ),
+            1,
+        );
+
+        // And the unconditional consequence: abs is non-negative.
+        let nonneg = "fn s(x: f32) -> bool { proof { assert(abs(x) >= 0.0); } return true; }";
+        assert_all_discharged(&obligations_for(nonneg), 1);
+    }
+
+    /// The clamp theorem: `clamp(v, lo, hi)` is within `[lo, hi]` for EVERY real `v`.
+    ///
+    /// This needs no premise at all, which is the point -- it is what makes the `as i8` narrowing
+    /// in `quant_int8.naso` well-defined for inputs that violate the quantiser's contract.
+    #[test]
+    fn a_clamp_is_provably_within_its_bounds_for_every_input() {
+        let src = concat!(
+            "fn q(v: f32) -> bool {\n",
+            "  proof {\n",
+            "    assert(clamp(v, -128.0, 127.0) <= 127.0);\n",
+            "    assert(clamp(v, -128.0, 127.0) >= -128.0);\n",
+            "  }\n",
+            "  return true;\n",
+            "}"
+        );
+        assert_all_discharged(&obligations_for(src), 2);
+
+        // The control: a bound the clamp does NOT enforce must be refuted.
+        let false_clamp = "fn q(v: f32) -> bool { proof { assert(clamp(v, -128.0, 127.0) >= 200.0); } return true; }";
+        let diags = obligations_for(false_clamp);
+        assert!(
+            diags.iter().any(|d| d.code == OBL_FALSE),
+            "a clamp claim outside its own bounds must be REFUTED. got {diags:?}"
+        );
+    }
+
+    /// `min` and `max` are defined, and each is refutable when the claim is wrong.
+    #[test]
+    fn min_and_max_are_defined_and_not_rubber_stamps() {
+        let true_src = concat!(
+            "fn q(a: f32, b: f32) -> bool {\n",
+            "  proof {\n",
+            "    assert(min(a, b) <= a);\n",
+            "    assert(min(a, b) <= b);\n",
+            "    assert(max(a, b) >= a);\n",
+            "    assert(max(a, b) >= b);\n",
+            "  }\n",
+            "  return true;\n",
+            "}"
+        );
+        assert_all_discharged(&obligations_for(true_src), 4);
+
+        // `min(a,b) >= a` is false whenever a is the larger argument.
+        let false_src =
+            "fn q(a: f32, b: f32) -> bool { proof { assert(min(a, b) >= a); } return true; }";
+        let diags = obligations_for(false_src);
+        assert!(
+            diags.iter().any(|d| d.code == OBL_FALSE),
+            "min(a,b) >= a must be REFUTED. got {diags:?}"
+        );
+    }
+
+    /// `round` is REFUSED, not encoded.
+    ///
+    /// Encoding it as an uninterpreted function would be the worst outcome: the solver could
+    /// then prove statements about an arbitrary `round` and report success. Nearest-integer
+    /// rounding needs a universally quantified half-step axiom to be sound, and this encoder
+    /// cannot emit one from a single term, so it refuses and says so.
+    #[test]
+    fn round_is_refused_rather_than_left_uninterpreted() {
+        let src = "fn q(x: f32) -> bool { proof { assert(round(x) >= 0.0); } return true; }";
+        let diags = obligations_for(src);
+        assert!(
+            diags.iter().any(|d| d.code == OBL_UNSUPPORTED),
+            "round must be UNDECIDED, never silently accepted. got {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|d| d.code == OBL_DISCHARGED),
+            "round must never be reported as discharged. got {diags:?}"
+        );
+    }
+
+    /// A quantiser range stated as a GOAL is refuted, because an unconstrained tensor has no
+    /// range. It is only provable as a PREMISE.
+    ///
+    /// This is the correction made to `kernels/quant_int8.naso`: its range obligation sat in a
+    /// `proof` block, where it claimed the function established something about its own inputs
+    /// that nothing in the function establishes.
+    #[test]
+    fn a_quantiser_range_goal_is_refuted_but_discharges_as_a_premise() {
+        let goal_only = concat!(
+            "fn q(input: Tensor[f32, 16], scale: f32) -> bool {\n",
+            "  proof { forall i in 0..16 { assert(abs(input[i] / scale) <= 127.0); } }\n",
+            "  return true;\n",
+            "}"
+        );
+        let diags = obligations_for(goal_only);
+        assert!(
+            diags.iter().any(|d| d.code == OBL_FALSE),
+            "an unbounded tensor must REFUTE the range goal. got {diags:?}"
+        );
+
+        let with_premise = concat!(
+            "fn q(input: Tensor[f32, 16], scale: f32) requires {\n",
+            "  forall i in 0..16 { assert(abs(input[i] / scale) <= 127.0); }\n",
+            "} {\n",
+            "  proof { forall i in 0..16 { assert(abs(input[i] / scale) <= 127.0); } }\n",
+            "  return true;\n",
+            "}"
+        );
+        assert_all_discharged(&obligations_for(with_premise), 1);
+    }
+
+    /// The shipped int8 quantiser discharges every obligation it states.
+    #[test]
+    fn the_shipped_int8_quantiser_kernel_discharges_completely() {
+        let kernel = quant_int8_kernel();
+        // Three obligations: the range goal in `quantize_int8_symmetric`, and the two clamp
+        // bounds in `clamp_keeps_the_narrowing_in_range`.
+        assert_all_discharged(&obligations_for(&kernel), 3);
+    }
+
+    /// An UNKNOWN intrinsic is refused, and the refusal names what was refused and why.
+    ///
+    /// The message is asserted as well as the code because a refusal that says only "not
+    /// supported" is half a diagnostic: the reader still cannot tell which construct blocked
+    /// them. A mutation that blanks this string survived the whole suite until this check was
+    /// added -- the BEHAVIOUR was already right and only the explanation was untested, which
+    /// is exactly the kind of gap a mutation run is for.
+    #[test]
+    fn an_unknown_intrinsic_is_refused_with_a_reason_a_reader_can_act_on() {
+        let src = "fn q(x: f32) -> bool { proof { assert(sigmoidise(x) > 0.0); } return true; }";
+        let diags = obligations_for(src);
+        let undecided = diags
+            .iter()
+            .find(|d| d.code == OBL_UNSUPPORTED)
+            .unwrap_or_else(|| panic!("an unknown intrinsic must be UNDECIDED, got {diags:?}"));
+        let msg = &undecided.message;
+        assert!(
+            msg.contains("sigmoidise"),
+            "the refusal must name the function it refused, got: {msg}"
+        );
+        assert!(
+            msg.contains("uninterpreted"),
+            "the refusal must explain why an uninterpreted definition is unacceptable, \
+             because that is the part the reader cannot check for themselves. got: {msg}"
+        );
     }
 }

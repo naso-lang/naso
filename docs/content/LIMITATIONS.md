@@ -257,6 +257,31 @@ bytes untouched after the kernel runs.
   erased regions is reported as an **unused linear leak**, because nothing at runtime touches
   it. An earlier version excused it; that let a linear tensor be declared, proved about, and
   silently dropped, which is the failure this compiler exists to make impossible.
+- **`abs`, `min`, `max` and `clamp` are defined exactly; `round` is NOT.**
+
+  These four intrinsics are encoded as their real mathematical definitions (`abs` via `ite`,
+  `clamp` composed from `min`/`max`), so an obligation discharged using them is a true
+  statement about the real function. `kernels/quant_int8.naso` now discharges completely as a
+  result, including a theorem that needs **no premise at all**: `clamp(v, -128, 127)` lies in
+  `[-128, 127]` for every real `v`. That is what makes the `as i8` narrowing well-defined for
+  inputs that violate the quantiser's contract, so the clamp is proved load-bearing rather
+  than asserted to be.
+
+  An intrinsic with no exact definition is REFUSED, never declared uninterpreted. Declaring
+  `abs` uninterpreted would be strictly worse than refusing: Z3 would treat it as an arbitrary
+  function, "prove" claims that are false of the real one, and report success.
+
+- **`round` has no encoding, and that is a real limit on what the quantiser proofs mean.**
+  Nearest-integer rounding has no closed form over an exact real without a floor primitive,
+  and SMT-LIB's `to_int` truncates toward zero rather than rounding. Encoding it by its
+  defining property (`x - 0.5 <= round(x) <= x + 0.5`) is sound but requires a universally
+  quantified axiom, which the encoder cannot emit from a single term. So it refuses.
+  The consequence, stated plainly: `abs(input[i] / scale) <= 127` constrains the **division**,
+  not the rounded quotient. A value of exactly 127.4 divided in and then rounded gives 127 and
+  is fine, but that reasoning is not what the proof says.
+  This is the same family of gap as the IEEE-754 rounding limitation above, one level further
+  down: exact reals, exact `abs`, and an unmodelled `round`.
+
 - **`naso verify` is not a subcommand of `naso`; it is the `naso-verify` binary.**
   `naso-verify` depends on `naso-compiler` (it parses and lowers the AST), so the compiler
   crate cannot depend on `naso-verify` to implement a subcommand -- that is a dependency cycle,

@@ -96,7 +96,7 @@ Commits, newest first:
 - `eb56055` wire reversible uncomputation for gate sequences
 - `ea5582a` delete 682 dead lines, repair six fabricated inverses
 
-### Current matrix (all green at `bd87c2f`)
+### Current matrix (all green at `425d6bb`)
 
 - LLVM workspace (`--features llvm`): **1045 passed, 0 failed**, 1 ignored -- `63ff0d9` was 1042, so this tranche's three net-new `round` tests sit in LLVM too
 - Default workspace: **637 passed, 0 failed**, 1 ignored -- `63ff0d9` was 634

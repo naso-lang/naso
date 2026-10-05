@@ -115,11 +115,13 @@ fn a_refuted_obligation_exits_one() {
 
 #[test]
 fn an_undecidable_obligation_exits_two_not_zero() {
-    // A `call` has no SMT encoding yet, so the prover cannot decide it. This must NOT be
-    // reported as success: "I could not look at it" and "it is true" are different claims and
-    // only one of them justifies a green build.
+    // `sigmoidise` has no SMT definition and is refused by name, so the obligation is
+    // undecidable. (round USED to be this stand-in; it now carries a bounding axiom, so it
+    // is no longer an honest "unsupported" example.) An undecidable obligation must NOT be
+    // reported as success: "I could not look at it" and "it is true" are different claims,
+    // and only one of them justifies a green build.
     let r = verify(
-        "fn f(n: int) -> bool { proof { assert(round(n)); } return true; }\n",
+        "fn f(n: int) -> bool { proof { assert(sigmoidise(n)); } return true; }\n",
         &[],
     );
     assert_eq!(
@@ -136,8 +138,10 @@ fn an_undecidable_obligation_exits_two_not_zero() {
 
 #[test]
 fn a_refutation_outranks_an_undecided_obligation() {
+    // `sigmoidise(n)` is undecidable and `n >= 10` is refutable; the refutation outranks.
+    // (round is no longer the undecidable stand-in.)
     let r = verify(
-        "fn f(n: int) -> bool { proof { assert(round(n)); assert(n >= 10); } return true; }\n",
+        "fn f(n: int) -> bool { proof { assert(sigmoidise(n)); assert(n >= 10); } return true; }\n",
         &[],
     );
     assert_eq!(

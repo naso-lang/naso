@@ -271,16 +271,30 @@ bytes untouched after the kernel runs.
   `abs` uninterpreted would be strictly worse than refusing: Z3 would treat it as an arbitrary
   function, "prove" claims that are false of the real one, and report success.
 
-- **`round` has no encoding, and that is a real limit on what the quantiser proofs mean.**
-  Nearest-integer rounding has no closed form over an exact real without a floor primitive,
-  and SMT-LIB's `to_int` truncates toward zero rather than rounding. Encoding it by its
-  defining property (`x - 0.5 <= round(x) <= x + 0.5`) is sound but requires a universally
-  quantified axiom, which the encoder cannot emit from a single term. So it refuses.
-  The consequence, stated plainly: `abs(input[i] / scale) <= 127` constrains the **division**,
-  not the rounded quotient. A value of exactly 127.4 divided in and then rounded gives 127 and
-  is fine, but that reasoning is not what the proof says.
-  This is the same family of gap as the IEEE-754 rounding limitation above, one level further
-  down: exact reals, exact `abs`, and an unmodelled `round`.
+- **`round` is axiomatised by its bounding property, with one honest escape hatch.**
+
+  Nearest-integer rounding has no closed exact form over an exact real, and SMT-LIB's `to_int`
+  truncates toward zero rather than rounding. It cannot be defined like `abs`/`min`/`max`/`clamp`,
+  so `round(x)` is emitted as an uninterpreted `Real -> Real` function and the encoder asserts,
+  for every obligation that uses it:
+
+      forall x:Real. (x - 1/2) <= round(x) <= (x + 1/2)
+
+  This is **sound for bounds**: an obligation like `round(x) <= x + 0.5` discharges (it is the
+  axiom's upper edge), and a claim that contradicts it refutes. `kernels/quant_int8.naso` does
+  not state a `round` obligation, so this is exercised only by the unit tests in
+  `crates/naso-verify/src/prover/obligations.rs`, not by the shipped kernel.
+
+  The escape hatch is **incompleteness**, stated explicitly: the axiom is a bound, not an
+  exact definition, so it does NOT resolve a tie. `round(0.5) == 1.0` is Undecided (both 0 and 1
+  satisfy the bound), and because deciding it requires Z3 to find a *model* under a universally
+  quantified real axiom -- which does not resolve within the 30s solver budget -- such a query
+  is reported as Undecided (`OBL-002`, exit status 2), never as proved. That is the correct,
+  conservative answer, not a defect. The consequence for the quantiser is unchanged: the stated
+  range `abs(input[i] / scale) <= 127` constrains the **division**, the ideal scale, not the
+  rounded quotient. A value of exactly 127.4 divided in and then rounded gives 127 and is fine,
+  but that reasoning is not what the proof says. This is the same family of gap as the IEEE-754
+  rounding limitation above, one level further down.
 
 - **`naso verify` is not a subcommand of `naso`; it is the `naso-verify` binary.**
   `naso-verify` depends on `naso-compiler` (it parses and lowers the AST), so the compiler

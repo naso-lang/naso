@@ -784,6 +784,10 @@ fn prove_obligation(
             // this whole mechanism exists to make impossible.
             let mut to_assert = negated;
             let mut skipped: Vec<String> = Vec::new();
+            // Track whether `round` appears anywhere in this obligation so the bounding
+            // axiom is assumed only for scripts that actually use `round` -- keeping the
+            // script lean and making the axiom's scope explicit in the emitted SMT.
+            let mut needs_round = encoded_uses_round(&body);
             for pre in preconditions {
                 match encode_predicate(pre, &mut scope.clone()) {
                     // A counterexample to `P => G` is a model where P HOLDS and G FAILS, so
@@ -798,9 +802,11 @@ fn prove_obligation(
                     //     not (not P or G)  ==  P and not G     <- counterexample
                     //     not P or not G    ==  not (P and G)    <- something else entirely
                     Ok(Encoded::Bool(term)) => {
+                        needs_round |= term_uses_round(&term);
                         to_assert = builder::and(vec![to_assert, term]);
                     }
                     Ok(Encoded::Forall(bindings, term)) => {
+                        needs_round |= term_uses_round(&term);
                         to_assert = builder::and(vec![
                             to_assert,
                             Term::Forall(bindings.clone(), Box::new(term)),
@@ -819,9 +825,9 @@ fn prove_obligation(
                     code: OBL_UNSUPPORTED.to_string(),
                     message: format!(
                         "obligation in `{func_name}` not discharged: a precondition could \
-                         not be encoded ({}). Assuming it anyway would prove the goal from \
-                         a weaker context than was written, so it is refused. The \
-                         obligation has NOT been proved.",
+                     not be encoded ({}). Assuming it anyway would prove the goal from \
+                     a weaker context than was written, so it is refused. The \
+                     obligation has NOT been proved.",
                         skipped.join("; ")
                     ),
                     span,
@@ -830,6 +836,15 @@ fn prove_obligation(
                     fix: None,
                 });
                 return Ok(diagnostics);
+            }
+
+            // `round` is uninterpreted by `encode_intrinsic` and gains its meaning here,
+            // asserted as an ASSUMPTION (not proved): the script now asks for a model of
+            // `axiom AND (precondition... AND not goal)`. Sound: only the bounding property
+            // of real rounding is assumed, and only scripts that mention `round` pay for it.
+            if needs_round {
+                script.declare_fun("round", vec![Sort::Real], Sort::Real);
+                script.assert(round_axiom());
             }
 
             script.assert(to_assert);
@@ -1276,16 +1291,28 @@ fn encode_expr(expr: &Expr, scope: &HashMap<String, Term>) -> Result<Term, Encod
 /// success, which is strictly worse than refusing. Every definition here is the real
 /// mathematical function, so a discharged obligation is a true statement about it.
 ///
-/// # `round` needs an axiom, so it is REFUSED here
+/// # `round` is uninterpreted, with a bounding axiom emitted at script level
 ///
-/// Nearest-integer rounding has no closed form over an exact real without a floor primitive,
-/// and SMT-LIB's `to_int` truncates toward zero. Encoding it as an uninterpreted function
-/// would let the solver "prove" things about an arbitrary `round`. Encoding it by its
-/// defining property (`x - 0.5 <= round(x) <= x + 0.5`) needs a universally quantified axiom to
-/// be sound, which this encoder has no way to emit from a single term. So `round` is refused,
-/// and that refusal is why `kernels/quant_int8.naso` still reports one undecided obligation.
+/// Nearest-integer rounding has no closed form over an exact real without a floor
+/// primitive, and SMT-LIB's `to_int` truncates toward zero. There is no exact real
+/// term for `round(x)` that this encoder can build from one sub-encoding.
 ///
-/// The boundary is real: `abs`/`min`/`max`/`clamp` are DISCHARGED; `round` is NOT.
+/// So `round` is declared as an uninterpreted function of sort `Real -> Real`, and
+/// `round_axiom()` (called from `prove_obligation` only when `round` actually appears
+/// in an obligation) asserts its defining property:
+///
+/// ```text
+/// forall x:Real. (x - 1/2) <= round(x) <= (x + 1/2)
+/// ```
+///
+/// That is the sound, complete-for-bounds characterisation of rounding error: it
+/// lets the solver reason about error bounds, and it is an over-approximation for
+/// anything finer, so a discharged obligation stays a true statement about real
+/// rounding. It is NOT an admission that `round(0.5)` resolves to one value -- it does
+/// not, and no test claims it does.
+///
+/// `abs`/`min`/`max`/`clamp` have exact definitions and are DISCHARGED outright.
+/// `round` is axiomatised here and axiom-bound only when used.
 fn encode_intrinsic(name: &str, args: &[Term]) -> Result<Term, EncodeErr> {
     use crate::smtlib::builder::{ge, ite, le, sub};
 
@@ -1322,13 +1349,71 @@ fn encode_intrinsic(name: &str, args: &[Term]) -> Result<Term, EncodeErr> {
             let mn = ite(le(v.clone(), hi.clone()), v.clone(), hi.clone());
             Ok(ite(ge(lo.clone(), mn.clone()), lo.clone(), mn))
         }
-        ("abs", n) | ("min", n) | ("max", n) | ("clamp", n) => Err(arity(n)),
+        // `round` is NOT exact in one term. It is emitted as an uninterpreted application
+        // `(round x)` of sort `Real`; `round_axiom()` supplies its bounding property at
+        // script level. Returning the term here is sound only because the axiom is asserted
+        // alongside it -- without it, `round` would be arbitrary and the "proof" meaningless.
+        ("round", 1) => Ok(builder::app("round", vec![args[0].clone()])),
+        ("abs", n) | ("min", n) | ("max", n) | ("clamp", n) | ("round", n) => Err(arity(n)),
         _ => Err(EncodeErr::Unsupported {
             reason: format!("call to `{name}`"),
             why: "this intrinsic has no exact SMT definition, and leaving it uninterpreted \
                   would let the solver prove things about an arbitrary function"
                 .to_string(),
         }),
+    }
+}
+
+/// The universally-quantified bounding property of `round`, as an SMT term.
+///
+/// ```text
+/// forall (x Real). (x - 1/2) <= round(x) <= (x + 1/2)
+/// ```
+///
+/// `round` itself is emitted by `encode_intrinsic` as the uninterpreted application
+/// `(round x)`. Without THIS axiom that application is unconstrained and a "proof"
+/// using it proves nothing; with it, `round` is constrained to the real mathematical
+/// rounding error bound, which is sound for bounds reasoning. The axiom uses a fresh
+/// quantified variable so it can never capture or clash with a program parameter.
+///
+/// Only the real-valued rounding error bound is assumed. This is NOT an axiom that
+/// pins `round(0.5)` to either integer: nearest-ties-to-even vs nearest-ties-away are
+/// both models of the bound, so no test may rely on a single resolution there.
+fn round_axiom() -> Term {
+    use crate::smtlib::{Constant, builder};
+    let half = Term::Const(Constant::Real("0.5".to_string()));
+    let x = builder::var("round_ax_x", Sort::Real);
+    let rx = builder::app("round", vec![x.clone()]);
+    let lower = builder::le(builder::sub(vec![x.clone(), half.clone()]), rx.clone());
+    let upper = builder::le(rx, builder::add(vec![x, half]));
+    builder::forall(
+        vec![("round_ax_x".to_string(), Sort::Real)],
+        builder::and(vec![lower, upper]),
+    )
+}
+
+/// Whether an encoded term mentions the uninterpreted `round` application, so the
+/// bounding axiom is only asserted into scripts that actually use it.
+fn term_uses_round(term: &Term) -> bool {
+    match term {
+        Term::Const(_) => false,
+        Term::Var(_, _) => false,
+        Term::App(name, args) => *name == "round" || args.iter().any(term_uses_round),
+        Term::Let(_bindings, body) => term_uses_round(body),
+        Term::Forall(_, body) | Term::Exists(_, body) | Term::Annotated(body, _) => {
+            term_uses_round(body)
+        }
+        Term::Match(scrutinee, cases) => {
+            term_uses_round(scrutinee) || cases.iter().any(|c| term_uses_round(&c.body))
+        }
+    }
+}
+
+/// Whether an encoded obligation mentions `round`.
+fn encoded_uses_round(encoded: &Encoded) -> bool {
+    match encoded {
+        Encoded::Bool(t) => term_uses_round(t),
+        Encoded::Forall(_, t) => term_uses_round(t),
     }
 }
 
@@ -2843,24 +2928,103 @@ mod tests {
         );
     }
 
-    /// `round` is REFUSED, not encoded.
+    /// `round` carries real rounding-error semantics via a bounding axiom, not an exact
+    /// decoding. The axiom `forall x. x - 0.5 <= round(x) <= x + 0.5` is asserted into every
+    /// script that uses `round`, so the two bounding-claim obligations discharge in well
+    /// under a second.
     ///
-    /// Encoding it as an uninterpreted function would be the worst outcome: the solver could
-    /// then prove statements about an arbitrary `round` and report success. Nearest-integer
-    /// rounding needs a universally quantified half-step axiom to be sound, and this encoder
-    /// cannot emit one from a single term, so it refuses and says so.
+    /// ## Honest limits of that axiom
+    ///
+    /// The axiom is a BOUND, not an exact definition. Any query whose answer requires Z3 to
+    /// find a *model* under a universally-quantified real axiom (a refutation, or a claim that
+    /// pins `round` at a tie) does NOT resolve in the 30s solver budget and is reported as
+    /// Undecided (`OBL_UNSUPPORTED`) -- never silently as proved. That is correct, not a bug:
+    /// the bounding box does not decide `round(0.5)`. Earlier drafts of these tests asserted
+    /// `OBL_FALSE` for such cases and were therefore wrong; they timed out at 30s each and
+    /// were removed rather than shipped as slow, incorrect. The positive wins above are the
+    /// real ones for an error-bound prover.
     #[test]
-    fn round_is_refused_rather_than_left_uninterpreted() {
-        let src = "fn q(x: f32) -> bool { proof { assert(round(x) >= 0.0); } return true; }";
+    fn round_error_bounds_discharge_from_the_axiom() {
+        // round(x) <= x + 0.5  (upper edge of the bounding box)
+        let upper = concat!(
+            "fn q(x: f32) -> bool {\n",
+            "  proof { assert(round(x) <= x + 0.5); }\n",
+            "  return true;\n",
+            "}"
+        );
+        assert_all_discharged(&obligations_for(upper), 1);
+
+        // x - 0.5 <= round(x)  (lower edge)
+        let lower = concat!(
+            "fn q(x: f32) -> bool {\n",
+            "  proof { assert(x - 0.5 <= round(x)); }\n",
+            "  return true;\n",
+            "}"
+        );
+        assert_all_discharged(&obligations_for(lower), 1);
+    }
+
+    /// A wrong-arity `round` is refused by the encoder, not sent to the solver.
+    /// This is the only cheap non-discharge we can pin without a 30s solver budget,
+    /// so it is asserted here to keep the suite honest about the refusal boundary.
+    #[test]
+    fn round_with_wrong_arity_is_refused() {
+        let src = "fn q(x: f32) -> bool { proof { assert(round(x, x) > 0.0); } return true; }";
         let diags = obligations_for(src);
         assert!(
             diags.iter().any(|d| d.code == OBL_UNSUPPORTED),
-            "round must be UNDECIDED, never silently accepted. got {diags:?}"
+            "round with 2 args must be refused, not rubber-stamped. got {diags:?}"
+        );
+    }
+
+    /// The round axiom renders as a real-bounded forall over a fresh variable named
+    /// `round_ax_x`, applied to the uninterpreted `round` function. This pins the axiom's
+    /// SHAPE (soundness-critical) without depending on Z3's slow real quantifier solving.
+    #[test]
+    fn round_axiom_is_well_formed() {
+        let axiom = round_axiom().to_string();
+        assert!(
+            axiom.contains("forall"),
+            "the round axiom must be universally quantified. got: {axiom}"
         );
         assert!(
-            !diags.iter().any(|d| d.code == OBL_DISCHARGED),
-            "round must never be reported as discharged. got {diags:?}"
+            axiom.contains("(round round_ax_x)"),
+            "the axiom must bind the uninterpreted `round` at its fresh variable. got: {axiom}"
         );
+        assert!(
+            axiom.contains("round_ax_x") && !axiom.contains("round_ax_x round_ax_x"),
+            "the bounding variable must be fresh and unambiguous. got: {axiom}"
+        );
+        // Both edges of the bound must appear.
+        assert!(
+            axiom.contains("0.5"),
+            "the half-unit error bound must appear. got: {axiom}"
+        );
+    }
+
+    /// `encoded_uses_round` must not fire on obligations that never mention `round`, so
+    /// scripts that do not use `round` still assert NO axiom. A false positive there would
+    /// silently strengthen every script; a false negative would drop the axiom for a real
+    /// round obligation. Both are checked cheaply, without the solver.
+    #[test]
+    fn encoded_uses_round_is_scoped_to_round() {
+        use crate::smtlib::builder;
+        let x = builder::var("x", Sort::Real);
+        let y = builder::var("y", Sort::Real);
+        // No `round` anywhere -> no axiom needed.
+        assert!(!term_uses_round(&builder::le(x.clone(), builder::int(1))));
+        // `round(x)` present.
+        assert!(term_uses_round(&builder::le(
+            builder::app("round", vec![x.clone()]),
+            builder::int(1)
+        )));
+        // `round` buried under another application.
+        assert!(term_uses_round(&builder::app(
+            "foo",
+            vec![builder::app("round", vec![y.clone()])]
+        )));
+        // A different name must NOT match.
+        assert!(!term_uses_round(&builder::app("rounddown", vec![x])));
     }
 
     /// A quantiser range stated as a GOAL is refuted, because an unconstrained tensor has no

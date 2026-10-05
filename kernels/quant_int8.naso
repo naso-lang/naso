@@ -93,10 +93,13 @@
 //   by `naso-verify`:
 //     quantize_int8_symmetric   the range premise implies the in-range goal
 //     clamp_keeps_the_narrowing_in_range   no premise at all
-//   What is still NOT proved: the IEEE-754 rounding of the division, and
-//   `round` itself, which has no encoding in the prover and is REFUSED rather
-//   than left uninterpreted. So the range bounds the DIVISION, not the rounded
-//   quotient. That gap is named in `docs/content/LIMITATIONS.md`.
+//   What is still NOT proved: the IEEE-754 rounding of the division. `round` now
+//   has a bounding axiom in `naso-verify` (`x - 0.5 <= round(x) <= x + 0.5`), so an
+//   obligation LIKE `round(...) <= x + 0.5` discharges -- rounding ERROR bounds are
+//   in reach. But the axiom decides only the bound; it does NOT resolve a tie, so a
+//   claim like `round(0.5) == 1.0` is Undecided, never silently proved. This kernel
+//   states no `round` obligation, so that capability is not exercised here. The gap
+//   that remains is IEEE-754, as named in `docs/content/LIMITATIONS.md`.
 
 /// Quantize f32 -> i8 with a symmetric scale.
 ///
@@ -152,9 +155,10 @@ fn quantize_int8_symmetric(
 /// the clamp -- not the precondition -- is what actually guarantees the cast does not wrap.
 ///
 /// It is discharged over exact reals. That covers the clamp's range property. It does NOT
-/// cover the IEEE-754 rounding of the division and of `round`, and `round` has no encoding in
-/// the prover at all, so `abs(input[i] / scale) <= 127` constrains the DIVISION, not the
-/// rounded quotient. The claim here is deliberately the narrower one it can actually support.
+/// cover the IEEE-754 rounding of the division. `round` carries a bounding axiom in the
+/// prover, but it resolves only the bound, not an exact quotient, so the claim here is
+/// deliberately the narrower one it can actually support: the division's range, not the
+/// rounded value's.
 fn clamp_keeps_the_narrowing_in_range(v: f32) -> bool {
     proof {
         assert(clamp(v, -128.0, 127.0) <= 127.0);

@@ -96,20 +96,20 @@ Commits, newest first:
 - `eb56055` wire reversible uncomputation for gate sequences
 - `ea5582a` delete 682 dead lines, repair six fabricated inverses
 
-### Current matrix (all green at `63ff0d9`)
+### Current matrix (all green at `bd87c2f`)
 
-- LLVM workspace: **1042 passed, 0 failed**
-- Default workspace: **634 passed, 0 failed**
-- Cranelift honesty: **5 passed, 0 failed**
+- LLVM workspace (`--features llvm`): **1045 passed, 0 failed**, 1 ignored -- `63ff0d9` was 1042, so this tranche's three net-new `round` tests sit in LLVM too
+- Default workspace: **637 passed, 0 failed**, 1 ignored -- `63ff0d9` was 634
+- Cranelift subsystem (`cranelift_honesty_test.rs`): **5 passed, 0 failed**, 1 ignored, unchanged; NOT a regression in this tranche
 - `cargo fmt --all --check`: clean
 - `cargo clippy -q --all-targets`: **zero** warnings
-- CI run `37247733544`: **1644 passed, 0 failed**, read from the runner log at `63ff0d9`
 
 NOTE ON THE CRANELIFT COUNT: an earlier revision of this file recorded 12. That was simply
 WRONG. `compiler/tests/cranelift_honesty_test.rs` has exactly 5 `#[test]` functions and
 `git log 04b77db..HEAD -- compiler/tests/cranelift_honesty_test.rs` is empty, so the count has
 been 5 the whole time. Nothing was removed. Recording a number nobody checked is the same
-class of error as the rest of what this project is auditing.
+class of error as the rest of what this project is auditing. The "Cranelift" column in an
+older matrix mixed the subsystem count with workspace totals; this one does not.
 
 ---
 

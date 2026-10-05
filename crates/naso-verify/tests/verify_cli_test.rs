@@ -328,3 +328,27 @@ fn the_shipped_quantisation_kernel_discharges_through_the_cli() {
         "both kernel obligations must be discharged, got:\n{stdout}"
     );
 }
+
+#[test]
+fn the_shipped_int8_quantiser_kernel_discharges_through_the_cli() {
+    // End to end: the int8 quantiser kernel on disk, through the real binary.
+    // Six obligations must all discharge -- pins the `to_real` cast lowering + the
+    // gated round axiom against regressions a library-only test cannot observe.
+    let kernel =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../kernels/quant_int8.naso");
+    let out = Command::new(binary())
+        .args(["--mode", "obligations", "--require-obligations"])
+        .arg(&kernel)
+        .output()
+        .expect("run naso-verify");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the shipped int8 kernel must verify clean. stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("6 obligation(s) discharged"),
+        "all six kernel obligations must be discharged, got:\n{stdout}"
+    );
+}

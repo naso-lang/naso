@@ -609,12 +609,14 @@ fn infer_quantified_with_body(
     for (var, lower, upper) in &quant.bindings {
         let _ = infer_expr(checker, lower)?;
         let _ = infer_expr(checker, upper)?;
-        checker.env.bind_var(
-            var.clone(),
-            Type::new(TypeKind::Int, Quantity::Many, span),
-            Quantity::Many,
-            Mutability::Immutable,
-        );
+        // Infer the bound variable's type from its range literal bounds, not a
+        // hard-coded `Int`. A float range (`forall t in 0.0..1.0`) makes `t` a Float,
+        // so `round(t)` (which expects f32) typechecks and the obligation encoder
+        // can bind `t` as a Real. Integer ranges keep `Int` (the polyhedral path).
+        let bound_ty = type_of_range_bound(lower, span);
+        checker
+            .env
+            .bind_var(var.clone(), bound_ty, Quantity::Many, Mutability::Immutable);
     }
     // Every statement is checked EXCEPT the trailing `assert`, whose argument is `predicate`.
     // Checking it as a statement and then inferring `predicate` separately records the same
@@ -789,6 +791,19 @@ fn literal_type(lit: &Literal, span: Span) -> Type {
     }
 }
 
+/// Infer the type of a `forall` bound variable from its range-literal bounds.
+/// A float bound -> Float (Real in SMT); integer bounds -> Int. Non-literal bounds
+/// fall back to Int, preserving the existing `forall i in 0..N` behaviour for the
+/// polyhedral/parallel path. Only the PROPOSITIONAL `forall` reaches here with float
+/// ranges -- the parallel loop form is a separate `ExprKind::Forall` and is refused
+/// over floats by `loop_extraction` before a bound var type is assigned.
+fn type_of_range_bound(bound: &Expr, span: Span) -> Type {
+    if let ExprKind::Literal(Literal::Float(_)) = &bound.kind {
+        Type::new(TypeKind::Float, Quantity::Many, span)
+    } else {
+        Type::new(TypeKind::Int, Quantity::Many, span)
+    }
+}
 /// Validate quantity/mutability combination
 fn validate_binding_quantity_mutability(
     _name: &Ident,

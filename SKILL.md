@@ -174,12 +174,13 @@ so it also kills C. This is legitimate, not slop: the invariant (`<=` must be in
 is a real soundness property, and the structural check is the honest witness for it.
 
 Accepted limitation (NOT a survivor gap): the quantified round-equality frontier
-(`forall t. round(t) = t`) is currently UNREACHABLE because naso's `forall` binds only
-Int range variables (`forall i in 0..N`); there is no `forall t: f32` syntax, and the
-encoder hardcodes bound-var sort `Int` (obligations.rs:1104). Bounds
-(`round(v) <= v + 0.5`) and free-argument equality (`round(v) == 4.5`, `round(v) == v`)
-are decidable; `as f32` casts lower to SMT `to_real`, so `forall i { round((i as f32))
-<= (i as f32) + 0.5 }` DISCHARGES. An `ExprKind::Ascribe -> to_real` axiom was prototyped
-but REVERTED: a mutation check (drop the axiom) showed zero behavioral change -- with no
-Real-typed `forall`, the integer-value axiom is un-pinned dead code (equivalent mutant),
-violating the "never ship un-pinned" rule. Step-7 requires Real-typed quantifiers first.
+(`forall t. round(t) = t`) is now REACHABLE via a float range (`forall t in 0.0..1.0`)
+-- as of this tranche the typechecker infers `t: Float` from float-literal bounds
+(check.rs `type_of_range_bound`) and the encoder infers `Sort::Real` (obligations.rs
+`sort_of_range_bound`). BUT it STILL times out (Undecided): the integer-value axiom
+`round(x) = to_int(round(x))` (retained, load-bearing as G4 for bound discharge) does
+not let Z3 ground a Real-interval witness. Refuting the equality needs a dedicated
+equality-axiom encoder (a `round` definition as piecewise floor/ceil + SMT triggers),
+the genuine tranche-8 frontier. Bounds (`round(v) <= v + 0.5`) and free-argument
+equality (`round(v) == 4.5`, `round(v) == v`) are decidable; `as f32` casts + Real-typed
+`forall` round bounds DISCHARGE.

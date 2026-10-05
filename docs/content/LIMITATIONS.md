@@ -287,6 +287,19 @@ bytes untouched after the kernel runs.
   `the_shipped_int8_quantiser_kernel_discharges_completely` pins the axiom path through the
   real kernel, not only unit tests.
 
+  **Determinism.** The scalar obligations (`round(v) <= v + 0.5`, `v - 0.5 <= round(v)`)
+  are discharged by GROUND instances of the bound -- the encoder detects `round(t)` whose
+  argument `t` is free (captures no quantified variable) and asserts `(t - 0.5) <= round(t)
+  <= (t + 0.5)` directly, so those discharge by ground UNSAT with no Z3 quantifier
+  instantiation. The tensor obligation in the kernel (`forall i. round(input[i]/scale)`)
+  captures the loop index, so it stays on the universal `forall` and is discharged (under
+  the fixed `random_seed`) by Z3 e-matching. To keep results deterministic across cargo-test
+  parallelism, `solver::verify` holds a process-global `Mutex<()>` around every solve; the
+  z3 0.19 (z3-sys 0.10) C library is not built with `Z3_THREAD_SAFE`, and concurrent solves
+  otherwise risk parser corruption. (CLI invocations are separate processes and are
+  unaffected. A corrupt `z3-sys` artifact makes z3 reject well-formed scripts as a
+  `ParseError`, which is reported honestly rather than silently false-proved.)
+
   The escape hatch is **incompleteness**, stated explicitly: the axiom is a bound, not an
   exact definition, so it does NOT resolve a tie. `round(0.5) == 1.0` is Undecided (both 0 and 1
   satisfy the bound), and because deciding it requires Z3 to find a *model* under a universally

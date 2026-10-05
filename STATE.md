@@ -13,8 +13,11 @@ Last updated: 2026-10-04, at commit `63ff0d9` (pushed, CI green: 1644 passed, 0 
    `5` internal, `6` nothing-discharged. **Undecidable is not passing.** Never let that
    collapse back to 0; the whole point is that a green build means something.
 2. `kernels/quant_error_bound.naso` and `kernels/quant_int8.naso` both **fully discharge**
-   through the binary. `abs`/`min`/`max`/`clamp` have exact SMT definitions. `round` is
-   REFUSED — see the next section, this is the live limitation.
+   through the binary. `abs`/`min`/`max`/`clamp` have exact SMT definitions (real
+   `ite`, `clamp` composed from them). `round` is axiomatised by its bounding property
+   (inclusive `<=`); scalar obligations discharge via grounded instances, the kernel's
+   tensor obligation via the universal `forall` under the fixed seed -- see item 4. It is
+   not a closed-form definition, so tie-breaking (`round(0.5)`) is intentionally Undecided.
 3. Floats are **exact reals**, not IEEE-754. Every proof about a quantiser here is a
    statement about the *mathematics* of quantisation. Nothing bounds runtime rounding.
 
@@ -268,23 +271,49 @@ Documented in `docs/content/LIMITATIONS.md`.
    `all`, `uncomputation`, `linearity`, `obligations`. `custom` was DELETED rather than wired:
    `prove_custom_vc` returned an empty diagnostic list, which is indistinguishable from a pass.
 4. `round` bounding axiom: DONE. `forall (x Real). (x - 0.5) <= round(x) <= (x + 0.5)` is
-   emitted as an assumption only when `term_uses_round` detects a real `round` application, and
-   it is now exercised by the SHIPPING kernel: `quant_int8.naso`'s proof blocks state that its
+   emitted as an assumption only when `term_uses_round` detects a real `round` application. It
+   is now exercised by the SHIPPING kernel: `quant_int8.naso`'s proof blocks state that its
    runtime `round(input[i]/scale)` step's error is bounded by a half unit, and these obligations
-   discharge (`425d6bb`, `59a43b2`). The bound is INCLUSIVE (`<=`, not `<`) deliberately: real
-   rounding hits the boundary (`round(0.5) = 1.0 = 0.5 + 0.5`), so a strict axiom is unsound.
-   **Mutation (verified, clean build): 5/5 axiom mutants killed, 0 survivors.** Four mutants
-   (blank either bound edge, drop axiom emission, break `term_uses_round`) are caught by the
-   discharge count pin in `the_shipped_int8_quantiser_kernel_discharges_completely` and by
-   `round_error_bounds_discharge_from_the_axiom`. The fifth -- swapping `<=` to `<` (strict) --
-   is caught structurally by `round_axiom_is_well_formed`, which asserts the axiom renders
-   `(<= ...)` exactly twice: strict `<` is unsound because real rounding attains the boundary
-   (`round(0.5) = 1.0 = 0.5 + 0.5`), and a structural guard is the only pin available, since no
-   semantic claim distinguishes the two (strict implies inclusive for a `<=` goal, and a tie
-   cannot be asserted as a theorem without choosing a convention the prover refuses to make).
+   discharge. The bound is INCLUSIVE (`<=`, not `<`) deliberately: real rounding hits the
+   boundary (`round(0.5) = 1.0 = 0.5 + 0.5`), so a strict axiom is unsound.
+
+   Determinism hardening (this tranche):
+   - **Grounded axiom instances.** For `round(t)` whose argument `t` is free (captures no
+     quantified variable -- the scalar obligations `round(v) <= v + 0.5` and `v - 0.5 <=
+     round(v)`, and the synthetic axiom tests), the encoder emits a GROUND instance
+     `(t - 0.5) <= round(t) <= (t + 0.5)` as a direct assumption, so those obligations discharge
+     by ground UNSAT instead of relying on Z3 to instantiate the universal `forall`. This removes
+     Z3 quantifier e-matching from the common scalar case. The universal axiom is still asserted
+     for `round(t)` whose `t` captures a quantifier (`forall i. round(input[i]/scale)` in the
+     kernel) -- that path stays instantiation-based, but is still sound and deterministic under
+     the fixed seed.
+   - **`Z3_SERIALIZE` mutex.** `solver::verify` takes a process-global `Mutex<()>` around every
+     solve. z3 0.19 (z3-sys 0.10, official 4.8.15) links a z3 C library NOT built with
+     `Z3_THREAD_SAFE`, and `Context::thread_local()` reuses one context per thread; concurrent
+     `verify()` calls across cargo-test threads can otherwise silently corrupt the solver.
+     Serializing solves makes every result deterministic (no silent concurrent corruption), at
+     the cost of serializing the solve step only -- CLI invocations are separate processes and are
+     unaffected. It also bounds peak z3 memory (one context+solver alive at a time under the lock).
+   - **Clean z3-sys build required.** A corrupt `z3-sys` artifact makes z3 reject well-formed
+     scripts (`holds 0 assertion(s) but the script declares N`); the parse-guard in solver.rs
+     reports this as a ParseError (fail-honest, never a false `sat`). `cargo clean -p z3-sys`
+     after any disk-pressure `signal 7`/`signal 9` restores determinism. This tranche verified
+     20/20 at default, 16, 8 and 1 test threads after a clean rebuild.
+
+   **Mutation (verified, clean build): 6/6 axiom mutants killed, 0 survivors.** The `<=`->`<`
+   mutant was split into per-edge mutants (lower and upper). Blanks (either edge), dropped axiom
+   emission, and the `term_uses_round` walker break are caught by the discharge count pin and by
+   the two discharge tests -- a break propagates through the grounded instances too, because a
+   grounded `round(v)` bound is built from the SAME `round_bound_for` term the mutants edit, so a
+   blanked edge fails the scalar obligation it bounds, not just the tensor one. The strict-bound
+   mutants are caught structurally by `round_axiom_is_well_formed`, which asserts the axiom
+   renders `(<= ...)` exactly twice: strict `<` is unsound because real rounding attains the
+   boundary (`round(0.5) = 1.0 = 0.5 + 0.5`), and a structural guard is the only pin available,
+   since no semantic claim distinguishes the two (strict implies inclusive for a `<=` goal, and
+   a tie cannot be asserted as a theorem without choosing a convention the prover refuses to make).
    Note on environment: an EARLIER full-suite run flaked (2 round tests hit the malformed-script
    guard) because `/var/tmp/cargo-target` held 8 divergent, disk-pressure-corrupted `z3-sys`
-   builds; `cargo clean -p z3-sys` rebuilt a single clean z3, after which the suite ran 20/20
+   builds; `cargo clean -p z3-sys` rebuilt a clean z3, after which the suite ran 20/20
    deterministic. The guard itself is correct -- it reported the corruption as a ParseError
    rather than silently false-proving.
 5. Prove something about the tensor kernels themselves -- currently the error bound is proved

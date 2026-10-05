@@ -844,6 +844,24 @@ fn prove_obligation(
             // of real rounding is assumed, and only scripts that mention `round` pay for it.
             if needs_round {
                 script.declare_fun("round", vec![Sort::Real], Sort::Real);
+                // The universal axiom covers `round(t)` whose argument captures a
+                // quantified variable (e.g. `forall i. round(input[i]/scale)`). For every
+                // FREE argument, additionally assert a GROUND instance of the bound so the
+                // obligation discharges by syntactic ground UNSAT instead of relying on Z3
+                // to instantiate the universal quantifier -- the common scalar case is then
+                // deterministic rather than at the mercy of quantifier e-matching heuristics.
+                // Both the universal and the ground instances come from `round_bound_for`, so
+                // a mutation to an axiom edge propagates to both and stays catchable.
+                let mut ground_args: Vec<Term> = Vec::new();
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for arg in free_round_args(&to_assert, &Vec::<String>::new()) {
+                    if seen.insert(arg.to_string()) {
+                        ground_args.push(arg);
+                    }
+                }
+                for arg in ground_args {
+                    script.assert(round_bound_for(arg));
+                }
                 script.assert(round_axiom());
             }
 
@@ -1379,16 +1397,30 @@ fn encode_intrinsic(name: &str, args: &[Term]) -> Result<Term, EncodeErr> {
 /// Only the real-valued rounding error bound is assumed. This is NOT an axiom that
 /// pins `round(0.5)` to either integer: nearest-ties-to-even vs nearest-ties-away are
 /// both models of the bound, so no test may rely on a single resolution there.
-fn round_axiom() -> Term {
-    use crate::smtlib::{Constant, builder};
+/// The half-unit bounding predicate for a SPECIFIC `round(t)`:
+///   `(t - 0.5) <= round(t)  AND  round(t) <= (t + 0.5)`.
+///
+/// This is the single source of truth for the bound -- both the universal
+/// `round_axiom()` and the GROUND instances emitted into obligation scripts
+/// are built from it, so a mutation to an edge (or to `round`'s arity) propagates
+/// everywhere it is used. That is what keeps the mutation suite honest: a ground
+/// instance is not an independent copy that can mask a breakage of the axiom.
+fn round_bound_for(arg: Term) -> Term {
+    use crate::smtlib::{Constant, Sort, builder};
     let half = Term::Const(Constant::Real("0.5".to_string()));
-    let x = builder::var("round_ax_x", Sort::Real);
-    let rx = builder::app("round", vec![x.clone()]);
-    let lower = builder::le(builder::sub(vec![x.clone(), half.clone()]), rx.clone());
-    let upper = builder::le(rx, builder::add(vec![x, half]));
+    let rt = builder::app("round", vec![arg.clone()]);
+    let lower = builder::le(builder::sub(vec![arg.clone(), half.clone()]), rt.clone());
+    let upper = builder::le(rt, builder::add(vec![arg, half]));
+    builder::and(vec![lower, upper])
+}
+
+/// The universally-quantified bounding axiom, stated once so the prover assumes:
+///   `forall (x Real). (x - 0.5) <= round(x) <= (x + 0.5)`.
+fn round_axiom() -> Term {
+    use crate::smtlib::{Sort, builder};
     builder::forall(
         vec![("round_ax_x".to_string(), Sort::Real)],
-        builder::and(vec![lower, upper]),
+        round_bound_for(builder::var("round_ax_x", Sort::Real)),
     )
 }
 
@@ -1414,6 +1446,77 @@ fn encoded_uses_round(encoded: &Encoded) -> bool {
     match encoded {
         Encoded::Bool(t) => term_uses_round(t),
         Encoded::Forall(_, t) => term_uses_round(t),
+    }
+}
+
+/// Whether `term` references any name currently bound in `bound`. Used to decide
+/// whether a `round(t)` argument is free (groundable) or captures a quantified
+/// variable (must stay on the universal axiom). Conservative: a term containing
+/// any binder (`Let`/`Forall`/`Exists`/`Match`/`Annotated`) is treated as bound, so
+/// such an argument is never grounded -- sound, just sometimes leaves the
+/// universal path in place.
+fn term_captures_bound(term: &Term, bound: &[String]) -> bool {
+    match term {
+        Term::Const(_) => false,
+        Term::Var(name, _) => bound.iter().any(|b| b == name),
+        Term::App(_, args) => args.iter().any(|a| term_captures_bound(a, bound)),
+        Term::Let(..)
+        | Term::Forall(..)
+        | Term::Exists(..)
+        | Term::Match(..)
+        | Term::Annotated(..) => true,
+    }
+}
+
+/// Collect the arguments `t` of every `round(t)` whose `t` does NOT capture a
+/// variable bound by an enclosing `Forall`/`Exists`/`Let`. Those `t` are free or
+/// ground, so the bounding constraint can be emitted as a GROUND instance
+/// (`t-0.5 <= round(t) <= t+0.5`) and the obligation discharges by syntactic
+/// ground UNSAT instead of relying on Z3 to instantiate the universal axiom.
+/// `round(t)` whose `t` reaches a quantified variable (e.g.
+/// `forall i. round(input[i]/scale)`) returns an empty vector and stays on the
+/// universal.
+fn free_round_args(term: &Term, bound: &[String]) -> Vec<Term> {
+    match term {
+        Term::Const(_) | Term::Var(_, _) => Vec::new(),
+        Term::App(name, args) => {
+            let mut out = Vec::new();
+            if name == "round" && args.len() == 1 && !term_captures_bound(&args[0], bound) {
+                out.push(args[0].clone());
+            }
+            for a in args {
+                out.extend(free_round_args(a, bound));
+            }
+            out
+        }
+        Term::Let(bindings, body) => {
+            let mut inner: Vec<String> = bound.to_vec();
+            for (n, _) in bindings {
+                inner.push(n.clone());
+            }
+            let mut out = Vec::new();
+            for (_, value) in bindings {
+                out.extend(free_round_args(value, bound));
+            }
+            out.extend(free_round_args(body, &inner));
+            out
+        }
+        Term::Forall(vars, body) | Term::Exists(vars, body) => {
+            let mut inner: Vec<String> = bound.to_vec();
+            for (n, _) in vars {
+                inner.push(n.clone());
+            }
+            free_round_args(body, &inner)
+        }
+        Term::Match(scrutinee, cases) => {
+            let mut out = Vec::new();
+            out.extend(free_round_args(scrutinee, bound));
+            for c in cases {
+                out.extend(free_round_args(&c.body, bound));
+            }
+            out
+        }
+        Term::Annotated(body, _) => free_round_args(body, bound),
     }
 }
 

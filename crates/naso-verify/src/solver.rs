@@ -15,9 +15,24 @@ use crate::smtlib::Script;
 #[cfg(feature = "z3")]
 use std::collections::HashMap;
 #[cfg(feature = "z3")]
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 #[cfg(feature = "z3")]
 use std::time::{Duration, Instant};
+
+/// Process-global lock serializing ALL interaction with the z3 C library.
+///
+/// The z3-sys C build is not configured with thread-safety, and
+/// `z3::Context::thread_local()` mutates shared context parameters per solve
+/// (`logic`, `timeout`, `random_seed`, ...). When `cargo test` runs the
+/// obligation suite across many threads at once, concurrent `verify()` calls
+/// corrupt the parser and make well-formed scripts fail to load
+/// ("holds 0 assertion(s) but the script declares N"), which surfaces as a
+/// flaky `ParseError` under parallelism (often NOT in isolation). Locking every
+/// solve makes every result deterministic under any test parallelism, while
+/// keeping the `naso-verify` CLI correct: CLI invocations are separate processes,
+/// so this lock only affects in-process parallelism (tests / the library).
+#[cfg(feature = "z3")]
+static Z3_SERIALIZE: Mutex<()> = Mutex::new(());
 
 /// Verification result from the solver.
 #[cfg(feature = "z3")]
@@ -307,6 +322,9 @@ impl Solver {
 /// Parse and execute an SMT-LIB2 script using Z3.
 #[cfg(feature = "z3")]
 pub fn verify(smt_script: &str, config: SolverConfig) -> Result<VerifyResult, VerifyError> {
+    // Serialize all z3 interaction: see `Z3_SERIALIZE` (z3-sys is not thread-safe here,
+    // and concurrent solves corrupt the parser under cargo-test parallelism).
+    let _z3_guard = Z3_SERIALIZE.lock().unwrap_or_else(|e| e.into_inner());
     let mut solver = Solver::new(config)?;
 
     // Parse SMT-LIB2 script using high-level API

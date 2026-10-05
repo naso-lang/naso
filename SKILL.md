@@ -121,6 +121,32 @@ but it only yields trustworthy verdicts on a single clean native build.
   The guard is defence in depth, not load-bearing. Needed a test pinning the
   observable value so the redundancy cannot be read as permission to drop it.
 
+## Probing SMT obligation gaps: read the verdict literally
+
+When a round-axiom / equality hypothesis is tested by hand-building an SMT script and
+calling `solver::verify` directly (the throwaway `guard_tests` pattern), three verdicts
+commonly fool the author; treat them literally, never as proof progress:
+
+- A `ParseError("holds 0 assertion(s) but the script declares N")` means **Z3 rejected the
+  script's logic/declarations** (e.g. `floor`/`frac`, or a `define-fun` returning `Int` where
+  `Real` is declared, under the prover's `UFLIA`). The script never solved. The guard is
+  honest (it errs toward refusal); lean on it, do not work around it. "Rejected by the logic"
+  is a real answer: "this SMT form is unsupported under the current logic."
+- A `Sat` whose model leaves `round` uninterpreted (`functions: {round: else_branch: None}`)
+  is **INCONCLUSIVE**, not a refutation--a `forall`-axiom definition was never instantiated
+  by Z3's e-matching, so the solver found a countermodel where `round` is arbitrary. Force the
+  definition on a ground term before trusting Sat.
+- A bound-discharge pin (G4) proves the integer-value axiom is *present*; it does NOT prove
+  it *closes* the quantified equality. `forall t in [0,1). round(t) = t` times out even with
+  the axiom in place, because Z3 cannot synthesize a rational witness over a continuous Real
+  interval from a bound axiom. The discriminator is a refutation test that fails when the
+  axiom is gone; if it still times out WITH the axiom, the gap is the encoder's
+  definition/triggers, not the axiom--pin the axiom, then ship the encoder.
+
+The probing script must use the prover's real logic (`UFLIA`, set in `obligations.rs`), not
+`AUFLIRA`/`ALL`/`LRA`, until a logic switch is explicitly decided AND the G1-G4 bound tests
+are re-run under the new logic.
+
 ## Verified per-construct mutation result — the `round` bounding axiom
 
 `encode_round_axiom` in `crates/naso-verify/src/prover/obligations.rs` emits

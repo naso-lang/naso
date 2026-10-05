@@ -797,7 +797,7 @@ fn literal_type(lit: &Literal, span: Span) -> Type {
 /// polyhedral/parallel path. Only the PROPOSITIONAL `forall` reaches here with float
 /// ranges -- the parallel loop form is a separate `ExprKind::Forall` and is refused
 /// over floats by `loop_extraction` before a bound var type is assigned.
-fn type_of_range_bound(bound: &Expr, span: Span) -> Type {
+pub(super) fn type_of_range_bound(bound: &Expr, span: Span) -> Type {
     if let ExprKind::Literal(Literal::Float(_)) = &bound.kind {
         Type::new(TypeKind::Float, Quantity::Many, span)
     } else {

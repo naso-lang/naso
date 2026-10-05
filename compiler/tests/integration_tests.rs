@@ -391,3 +391,31 @@ fn parser_type_alias() {
         other => panic!("expected type def, got {other:?}"),
     }
 }
+
+#[test]
+// PIN (Step 8): a `forall` over a float range binds a Float variable, so
+// `round(t)` (signature `f32 -> f32`) typechecks. This is the *typecheck-side*
+// half of the Real-typed quantifier change -- the encoder-side sort inference
+// is pinned separately in naso-verify's `real_typed_forall_round_bound_discharges`.
+// Reverting `type_of_range_bound` to `TypeKind::Int` makes `round(t)` a type
+// error (argument Int != domain f32), so this test FAILS on that regression.
+fn typecheck_forall_float_range_binds_float_var() {
+    use naso_compiler::typecheck::check_program;
+    let src = r#"
+        fn k() -> Bool {
+            proof {
+                forall t in 0.0..1.0 {
+                    assert(round(t) <= 0.5);
+                }
+            }
+            return true;
+        }
+    "#;
+    let mut prog = parse_program(src).expect("parse failed");
+    let result = check_program(&mut prog);
+    assert!(
+        result.errors.is_empty(),
+        "float-range `forall` should typecheck with t: Float; errors: {:?}",
+        result.errors
+    );
+}

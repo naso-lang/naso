@@ -309,10 +309,17 @@ bytes untouched after the kernel runs.
   under round-half-down) both refute by ground SAT, because the universal axiom is no longer
   asserted for free scalar arguments (only for `round(t)` that captures a quantifier, e.g.
   the kernel's `forall i. round(input[i]/scale)`). The genuinely **Undecided** case is a
-  **quantified** `forall` (e.g. `forall t. round(t) = t`): its body carries an expression
-  form (`other`, such as an `as f32` cast) the prover does not yet lower to SMT, so the query
-  is reported Undecided (`OBL-002`, exit status 2) before Z3's real quantifier is consulted --
-  a lowering gap, not a round-axiom timeout. Free-argument round-equality (`round(v) == w`
+  **quantified** Real `forall` equality (e.g. `forall t in 0.0..1.0 { round(t) == t }`):
+  the typechecker now infers `t: Float` and the encoder binds it as a `Real` (so the
+  query is well-sorted and reaches Z3, unlike the earlier Int-typing gap), and the
+  integer-value axiom `round(x) = to_int(round(x))` pins round's range to integers --
+  but Z3's quantifier engine cannot instantiate its way to a countermodel witness
+  `t` with `frac(t) != 0` over the continuous Real interval `[0, 1)`. Refuting it needs
+  a dedicated equality-axiom encoder: a `round` definition as a piecewise
+  floor/ceil expression (e.g. `round(x) = floor(x - frac(x) + ite(2*frac(x) >= 1, 1, 0))`)
+  plus SMT trigger annotations or a rational-witness sampler -- neither of which the
+  encoder currently emits. No claim is made that this discharged: exit status is 2
+  (Undecided), reported honestly. Free-argument round-equality (`round(v) == w`
   with `v` free, including the tie `round(v) == v`) is decidable (refuted) by the ground
   bound. The consequence for the quantiser is unchanged: the stated
   range `abs(input[i] / scale) <= 127` constrains the **division**, the ideal scale, not the

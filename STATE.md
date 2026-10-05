@@ -97,7 +97,8 @@ The differentiator is *verified* compact quantization.
 
 Commits, newest first:
 
-- `d91a697` Step 8: Real-typed `forall` quantifier -- typecheck `type_of_range_bound` infers var type (Float/Real) from range literals; encoder already inferred Real sort; integer-value axiom retained (G4, load-bearing for bound discharge). Quantified round *equality* still timeouts (Z3 can't ground Real-interval witness; needs tranche-9 equality-axiom encoder). 99 lib + 64 integ green; 10/10 mutants.
+- `34e7e34` docs: log Steps 5-8 in commit history
+- `d91a697` Step 8/9: Real-typed `forall` quantifier -- typecheck `type_of_range_bound` (now in BOTH `check.rs::check_precondition_quantifier` AND `inference.rs::infer_forall`/`infer_quantified`) infers bound var type (Float/Real) from range literals; encoder `sort_of_range_bound` infers Real sort; integer-value axiom retained (G4, load-bearing for bound discharge + G5, load-bearing for `round(t)` typecheck). Quantified round *equality* still timeouts (Z3 can't ground Real-interval witness; needs tranche-10 equality-axiom encoder). 99 lib + 64 integ + 12 compiler green; **11/11 mutants** (G1-G5).
 - `2a80692` docs: round mutation count 9/9 -> 10/10 (G4 integer-value axiom)
 - `e46324c` Step 7: encoder Real-typed `forall` sort inference + `round_integer_axiom` (`round(x)=to_int(round(x))`); 10/10 round mutants; `real_typed_forall_round_bound_discharges` pin
 - `ca3af2d` docs: round frontier -- free-argument equality is decidable, quantify-forall is an `other`-lowering gap
@@ -318,17 +319,23 @@ Documented in `docs/content/LIMITATIONS.md`.
      after any disk-pressure `signal 7`/`signal 9` restores determinism. This tranche verified
      20/20 at default, 16, 8 and 1 test threads after a clean rebuild.
 
-   **Mutation (verified, clean build): 10/10 round-axiom mutants killed, 0 survivors.** The 6 bound
+   **Mutation (verified, clean build): 11/11 round-axiom + Real-typing mutants killed, 0 survivors.** The 6 bound
    mutants below (split `<=`->`<` per edge; blank either edge; drop axiom emission; walker miss);
    plus three gate/ground mutants on the round axiom/grounding -- drop the gate (always assert)
    makes scalar round-equality time out; invert the gate strips the universal from the tensor kernel, refuting
    it -- are both killed: by `round_equality_refutations_are_decided_not_undecided` (scalar
    refutation pin) and `the_shipped_int8_quantiser_kernel_discharges_completely` (tensor pin).
-   mutant was split into per-edge mutants (lower and upper). Blanks (either edge), dropped axiom
-   emission, and the `term_uses_round` walker break are caught by the discharge count pin and by
-   the two discharge tests -- a break propagates through the grounded instances too, because a
-   grounded `round(v)` bound is built from the SAME `round_bound_for` term the mutants edit, so a
-   blanked edge fails the scalar obligation it bounds, not just the tensor one. The strict-bound
+   A fifth mutant (G5) drops the typecheck-side Real inference in `infer_forall`/`infer_quantified`
+   (inference.rs) and hard-codes `TypeKind::Int` for the bound var: `round(t)` becomes a type error
+   (round: Float->Float, t: Int) -- killed by `typecheck_forall_float_range_binds_float_var`.
+   (Note: dropping only the *encoder-side* `sort_of_range_bound` and forcing `Sort::Int` SURVIVED
+   -- over `[0.0,1.0)` the only Int is 0, which satisfies the bound, so the bound test cannot
+   distinguish Real from Int; that survivor is honest, not a gap. G5 pins the typecheck side.)
+   The 6 bound mutants (split `<=`->`<` per edge; blank either edge; drop axiom emission; walker
+   miss) plus G5 are caught by the structural/render tests + the typecheck pin: a break
+   propagates through the grounded instances, because the grounded `round(v)` bound is
+   built from the SAME `round_bound_for` term the mutants edit, so a blanked edge fails
+   the scalar obligation it bounds, not just the tensor one. The strictly-bound
    mutants are caught structurally by `round_axiom_is_well_formed`, which asserts the axiom
    renders `(<= ...)` exactly twice: strict `<` is unsound because real rounding attains the
    boundary (`round(0.5) = 1.0 = 0.5 + 0.5`), and a structural guard is the only pin available,

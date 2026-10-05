@@ -8,7 +8,7 @@
 
 use crate::ast::ty::{TypeKind, TypeVar};
 use crate::ast::*;
-use crate::typecheck::check::{check_block, check_stmt};
+use crate::typecheck::check::{check_block, check_stmt, type_of_range_bound};
 use crate::typecheck::error::TypeError;
 use crate::typecheck::*;
 
@@ -1021,14 +1021,14 @@ fn infer_forall(
         let _lower_ty = infer_expr(checker, lower)?;
         let _upper_ty = infer_expr(checker, upper)?;
 
-        // For simplicity, assume bounds are integer types
-        // Bind the loop variable as integer type
-        checker.env.bind_var(
-            var.clone(),
-            Type::new(TypeKind::Int, Quantity::Many, span),
-            Quantity::Many,
-            Mutability::Immutable,
-        );
+        // Infer the bound variable's type from its range-literal bounds, not a
+        // hard-coded `Int`. A float range (`forall t in 0.0..1.0`) makes `t` a Float,
+        // so `round(t)` (which expects f32) typechecks and the obligation encoder
+        // can bind `t` as a Real. Integer ranges keep `Int` (the polyhedral path).
+        let bound_ty = type_of_range_bound(lower, span);
+        checker
+            .env
+            .bind_var(var.clone(), bound_ty, Quantity::Many, Mutability::Immutable);
     }
 
     check_block(checker, &forall_loop.body)?;
@@ -1055,12 +1055,14 @@ fn infer_quantified(
     for (var, lower, upper) in &quant.bindings {
         let _lower_ty = infer_expr(checker, lower)?;
         let _upper_ty = infer_expr(checker, upper)?;
-        checker.env.bind_var(
-            var.clone(),
-            Type::new(TypeKind::Int, Quantity::Many, span),
-            Quantity::Many,
-            Mutability::Immutable,
-        );
+        // Real-typed quantifier: float range -> Float bound var (so `round(t)`
+        // typechecks); integer range -> Int (polyhedral). Reuses the shared
+        // `type_of_range_bound` so the typechecker and the obligation encoder
+        // agree on the bound var's sort.
+        let bound_ty = type_of_range_bound(lower, span);
+        checker
+            .env
+            .bind_var(var.clone(), bound_ty, Quantity::Many, Mutability::Immutable);
     }
 
     for stmt in &quant.body.stmts {

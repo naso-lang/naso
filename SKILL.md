@@ -149,11 +149,10 @@ obligation it bounds, not just the tensor one.
 | G2 | invert the universal gate (`!has_bound_var_round`) | **KILLED** | tensor kernel `forall i. round(input[i]/scale)` loses the universal -> refutes -> `the_shipped_int8_quantiser_kernel_discharges_completely` fails |
 
 | G3 | drop the ground round instance (`round_bound_for`) | **KILLED** | scalar bound `round(v) <= v + 0.5` loses its ground proof -> refutes -> `the_shipped_int8_quantiser_kernel_discharges_completely` fails |
-| G4 | drop the integer-value axiom (`round_integer_axiom`) | **KILLED** | Real-typed `forall` round bounds (`forall t in 0.0..1.0 { round(t) <= t + 0.5 }`) and the int8 kernel lose round's Integer pinning -> fail |\n
-**10/10 killed, 0 survivors, 0 invalid.** (G1-G3 above + G4 drop the integer-value
-axiom `round(x) = to_int(round(x))`: killed -- `real_typed_forall_round_bound_discharges` and
-the int8 kernel fail without it, so the axiom is load-bearing for Real-typed `forall` round
-bounds.)**
+| G4 | drop the integer-value axiom (`round_integer_axiom`) | **KILLED** | Real-typed `forall` round bounds (`forall t in 0.0..1.0 { round(t) <= t + 0.5 }`) and the int8 kernel lose round's Integer pinning -> fail |
+| G5 | drop `type_of_range_bound` inference in `infer_forall`/`infer_quantified` (inference.rs), force `TypeKind::Int` | **KILLED** | `round(t)` becomes a type error (round: Float->Float, t: Int) -> `typecheck_forall_float_range_binds_float_var` fails |
+
+**11/11 killed, 0 survivors, 0 invalid.** (G1-G5 — the integer-value axiom is load-bearing for Real-typed `forall` round *bounds* (G4) and the typecheck-side Real inference is load-bearing for `round(t)` to typecheck (G5).)
 
 Determinism: `solver::verify` holds a process-global `Mutex<()>` around every solve (z3
 0.19 / z3-sys 0.10 is NOT built `Z3_THREAD_SAFE`; `Context::thread_local()` is reused across
@@ -181,6 +180,6 @@ Accepted limitation (NOT a survivor gap): the quantified round-equality frontier
 `round(x) = to_int(round(x))` (retained, load-bearing as G4 for bound discharge) does
 not let Z3 ground a Real-interval witness. Refuting the equality needs a dedicated
 equality-axiom encoder (a `round` definition as piecewise floor/ceil + SMT triggers),
-the genuine tranche-8 frontier. Bounds (`round(v) <= v + 0.5`) and free-argument
+the genuine tranche-9 equality-axiom encoder frontier. Bounds (`round(v) <= v + 0.5`) and free-argument
 equality (`round(v) == 4.5`, `round(v) == v`) are decidable; `as f32` casts + Real-typed
 `forall` round bounds DISCHARGE.

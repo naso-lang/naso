@@ -1305,6 +1305,28 @@ fn encode_expr(expr: &Expr, scope: &HashMap<String, Term>) -> Result<Term, Encod
                 .collect::<Result<_, _>>()?;
             encode_intrinsic(&name.name, &terms)
         }
+        // A cast `i as f32` parses to `ExprKind::Ascribe(inner, Float)`. Floats model as
+        // `Real`, so the faithful SMT coercion is `(to_real inner)` -- sound only when the
+        // inner is integer-typed. A Real-typed inner casts to itself (Float->Float is a
+        // no-op on the real line). Bool/Int targets other than Float are refused, because
+        // a truncation or reinterpret is a different mathematical function the encoder must
+        // not invent.
+        ExprKind::Ascribe(inner, target) => {
+            use naso_compiler::ast::TypeKind;
+            let t = encode_expr(inner, scope)?;
+            if matches!(target.kind, TypeKind::Float) {
+                if term_sort(&t) == Some(Sort::Int) {
+                    Ok(Term::App("to_real".to_string(), vec![t]))
+                } else {
+                    Ok(t)
+                }
+            } else {
+                Err(EncodeErr::Unsupported {
+                    reason: "non-float cast target".to_string(),
+                    why: "only `as f32` (Integer -> Real coercion) is encoded to SMT".to_string(),
+                })
+            }
+        }
         _ => Err(EncodeErr::Unsupported {
             reason: format!("expression form `{}`", describe(&expr.kind)),
             why: "this expression form is not yet lowered to SMT".to_string(),
@@ -3221,9 +3243,9 @@ mod tests {
 
     /// A free argument makes `round(v) == v` refute too -- `round(v) = 0` (v = 0.5) is a
     /// countermodel in `[v-0.5, v+0.5]` distinct from `v`. Free-argument round-equality is
-    /// decidable (refuted) for any RHS shape; the only Undecided case is a quantified `forall`
-    /// whose body hits an expression-lowering gap (the `other` form, e.g. an `as f32` cast),
-    /// not the round axiom's real quantifier.
+    /// decidable (refuted) for any RHS shape. The remaining Undecided case is a quantified
+    /// `forall` whose body contains an expression form the encoder still lacks (now a rare
+    /// cast target, not `as f32`, which `(to_real)` handles).
     #[test]
     fn free_argument_round_equality_refutes_even_when_symbolic() {
         let src = "fn q(v: f32) -> bool { proof { assert(round(v) == v); } return true; }";
@@ -3231,7 +3253,23 @@ mod tests {
         assert!(diags.iter().any(|d| d.code == OBL_FALSE), "got {diags:?}");
     }
 
-    /// `encoded_uses_round` must not fire on obligations that never mention `round`, so
+    /// A cast `i as f32` under a quantified `forall` is now encodable as
+    /// `(to_real i)`, so the obligation no longer hits the `other` form refus
+    /// and DISCHARGES (was: `expression form 'other' -- not yet lowered`).
+    #[test]
+    fn cast_to_float_under_forall_no_longer_refuses_with_other() {
+        // `round((i as f32)) <= (i as f32) + 0.5` is the upper bound of `round`'s axiom,
+        // true under the universal gated by `has_bound_var_round`, discharged by the
+        // real quantifier instead of refused as an un-encoded cast.
+        let src = "fn q() -> bool { proof { forall i in 0..10 { assert(round((i as f32)) <= (i as f32) + 0.5); } } return true; }";
+        let diags = obligations_for(src);
+        // Discharge is reported as an Info diagnostic (OBL_OK); an error would mean the
+        // cast refused or the bound failed. The obligation must come back clean.
+        assert!(
+            diags.iter().all(|d| d.code == "NASO-OBL-000"),
+            "expected the cast+round obligation to discharge (OBL-000), got {diags:?}"
+        );
+    }
     /// scripts that do not use `round` still assert NO axiom. A false positive there would
     /// silently strengthen every script; a false negative would drop the axiom for a real
     /// round obligation. Both are checked cheaply, without the solver.

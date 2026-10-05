@@ -3,7 +3,39 @@
 Written for the next agent (or the next session of this one) after a context
 compaction. **This file is the handoff.** Read it before touching anything.
 
-Last updated: 2026-10-04, at commit `04b77db` (pushed, CI green).
+Last updated: 2026-10-04, at commit `63ff0d9` (pushed, CI green: 1644 passed, 0 failed).
+
+### If you are resuming, read these three numbers and then `git log --oneline -12`
+
+1. `naso-verify` is the verifier, and it is a **binary, not a subcommand**. It cannot be
+   `naso verify`: it depends on `naso-compiler`, so the compiler cannot depend on it back.
+   Exit codes: `0` discharged, `1` refuted, **`2` UNDECIDED**, `3` usage, `4` input,
+   `5` internal, `6` nothing-discharged. **Undecidable is not passing.** Never let that
+   collapse back to 0; the whole point is that a green build means something.
+2. `kernels/quant_error_bound.naso` and `kernels/quant_int8.naso` both **fully discharge**
+   through the binary. `abs`/`min`/`max`/`clamp` have exact SMT definitions. `round` is
+   REFUSED — see the next section, this is the live limitation.
+3. Floats are **exact reals**, not IEEE-754. Every proof about a quantiser here is a
+   statement about the *mathematics* of quantisation. Nothing bounds runtime rounding.
+
+### The three ways this codebase has lied to you recently
+
+Worth knowing before you trust anything, because each was mine and each shipped green:
+
+- **A silent match arm.** `encode_quantity_expr` had `_ => "no special quantity handling
+  needed"` over compound expressions. That skipped `forall` loops — the one place a loop
+  body consumes a linear tensor — so the verifier reported *correct* programs as leaking.
+  A catch-all in an AST walker is never "just a default".
+- **A test that could not fail.** `prove_custom_vc` returned `Ok(Vec::new())`, which every
+  caller reads as a clean bill of health; its test body was `// Smoke test`. And twenty
+  obligation tests asserted `is_empty()`, which cannot tell a proof from a silence.
+  **Prefer asserting the count and the exact codes over asserting emptiness.**
+- **A mutation harness that hid failures.** It parsed the first `test result:` line, so a
+  failure in any later test binary was invisible and a mutant looked alive. Count failures
+  across **all** binaries. That rule is written into the `naso-mutation-harness` skill.
+
+If you add an AST walker, match **exhaustively** with no `_` arm. New variants should be
+compile errors, not silent skips.
 
 ---
 
@@ -52,6 +84,11 @@ The differentiator is *verified* compact quantization.
 
 Commits, newest first:
 
+- `63ff0d9` define `abs`/`min`/`max`/`clamp` exactly; discharge the int8 quantiser
+- `bd01917` ship `naso-verify`: a real verifier with an honest exit status
+- `49a3902` prove a quantisation error bound over exact reals
+- `1b60643` prove callee preconditions at every call site
+- `7afc260` typecheck preconditions; fix erased-reference semantics in linearity
 - `04b77db` sub-byte i4: two values per byte, measured not asserted
 - `2ae9111` remove duplicate `qir.r1` declaration; forbid duplicate intrinsics
 - `d757117` implement `rz`, carrying its angle from source to hardware
@@ -59,14 +96,20 @@ Commits, newest first:
 - `eb56055` wire reversible uncomputation for gate sequences
 - `ea5582a` delete 682 dead lines, repair six fabricated inverses
 
-### Current matrix (all green at `04b77db`)
+### Current matrix (all green at `63ff0d9`)
 
-- LLVM workspace: **929 passed, 0 failed**
-- Default workspace: **521 passed, 0 failed**
-- Cranelift honesty: **12 passed, 0 failed**
+- LLVM workspace: **1042 passed, 0 failed**
+- Default workspace: **634 passed, 0 failed**
+- Cranelift honesty: **5 passed, 0 failed**
 - `cargo fmt --all --check`: clean
-- `cargo clippy -D warnings`: clean for default, LLVM, and Cranelift
-- CI run `37194704690`: **1368 passed, 0 failed**, 95 result lines, all 3 jobs success
+- `cargo clippy -q --all-targets`: **zero** warnings
+- CI run `37247733544`: **1644 passed, 0 failed**, read from the runner log at `63ff0d9`
+
+NOTE ON THE CRANELIFT COUNT: an earlier revision of this file recorded 12. That was simply
+WRONG. `compiler/tests/cranelift_honesty_test.rs` has exactly 5 `#[test]` functions and
+`git log 04b77db..HEAD -- compiler/tests/cranelift_honesty_test.rs` is empty, so the count has
+been 5 the whole time. Nothing was removed. Recording a number nobody checked is the same
+class of error as the rest of what this project is auditing.
 
 ---
 

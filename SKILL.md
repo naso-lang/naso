@@ -148,7 +148,9 @@ obligation it bounds, not just the tensor one.
 | G1 | drop the universal gate (always assert `forall`) | **KILLED** | scalar `round(4.5) == 4.5` / `round(0.5) == 1.0` hit the real quantifier -> 30s timeout -> Undecided -> `round_equality_refutations_are_decided_not_undecided` fails |
 | G2 | invert the universal gate (`!has_bound_var_round`) | **KILLED** | tensor kernel `forall i. round(input[i]/scale)` loses the universal -> refutes -> `the_shipped_int8_quantiser_kernel_discharges_completely` fails |
 
-**8/8 killed, 0 survivors, 0 invalid.**
+| G3 | drop the ground round instance (`round_bound_for`) | **KILLED** | scalar bound `round(v) <= v + 0.5` loses its ground proof -> refutes -> `the_shipped_int8_quantiser_kernel_discharges_completely` fails |
+
+**9/9 killed, 0 survivors, 0 invalid.**
 
 Determinism: `solver::verify` holds a process-global `Mutex<()>` around every solve (z3
 0.19 / z3-sys 0.10 is NOT built `Z3_THREAD_SAFE`; `Context::thread_local()` is reused across

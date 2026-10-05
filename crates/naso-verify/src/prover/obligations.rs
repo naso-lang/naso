@@ -869,7 +869,8 @@ fn prove_obligation(
                 // discharge on their ground instances alone; asserting the universal there
                 // would only hand Z3 an uninterpreted real quantifier that times out an
                 // otherwise-decidable (ground) check (see
-                // `round_concrete_equality_is_decided_not_undecided`).
+                // `round_equality_refutations_are_decided_not_undecided` and
+                // `symbolic_round_equality_with_concrete_rhs_is_refuted`).
                 if has_bound_var_round(&to_assert, &Vec::new()) {
                     script.assert(round_axiom());
                 }
@@ -3183,9 +3184,11 @@ mod tests {
     ///    round-half-down) and is refuted -- soundly -- by the countermodel `round(0.5)=0`.
     ///    The universal axiom is NOT asserted for these (the argument is free), so Z3
     ///    decides them by ground SAT instead of timing out on the real quantifier.
-    /// The `quantized round-equality` (the kernel `forall i. round(input[i]/scale)` and
-    /// symbolic `round(v) == w`) stays Undecided -- that is the quantifier frontier (step 5),
-    /// not a regression of the conservative stance.
+    /// The genuinely-quantified `round(v) == w` with a SYMBOLIC `w` (e.g.
+    /// `forall t. round(t) == t`) stays Undecided -- Z3 times out on the real
+    /// quantifier; that is the remaining frontier. But `round(v) == <concrete w>`
+    /// (symbolic `v`, concrete RHS) is REFUTED by the ground bound -- see
+    /// `symbolic_round_equality_with_concrete_rhs_is_refuted`.
     #[test]
     fn round_equality_refutations_are_decided_not_undecided() {
         let src = "fn q() -> bool { proof { assert(round(4.5) == 4.5); } return true; }";
@@ -3203,6 +3206,15 @@ mod tests {
              it is not a theorem (false under round-half-down), so it is refuted, not \
              undecided. got {diags:?}"
         );
+    }
+
+    // `round(v) == 4.5` (v: f32, concrete RHS) refutes by the ground bound -- `round`
+    // returns an integer, so `round(v) = 4` (v = 4.0) is a countermodel in [v-0.5, v+0.5].
+    #[test]
+    fn symbolic_round_equality_with_concrete_rhs_is_refuted() {
+        let src = "fn q(v: f32) -> bool { proof { assert(round(v) == 4.5); } return true; }";
+        let diags = obligations_for(src);
+        assert!(diags.iter().any(|d| d.code == OBL_FALSE), "got {diags:?}");
     }
 
     /// `encoded_uses_round` must not fire on obligations that never mention `round`, so

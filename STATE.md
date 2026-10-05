@@ -307,10 +307,10 @@ Documented in `docs/content/LIMITATIONS.md`.
      after any disk-pressure `signal 7`/`signal 9` restores determinism. This tranche verified
      20/20 at default, 16, 8 and 1 test threads after a clean rebuild.
 
-   **Mutation (verified, clean build): 8/8 round-axiom mutants killed, 0 survivors.** The 6 bound
+   **Mutation (verified, clean build): 9/9 round-axiom mutants killed, 0 survivors.** The 6 bound
    mutants below (split `<=`->`<` per edge; blank either edge; drop axiom emission; walker miss)
-   plus two gate mutants on the universal-gating -- drop the gate (always assert) makes scalar
-   round-equality time out; invert the gate strips the universal from the tensor kernel, refuting
+   plus three gate/ground mutants on the round axiom/grounding -- drop the gate (always assert)
+   makes scalar round-equality time out; invert the gate strips the universal from the tensor kernel, refuting
    it -- are both killed: by `round_equality_refutations_are_decided_not_undecided` (scalar
    refutation pin) and `the_shipped_int8_quantiser_kernel_discharges_completely` (tensor pin).
    mutant was split into per-edge mutants (lower and upper). Blanks (either edge), dropped axiom

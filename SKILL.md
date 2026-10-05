@@ -170,7 +170,9 @@ The ONLY soundness pin available is the structural renderer check in `round_axio
 so it also kills C. This is legitimate, not slop: the invariant (`<=` must be inclusive)
 is a real soundness property, and the structural check is the honest witness for it.
 
-Accepted limitation (NOT a survivor gap): `round` equality/refutation (e.g.
-`round(4.5) == 4.5`) is Undecided -- Z3 times out on the universally-quantified real
-`round`. Bounding claims discharge; equality claims cannot. The tests pin the former and
-assert the latter as undecided.
+Accepted limitation (NOT a survivor gap): a QUANTIFIED `forall` over round (`forall t.
+round(t) = t`) is Undecided -- the body's `other` expression form (e.g. an `as f32` cast) is
+not yet lowered to SMT, so it is reported before Z3's real quantifier is consulted. FREE-argument
+round-equality (`round(v) == w`, `v` free, incl. `round(v) == v`) is REFUTED by ground SAT
+(`round(4.5) == 4.5`, `round(0.5) == 1.0`, `round(v) == 4.5`, `round(v) == v`). The tests pin the
+latter (refutation) and assert the former (quantified lowering gap) as undecided.

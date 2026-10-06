@@ -615,36 +615,19 @@ pub fn default_naso_program() -> String {
 
 // Full adder using reversible computation
 // fn reversible makes the ENTIRE function body a reversible block (no nested reversible { })
-fn reversible full_adder(inout a: [1] Qubit, inout b: [1] Qubit, inout cin: [1] Qubit) -> ([1] Qubit, [1] Qubit) {
+fn reversible full_adder(inout a: [1] Qubit, inout b: [1] Qubit, inout cin: [1] Qubit, inout sum: [1] Qubit, inout carry: [1] Qubit) {
     // Sum = a ^ b ^ cin
     // Carry = (a & b) | (a & cin) | (b & cin)
     
-    // Toffoli for carry computation (using cnot)
-    hadamard(a);
-    cnot(a, b);
-    hadamard(a);
-    
-    hadamard(a);
-    cnot(a, cin);
-    hadamard(a);
-    
-    hadamard(b);
-    cnot(b, cin);
-    hadamard(b);
-    
     // Sum computation (reversible XOR chain using cnot)
-    let [1] sum: Qubit = qalloc();
     cnot(a, sum);
     cnot(b, sum);
     cnot(cin, sum);
-
+    
     // Carry computation
-    let [1] carry: Qubit = qalloc();
     cnot(a, carry);
     cnot(b, carry);
     cnot(cin, carry);
-    
-    return (sum, carry);
 }
 
 // Quantum teleportation protocol
@@ -671,7 +654,7 @@ fn reversible teleport(msg: [1] Qubit, inout alice: [1] Qubit, inout bob: [1] Qu
 }
 
 // Simple reversible function: swap two values using arithmetic
-// Int is copyable (Quantity::Many), so use 'mut' not 'inout [1]'
+// Int is copy (Quantity::Many), so use 'mut' not 'inout [1]'
 fn reversible swap(mut x: Int, mut y: Int) {
     x = x + y;
     y = x - y;
@@ -684,9 +667,11 @@ fn main() -> Int {
     let [1] q1: Qubit = qalloc();
     let [1] q2: Qubit = qalloc();
     let [1] q3: Qubit = qalloc();
+    let [1] sum: Qubit = qalloc();
+    let [1] carry: Qubit = qalloc();
     
     // Run full adder
-    let (sum, carry) = full_adder(q1, q2, q3);
+    full_adder(q1, q2, q3, sum, carry);
     
     // Measure results
     let s = measure(sum);

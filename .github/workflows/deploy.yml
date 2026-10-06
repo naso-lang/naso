@@ -43,7 +43,7 @@ jobs:
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
       - name: Install Hugo
-        uses: regen100/hugo-install-action@v2
+        uses: peaceiris/actions-hugo@v3
         with:
           hugo-version: "0.146.0"
 

@@ -34,6 +34,16 @@ impl Script {
             .push(Command::DeclareFun(name.to_string(), args, ret));
     }
 
+    /// Emit a `(define-fun <name> (<params>) <ret> <body>)` command.
+    ///
+    /// Used for `round` under AUFLIRA: `define-fun` gives Z3 a complete definition
+    /// (via `to_int`/`to_real`), eliminating the need for the uninterpreted-function
+    /// + universal-axiom combination that causes quantifier e-matching timeouts.
+    pub fn define_fun(&mut self, name: &str, params: Vec<(String, Sort)>, ret: Sort, body: Term) {
+        self.commands
+            .push(Command::DefineFun(name.to_string(), params, ret, body));
+    }
+
     /// Declare a constant of the given sort.
     ///
     /// A FUNCTION sort cannot be expressed by `declare-const` in SMT-LIB2 -- it needs
@@ -112,6 +122,7 @@ pub enum Command {
     DeclareSort(String, usize),
     DefineSort(String, Vec<String>, Sort),
     DeclareFun(String, Vec<Sort>, Sort),
+    DefineFun(String, Vec<(String, Sort)>, Sort, Term),
     DeclareConst(String, Sort),
     Assert(Term),
     Push(u32),
@@ -167,6 +178,16 @@ impl fmt::Display for Command {
                     write!(f, "{}", arg)?;
                 }
                 write!(f, ")) {})", ret)
+            }
+            Command::DefineFun(name, params, ret, body) => {
+                write!(f, "(define-fun {} (", name)?;
+                for (i, (p, s)) in params.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " ")?;
+                    }
+                    write!(f, "({} {})", p, s)?;
+                }
+                write!(f, ") {} {})", ret, body)
             }
             Command::DeclareConst(name, sort) => write!(f, "(declare-const {} {})", name, sort),
             Command::Assert(term) => write!(f, "(assert {})", term),

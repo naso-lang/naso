@@ -24,9 +24,12 @@ Last updated: 2026-10-04, at commit `63ff0d9` (pushed, CI green: 1644 passed, 0 
    `round(0.5) == 1.0` is false under round-half-down) while only a QUANTIFIED `forall`
    remains Undecided -- its body needs a cross-script equality-axiom encoder (a
    `to_real`/`to_int` bridge between round's Integer output and the Real input) that is
-   out of scope this tranche. Bounds (`round(v) <= v + 0.5`) and free-argument equality
-   (`round(4.5) == 4.5`, `round(v) == v`) are decidable; `as f32` casts now lower to SMT
-   `to_real`, so `forall i { round((i as f32)) <= (i as f32) + 0.5 }` DISCHARGES.
+   RESOLVED by `define-fun round = to_real(to_int(x + 0.5))` under AUFLIRA. The logic
+   selection (`ground_round_equality_wants_lra`) now matches ANY quantified `forall` body
+   mentioning `round` over a Real float range (both equality and inequality), emitting
+   the define-fun via `round_define_fun()`. Bound-path obligations (kernel tensor bounds)
+   use UFLIA + bounding axiom since UFLIA has no `to_int`/`to_real`. All quantified round
+   obligations now discharge.
 3. Floats are **exact reals**, not IEEE-754. Every proof about a quantiser here is a
    statement about the *mathematics* of quantisation. Nothing bounds runtime rounding.
 

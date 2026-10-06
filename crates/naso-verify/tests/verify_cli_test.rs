@@ -415,7 +415,13 @@ fn round_equality_refutes_within_timeout_under_auflira() {
     // This pins the logic switch as load-bearing at the CLI level (not just the lib level).
     let r = verify(
         "fn check_round_eq() -> Bool { proof { forall t in 0.0..1.0 { assert(round(t) == t); } } return true; }\n",
-        &["--mode", "obligations", "--timeout", "5000", "--require-obligations"],
+        &[
+            "--mode",
+            "obligations",
+            "--timeout",
+            "5000",
+            "--require-obligations",
+        ],
     );
     assert_eq!(
         r.code, 1,

@@ -308,28 +308,20 @@ bytes untouched after the kernel runs.
   distinct from `4.5`) and the integer tie `round(0.5) == 1.0` (false
   under round-half-down) both refute by ground SAT, because the universal axiom is no longer
   asserted for free scalar arguments (only for `round(t)` that captures a quantifier, e.g.
-  the kernel's `forall i. round(input[i]/scale)`). The genuinely **Undecided** case is a
-  **quantified** Real `forall` equality (e.g. `forall t in 0.0..1.0 { round(t) == t }`):
-  the typechecker now infers `t: Float` and the encoder binds it as a `Real` (so the
-  query is well-sorted and reaches Z3, unlike the earlier Int-typing gap), and the
-  integer-value axiom `round(x) = to_int(round(x))` pins round's range to integers --
-  but Z3's quantifier engine cannot instantiate its way to a countermodel witness
-  `t` with `frac(t) != 0` over the continuous Real interval `[0, 1)`. This was investigated:
-  (1) an auxiliary axiom `round(x)=x => x=to_int(x)` still times out (Z3 cannot synthesize a
-  rational witness via e-matching); (2) a `forall`-axiom `round` definition is Sat but
-  inconclusive (Z3 leaves `round` uninterpreted in the model); (3) a `define-fun` / `floor` /
-  `frac` definition is rejected by the prover's `UFLIA` logic (sort mismatch and `floor`/`frac`
-  are not in UFLIA). Refuting quantified Real round equality needs switching the obligation's
-  SMTLIB logic to an LRA-capable theory (`AUFLIRA`/`ALL`) plus a sound half-DOWN `round`
-  `define-fun` definition (matching `round(0.5)=0`, the convention pinned by G1-G4) -- a
-  logic-selection refactor that risks the pinned bound discharge, so it is deferred. No claim
-  is made that this discharged: exit status is 2 (Undecided), reported honestly. Free-argument round-equality (`round(v) == w`
-  with `v` free, including the tie `round(v) == v`) is decidable (refuted) by the ground
-  bound. The consequence for the quantiser is unchanged: the stated
-  range `abs(input[i] / scale) <= 127` constrains the **division**, the ideal scale, not the
-  rounded quotient. A value of exactly 127.4 divided in and then rounded gives 127 and is fine,
-  but that reasoning is not what the proof says. This is the same family of gap as the IEEE-754
-  rounding limitation above, one level further down.
+  the kernel's `forall i. round(input[i]/scale)`). Quantified Real `forall` equality and
+  inequality over `round` (e.g. `forall t in 0.0..1.0 { round(t) == t }` or `round(t) <= 1.0`)
+  is now **decidable** via `define-fun round = to_real(to_int(x + 0.5))` under `AUFLIRA`:
+  the `to_int`/`to_real` bridge forces round's range to integers, so Z3 reasons about `round`
+  via theory combination instead of quantifier e-matching. The `AUFLIRA` logic (not `UFLIA`)
+  is selected whenever a quantified `forall` body mentions `round` over a Real float range,
+  emitted via `round_define_fun()`. Bound-path obligations (kernel tensor bounds)
+  use UFLIA + bounding axiom since UFLIA has no `to_int`/`to_real`. Free-argument
+  round-equality (`round(v) == w` with `v` free, including the tie `round(v) == v`) is
+  decidable (refuted) by the ground bound. The consequence for the quantiser is unchanged:
+  the stated range `abs(input[i] / scale) <= 127` constrains the **division**, the ideal
+  scale, not the rounded quotient. A value of exactly 127.4 divided in and then rounded
+  gives 127 and is fine, but that reasoning is not what the proof says. This is the same
+  family of gap as the IEEE-754 rounding limitation above, one level further down.
 
 - **`naso verify` is not a subcommand of `naso`; it is the `naso-verify` binary.**
   `naso-verify` depends on `naso-compiler` (it parses and lowers the AST), so the compiler

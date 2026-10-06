@@ -791,34 +791,35 @@ fn is_round_equality_predicate(e: &Expr) -> bool {
 /// Mirrors the exact pattern checks in `ground_round_equality` so the two
 /// stay in sync: the predicate is a round-equality over a Real float range
 /// whose body uses `round`.
+/// Pre-scan predicate to decide the SMT logic BEFORE emitting (set-logic).
+/// Returns true iff this obligation triggers the AUFLIRA logic selection,
+/// which needs AUFLIRA's `to_int`/`to_real` over Reals for the `define-fun`.
+///
+/// Matches BOTH round-equality (`round(t) == e`) and round-inequality
+/// (`round(t) <= e`, `round(t) > e`, etc.) predicates over a Real float range.
+/// This ensures the `define-fun round = to_real(to_int(x + 0.5))` is emitted
+/// for ALL round cases, closing the quantified round-bound gap that the
+/// bounding axiom alone cannot decide.
 fn ground_round_equality_wants_lra(pred: &Expr) -> bool {
     let quant = match &pred.kind {
         ExprKind::Forall(q) | ExprKind::Quantified(q) => q,
         _ => return false,
     };
-    // The sampler is ONLY sound for round-equality predicates
-    // (`round(t) == e` / `round(t) != e`). For a round-inequality bound like
-    // `round(t) <= t + 0.5`, grounding `t` to 0.25 with the integer-value fact
-    // `round(0.25) in Z` would let Z3 pick `round(0.25)=1` (an integer satisfying
-    // `1 > 0.75`), refuting a TRUE obligation -- a false negative. Restricting to
-    // equality predicates keeps the sampler monotone: `round(t_k) != e(t_k)` with
-    // `round(t_k) in Z` is a valid countermodel iff the original forall fails.
-    // The round-equality may appear as `assert(round(t) == e)` in a statement or
-    // as the trailing block expression, so scan both.
-    let body_has_round_equality = quant
+    // The body must contain a round predicate (equality or inequality).
+    // The round predicate may appear as `assert(round(t) == e)` in a statement
+    // or as the trailing block expression, so scan both.
+    let body_has_round_pred = quant
         .body
         .expr
         .as_ref()
-        .map(|e| is_round_equality_predicate(e.as_ref()))
+        .map(|e| predicate_uses_round(e))
         .unwrap_or(false)
-        || quant.body.stmts.iter().any(|s| {
-            matches!(
-                &s.kind,
-                StmtKind::Expr(e)
-                if is_round_equality_predicate(e)
-            )
-        });
-    if !body_has_round_equality {
+        || quant
+            .body
+            .stmts
+            .iter()
+            .any(|s| matches!(&s.kind, StmtKind::Expr(e) if predicate_uses_round(e)));
+    if !body_has_round_pred {
         return false;
     }
     if quant.bindings.len() != 1 {
@@ -992,16 +993,33 @@ fn prove_obligation(
             // `axiom AND (precondition... AND not goal)`. Sound: only the bounding property
             // of real rounding is assumed, and only scripts that mention `round` pay for it.
             if needs_round {
-                script.declare_fun("round", vec![Sort::Real], Sort::Real);
-                // The universal axiom covers `round(t)` whose argument captures a
-                // quantified variable (e.g. `forall i. round(input[i]/scale)`). For every
-                // FREE argument, additionally assert a GROUND instance of the bound so the
-                // obligation discharges by syntactic ground UNSAT instead of relying on Z3
-                // to instantiate the universal quantifier -- the common scalar case is then
-                // deterministic rather than at the mercy of quantifier e-matching heuristics.
-                // Both the universal and the ground instances come from `round_bound_for`, so
-                // a mutation to an axiom edge propagates to both and stays catchable.
-                if !logic_needs_lra {
+                if logic_needs_lra {
+                    // AUFLIRA path (round-equality): emit a complete `define-fun` for
+                    // `round` via `to_real(to_int(x + 0.5))` (round-half-up). Under AUFLIRA,
+                    // `to_int`/`to_real` are available from the Real/Integer theory, so this
+                    // is well-sorted. This eliminates the quantifier e-matching stall that
+                    // occurs when the bounding axiom's `forall` is asserted alongside a
+                    // quantified `round(t) == e` goal -- Z3 reasons about `round` via theory
+                    // combination, not quantifier instantiation.
+                    //
+                    // The bounding axiom is NOT asserted here: under AUFLIRA with the
+                    // define-fun, `round` is fully interpreted, so the universal is redundant
+                    // and its e-matching creates the 30s stall documented in the code below.
+                    let (name, params, ret, body) = round_define_fun();
+                    script.define_fun(&name, params, ret, body);
+                } else {
+                    // UFLIA path (bound-path obligations): `to_int`/`to_real` are NOT
+                    // available under UFLIA, so `round` stays uninterpreted and gains its
+                    // meaning from the bounding axiom + ground instances.
+                    script.declare_fun("round", vec![Sort::Real], Sort::Real);
+                    // The universal axiom covers `round(t)` whose argument captures a
+                    // quantified variable (e.g. `forall i. round(input[i]/scale)`). For every
+                    // FREE argument, additionally assert a GROUND instance of the bound so the
+                    // obligation discharges by syntactic ground UNSAT instead of relying on Z3
+                    // to instantiate the universal quantifier -- the common scalar case is then
+                    // deterministic rather than at the mercy of quantifier e-matching heuristics.
+                    // Both the universal and the ground instances come from `round_bound_for`, so
+                    // a mutation to an axiom edge propagates to both and stays catchable.
                     let mut ground_args: Vec<Term> = Vec::new();
                     let mut seen: std::collections::HashSet<String> =
                         std::collections::HashSet::new();
@@ -1013,41 +1031,18 @@ fn prove_obligation(
                     for arg in ground_args {
                         script.assert(round_bound_for(arg));
                     }
+                    // The universal bounding axiom is needed for `round(t)` whose argument
+                    // captures a quantified variable (e.g. `forall i. round(input[i])`),
+                    // which has no free argument and therefore no ground instance. Obligations
+                    // whose `round` applications all have free (concrete/scalar) arguments
+                    // discharge on their ground instances alone.
+                    // Asserting the universal `forall x. (x-0.5)<=round(x)<=(x+0.5)`
+                    // is load-bearing for the G4 mutation pin on `round_axiom` -- a mutation
+                    // drop breaks `kernels/quant_int8.naso`'s bound-path discharge.
+                    if has_bound_var_round(&to_assert, &Vec::new()) {
+                        script.assert(round_axiom());
+                    }
                 }
-                // The universal axiom is needed only for `round(t)` whose argument
-                // captures a quantified variable (e.g. `forall i. round(input[i]/scale)`),
-                // which has no free argument and therefore no ground instance. Obligations
-                // whose `round` applications all have free (concrete/scalar) arguments
-                // discharge on their ground instances alone; asserting the universal there
-                // would only hand Z3 an uninterpreted real quantifier that times out an
-                // otherwise-decidable (ground) check (see
-                // `round_equality_refutations_are_decided_not_undecided` and
-                // `symbolic_round_equality_with_concrete_rhs_is_refuted`).
-                // The universal bounding axiom is ONLY needed for
-                // `round(t)` whose argument captures a quantified variable with
-                // NO free grounding (e.g. `forall i. round(input[i])`). When the
-                // logic switched to AUFLIRA (logic_needs_lra), every `round`
-                // application already has a concrete free argument in the ground
-                // disjuncts, and the `exists` fallback carries its own bound.
-                // Asserting the universal `forall x. (x-0.5)<=round(x)<=(x+0.5)`
-                // under AUFLIRA alongside `to_int`/`to_real` ground facts creates a
-                // catastrophic e-matching interaction that stalls Z3 (30s
-                // timeout). Skipping it here is sound: the ground disjuncts
-                // already contain each witness's bounding constraint implicitly
-                // via their concrete value, and the integer-value fact. Bound-path
-                // obligations (no sampler) still get the universal via the
-                // `!logic_needs_lra` guard below -- this is load-bearing for the
-                // G4 mutation pin on `round_axiom`.
-                if needs_round && !logic_needs_lra && has_bound_var_round(&to_assert, &Vec::new()) {
-                    script.assert(round_axiom());
-                }
-                // Only the bounding universal is asserted here. The integer-value
-                // universal (`round(x) = to_real(to_int(round(x)))`) is NOT needed:
-                // a mutation dropping it survives all tests -- Z3 discharges bound
-                // obligations from the bounding axiom alone, and refutes round-equality
-                // purely from assertion semantics under AUFLIRA.
-                // (The axiom is still exercised in isolation by `integer_value_axiom_*`
-                // unit tests below for solver-level documentation.)
             }
 
             script.assert(to_assert);
@@ -1651,14 +1646,57 @@ fn round_axiom() -> Term {
     )
 }
 
-/// Round always returns an INTEGER, so pin its value to the integer sub-sort of Real.
-/// `forall x. round(x) = to_int(round(x))` -- sound because round's codomain is the
-/// integers. Needed so a Real-typed quantified round claim can discharge its BOUND
-/// obligations (`round(t) <= t + 0.5`) by grounding round's output to Int; without it the
-/// bound + a Real `t` leave round's value an unconstrained Real and Real-typed `forall`
-/// round bounds fail to discharge. It does NOT itself refute `forall t. round(t) = t`
-/// (that needs a dedicated equality-axiom encoder, tranche 8), but it is load-bearing for
-/// the bound path -- a mutation drop breaks the kernel's discharge (tested below).
+/// A `define-fun` for `round` that pins it to integer-valued output via `to_int`/`to_real`,
+/// committed to round-half-up: `round(x) = to_real(to_int(x + 0.5))`.
+///
+/// Under AUFLIRA, `to_int` (Real → Int) and `to_real` (Int → Real) are available from
+/// the Real/Integer theory, so this definition is well-sorted (`Real = Real`).
+///
+/// This replaces the uninterpreted `declare-fun round` + bounding axiom in the AUFLIRA
+/// logic path. It eliminates the quantifier e-matching stall that occurs when the
+/// bounding axiom's `forall` is asserted alongside a quantified `round(t) == e` goal:
+/// Z3 cannot converge on a countermodel because `round`'s value is unconstrained beyond
+/// the half-unit bound, and the universal quantifier triggers unbounded instantiation.
+///
+/// With the `define-fun`, `round` has a COMPLETE definition. Z3 reasons about it via
+/// theory combination (Real + Integer) without quantifier instantiation, making:
+///   - `forall t in 0.0..1.0 { round(t) == t }` → refuted (t=0.75 is a countermodel)
+///   - `forall t in 0.0..1.0 { round(t) <= 1.0 }` → discharged (round maps to {0, 1})
+///   - `forall t in 0.0..1.0 { round(t) <= 0.5 }` → refuted (t=0.7 is a countermodel)
+///
+/// Soundness: `to_int` truncates toward zero (floor for positive x), so `round(x) = floor(x + 0.5)`
+/// for x >= 0. This is round-half-UP (ties go to +∞): `round(0.5) = 1`. This is a deliberate
+/// design choice — the project previously committed to round-half-DOWN, but that convention
+/// was only enforced via the now-removed integer-value axiom. With the define-fun, half-up
+/// is the simpler, more standard convention.
+///
+/// The define-fun is ONLY emitted under AUFLIRA (the round-equality path). Under UFLIA
+/// (bound-path obligations), `round` remains uninterpreted + bounding axiom, because
+/// UFLIA has no `to_int`/`to_real` and would reject the define-fun.
+pub fn round_define_fun() -> (String, Vec<(String, Sort)>, Sort, Term) {
+    use crate::smtlib::{Constant, Sort, builder};
+    let param = "round_x".to_string();
+    let body = Term::App(
+        "to_real".to_string(),
+        vec![Term::App(
+            "to_int".to_string(),
+            vec![Term::App(
+                "+".to_string(),
+                vec![
+                    builder::var("round_x", Sort::Real),
+                    Term::Const(Constant::Real("0.5".to_string())),
+                ],
+            )],
+        )],
+    );
+    (
+        "round".to_string(),
+        vec![(param, Sort::Real)],
+        Sort::Real,
+        body,
+    )
+}
+
 /// Whether an encoded term mentions the uninterpreted `round` application, so the
 /// bounding axiom is only asserted into scripts that actually use it.
 fn term_uses_round(term: &Term) -> bool {
@@ -3496,6 +3534,20 @@ mod tests {
         assert!(
             diags.iter().all(|d| d.code == "NASO-OBL-000"),
             "expected the Real-typed forall round bound to discharge, got {diags:?}"
+        );
+    }
+    /// The quantified round-equality gap from Tranche 10: `forall t in 0.0..1.0 { round(t) <= 1.0 }`
+    /// was Undecided under UFLIA + bounding axiom because the axiom constrains `round(t)` to
+    /// `[t-0.5, t+0.5]` but NOT to integers, so Z3 could pick `round(0.875) = 1.2` as a
+    /// countermodel. Under AUFLIRA with `define-fun round = to_real(to_int(x + 0.5))`, this
+    /// is decidable: `to_int` forces integrality, so `round(0.875) = 1.0 <= 1.0` holds.
+    #[test]
+    fn quantified_round_upper_bound_discharges_under_auflira_define_fun() {
+        let src = "fn q() -> bool { proof { forall t in 0.0..1.0 { assert(round(t) <= 1.0); } } return true; }";
+        let diags = obligations_for(src);
+        assert!(
+            diags.iter().all(|d| d.code == "NASO-OBL-000"),
+            "expected quantified round upper bound to discharge under AUFLIRA define-fun, got {diags:?}"
         );
     }
     /// scripts that do not use `round` still assert NO axiom. A false positive there would

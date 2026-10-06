@@ -399,3 +399,37 @@ fn a_true_round_equality_discharges_under_universal_axiom() {
         r.stdout
     );
 }
+
+#[test]
+fn round_equality_refutes_within_timeout_under_auflira() {
+    // DISCRIMINATING PIN for `ground_round_equality_wants_lra` (the AUFLIRA pre-scan
+    // logic switch). `round(t) == t` is FALSE for any t in (0, 1) (e.g. t=0.25 -> round(0.25)=0).
+    // Under AUFLIRA (selected by the pre-scan for round-equality), Z3 refutes by treating
+    // `round` as uninterpreted -- it finds a model where round(t) != t. Exit 1, fast.
+    //
+    // Under UFLIA (mutation A: forcing `logic_needs_lra = false`), Z3 cannot e-match on
+    // the universal integer-value axiom, so it times out -- exit 2, not exit 1. The 5s
+    // timeout makes this a discriminating case: if the pre-scan stopped selecting AUFLIRA,
+    // this test would flip from exit 1 to exit 2, killing the mutant immediately.
+    //
+    // This pins the logic switch as load-bearing at the CLI level (not just the lib level).
+    let r = verify(
+        "fn check_round_eq() -> Bool { proof { forall t in 0.0..1.0 { assert(round(t) == t); } } return true; }\n",
+        &["--mode", "obligations", "--timeout", "5000", "--require-obligations"],
+    );
+    assert_eq!(
+        r.code, 1,
+        "round-equality must REFUTE (exit 1) within 5s under AUFLIRA, not time out (exit 2). stdout:\n{}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("NASO-OBL-001"),
+        "the refutation must be reported as NASO-OBL-001, got:\n{}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("1 refuted"),
+        "exactly 1 obligation must be reported as refuted, got:\n{}",
+        r.stdout
+    );
+}

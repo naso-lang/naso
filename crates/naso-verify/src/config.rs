@@ -18,6 +18,9 @@ pub enum Logic {
     QF_AUFLIA,
     /// Full first-order with linear integer arithmetic (with quantifiers)
     AUFLIA,
+    /// Full first-order with mixed real/integer arithmetic + arrays + UF (quantifiers).
+    /// Needed for `to_int`/`to_real` reasoning over bounded reals.
+    AUFLIRA,
     /// Non-linear arithmetic
     QF_NRA,
 }
@@ -30,6 +33,7 @@ impl Logic {
             Logic::QF_BV => "QF_BV",
             Logic::QF_AUFLIA => "QF_AUFLIA",
             Logic::AUFLIA => "AUFLIA",
+            Logic::AUFLIRA => "AUFLIRA",
             Logic::QF_NRA => "QF_NRA",
         }
     }
@@ -42,9 +46,10 @@ impl Logic {
             "QF_BV" => Ok(Logic::QF_BV),
             "QF_AUFLIA" => Ok(Logic::QF_AUFLIA),
             "AUFLIA" => Ok(Logic::AUFLIA),
+            "AUFLIRA" => Ok(Logic::AUFLIRA),
             "QF_NRA" => Ok(Logic::QF_NRA),
             other => Err(format!(
-                "Unknown SMT logic: {}. Use QF_UFLIA, QF_BV, QF_AUFLIA, AUFLIA, or QF_NRA",
+                "Unknown SMT logic: {}. Use QF_UFLIA, QF_BV, QF_AUFLIA, AUFLIA, AUFLIRA, or QF_NRA",
                 other
             )),
         }

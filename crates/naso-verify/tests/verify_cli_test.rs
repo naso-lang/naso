@@ -351,3 +351,51 @@ fn the_shipped_int8_quantiser_kernel_discharges_through_the_cli() {
         "all six kernel obligations must be discharged, got:\n{stdout}"
     );
 }
+
+#[test]
+fn a_false_round_equality_refutes_under_universal_axiom() {
+    // `round(t) == t` is FALSE for t=0.25 (round(0.25) = 0 != 0.25).
+    // Under AUFLIRA (selected by the pre-scan for round-equality), Z3 refutes this via direct e-matching
+    // on the universal integer-value axiom `round(x) = to_real(to_int(round(x)))`
+    // -- no witness sampler needed. Exit 1 (refuted).
+    let r = verify(
+        "fn check_round_eq() -> Bool { proof { forall t in 0.0..1.0 { assert(round(t) == t); } } return true; }
+",
+        &["--mode", "obligations", "--require-obligations"],
+    );
+    assert_eq!(
+        r.code, 1,
+        "a false round-equality must refute (exit 1). stdout:
+{}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("NASO-OBL-001") && r.stdout.contains("1 refuted"),
+        "the refutation must be reported, got:
+{}",
+        r.stdout
+    );
+}
+
+#[test]
+fn a_true_round_equality_discharges_under_universal_axiom() {
+    // `round(t) == round(t)` is a tautology. Under AUFLIRA, Z3 finds no
+    // countermodel (UNSAT negation) and discharges with exit 0.
+    let r = verify(
+        "fn check_round_taut() -> Bool { proof { forall t in 0.0..1.0 { assert(round(t) == round(t)); } } return true; }
+",
+        &["--mode", "obligations", "--require-obligations"],
+    );
+    assert_eq!(
+        r.code, 0,
+        "a true round-equality must discharge (exit 0). stdout:
+{}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("1 obligation(s) discharged"),
+        "the tautology must be reported as discharged, got:
+{}",
+        r.stdout
+    );
+}

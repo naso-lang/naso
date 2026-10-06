@@ -736,46 +736,6 @@ fn stmt_uses_round(s: &Stmt) -> bool {
     matches!(&s.kind, StmtKind::Expr(e) if predicate_uses_round(e))
 }
 
-/// True when `e` is a round-equality predicate: a binary `==`/`!=` whose
-/// left or right operand mentions `round`. This gates the logic selection so it
-/// only fires on genuine round-equality obligations (`forall t. round(t) == e`),
-/// never on round-inequality bounds like `round(t) <= t + 0.5` (which would
-/// admit spurious countermodels when grounded — see `ground_round_equality_wants_lra`).
-fn is_round_equality_predicate(e: &Expr) -> bool {
-    match &e.kind {
-        ExprKind::Binary(op, l, r) => {
-            (*op == BinOp::Eq || *op == BinOp::Ne)
-                && (predicate_uses_round(l) || predicate_uses_round(r))
-        }
-        ExprKind::Unary(_, inner) => is_round_equality_predicate(inner.as_ref()),
-        // Recurse into the body of a quantified predicate.
-        ExprKind::Forall(q) | ExprKind::Quantified(q) => {
-            q.body
-                .expr
-                .as_ref()
-                .map(|e| is_round_equality_predicate(e.as_ref()))
-                .unwrap_or(false)
-                || q.body.stmts.iter().any(|s| {
-                    matches!(
-                        &s.kind,
-                        StmtKind::Expr(e)
-                        if is_round_equality_predicate(e)
-                    )
-                })
-        }
-        // Unwrap `assert(e)` / `assume(e)` wrappers so the equality inside is seen.
-        ExprKind::Call(callee, args) => {
-            if matches!(&callee.kind, ExprKind::Var(v) if v.name == "assert" || v.name == "assume")
-            {
-                args.iter().any(is_round_equality_predicate)
-            } else {
-                false
-            }
-        }
-        _ => false,
-    }
-}
-
 /// Ground-witness expansion for a round-equality quantified obligation.
 ///
 /// For `forall t in lo..hi { round(t) == e }` (or `!=`), the solver must find a
@@ -3455,6 +3415,7 @@ mod tests {
     ///    round-half-down) and is refuted -- soundly -- by the countermodel `round(0.5)=0`.
     ///    The universal axiom is NOT asserted for these (the argument is free), so Z3
     ///    decides them by ground SAT instead of timing out on the real quantifier.
+    ///
     /// Free-argument round-equality is decidable (refuted) for any RHS shape:
     /// `round(v) == 4.5` (concrete RHS) and `round(v) == v` (symbolic RHS = v) both refute
     /// by a ground countermodel. The only Undecided case is a quantified `forall` whose

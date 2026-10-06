@@ -180,9 +180,15 @@ fn check_let(checker: &mut TypeChecker, let_stmt: &LetStmt) -> Result<(), TypeEr
         }
     }
 
-    // If explicit type annotation, check against it
+    // If explicit type annotation, unify against the already-inferred type.
+    //
+    // Do NOT call `check_expr` here. `check_expr` calls `infer_expr` again on the
+    // same expression, which for a consuming quantum operation like `measure(q)`
+    // tries to consume the qubit a SECOND time — the first `infer_expr` (above)
+    // already moved it, so the second hits `use of moved value`. Unifying the
+    // inferred type against the annotation is cheaper and avoids the double-use.
     if let Some(ann_ty) = &let_stmt.ty {
-        checker.check_expr(&let_stmt.value, ann_ty)?;
+        unify::unify_types(checker, &init_ty, ann_ty)?;
     }
 
     // Bind each variable in the pattern (use pattern quantity for each binding)

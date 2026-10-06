@@ -632,9 +632,12 @@ fn main() -> Int {
     cnot(q2, carry);
     cnot(q3, carry);
 
-    // Measure results (consumes sum and carry - each used exactly once)
+    // Measure and free all qubits (each consumed exactly once)
     let s: Bool = measure(sum);
     let c: Bool = measure(carry);
+    let _a: Bool = measure(q1);
+    let _b: Bool = measure(q2);
+    let _d: Bool = measure(q3);
 
     if s { 1 } else { 0 } + if c { 2 } else { 0 }
 }

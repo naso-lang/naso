@@ -1,4 +1,4 @@
-name: Deploy NasoChat to GitHub Pages
+name: Deploy to GitHub Pages
 
 on:
   push:
@@ -14,6 +14,10 @@ concurrency:
   group: "pages"
   cancel-in-progress: true
 
+env:
+  # The repo is served from a /naso/ subpath on GitHub Pages.
+  BASE_URL: /naso/
+
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
@@ -26,31 +30,65 @@ jobs:
         with:
           node-version: 20
           cache: 'npm'
-          # The npm project lives in app/, not at the repo root. Without this,
-          # setup-node looks for a lockfile in the root and aborts the job.
-          cache-dependency-path: app/package-lock.json
+          cache-dependency-path: |
+            app/package-lock.json
+            play/package-lock.json
 
-      # There is no root package.json; this is not a monorepo workspace root.
-      # Install and build from app/ directly.
-      - name: Install Dependencies
-        run: npm ci
-        working-directory: app
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
 
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Install Hugo
+        uses: regen100/hugo-install-action@v2
+        with:
+          hugo-version: "0.146.0"
+
+      # ---- 1. Build the docs site (Hugo) ----
+      - name: Build docs site
+        run: hugo --gc --minify --baseURL "${{ env.BASE_URL }}docs/"
+        working-directory: docs
+
+      # ---- 2. Build the playground site (Vite + wasm-pack) ----
+      - name: Build wasm playground module
+        run: wasm-pack build ../crates/nasoc-wasm --target web --out-dir ../../play/pkg
+        working-directory: play
+
+      - name: Build playground site
+        run: npm ci && npm run build
+        working-directory: play
+        env:
+          VITE_BASE_URL: ${{ env.BASE_URL }}play/
+          VITE_DOCS_BASE_URL: ${{ env.BASE_URL }}docs/
+
+      # ---- 3. Build the app (Nuxt 3) ----
       - name: Inject COOP/COEP ServiceWorker for SharedArrayBuffer
         run: |
-          # app/public is gitignored, so it does not exist in a fresh checkout.
           mkdir -p app/public
           curl -sL https://raw.githubusercontent.com/gzuidhof/coi-serviceworker/master/coi-serviceworker.js -o app/public/coi-serviceworker.js
 
       - name: Generate Nuxt 3 Static Site
-        run: npm run generate
+        run: npm ci && npm run generate
         working-directory: app
         env:
-          # GitHub Pages serves this repo from a /naso/ subpath, so the
-          # generated asset and router paths have to be prefixed. Without
-          # this the site builds fine but every asset 404s in production.
-          # Netlify and local dev leave it unset and serve from the root.
-          NUXT_APP_BASE_URL: /naso/
+          NUXT_APP_BASE_URL: ${{ env.BASE_URL }}app/
+          NUXT_PUBLIC_BASE_URL: ${{ env.BASE_URL }}app/
+
+      # ---- 4. Assemble all three into a single pages directory ----
+      - name: Assemble pages directory
+        run: |
+          mkdir -p pages/docs pages/play pages/app
+          # Copy Hugo output
+          cp -r docs/public/* pages/docs/
+          # Copy Vite output
+          cp -r play/dist/* pages/play/
+          # Copy Nuxt output
+          cp -r app/.output/public/* pages/app/
+          # Create a top-level index.html redirect
+          printf '%s\n' '<!DOCTYPE html>' '<html>' '<head><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=./docs/"><link rel="canonical" href="./docs/"><title>Naso</title></head>' '<body><p>Redirecting to <a href="./docs/">documentation</a>...</p><ul><li><a href="./docs/">Documentation</a></li><li><a href="./play/">Playground</a></li><li><a href="./app/">App</a></li></ul></body>' '</html>' > pages/index.html
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
@@ -58,7 +96,7 @@ jobs:
       - name: Upload Pages Artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: app/.output/public
+          path: pages
 
       - name: Deploy to GitHub Pages
         id: deployment

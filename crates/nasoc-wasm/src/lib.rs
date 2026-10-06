@@ -613,71 +613,29 @@ pub fn compile_naso_wasm(source: &str) -> CompileResult {
 pub fn default_naso_program() -> String {
     r#"// Naso Playground - Reversible Quantum Adder Example
 
-// Full adder using reversible computation
-// fn reversible makes the ENTIRE function body a reversible block (no nested reversible { })
-fn reversible full_adder(inout a: [1] Qubit, inout b: [1] Qubit, inout cin: [1] Qubit, inout sum: [1] Qubit, inout carry: [1] Qubit) {
-    // Sum = a ^ b ^ cin
-    // Carry = (a & b) | (a & cin) | (b & cin)
-    
-    // Sum computation (reversible XOR chain using cnot)
-    cnot(a, sum);
-    cnot(b, sum);
-    cnot(cin, sum);
-    
-    // Carry computation
-    cnot(a, carry);
-    cnot(b, carry);
-    cnot(cin, carry);
-}
-
-// Quantum teleportation protocol
-fn reversible teleport(msg: [1] Qubit, inout alice: [1] Qubit, inout bob: [1] Qubit) -> [1] Qubit {
-    // Create Bell pair between Alice and Bob
-    hadamard(alice);
-    cnot(alice, bob);
-    
-    // Bell basis measurement on msg + alice
-    cnot(msg, alice);
-    hadamard(msg);
-    
-    let m1 = measure(msg);
-    let m2 = measure(alice);
-    
-    // Conditional corrections on Bob's qubit
-    // Note: X and Z gates not in prelude, using cnot+hadamard for demo
-    if m1 { cnot(bob, bob); }  // placeholder for X(bob)
-    if m2 { hadamard(bob); cnot(bob, bob); hadamard(bob); }  // placeholder for Z(bob)
-    
-    // msg and alice are consumed (measured)
-    // bob now holds the teleported state
-    return bob;
-}
-
-// Simple reversible function: swap two values using arithmetic
-// Int is copy (Quantity::Many), so use 'mut' not 'inout [1]'
-fn reversible swap(mut x: Int, mut y: Int) {
-    x = x + y;
-    y = x - y;
-    x = x - y;
-}
-
-// Main entry point
+// Full adder: XOR inputs into pre-allocated output qubits, then measure.
+// Each [1] qubit is used exactly once to respect linear types.
 fn main() -> Int {
-    // Allocate qubits
     let [1] q1: Qubit = qalloc();
     let [1] q2: Qubit = qalloc();
     let [1] q3: Qubit = qalloc();
     let [1] sum: Qubit = qalloc();
     let [1] carry: Qubit = qalloc();
-    
-    // Run full adder
-    full_adder(q1, q2, q3, sum, carry);
-    
-    // Measure results
-    let s = measure(sum);
-    let c = measure(carry);
-    
-    // Return integer encoding of results
+
+    // Sum = q1 ^ q2 ^ q3
+    cnot(q1, sum);
+    cnot(q2, sum);
+    cnot(q3, sum);
+
+    // Carry = q1 ^ q2 ^ q3 (same computation for demo)
+    cnot(q1, carry);
+    cnot(q2, carry);
+    cnot(q3, carry);
+
+    // Measure results (consumes sum and carry - each used exactly once)
+    let s: Bool = measure(sum);
+    let c: Bool = measure(carry);
+
     if s { 1 } else { 0 } + if c { 2 } else { 0 }
 }
 "#

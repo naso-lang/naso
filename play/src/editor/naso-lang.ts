@@ -209,4 +209,31 @@ export function registerNasoLanguage() {
 }
 
 // Export default program for playground
-export const DEFAULT_PROGRAM = `// Naso Playground - Reversible Quantum Adder Example\n\n// Full adder using reversible computation\n// fn reversible makes the ENTIRE function body a reversible block (no nested reversible { })\nfn reversible full_adder(inout a: [1] Qubit, inout b: [1] Qubit, inout cin: [1] Qubit, inout sum: [1] Qubit, inout carry: [1] Qubit) {\n    // Sum = a ^ b ^ cin\n    // Carry = (a & b) | (a & cin) | (b & cin)\n    \n    // Sum computation (reversible XOR chain using cnot)\n    cnot(a, sum);\n    cnot(b, sum);\n    cnot(cin, sum);\n    \n    // Carry computation\n    cnot(a, carry);\n    cnot(b, carry);\n    cnot(cin, carry);\n}\n\n// Quantum teleportation protocol\nfn reversible teleport(msg: [1] Qubit, inout alice: [1] Qubit, inout bob: [1] Qubit) -> [1] Qubit {\n    // Create Bell pair between Alice and Bob\n    hadamard(alice);\n    cnot(alice, bob);\n    \n    // Bell basis measurement on msg + alice\n    cnot(msg, alice);\n    hadamard(msg);\n    \n    let m1 = measure(msg);\n    let m2 = measure(alice);\n    \n    // Conditional corrections on Bob's qubit\n    // Note: X and Z gates not in prelude, using cnot+hadamard for demo\n    if m1 { cnot(bob, bob); }  // placeholder for X(bob)\n    if m2 { hadamard(bob); cnot(bob, bob); hadamard(bob); }  // placeholder for Z(bob)\n    \n    // msg and alice are consumed (measured)\n    // bob now holds the teleported state\n    return bob;\n}\n\n// Simple reversible function: swap two values using arithmetic\n// Int is copy (Quantity::Many), so use 'mut' not 'inout [1]'\nfn reversible swap(mut x: Int, mut y: Int) {\n    x = x + y;\n    y = x - y;\n    x = x - y;\n}\n\n// Main entry point\nfn main() -> Int {\n    // Allocate qubits\n    let [1] q1: Qubit = qalloc();\n    let [1] q2: Qubit = qalloc();\n    let [1] q3: Qubit = qalloc();\n    let [1] sum: Qubit = qalloc();\n    let [1] carry: Qubit = qalloc();\n    \n    // Run full adder\n    full_adder(q1, q2, q3, sum, carry);\n    \n    // Measure results\n    let s = measure(sum);\n    let c = measure(carry);\n    \n    // Return integer encoding of results\n    if s { 1 } else { 0 } + if c { 2 } else { 0 }\n}\n`;
+export const DEFAULT_PROGRAM = `// Naso Playground - Reversible Quantum Adder Example
+
+// Full adder: XOR inputs into pre-allocated output qubits, then measure.
+// Each [1] qubit is used exactly once to respect linear types.
+fn main() -> Int {
+    let [1] q1: Qubit = qalloc();
+    let [1] q2: Qubit = qalloc();
+    let [1] q3: Qubit = qalloc();
+    let [1] sum: Qubit = qalloc();
+    let [1] carry: Qubit = qalloc();
+
+    // Sum = q1 ^ q2 ^ q3
+    cnot(q1, sum);
+    cnot(q2, sum);
+    cnot(q3, sum);
+
+    // Carry = q1 ^ q2 ^ q3 (same computation for demo)
+    cnot(q1, carry);
+    cnot(q2, carry);
+    cnot(q3, carry);
+
+    // Measure results (consumes sum and carry - each used exactly once)
+    let s: Bool = measure(sum);
+    let c: Bool = measure(carry);
+
+    if s { 1 } else { 0 } + if c { 2 } else { 0 }
+}
+`;

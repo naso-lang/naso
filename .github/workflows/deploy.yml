@@ -61,8 +61,7 @@ jobs:
         run: npm ci && npm run build
         working-directory: play
         env:
-          VITE_BASE_URL: ${{ env.BASE_URL }}play/
-          VITE_DOCS_BASE_URL: ${{ env.BASE_URL }}docs/
+          BASE_URL: ${{ env.BASE_URL }}play/
 
       # ---- 3. Build the app (Nuxt 3) ----
       - name: Inject COOP/COEP ServiceWorker for SharedArrayBuffer

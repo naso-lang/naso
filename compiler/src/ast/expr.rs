@@ -114,6 +114,8 @@ pub enum ExprKind {
     QuantumOp(QuantumOp),
     /// Type ascription
     Ascribe(Box<Expr>, crate::ast::ty::Type),
+    /// Range expression `start..end` (exclusive)
+    Range(Box<Expr>, Box<Expr>),
     /// Error placeholder
     Error,
 }
@@ -230,6 +232,24 @@ pub struct ForallLoop {
     /// Multiple loop bindings: (var, lower, upper)
     pub bindings: Vec<(Ident, Expr, Expr)>,
     pub body: crate::ast::Block,
+    pub span: Span,
+}
+
+/// Reduction expression: `reduce_sum!(init, k, lo..hi, body)`
+///
+/// `var` is the accumulator variable name, `init` is the initial value,
+/// `iter` is the loop bound (Range or count), and `body` is the per-iteration
+/// expression that's added to (or compared against) the accumulator.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReduceExpr {
+    /// Accumulator variable name (e.g. "sum")
+    pub var: Ident,
+    /// Initial value of the accumulator
+    pub init: Expr,
+    /// Loop binding: (loop_var, lower, upper)
+    pub binding: (Ident, Expr, Expr),
+    /// Per-iteration expression (added to accumulator for sum, compared for max)
+    pub body: Expr,
     pub span: Span,
 }
 
@@ -387,6 +407,7 @@ impl fmt::Display for ExprKind {
             ExprKind::Let(b) => write!(f, "let {:?} = {:?}", b.name, b.value),
             ExprKind::Reversible(_) => write!(f, "reversible {{ ... }}"),
             ExprKind::QuantumOp(q) => write!(f, "quantum {:?}", q),
+            ExprKind::Range(lo, hi) => write!(f, "{:?}..{:?}", lo, hi),
             ExprKind::Error => write!(f, "<error>"),
             _ => write!(f, "<expr>"),
         }

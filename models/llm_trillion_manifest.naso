@@ -1,0 +1,26 @@
+// Trillion-parameter LLM model manifest
+//
+// Architecture: MoE transformer with 64 experts
+// - Context length: 4096 tokens (paged KV cache, 128 tokens/page)
+// - Hidden size: 8192
+// - Intermediate size (FFN): 28672
+// - Attention heads: 64
+// - Experts: 64 (2 active per token via top-2 routing)
+// - Layers: 32
+//
+// Storage footprint at 8-bit (quint8):
+// - Each parameter = 1 byte (packed 4-per-u32)
+// - 1T params / 4 per u32 = 250M u32 values = ~926 GB full model
+// - With sparse activation (2/64 experts): ~940M params active = ~940 MB
+// - Paged KV cache (8 pages max, 128 tokens/page): ~16 MB
+//
+// Kernels:
+// - ffn_expert_a/b: quantized FFN matmul per expert
+// - attention_qkv/o: quantized QKV projection and output projection
+// - moe_router: routing scores from input to 64 experts
+// - kv_read: dequantize KV page for attention computation
+// - kv_attention_scores: QK dot-product with KV cache
+
+import "models/llama_trillion.naso";
+import "models/attention_moe.naso";
+import "models/kv_cache.naso";

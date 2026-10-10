@@ -375,6 +375,12 @@ pub mod walk {
                 }
                 walk_block(visitor, &loop_.body)
             }
+            ExprKind::Range(lo, hi) => {
+                if visitor.visit_expr(lo)? == VisitOutcome::Stop {
+                    return Ok(VisitOutcome::Stop);
+                }
+                visitor.visit_expr(hi)
+            }
             ExprKind::Forall(loop_) => {
                 for (_, lower, upper) in &loop_.bindings {
                     if visitor.visit_expr(lower)? == VisitOutcome::Stop {
@@ -521,6 +527,7 @@ pub mod walk {
             | TypeKind::String
             | TypeKind::Char
             | TypeKind::Nat
+            | TypeKind::Quint8
             | TypeKind::Qubit
             | TypeKind::Universe(_)
             | TypeKind::Var(_)

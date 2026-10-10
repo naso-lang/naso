@@ -1,0 +1,116 @@
+// Matmul kernel using a `for` loop for accumulation.
+//
+// This kernel demonstrates that the WGSL compute backend now handles:
+//   - `for j in 0..K { ... }` — a sequential (non-parallel) loop
+//   - `let mut sum = 0.0` — a mutable local binding
+//   - `sum = sum + ...` — an assignment to a mutable local
+//   - `reduce_sum!(...)` — reduction builtin that expands to for + let mut
+//   - `reduce_max!(...)` — reduction builtin with arithmetic max identity
+//
+// Three variants:
+//   - matmul:         K=4,   simple accumulation for testing
+//   - matmul_k1024:   K=1024, stress-tests the per-thread dot product loop
+//   - matmul_reduced: K=4,   uses reduce_sum! builtin
+//   - matmul_max:     K=4,   uses reduce_max! builtin
+//
+// PERFORMANCE CHARACTERISTICS:
+//   - workgroup_size(64): 16 workgroups for 1024 output elements
+//   - Each invocation runs K sequential float multiplications (the dot product)
+//   - No workgroup-shared memory (the backend does not emit var<workgroup>)
+//   - No cross-invocation reduction — each output element is independent
+//   - Register pressure: the `for` body has ~5 instructions (load, mul, load,
+//     add, store), which stays under mobile GPU limits
+//
+// The WGSL backend is elementwise-only by design. It cannot express a
+// parallel reduction across invocations within a workgroup. The sequential
+// per-thread loop is the honest mapping — no tiling, no sub-group shuffles,
+// no cross-thread accumulation.
+//
+// CONSTRAINT: All tensor parameters must share the same extent. The `forall`
+// covers 0..extent, so each invocation i handles output element i. The inner
+// `for j in 0..K` accumulates within that single element's computation.
+// Input tensors use `[*]` (many-use) so they can be read repeatedly in the loop.
+//
+// STATUS:
+//   parses -> emits a valid WGSL compute shader with a nested `for` loop
+//
+// naso build --target wgsl --kernel matmul kernels/matmul.naso
+// naso build --target wgsl --kernel matmul_k1024 kernels/matmul.naso
+// naso build --target wgsl --kernel matmul_reduced kernels/matmul.naso
+// naso build --target wgsl --kernel matmul_max kernels/matmul.naso
+
+/// Dot-product accumulation: out[i] = sum(a[i] * b[i]) * scale
+///
+/// Each invocation i accumulates K=4 identical products (a[i]*b[i]) into a
+/// mutable `sum`, then scales. All tensors share extent N=1024.
+fn matmul(
+    a: [*] Tensor[f32, 1024],
+    b: [*] Tensor[f32, 1024],
+    output: inout [1] Tensor[f32, 1024],
+    scale: f32,
+) {
+    forall i in 0..1024 {
+        let mut sum = 0.0;
+        for j in 0..4 {
+            sum = sum + a[i] * b[i];
+        }
+        output[i] = sum * scale;
+    }
+}
+
+/// Large accumulation: out[i] = sum(a[i] * b[i]) * scale, K=1024
+///
+/// Same as `matmul` but with K=1024 iterations of the inner loop, stressing
+/// the per-thread sequential accumulation path. Each invocation computes
+/// one output element with a 1024-iteration dot product.
+fn matmul_k1024(
+    a: [*] Tensor[f32, 1024],
+    b: [*] Tensor[f32, 1024],
+    output: inout [1] Tensor[f32, 1024],
+    scale: f32,
+) {
+    forall i in 0..1024 {
+        let mut sum = 0.0;
+        for j in 0..1024 {
+            sum = sum + a[i] * b[i];
+        }
+        output[i] = sum * scale;
+    }
+}
+
+/// Matmul using reduce_sum! builtin: out[i] = reduce_sum!(0.0, j, 0..4, a[i] * b[i]) * scale
+///
+/// The `reduce_sum!` macro expands at parse time to:
+///   let mut sum = 0.0;
+///   for j in 0..4 { sum = sum + a[i] * b[i]; }
+///   sum
+///
+/// This is functionally identical to `matmul` above but demonstrates the
+/// reduction builtin syntax.
+fn matmul_reduced(
+    a: [*] Tensor[f32, 1024],
+    b: [*] Tensor[f32, 1024],
+    output: inout [1] Tensor[f32, 1024],
+    scale: f32,
+) {
+    forall i in 0..1024 {
+        let sum = reduce_sum!(sum, 0.0, j, 0, 4, a[i] * b[i]);
+        output[i] = sum * scale;
+    }
+}
+
+/// Matmul using reduce_max! builtin: out[i] = max over j of (a[i] * b[i])
+///
+/// The `reduce_max!` macro expands at parse time to a `for` loop with
+/// the arithmetic max identity: `((a - b) + abs(a - b)) * 0.5 + b`
+/// No if/else (which miscompiles in this backend).
+fn matmul_max(
+    a: [*] Tensor[f32, 1024],
+    b: [*] Tensor[f32, 1024],
+    output: inout [1] Tensor[f32, 1024],
+) {
+    forall i in 0..1024 {
+        let max_val = reduce_max!(max_val, a[i] * b[i], j, 0, 4, a[i] * b[i]);
+        output[i] = max_val;
+    }
+}

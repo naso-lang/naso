@@ -1,0 +1,36 @@
+// Sprint 8: Paged KV cache kernels for long-context inference
+//
+// KV cache is stored in quint8 blocks — each block is a page of key/value vectors
+// (D_MODEL * 2 = 16384 params per token per layer, packed as u32 words).
+// Pages are loaded on-demand during generation.
+//
+// Constraint: all tensor params must share the same extent.
+
+// Read key/value from a specific page position
+// All tensors share extent 65536 (4 tokens * 16384 elements per token)
+fn kv_read(
+    kv_page: [*] Tensor[quint8, 65536],
+    output: inout [1] Tensor[f32, 65536]
+) {
+    forall i in 0..65536 {
+        output[i] = dequantize!(kv_page, i, 1.0, 0.0);
+    }
+}
+
+// Compute attention scores: dot-product of query with past keys
+// scores[i] = sum_k(query[k] * dequantize!(kv_page, key_offset + k))
+// All tensors share extent 65536
+fn kv_attention_scores(
+    query: [*] Tensor[f32, 65536],
+    kv_page: [*] Tensor[quint8, 65536],
+    scale: f32,
+    zp: f32,
+    output: inout [1] Tensor[f32, 65536]
+) {
+    forall i in 0..65536 {
+        let key_offset = (i / 8192) * 16384;
+        let score = reduce_sum!(score, 0.0, k, 0, 8192,
+            query[k] * dequantize!(kv_page, key_offset + k, scale, zp));
+        output[i] = score;
+    }
+}

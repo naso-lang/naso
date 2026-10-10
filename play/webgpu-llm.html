@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Naso — Trillion-Parameter LLM Chat</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Fira Code', monospace;
+      background: #0d0d14;
+      color: #e0e0e0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      padding: 16px 24px;
+      background: #12121a;
+      border-bottom: 1px solid #2a2a3a;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    h1 {
+      font-size: 1.3rem;
+      color: #5ae6ff;
+    }
+    .header-right {
+      display: flex;
+      gap: 16px;
+      align-items: center;
+    }
+    .status-indicator {
+      padding: 4px 12px;
+      border-radius: 12px;
+      font-size: 0.75rem;
+      font-weight: 600;
+    }
+    .status-indicator.ok { background: #1a3a1a; color: #4ade80; }
+    .status-indicator.err { background: #3a1a1a; color: #f85149; }
+    .status-indicator.warn { background: #3a2e1a; color: #fbbf24; }
+    
+    main {
+      flex: 1;
+      max-width: 900px;
+      width: 100%;
+      margin: 0 auto;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    
+    .model-bar {
+      background: #1a1a24;
+      border: 1px solid #2a2a3a;
+      border-radius: 8px;
+      padding: 12px 16px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      font-size: 0.8rem;
+    }
+    .model-bar .stat {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .model-bar .label { color: #666; }
+    .model-bar .value { color: #5ae6ff; font-weight: 600; }
+    
+    .chat-container {
+      flex: 1;
+      background: #1a1a24;
+      border: 1px solid #2a2a3a;
+      border-radius: 8px;
+      display: flex;
+      flex-direction: column;
+      min-height: 400px;
+      max-height: 60vh;
+    }
+    .messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .message {
+      max-width: 85%;
+      padding: 12px 16px;
+      border-radius: 12px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+    }
+    .message.user {
+      align-self: flex-end;
+      background: #2563eb;
+      color: white;
+      border-bottom-right-radius: 4px;
+    }
+    .message.assistant {
+      align-self: flex-start;
+      background: #2a2a3a;
+      color: #e0e0e0;
+      border-bottom-left-radius: 4px;
+      font-size: 0.88rem;
+      line-height: 1.6;
+    }
+    .message.system {
+      align-self: center;
+      background: #3a2e1a;
+      color: #fbbf24;
+      font-size: 0.75rem;
+      padding: 6px 12px;
+      border-radius: 8px;
+    }
+    
+    .input-bar {
+      border-top: 1px solid #2a2a3a;
+      padding: 12px 16px;
+      display: flex;
+      gap: 12px;
+    }
+    .input-bar textarea {
+      flex: 1;
+      min-height: 48px;
+      max-height: 120px;
+      padding: 10px 14px;
+      background: #12121a;
+      border: 1px solid #333;
+      border-radius: 8px;
+      color: #e0e0e0;
+      resize: vertical;
+      font-family: inherit;
+      font-size: 0.95rem;
+    }
+    .input-bar button {
+      padding: 10px 24px;
+      background: #2563eb;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 0.9rem;
+      align-self: flex-end;
+    }
+    .input-bar button:hover:not(:disabled) { background: #3b82f6; }
+    .input-bar button:disabled { background: #475569; cursor: not-allowed; }
+    
+    .thinking {
+      color: #868e96;
+      font-style: italic;
+      font-size: 0.8rem;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Naso Trillion-Parameter LLM</h1>
+    <div class="header-right">
+      <span id="gpu-status" class="status-indicator warn">GPU: Checking...</span>
+      <span id="server-status" class="status-indicator warn">Server: Connecting...</span>
+    </div>
+  </header>
+  
+  <main>
+    <div class="model-bar" id="model-bar">
+      <span class="stat"><span class="label">Params:</span><span class="value" id="param-count">Loading...</span></span>
+      <span class="stat"><span class="label">Experts:</span><span class="value">64 (2 active)</span></span>
+      <span class="stat"><span class="label">Layers:</span><span class="value">32</span></span>
+      <span class="stat"><span class="label">KV Cache:</span><span class="value" id="kv-stats">Loading...</span></span>
+    </div>
+    
+    <div class="chat-container">
+      <div class="messages" id="messages"></div>
+      <div class="input-bar">
+        <textarea id="prompt-input" placeholder="Ask me anything... (Ctrl+Enter to send)"></textarea>
+        <button id="send-btn" disabled>Send</button>
+      </div>
+    </div>
+  </main>
+
+  <script type="module">
+    const messagesEl = document.getElementById('messages');
+    const inputEl = document.getElementById('prompt-input');
+    const sendBtn = document.getElementById('send-btn');
+    const gpuStatusEl = document.getElementById('gpu-status');
+    const serverStatusEl = document.getElementById('server-status');
+    const paramCountEl = document.getElementById('param-count');
+    const kvStatsEl = document.getElementById('kv-stats');
+    
+    let canSend = false;
+    let isThinking = false;
+    
+    function addMessage(role, content, isSystem = false) {
+      const div = document.createElement('div');
+      if (isSystem) {
+        div.className = 'message system';
+        div.textContent = content;
+      } else {
+        div.className = `message ${role}`;
+        div.textContent = content;
+      }
+      messagesEl.appendChild(div);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+    
+    function showThinking() {
+      const div = document.createElement('div');
+      div.className = 'message assistant thinking';
+      div.id = 'thinking-msg';
+      div.textContent = 'Processing through 1.0T parameter MoE...';
+      messagesEl.appendChild(div);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+      return div;
+    }
+    
+    function hideThinking() {
+      const thinking = document.getElementById('thinking-msg');
+      if (thinking) thinking.remove();
+    }
+    
+    function setSendEnabled(enabled) {
+      canSend = enabled;
+      sendBtn.disabled = !enabled;
+    }
+    
+    async function fetchModelInfo() {
+      try {
+        const res = await fetch('/info');
+        const info = await res.json();
+        paramCountEl.textContent = info.total_params_str;
+        const kv = info.kv_cache;
+        kvStatsEl.textContent = `${kv.pages_resident || 0}/${kv.max_pages} pages (${kv.storage_per_page_mb.toFixed(0)}MB/page)`;
+        serverStatusEl.textContent = 'Server: Connected';
+        serverStatusEl.className = 'status-indicator ok';
+      } catch (e) {
+        serverStatusEl.textContent = 'Server: Offline';
+        serverStatusEl.className = 'status-indicator err';
+        paramCountEl.textContent = 'N/A';
+      }
+    }
+    
+    function checkGPU() {
+      if (!navigator.gpu) {
+        gpuStatusEl.textContent = 'GPU: Not Supported';
+        gpuStatusEl.className = 'status-indicator err';
+        return;
+      }
+      gpuStatusEl.textContent = 'GPU: Available';
+      gpuStatusEl.className = 'status-indicator ok';
+    }
+    
+    async function sendMessage(message) {
+      if (!message.trim() || isThinking) return;
+      
+      addMessage('user', message);
+      inputEl.value = '';
+      setSendEnabled(false);
+      isThinking = true;
+      
+      const thinkingEl = showThinking();
+      
+      try {
+        const res = await fetch('/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message })
+        });
+        
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        
+        const data = await res.json();
+        hideThinking();
+        addMessage('assistant', data.response);
+        
+        // Update KV stats
+        if (data.footprint?.kv_cache) {
+          const kv = data.footprint.kv_cache;
+          kvStatsEl.textContent = `${kv.pages_resident || 0}/${kv.max_pages} pages (${kv.storage_per_page_mb.toFixed(0)}MB/page)`;
+        }
+      } catch (e) {
+        hideThinking();
+        addMessage('system', `Error: ${e.message}`, true);
+      }
+      
+      isThinking = false;
+      setSendEnabled(true);
+      inputEl.focus();
+    }
+    
+    // Event handlers
+    sendBtn.addEventListener('click', () => {
+      const msg = inputEl.value.trim();
+      if (msg) sendMessage(msg);
+    });
+    
+    inputEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        const msg = inputEl.value.trim();
+        if (msg) sendMessage(msg);
+      }
+    });
+    
+    // Init
+    checkGPU();
+    fetchModelInfo();
+    setInterval(fetchModelInfo, 30000);
+    setSendEnabled(true);
+    inputEl.focus();
+    
+    // Welcome message
+    setTimeout(() => {
+      addMessage('system', 'Naso Trillion-Parameter LLM ready. 1.0T params, 64 experts, 2/64 active per token, paged KV cache. Type a message to begin.');
+    }, 500);
+  </script>
+</body>
+</html>

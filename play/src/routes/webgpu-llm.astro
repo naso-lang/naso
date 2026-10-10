@@ -1,0 +1,49 @@
+---
+title: "Naso LLM — WebGPU Frontend"
+type: page
+---
+
+# Trillion-Parameter LLM — WebGPU Inference
+
+This page runs the Naso trillion-parameter MoE transformer model using WebGPU compute shaders.
+
+- **1.0T parameters** stored as 8-bit quantized `quint8`
+- **Paged KV cache**: 8 pages max, 2MB/page — long-context within hundreds of MB
+- **64 experts × 32 layers** with top-2 MoE routing
+- **Server** (port 8765) handles weight paging and quantized matmul dispatch
+- **WebGPU** executes WGSL compute kernels for attention scoring
+
+<script type="module">
+  // Check for WebGPU support
+  if (!navigator.gpu) {
+    document.getElementById('gpu-warning').style.display = 'block';
+  }
+
+  // Fetch model info
+  fetch('http://127.0.0.1:8765/info')
+    .then(r => r.json())
+    .then(info => {
+      const el = document.getElementById('model-info');
+      if (el) {
+        el.innerHTML = `
+          <p><strong>Parameters:</strong> ${info.total_params_str}</p>
+          <p><strong>Experts:</strong> ${info.experts} per layer, ${info.layers} layers</p>
+          <p><strong>Storage:</strong> ${info.storage_mb.toFixed(0)} MB (8-bit quantized)</p>
+          <p><strong>Active/Token:</strong> ${(info.active_params_per_token/1e6).toFixed(1)}M params</p>
+        `;
+      }
+    })
+    .catch(() => {
+      document.getElementById('model-info').innerHTML = '<p>Server not running. Start with: python3 host_server/src/model_server.py 8765</p>';
+    });
+</script>
+
+<div id="gpu-warning" style="display:none; background:#3a1a1a; padding:12px; border-radius:8px; margin:16px 0;">
+  ⚠️ WebGPU is not supported in this browser. Use Chrome 113+, Firefox 114+, or Edge 113+.
+</div>
+
+<div id="model-info" style="background:#1a1a24; padding:16px; border-radius:8px; margin:16px 0;">
+  <p>Loading model info...</p>
+</div>
+
+<iframe src="/webgpu-llm.html" style="width:100%; height:800px; border:1px solid #333; border-radius:8px;"></iframe>

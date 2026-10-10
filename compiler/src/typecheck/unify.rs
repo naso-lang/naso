@@ -57,6 +57,7 @@ fn unify_kinds(
         (TypeKind::UInt, TypeKind::UInt) => Ok(TypeKind::UInt),
         (TypeKind::Float, TypeKind::Float) => Ok(TypeKind::Float),
         (TypeKind::Nat, TypeKind::Nat) => Ok(TypeKind::Nat),
+        (TypeKind::Quint8, TypeKind::Quint8) => Ok(TypeKind::Quint8),
         (TypeKind::Qubit, TypeKind::Qubit) => Ok(TypeKind::Qubit),
         (TypeKind::String, TypeKind::String) => Ok(TypeKind::String),
         (TypeKind::Char, TypeKind::Char) => Ok(TypeKind::Char),
@@ -173,6 +174,13 @@ fn unify_kinds(
         // Type variables
         (TypeKind::Var(v1), TypeKind::Var(v2)) if v1 == v2 => Ok(TypeKind::Var(*v1)),
 
+        // Quint8 coerces to UInt (it's an unsigned 8-bit value stored in u32 storage).
+        // This lets bitwise shifts and ANDs work when mixing quint8 tensor elements
+        // with integer literals in dequantization.
+        (TypeKind::UInt, TypeKind::Quint8) => Ok(TypeKind::UInt),
+        (TypeKind::Quint8, TypeKind::UInt) => Ok(TypeKind::UInt),
+        (TypeKind::Int, TypeKind::Quint8) => Ok(TypeKind::Int),
+        (TypeKind::Quint8, TypeKind::Int) => Ok(TypeKind::Int),
         // Metavariables handled above
 
         // Mismatch

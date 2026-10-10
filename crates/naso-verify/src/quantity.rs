@@ -500,10 +500,18 @@ pub fn encode_quantity_expr(
         ExprKind::Assign(lhs, rhs) => {
             constraints.extend(encode_quantity_expr(rhs, tracker)?);
             // The target is walked, which is what records the write. It is usually an INDEX
-            // (`output[i] = ..`), not a bare `Var`, so the consumption is found by descending to
+            // `output[i] = ..`, not a bare `Var`, so the consumption is found by descending to
             // the base -- which is exactly why an earlier name-matching shortcut here silently
             // found nothing and reported a false leak.
             constraints.extend(encode_quantity_expr(lhs, tracker)?);
+        }
+        ExprKind::Range(lo, hi) => {
+            // A range in a `for` iterator is walked so that any linear tensors
+            // referenced in the bounds are tracked. In practice these are
+            // integer literals, so this arm is usually a no-op, but it must
+            // exist for exhaustiveness.
+            constraints.extend(encode_quantity_expr(lo, tracker)?);
+            constraints.extend(encode_quantity_expr(hi, tracker)?);
         } // NO CATCH-ALL ARM, ON PURPOSE.
           //
           // The arm that used to sit here said every unrecognised expression had "no special
@@ -571,6 +579,7 @@ fn describe_expr_kind(expr: &naso_compiler::ast::Expr) -> &'static str {
         ExprKind::Projection(..) => "projection",
         ExprKind::QuantumOp(..) => "quantum operation",
         ExprKind::Ascribe(..) => "ascription",
+        ExprKind::Range(..) => "range",
         ExprKind::Error => "parse-error node",
     }
 }

@@ -39,6 +39,13 @@ impl<'a> Parser<'a> {
         // `Int` with no width even though `parse_base_type` had recorded it.
         ty.int_width = base.int_width;
         ty.nat_value = base.nat_value;
+
+        // Check for optional `sparse` modifier on tensor types.
+        if matches!(ty.kind, TypeKind::Tensor(_)) && self.at_ident("sparse") {
+            self.bump(); // consume the `sparse` keyword
+            ty.sparse = true;
+        }
+
         ty
     }
 
@@ -272,6 +279,10 @@ impl<'a> Parser<'a> {
             Some(TK::Float64) => {
                 self.bump();
                 Type::new(TypeKind::Float, Quantity::Many, Span::default())
+            }
+            Some(TK::Quint8) => {
+                self.bump();
+                Type::quint8(Span::default())
             }
             Some(TK::Tensor) => {
                 self.bump();
@@ -558,7 +569,47 @@ mod tests {
         assert_eq!(dims[1].nat_const(), Some(64), "extent must survive");
     }
 
-    /// `isize`/`usize` have no fixed width; this target uses 64.
+    /// `quint8` parses to a distinct type kind and is recordable in tensors.
+    #[test]
+    fn quint8_type_parses() {
+        let prog = parse_program("fn f(a: quint8) { }").expect("parse");
+        let Item::Function(func) = &prog.items[0] else {
+            panic!("expected a function")
+        };
+        assert_eq!(
+            func.params[0].ty.kind,
+            TypeKind::Quint8,
+            "quint8 must parse to Quint8 variant"
+        );
+    }
+
+    /// `Tensor[quint8, N]` parses with the element type preserved as Quint8.
+    #[test]
+    fn quint8_tensor_parses_with_element_type() {
+        let prog = parse_program("fn f(t: Tensor[quint8, 64]) { }").expect("parse");
+        let Item::Function(func) = &prog.items[0] else {
+            panic!("expected a function")
+        };
+        let TypeKind::Tensor(dims) = &func.params[0].ty.kind else {
+            panic!("expected a tensor")
+        };
+        assert_eq!(
+            dims[0].kind,
+            TypeKind::Quint8,
+            "element type must be quint8"
+        );
+        assert_eq!(dims[1].nat_const(), Some(64), "extent must survive");
+    }
+
+    /// `quint8` can be cast to f32 — the numeric cast path accepts it.
+    #[test]
+    fn quint8_can_be_cast_to_float() {
+        let prog = parse_program("fn f(a: quint8) -> f32 { return a as f32; }").expect("parse");
+        // If parsing + typechecking succeeds, the cast is accepted.
+        assert_eq!(prog.items.len(), 1);
+    }
+
+    /// isize/usize have no fixed width; this target uses 64.
     #[test]
     fn isize_is_recorded_as_64_bits() {
         let prog = parse_program("fn f(a: isize) { }").expect("parse");

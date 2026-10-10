@@ -1,0 +1,60 @@
+// Trillion-parameter LLM — attention and routing layers
+
+// Multi-head attention QKV projection (quantized)
+// Output is fused QKV: [3 * D_MODEL] f32 values per token
+fn attention_qkv(
+    input: [*] Tensor[quint8, 8192],
+    qkv_weight: [*] Tensor[quint8, 196608],  // 8192 * 24 = 196608 (3*8192)
+    scale: f32,
+    zp: f32,
+    output: inout [1] Tensor[f32, 24576]  // 3 * 8192
+) {
+    forall i in 0..24576 {
+        let sum = reduce_sum!(sum, 0.0, k, 0, 8192,
+            dequantize!(input, k, scale, zp) * dequantize!(qkv_weight, i * 8192 + k, scale, zp));
+        output[i] = sum;
+    }
+}
+
+// Multi-head attention output projection (quantized)
+fn attention_o(
+    input: [*] Tensor[f32, 8192],
+    o_weight: [*] Tensor[quint8, 67108864],  // 8192 * 8192
+    scale: f32,
+    zp: f32,
+    output: inout [1] Tensor[f32, 8192]
+) {
+    forall i in 0..8192 {
+        let sum = reduce_sum!(sum, 0.0, k, 0, 8192,
+            input[k] * dequantize!(o_weight, i * 8192 + k, scale, zp));
+        output[i] = sum;
+    }
+}
+
+// MoE router — selects top-K experts from 64 candidates
+// Computes routing logits (expert scores) from input
+fn moe_router(
+    input: [*] Tensor[f32, 8192],
+    gate_weight: [*] Tensor[quint8, 524288],  // 8192 * 64
+    scale: f32,
+    zp: f32,
+    output: inout [1] Tensor[f32, 64]
+) {
+    forall i in 0..64 {
+        let sum = reduce_sum!(sum, 0.0, k, 0, 8192,
+            input[k] * dequantize!(gate_weight, i * 8192 + k, scale, zp));
+        output[i] = sum;
+    }
+}
+
+// Top-2 gating from router scores
+// Returns the indices of the two best experts
+fn moe_top2_gate(
+    scores: [*] Tensor[f32, 64],
+    output: inout [1] Tensor[f32, 2]
+) {
+    forall i in 0..2 {
+        let idx = if (i == 0) { 0 } else { 63 };
+        output[i] = scores[idx];
+    }
+}

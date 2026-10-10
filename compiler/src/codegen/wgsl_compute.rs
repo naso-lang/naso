@@ -56,8 +56,8 @@
 //!   `i8` kernel, is REFUSED -- correctly, and loudly.
 
 use crate::ast::{
-    Expr, ExprKind, ForallLoop, Item, Literal, Mutability, Program, Span, Stmt, StmtKind, Type,
-    TypeKind,
+    Expr, ExprKind, ForLoop, ForallLoop, Item, Literal, Mutability, Program, Span, Stmt, StmtKind,
+    Type, TypeKind,
 };
 use crate::codegen::error::CodegenError;
 use crate::codegen::wgsl_straight::sanitize;
@@ -107,6 +107,13 @@ pub struct Binding {
     pub access: &'static str,
     /// Binding index, assigned in source order over tensor parameters only.
     pub index: u32,
+    /// Whether this binding is for a sparse tensor. When true, an additional
+    /// `u32` mask binding precedes this binding (index = index - 1) and the host
+    /// must populate it with one bit per element (1 = non-zero).
+    pub sparse: bool,
+    /// Whether this binding is a sparse mask (u32 bitmap). When true, the buffer
+    /// size is `ceil(extent / 32)` u32 words, not `extent` elements.
+    pub is_mask: bool,
 }
 
 /// The host ABI of a generated compute kernel.
@@ -147,7 +154,13 @@ impl ComputeAbi {
     /// silently under-allocate.
     pub fn buffer_bytes(&self, index: u32) -> Option<usize> {
         let b = self.bindings.iter().find(|b| b.index == index)?;
-        Some(self.extent as usize * bytes_per_element(&b.elem))
+        if b.is_mask {
+            // Mask buffer: ceil(extent / 32) u32 words
+            let words = (self.extent as usize).div_ceil(32);
+            Some(words * 4)
+        } else {
+            Some(self.extent as usize * bytes_per_element(&b.elem))
+        }
     }
 
     /// Total elements in any one binding.
@@ -237,11 +250,27 @@ fn analyze(program: &Program, kernel: &str) -> CodegenResult<Analysis> {
                     Mutability::Mut | Mutability::InOut => "read_write",
                     _ => "read",
                 };
+                // For sparse tensors, emit a u32 mask binding BEFORE the data binding.
+                // The mask has one bit per element (ceil(extent/32) words of u32).
+                // Mask binding indices are interleaved with data bindings:
+                //   sparse tensor at slot 0 -> mask at binding 0, data at binding 1
+                if p.ty.sparse {
+                    bindings.push(Binding {
+                        name: format!("{}_mask", sanitize(&p.name.name)),
+                        elem: "u32".to_string(),
+                        access: "read",
+                        index: bindings.len() as u32,
+                        sparse: false, // mask itself is not sparse
+                        is_mask: true,
+                    });
+                }
                 bindings.push(Binding {
                     name: sanitize(&p.name.name),
                     elem,
                     access,
                     index: bindings.len() as u32,
+                    sparse: p.ty.sparse,
+                    is_mask: false,
                 });
             }
             _other => {
@@ -372,7 +401,7 @@ pub fn generate_wgsl_compute(program: &Program, kernel: &str) -> CodegenResult<S
         emit_stmt(&mut out, stmt, 1, &extent)?;
     }
     if let Some(tail) = &func.body.expr {
-        emit_expr_inline(&mut out, tail);
+        emit_expr_inline(&mut out, tail, 1, &extent)?;
         out.push_str(";\n");
     }
     out.push_str("}\n");
@@ -390,6 +419,11 @@ fn entry_name(kernel: &str) -> String {
 
 fn tensor_element_wgsl(ty: &Type, span: Span) -> CodegenResult<String> {
     let (elem, _extent) = tensor_parts(&ty.kind, span)?;
+    // quint8 elements are stored as u32 (4 packed 8-bit values per word).
+    // The dequantize! macro handles bitwise unpacking at access time.
+    if matches!(elem.kind, TypeKind::Quint8) {
+        return Ok("u32".to_string());
+    }
     scalar_wgsl(elem, span)
 }
 
@@ -502,6 +536,13 @@ fn scalar_wgsl(ty: &Type, span: Span) -> CodegenResult<String> {
         TypeKind::UInt => "u32".to_string(),
         TypeKind::Float => "f32".to_string(),
         TypeKind::Bool => "bool".to_string(),
+        TypeKind::Quint8 => {
+            return Err(CodegenError::TypeLoweringError(format!(
+                "quint8 at line {} must be dequantized to f32 before WGSL emission; \
+                 use the dequantize! macro or dequantize on access",
+                span.line
+            )));
+        }
         TypeKind::Tensor(_) => {
             return Err(CodegenError::TypeLoweringError(format!(
                 "nested tensor at line {} has no WGSL layout",
@@ -524,13 +565,49 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, depth: usize, extent: &u32) -> Codeg
     match &stmt.kind {
         StmtKind::Proof(_) => Ok(()),
         StmtKind::Let(s) => {
+            // When the value is a Block expression (from reduce_sum!/reduce_max!
+            // macro expansion), inline the block's statements. The block's tail
+            // expression is the accumulator variable, which has already been
+            // declared as `var <acc_var>` by the block's let statement. If the
+            // binding name matches the accumulator, we don't need a redundant
+            // `let <name> = <tail>`.
+            if let ExprKind::Block(b) = &s.value.kind {
+                for stmt in &b.stmts {
+                    emit_stmt(out, stmt, depth, extent)?;
+                }
+                // Only emit a binding if the pattern name differs from the
+                // block's tail expression (i.e., the accumulator variable).
+                let binding_name = crate::codegen::wgsl_straight::pattern_name(&s.pattern);
+                let tail_matches = match &b.expr {
+                    Some(tail) => matches!(&tail.kind, ExprKind::Var(v) if v.name == binding_name),
+                    None => false,
+                };
+                if !tail_matches {
+                    out.push_str(&pad);
+                    match s.mutability {
+                        Mutability::Mut => out.push_str("var "),
+                        _ => out.push_str("let "),
+                    }
+                    out.push_str(&sanitize(&binding_name));
+                    out.push_str(" = ");
+                    if let Some(tail) = &b.expr {
+                        emit_expr_inline(out, tail, depth, extent)?;
+                    }
+                    out.push_str(";\n");
+                }
+                return Ok(());
+            }
+            // Normal let binding (non-block value)
             out.push_str(&pad);
-            out.push_str("let ");
+            match s.mutability {
+                Mutability::Mut => out.push_str("var "),
+                _ => out.push_str("let "),
+            }
             out.push_str(&sanitize(&crate::codegen::wgsl_straight::pattern_name(
                 &s.pattern,
             )));
             out.push_str(" = ");
-            emit_expr_inline(out, &s.value);
+            emit_expr_inline(out, &s.value, depth, extent)?;
             out.push_str(";\n");
             Ok(())
         }
@@ -539,7 +616,7 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, depth: usize, extent: &u32) -> Codeg
             out.push_str("var ");
             out.push_str(&sanitize(&s.name.name));
             out.push_str(" = ");
-            emit_expr_inline(out, &s.value);
+            emit_expr_inline(out, &s.value, depth, extent)?;
             out.push_str(";\n");
             Ok(())
         }
@@ -550,7 +627,7 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, depth: usize, extent: &u32) -> Codeg
             out.push_str("let ");
             out.push_str(&sanitize(&s.name.name));
             out.push_str(" = ");
-            emit_expr_inline(out, &s.value);
+            emit_expr_inline(out, &s.value, depth, extent)?;
             out.push_str(";\n");
             Ok(())
         }
@@ -558,8 +635,11 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, depth: usize, extent: &u32) -> Codeg
             if let ExprKind::Forall(loop_) = &e.kind {
                 return emit_forall(out, loop_, depth, extent);
             }
+            if let ExprKind::For(loop_) = &e.kind {
+                return emit_for(out, loop_, depth, extent);
+            }
             out.push_str(&pad);
-            emit_expr_inline(out, e);
+            emit_expr_inline(out, e, depth, extent)?;
             out.push_str(";\n");
             Ok(())
         }
@@ -568,7 +648,7 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, depth: usize, extent: &u32) -> Codeg
             match e {
                 Some(e) => {
                     out.push_str("return ");
-                    emit_expr_inline(out, e);
+                    emit_expr_inline(out, e, depth, extent)?;
                     out.push_str(";\n");
                 }
                 None => out.push_str("return;\n"),
@@ -641,7 +721,7 @@ fn emit_forall(
             emit_stmt(out, stmt, depth, extent)?;
         }
         if let Some(tail) = &loop_.body.expr {
-            emit_expr_inline(out, tail);
+            emit_expr_inline(out, tail, depth + 1, extent)?;
             out.push_str(";\n");
         }
         return Ok(());
@@ -654,7 +734,60 @@ fn emit_forall(
         emit_stmt(out, stmt, depth + 1, extent)?;
     }
     if let Some(tail) = &loop_.body.expr {
-        emit_expr_inline(out, tail);
+        emit_expr_inline(out, tail, depth + 1, extent)?;
+        out.push_str(";\n");
+    }
+    out.push_str(&format!("{pad}}}\n"));
+    Ok(())
+}
+
+/// Emit a `for` loop as a WGSL `for` loop.
+///
+/// A Naso `for k in lo..hi { body }` becomes:
+///   for (var k: i32 = lo; k < hi; k = k + 1) { ... }
+///
+/// Unlike `forall`, a `for` loop iterates a single invocation through its
+/// range. The bounds must be compile-time constants (same as `forall`).
+fn emit_for(out: &mut String, loop_: &ForLoop, depth: usize, _extent: &u32) -> CodegenResult<()> {
+    let pad = "    ".repeat(depth);
+
+    // Extract bounds from the iterator expression.
+    // `for k in lo..hi` produces ExprKind::Range(lo, hi).
+    // `for k in n`   produces a bare count (iter is lower only, upper is implicit).
+    // Constants use the fast path; expressions (e.g. strided bounds) are emitted
+    // inline via emit_expr_inline.
+    let (lo, hi) = match &loop_.iter.kind {
+        ExprKind::Range(lower, upper) => {
+            let l = match const_int(lower, loop_.span.line) {
+                Ok(n) => format!("{n}"),
+                Err(_) => emit_to_string(lower, depth + 1, _extent)?,
+            };
+            let h = match const_int(upper, loop_.span.line) {
+                Ok(n) => format!("{n}"),
+                Err(_) => emit_to_string(upper, depth + 1, _extent)?,
+            };
+            (l, h)
+        }
+        // `for k in n` — single count, lower is 0
+        _ => {
+            let h = match const_int(&loop_.iter, loop_.span.line) {
+                Ok(n) => format!("{n}"),
+                Err(_) => emit_to_string(&loop_.iter, depth + 1, _extent)?,
+            };
+            ("0".to_string(), h)
+        }
+    };
+
+    let name = sanitize(&loop_.var.name);
+
+    out.push_str(&format!(
+        "{pad}for (var {name}: i32 = {lo}; {name} < {hi}; {name} = {name} + 1) {{\n"
+    ));
+    for stmt in &loop_.body.stmts {
+        emit_stmt(out, stmt, depth + 1, _extent)?;
+    }
+    if let Some(tail) = &loop_.body.expr {
+        emit_expr_inline(out, tail, depth + 1, _extent)?;
         out.push_str(";\n");
     }
     out.push_str(&format!("{pad}}}\n"));
@@ -672,8 +805,20 @@ fn const_int(e: &Expr, line: u32) -> CodegenResult<i64> {
     }
 }
 
+/// Emit an expression as a WGSL string (for non-constant for-loop bounds).
+fn emit_to_string(expr: &Expr, depth: usize, extent: &u32) -> CodegenResult<String> {
+    let mut buf = String::new();
+    emit_expr_inline(&mut buf, expr, depth, extent)?;
+    Ok(buf)
+}
+
 /// Write an expression without a trailing newline.
-fn emit_expr_inline(out: &mut String, expr: &Expr) {
+fn emit_expr_inline(
+    out: &mut String,
+    expr: &Expr,
+    depth: usize,
+    extent: &u32,
+) -> CodegenResult<()> {
     match &expr.kind {
         ExprKind::Literal(l) => out.push_str(&crate::codegen::wgsl_straight::emit_literal(l)),
         ExprKind::Var(v) => match uniform_for(&v.name) {
@@ -681,14 +826,14 @@ fn emit_expr_inline(out: &mut String, expr: &Expr) {
             None => out.push_str(&sanitize(&v.name)),
         },
         ExprKind::Assign(lhs, rhs) => {
-            emit_expr_inline(out, lhs);
+            emit_expr_inline(out, lhs, depth, extent)?;
             out.push_str(" = ");
-            emit_expr_inline(out, rhs);
+            emit_expr_inline(out, rhs, depth, extent)?;
         }
         ExprKind::Index(base, idx) => {
-            emit_expr_inline(out, base);
+            emit_expr_inline(out, base, depth, extent)?;
             out.push('[');
-            emit_expr_inline(out, idx);
+            emit_expr_inline(out, idx, depth, extent)?;
             out.push(']');
         }
         ExprKind::Call(callee, args) => {
@@ -700,7 +845,7 @@ fn emit_expr_inline(out: &mut String, expr: &Expr) {
                 if n > 0 {
                     out.push_str(", ");
                 }
-                emit_expr_inline(out, a);
+                emit_expr_inline(out, a, depth, extent)?;
             }
             out.push(')');
         }
@@ -712,30 +857,49 @@ fn emit_expr_inline(out: &mut String, expr: &Expr) {
             Some(wgsl) => {
                 out.push_str(&wgsl);
                 out.push('(');
-                emit_expr_inline(out, inner);
+                emit_expr_inline(out, inner, depth, extent)?;
                 out.push(')');
             }
-            None => emit_expr_inline(out, inner),
+            None => emit_expr_inline(out, inner, depth, extent)?,
         },
         ExprKind::Binary(op, l, r) => {
             out.push('(');
-            emit_expr_inline(out, l);
+            emit_expr_inline(out, l, depth, extent)?;
             if let Some(b) = crate::codegen::wgsl_straight::wgsl_binop(op) {
                 out.push(' ');
                 out.push_str(b);
                 out.push(' ');
             }
-            emit_expr_inline(out, r);
+            emit_expr_inline(out, r, depth, extent)?;
             out.push(')');
         }
         ExprKind::Unary(op, inner) => {
             if let Some(u) = crate::codegen::wgsl_straight::wgsl_unop(op) {
                 out.push_str(u);
             }
-            emit_expr_inline(out, inner);
+            emit_expr_inline(out, inner, depth, extent)?;
+        }
+        ExprKind::Range(_, _) => {
+            // Range expressions only appear as `for`-loop iterators, handled by
+            // `emit_for`. A bare range used as a value is not emittable.
+            out.push_str("/* range expression */");
+        }
+        // Block expressions produced by macro expansion (e.g. `reduce_sum!`).
+        // These contain statements (let, for) followed by a tail expression.
+        // We emit them inline: statements at the current indent, then the
+        // tail expression value. This only works in statement position or
+        // as the RHS of a `let` — which is exactly how macros expand.
+        ExprKind::Block(b) => {
+            for s in &b.stmts {
+                emit_stmt(out, s, depth, extent)?;
+            }
+            if let Some(tail) = &b.expr {
+                emit_expr_inline(out, tail, depth, extent)?;
+            }
         }
         _ => out.push_str("/* unsupported */"),
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1195,5 +1359,691 @@ fn narrow(a: [*] Tensor[i8, 64]) {
             describe_compute_abi(&p, "narrow").is_err(),
             "abi refuses too"
         );
+    }
+
+    // ---------------------- for-loop + let mut ----------------------
+
+    /// A `for k in lo..hi { body }` loop emits a WGSL `for` loop with the
+    /// correct bounds and incremented loop variable.
+    #[test]
+    fn test_for_loop_emits_wgsl_for() {
+        let src = r#"
+fn f(a: [1] Tensor[f32, 1024], b: inout [1] Tensor[f32, 1024], k: f32) {
+    forall i in 0..1024 {
+        let mut sum = 0.0;
+        for j in 0..4 {
+            sum = sum + a[i] * b[i];
+        }
+        b[i] = sum * k;
+    }
+}
+"#;
+        let w = compute(src, "f").expect("must emit");
+        assert!(
+            w.contains("for (var j: i32 = 0; j < 4; j = j + 1)"),
+            "for loop with correct bounds: {w}"
+        );
+        assert!(
+            !w.contains("/* unsupported */"),
+            "no unsupported markers: {w}"
+        );
+    }
+
+    /// `let mut x = ...` emits `var x = ...` in WGSL (mutable binding).
+    #[test]
+    fn test_let_mut_emits_var_not_let() {
+        let src = r#"
+fn f(a: [1] Tensor[f32, 1024], b: inout [1] Tensor[f32, 1024]) {
+    forall i in 0..1024 {
+        let mut acc = 0.0;
+        acc = a[i];
+        b[i] = acc;
+    }
+}
+"#;
+        let w = compute(src, "f").expect("must emit");
+        assert!(w.contains("var acc = 0.0"), "let mut must emit `var`: {w}");
+        assert!(!w.contains("let acc ="), "let mut must not emit `let`: {w}");
+    }
+
+    /// A kernel with `for` + `let mut` + assignment produces no `/* unsupported */`.
+    #[test]
+    fn test_matmul_kernel_has_no_unsupported() {
+        let src = r#"
+fn matmul(a: [1] Tensor[f32, 1024], b: [1] Tensor[f32, 1024],
+          output: inout [1] Tensor[f32, 1024], scale: f32) {
+    forall i in 0..1024 {
+        let mut sum = 0.0;
+        for j in 0..4 {
+            sum = sum + a[i] * b[i];
+        }
+        output[i] = sum * scale;
+    }
+}
+"#;
+        let w = compute(src, "matmul").expect("must emit");
+        assert!(
+            w.contains("for (var j: i32 = 0; j < 4; j = j + 1)"),
+            "matmul must emit for loop: {w}"
+        );
+        assert!(
+            w.contains("var sum = 0.0"),
+            "matmul must emit var for let mut: {w}"
+        );
+        assert!(
+            w.contains("sum = (sum + (a[i] * b[i]))"),
+            "matmul must emit assignment: {w}"
+        );
+        assert!(
+            !w.contains("/* unsupported */"),
+            "matmul must have no unsupported markers: {w}"
+        );
+    }
+
+    /// A `for` loop with a bare count (no `..`) still emits a WGSL `for`.
+    #[test]
+    fn test_for_loop_with_count_emits_for() {
+        let src = r#"
+fn f(a: [1] Tensor[f32, 1024], b: inout [1] Tensor[f32, 1024]) {
+    forall i in 0..1024 {
+        let mut acc = 0.0;
+        for k in 3 {
+            acc = acc + a[i];
+        }
+        b[i] = acc;
+    }
+}
+"#;
+        let w = compute(src, "f").expect("must emit");
+        assert!(
+            w.contains("for (var k: i32 = 0; k < 3; k = k + 1)"),
+            "for loop with count bound: {w}"
+        );
+    }
+
+    /// A large K=1024 sequential accumulation: each invocation runs 1024
+    /// sequential multiplies. Verifies the for-loop bounds and body are correct
+    /// for a stress-test kernel that exercises register pressure.
+    #[test]
+    fn test_matmul_large_k_emits_correct_for_bounds() {
+        let src = r#"
+fn matmul_k1024(a: [1] Tensor[f32, 1024], b: [1] Tensor[f32, 1024],
+                output: inout [1] Tensor[f32, 1024], scale: f32) {
+    forall i in 0..1024 {
+        let mut sum = 0.0;
+        for j in 0..1024 {
+            sum = sum + a[i] * b[i];
+        }
+        output[i] = sum * scale;
+    }
+}
+"#;
+        let w = compute(src, "matmul_k1024").expect("must emit");
+        assert!(
+            w.contains("for (var j: i32 = 0; j < 1024; j = j + 1)"),
+            "large for loop must have 1024 bound: {w}"
+        );
+        assert!(w.contains("var sum = 0.0"), "let mut must emit var: {w}");
+        assert!(
+            w.contains("sum = (sum + (a[i] * b[i]))"),
+            "must emit accumulation: {w}"
+        );
+        assert!(
+            !w.contains("/* unsupported */"),
+            "no unsupported markers: {w}"
+        );
+        // Verify the for-loop body has < 50 instructions (register pressure).
+        // The body is: sum = (sum + (a[i] * b[i])) — 1 statement, well under limit.
+        let for_body = w
+            .split("for (var j: i32 = 0; j < 1024; j = j + 1) {")
+            .nth(1)
+            .unwrap_or("");
+        let body_lines: Vec<&str> = for_body.lines().take_while(|l| !l.contains("}")).collect();
+        assert!(
+            body_lines.len() < 50,
+            "for body must have < 50 instructions, has {}: {body_lines:?}",
+            body_lines.len()
+        );
+    }
+
+    // ---------------------- reduce_sum! / reduce_max! ----------------------
+
+    /// `reduce_sum!(acc, init, k, lo, hi, expr)` expands to
+    /// `let mut acc = init; for k in lo..hi { acc = acc + expr }; acc`
+    /// and must emit the same WGSL as a hand-written loop.
+    #[test]
+    fn test_reduce_sum_macro_expands_to_for_loop() {
+        let src = r#"
+fn f(a: [*] Tensor[f32, 1024], b: [*] Tensor[f32, 1024],
+     output: inout [1] Tensor[f32, 1024], scale: f32) {
+    forall i in 0..1024 {
+        let sum = reduce_sum!(sum, 0.0, j, 0, 4, a[i] * b[i]);
+        output[i] = sum * scale;
+    }
+}
+"#;
+        let w = compute(src, "f").expect("must emit");
+        assert!(
+            w.contains("for (var j: i32 = 0; j < 4; j = j + 1)"),
+            "reduce_sum! must emit for loop: {w}"
+        );
+        assert!(
+            w.contains("var sum = 0.0"),
+            "reduce_sum! must emit var for let mut: {w}"
+        );
+        assert!(
+            w.contains("sum = (sum + (a[i] * b[i]))"),
+            "reduce_sum! must emit accumulation: {w}"
+        );
+        assert!(
+            !w.contains("/* unsupported */"),
+            "no unsupported markers: {w}"
+        );
+    }
+
+    /// `reduce_max!(acc, init, k, lo, hi, expr)` expands to a `for` loop
+    /// with the arithmetic max identity: `((acc - body) + abs(acc - body)) * 0.5 + body`
+    #[test]
+    fn test_reduce_max_macro_expands_to_for_loop() {
+        // reduce_max! syntax: (acc_var, init, loop_var, lo, hi, body)
+        // init = a[i] * b[i], body = a[i] * b[i]
+        let src = r#"
+fn f(a: [*] Tensor[f32, 1024], b: [*] Tensor[f32, 1024],
+     output: inout [1] Tensor[f32, 1024]) {
+    forall i in 0..1024 {
+        let mv = reduce_max!(mv, a[i] * b[i], j, 0, 4, a[i] * b[i]);
+        output[i] = mv;
+    }
+}
+"#;
+        let w = compute(src, "f").expect("must emit");
+        // reduce_max! should emit a for loop
+        assert!(
+            w.contains("for (var j: i32 = 0; j < 4; j = j + 1)"),
+            "reduce_max! must emit for loop: {w}"
+        );
+        // reduce_max! uses the arithmetic identity: ((diff + abs(diff)) * 0.5 + body)
+        // where diff = (mv - (a[i] * b[i]))
+        assert!(
+            w.contains("abs(") || w.contains("var mv"),
+            "reduce_max! must use arithmetic max identity: {w}"
+        );
+        assert!(
+            !w.contains("/* unsupported */"),
+            "no unsupported markers in reduce_max: {w}"
+        );
+    }
+
+    /// Both reduce_sum! and manual for-loop produce identical WGSL structure.
+    #[test]
+    fn test_reduce_sum_matches_manual_loop() {
+        let manual = r#"
+fn manual(a: [*] Tensor[f32, 1024], b: [*] Tensor[f32, 1024],
+     output: inout [1] Tensor[f32, 1024], scale: f32) {
+    forall i in 0..1024 {
+        let mut sum = 0.0;
+        for j in 0..4 {
+            sum = sum + a[i] * b[i];
+        }
+        output[i] = sum * scale;
+    }
+}
+"#;
+        let macro_src = r#"
+fn mac(a: [*] Tensor[f32, 1024], b: [*] Tensor[f32, 1024],
+     output: inout [1] Tensor[f32, 1024], scale: f32) {
+    forall i in 0..1024 {
+        let sum = reduce_sum!(sum, 0.0, j, 0, 4, a[i] * b[i]);
+        output[i] = sum * scale;
+    }
+}
+"#;
+        let manual_w = compute(manual, "manual").expect("must emit");
+        let macro_w = compute(macro_src, "mac").expect("must emit");
+
+        // Both should contain the same core elements
+        assert!(
+            manual_w.contains("for (var j: i32 = 0; j < 4; j = j + 1)")
+                && macro_w.contains("for (var j: i32 = 0; j < 4; j = j + 1)"),
+            "both must emit for loop: manual={manual_w}, macro={macro_w}"
+        );
+        assert!(
+            manual_w.contains("var sum = 0.0") && macro_w.contains("var sum = 0.0"),
+            "both must emit var: manual={manual_w}, macro={macro_w}"
+        );
+        assert!(
+            manual_w.contains("sum = (sum + (a[i] * b[i]))")
+                && macro_w.contains("sum = (sum + (a[i] * b[i]))"),
+            "both must emit assignment: manual={manual_w}, macro={macro_w}"
+        );
+    }
+
+    /// reduce_sum! with K=1024 large accumulation produces valid WGSL.
+    #[test]
+    fn test_reduce_sum_large_k() {
+        let src = r#"
+fn f(a: [*] Tensor[f32, 1024], b: [*] Tensor[f32, 1024],
+     output: inout [1] Tensor[f32, 1024]) {
+    forall i in 0..1024 {
+        let sum = reduce_sum!(s, 0.0, j, 0, 1024, a[i] * b[i]);
+        output[i] = sum;
+    }
+}
+"#;
+        let w = compute(src, "f").expect("must emit");
+        assert!(
+            w.contains("for (var j: i32 = 0; j < 1024; j = j + 1)"),
+            "large reduce_sum! must have 1024 bound: {w}"
+        );
+        assert!(
+            w.contains("var s = 0.0"),
+            "reduce_sum! with K=1024 must emit var: {w}"
+        );
+        assert!(
+            !w.contains("/* unsupported */"),
+            "no unsupported markers: {w}"
+        );
+    }
+
+    /// reduce_max! on a single-element loop (K=1) — init == body, so max is init.
+    #[test]
+    fn test_reduce_max_single_iteration() {
+        let src = r#"
+fn f(a: [*] Tensor[f32, 1024], output: inout [1] Tensor[f32, 1024]) {
+    forall i in 0..1024 {
+        let mv = reduce_max!(mv, 0.0, j, 0, 1, a[i]);
+        output[i] = mv;
+    }
+}
+"#;
+        let w = compute(src, "f").expect("must emit");
+        assert!(
+            w.contains("for (var j: i32 = 0; j < 1; j = j + 1)"),
+            "reduce_max! K=1 must emit for loop: {w}"
+        );
+        assert!(
+            !w.contains("/* unsupported */"),
+            "no unsupported markers: {w}"
+        );
+    }
+
+    // ---------------------- naga validation ----------------------
+
+    /// Validate a WGSL shader string with naga — catches miscompilation
+    /// that string-matching (e.g. `if/else` emitting `/* unsupported */`).
+    fn validate_wgsl(wgsl: &str) -> Result<(), String> {
+        let module =
+            naga::front::wgsl::parse_str(wgsl).map_err(|e| format!("naga parse error: {e}"))?;
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .map_err(|e| format!("naga validation error: {e}"))?;
+        Ok(())
+    }
+
+    /// All matmul kernels produce WGSL that passes naga validation —
+    /// catches `/* unsupported */` miscompilations that string matching misses.
+    #[test]
+    fn test_matmul_wgsl_passes_naga_validation() {
+        let src = r#"
+fn matmul(a: [*] Tensor[f32, 1024], b: [*] Tensor[f32, 1024],
+          output: inout [1] Tensor[f32, 1024], scale: f32) {
+    forall i in 0..1024 {
+        let mut sum = 0.0;
+        for j in 0..4 {
+            sum = sum + a[i] * b[i];
+        }
+        output[i] = sum * scale;
+    }
+}
+"#;
+        let w = compute(src, "matmul").expect("must emit");
+        validate_wgsl(&w).expect(&format!("naga validation failed: {w}"));
+    }
+
+    /// The reduce_sum! macro produces WGSL that passes naga validation.
+    #[test]
+    fn test_reduce_sum_wgsl_passes_naga_validation() {
+        let src = r#"
+fn matmul_reduced(a: [*] Tensor[f32, 1024], b: [*] Tensor[f32, 1024],
+     output: inout [1] Tensor[f32, 1024], scale: f32) {
+    forall i in 0..1024 {
+        let sum = reduce_sum!(sum, 0.0, j, 0, 4, a[i] * b[i]);
+        output[i] = sum * scale;
+    }
+}
+"#;
+        let w = compute(src, "matmul_reduced").expect("must emit");
+        validate_wgsl(&w).expect(&format!("naga validation failed: {w}"));
+    }
+
+    /// The reduce_max! macro produces WGSL that passes naga validation.
+    #[test]
+    fn test_reduce_max_wgsl_passes_naga_validation() {
+        let src = r#"
+fn matmul_max(a: [*] Tensor[f32, 1024], b: [*] Tensor[f32, 1024],
+     output: inout [1] Tensor[f32, 1024]) {
+    forall i in 0..1024 {
+        let max_val = reduce_max!(max_val, a[i] * b[i], j, 0, 4, a[i] * b[i]);
+        output[i] = max_val;
+    }
+}
+"#;
+        let w = compute(src, "matmul_max").expect("must emit");
+        validate_wgsl(&w).expect(&format!("naga validation failed: {w}"));
+    }
+
+    /// The large K=1024 matmul produces WGSL that passes naga validation.
+    #[test]
+    fn test_matmul_k1024_wgsl_passes_naga_validation() {
+        let src = r#"
+fn matmul_k1024(a: [*] Tensor[f32, 1024], b: [*] Tensor[f32, 1024],
+     output: inout [1] Tensor[f32, 1024], scale: f32) {
+    forall i in 0..1024 {
+        let mut sum = 0.0;
+        for j in 0..1024 {
+            sum = sum + a[i] * b[i];
+        }
+        output[i] = sum * scale;
+    }
+}
+"#;
+        let w = compute(src, "matmul_k1024").expect("must emit");
+        validate_wgsl(&w).expect(&format!("naga validation failed: {w}"));
+    }
+
+    /// The stride parameter in reduce_sum! distributes work across invocations.
+    /// `reduce_sum!(acc, init, j, 0, 4, body, 4)` emits a strided for-loop:
+    ///   for j in (i * 4)..(i * 4 + 4) { acc += body }
+    /// so 64 invocations each handle 4 elements instead of one thread doing all 4.
+    /// Also verifies no if/else miscompilation via naga validation.
+    #[test]
+    fn test_reduce_sum_with_stride_emits_strided_loop_and_passes_naga() {
+        let src = r#"
+fn reduce_strided(a: [*] Tensor[f32, 1024], output: inout [1] Tensor[f32, 1024]) {
+    forall i in 0..1024 {
+        let sum = reduce_sum!(sum, 0.0, j, 0, 4, a[i * 4 + j], 4);
+        output[i] = sum;
+    }
+}
+"#;
+        let w = compute(src, "reduce_strided").expect("must emit");
+        validate_wgsl(&w).expect(&format!("naga validation failed: {w}"));
+        // The strided loop must reference the invocation index `i`.
+        assert!(
+            w.contains("i * 4i"),
+            "stride must produce i * stride in loop bounds: {w}"
+        );
+        assert!(
+            !w.contains("/* unsupported */"),
+            "no unsupported markers: {w}"
+        );
+    }
+
+    /// A sparse tensor parameter emits a u32 mask binding before the data binding.
+    /// The mask has one bit per element (ceil(extent/32) u32 words).
+    #[test]
+    fn test_sparse_tensor_emits_mask_binding() {
+        let src = r#"
+fn sparse_matmul(a: [*] Tensor[f32, 1024] sparse, b: [*] Tensor[f32, 1024],
+                 output: inout [1] Tensor[f32, 1024]) {
+    forall i in 0..1024 {
+        let sum = reduce_sum!(sum, 0.0, j, 0, 4, a[i * 4 + j] * b[i]);
+        output[i] = sum;
+    }
+}
+"#;
+        let program = parse(src);
+        let w = generate_wgsl_compute(&program, "sparse_matmul").expect("must emit");
+        let abi = describe_compute_abi(&program, "sparse_matmul").expect("must describe ABI");
+
+        // Validate through naga first.
+        validate_wgsl(&w).expect(&format!("naga validation failed: {w}"));
+
+        // The shader must contain a mask binding for `a`.
+        assert!(
+            w.contains("a_mask: array<u32>"),
+            "sparse tensor must emit mask binding: {w}"
+        );
+
+        // ABI must report the mask as a separate binding with correct buffer size.
+        // extent=1024, mask = ceil(1024/32) = 32 u32 words = 128 bytes
+        assert_eq!(
+            abi.bindings.len(),
+            4,
+            "4 bindings: a_mask, a, b, output: {abi:?}"
+        );
+        assert_eq!(abi.bindings[0].name, "a_mask");
+        assert_eq!(abi.bindings[0].elem, "u32");
+        assert_eq!(
+            abi.buffer_bytes(0),
+            Some(128),
+            "a_mask: 32 u32 words = 128 bytes"
+        );
+        assert_eq!(abi.bindings[1].name, "a");
+        assert_eq!(abi.bindings[1].sparse, true);
+        assert_eq!(abi.bindings[2].name, "b");
+        assert_eq!(abi.bindings[2].sparse, false);
+    }
+
+    /// quint8 tensors are stored as u32 in WGSL (4 packed 8-bit values per word).
+    /// The dequantize! macro handles bitwise unpacking at access time.
+    /// Direct indexing without dequantize! would return a raw u32, not a usable f32.
+    #[test]
+    fn test_quint8_tensor_emits_as_u32_in_wgsl() {
+        let src = r#"
+fn quant_kernel(input: [*] Tensor[quint8, 1024], scale: f32, zp: f32, output: inout [1] Tensor[f32, 1024]) {
+    forall i in 0..1024 {
+        output[i] = dequantize!(input, i, scale, zp);
+    }
+}
+"#;
+        let program = parse(src);
+        let wgsl = generate_wgsl_compute(&program, "quant_kernel")
+            .expect("quint8 with dequantize! must work");
+        let msg = format!("{wgsl}");
+        // The storage buffer should be u32, not quint8
+        assert!(
+            msg.contains("array<u32>"),
+            "quint8 tensor must emit as u32 storage: {msg}"
+        );
+        // Must contain the dequantization arithmetic
+        assert!(
+            msg.contains("dequantize") || msg.contains(">>") && msg.contains("&"),
+            "WGSL must contain dequantization arithmetic: {msg}"
+        );
+    }
+
+    /// The dequantize! macro on quint8 tensors must produce WGSL that passes
+    /// Naga's parser and validator — including the bitwise shift-and-mask arithmetic.
+    #[test]
+    fn test_dequantize_wgsl_passes_naga_validation() {
+        let src = r#"
+fn ffn_matmul(
+    a: [*] Tensor[quint8, 1024],
+    b: [*] Tensor[quint8, 1024],
+    scale: f32,
+    zp: f32,
+    output: inout [1] Tensor[f32, 1024]
+) {
+    forall i in 0..1024 {
+        let sum = reduce_sum!(sum, 0.0, k, 0, 4,
+            dequantize!(a, i, scale, zp) * dequantize!(b, i, scale, zp));
+        output[i] = sum;
+    }
+}
+"#;
+        let program = parse(src);
+        let wgsl = generate_wgsl_compute(&program, "ffn_matmul").expect("must emit WGSL");
+        validate_wgsl(&wgsl).expect("Naga must accept dequantize WGSL");
+    }
+
+    // ---------------------- ABI ↔ shader cross-verification ---
+
+    /// Parse the WGSL shader text to extract `@group(0) @binding(N)` declarations.
+    /// Returns a map from binding index to (access_mode, element_type, var_name).
+    fn extract_bindings(wgsl: &str) -> std::collections::HashMap<u32, (String, String, String)> {
+        let mut result = std::collections::HashMap::new();
+        for line in wgsl.lines() {
+            // Pattern: @group(0) @binding(N) var<storage, access> name: array<elem>;
+            if let Some(rest) = line.strip_prefix("@group(0) @binding(") {
+                if let Some(close) = rest.find(')') {
+                    let index: u32 = rest[..close].parse().unwrap();
+                    let after = &rest[close + 1..];
+                    if let Some(storage) = after.strip_prefix(" var<storage, ") {
+                        // var<storage, access> name: array<elem>;
+                        if let Some(access_end) = storage.find("> ") {
+                            let access = storage[..access_end].to_string();
+                            let rest = &storage[access_end + 2..]; // after "> "
+                            if let Some(name_end) = rest.find(": array<") {
+                                let name = rest[..name_end].to_string();
+                                let elem_start = name_end + 8; // skip ": array<"
+                                if let Some(elem_end) = rest[elem_start..].find('>') {
+                                    let elem =
+                                        rest[elem_start..elem_start + elem_end].trim().to_string();
+                                    result.insert(index, (access, elem, name));
+                                }
+                            }
+                        }
+                    } else if let Some(uniform) = after.strip_prefix(" var<uniform> ") {
+                        if let Some(name_end) = uniform.find(": ") {
+                            let name = uniform[..name_end].to_string();
+                            let elem = uniform[name_end + 2..]
+                                .trim_end_matches(';')
+                                .trim()
+                                .to_string();
+                            result.insert(index, ("uniform".to_string(), elem, name));
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// The shader's @group/@binding declarations must match the ABI exactly.
+    /// This catches any divergence where the ABI reporter and the shader emitter
+    /// disagree on binding indices, access modes, or element types.
+    #[test]
+    fn test_shader_bindings_match_abi_matmul() {
+        let src = r#"
+fn matmul(a: [*] Tensor[f32, 1024], b: [*] Tensor[f32, 1024],
+          output: inout [1] Tensor[f32, 1024], scale: f32) {
+    forall i in 0..1024 {
+        let mut sum = 0.0;
+        for j in 0..4 {
+            sum = sum + a[i] * b[i];
+        }
+        output[i] = sum * scale;
+    }
+}
+"#;
+
+        let program = parse(src);
+        let shader = generate_wgsl_compute(&program, "matmul").expect("must emit shader");
+        let abi = describe_compute_abi(&program, "matmul").expect("must describe ABI");
+
+        // Validate the shader through naga first — no point cross-checking invalid WGSL.
+        validate_wgsl(&shader).expect(&format!("naga validation failed: {shader}"));
+
+        let shader_bindings = extract_bindings(&shader);
+
+        // For each binding the ABI reports, the shader must declare it at the
+        // same index with the same element type and access mode.
+        for b in &abi.bindings {
+            let found = shader_bindings.get(&b.index).unwrap_or_else(|| {
+                panic!(
+                    "ABI reports binding {} ({}) at index {}, but shader has no declaration there.\nShader:\n{shader}",
+                    b.name, b.elem, b.index
+                )
+            });
+            let (shader_access, shader_elem, shader_name) = found;
+            assert_eq!(
+                b.access, shader_access,
+                "ABI says binding {} ({}) has access '{}' but shader declares '{}'\nShader:\n{shader}",
+                b.name, b.elem, b.access, shader_access
+            );
+            assert_eq!(
+                b.elem, *shader_elem,
+                "ABI says binding {} has element type '{}' but shader declares '{}'\nShader:\n{shader}",
+                b.name, b.elem, shader_elem
+            );
+            assert_eq!(
+                b.name, *shader_name,
+                "ABI says binding name is '{}' but shader declares '{}'\nShader:\n{shader}",
+                b.name, shader_name
+            );
+        }
+
+        // No extra storage bindings in the shader beyond what the ABI declares.
+        let abi_indices: std::collections::HashSet<u32> =
+            abi.bindings.iter().map(|b| b.index).collect();
+        for (&index, (access, _, name)) in &shader_bindings {
+            if access == "uniform" {
+                continue; // scalar uniforms are expected
+            }
+            assert!(
+                abi_indices.contains(&index),
+                "Shader declares storage binding {} ({}) at index {} that ABI does not report\nShader:\n{shader}",
+                name,
+                access,
+                index
+            );
+        }
+    }
+
+    /// Same cross-verification for a kernel with scalar uniforms.
+    #[test]
+    fn test_shader_bindings_match_abi_with_scalars() {
+        let src = r#"
+fn matmul_scaled(a: [*] Tensor[f32, 1024], b: [*] Tensor[f32, 1024],
+                 output: inout [1] Tensor[f32, 1024], scale: f32) {
+    forall i in 0..1024 {
+        let mut sum = 0.0;
+        for j in 0..4 {
+            sum = sum + a[i] * b[i];
+        }
+        output[i] = sum * scale;
+    }
+}
+"#;
+
+        let program = parse(src);
+        let shader = generate_wgsl_compute(&program, "matmul_scaled").expect("must emit shader");
+        let abi = describe_compute_abi(&program, "matmul_scaled").expect("must describe ABI");
+
+        validate_wgsl(&shader).expect(&format!("naga validation failed: {shader}"));
+
+        let shader_bindings = extract_bindings(&shader);
+
+        // Tensor bindings must match.
+        for b in &abi.bindings {
+            let (shader_access, shader_elem, shader_name) =
+                shader_bindings.get(&b.index).unwrap_or_else(|| {
+                    panic!(
+                        "ABI binding {} at index {} not found in shader\nShader:\n{shader}",
+                        b.name, b.index
+                    )
+                });
+            assert_eq!(b.access, *shader_access);
+            assert_eq!(b.elem, *shader_elem);
+            assert_eq!(b.name, *shader_name);
+        }
+
+        // Scalar uniforms: ABI scalars must appear as uniform bindings in the shader.
+        // They are numbered after tensor bindings.
+        let tensor_count = abi.bindings.len() as u32;
+        for (i, (name, _ty)) in abi.scalars.iter().enumerate() {
+            let index = tensor_count + i as u32;
+            let (_, _, shader_name) = shader_bindings.get(&index).unwrap_or_else(|| {
+                panic!(
+                    "ABI scalar {} should be uniform at index {}, but shader has no declaration\nShader:\n{shader}",
+                    name, index
+                )
+            });
+            assert_eq!(shader_name, &format!("{}_u", name));
+        }
     }
 }

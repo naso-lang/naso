@@ -316,6 +316,11 @@ fn walk_expr_for_calls(expr: &Expr, out: &mut Vec<(String, Vec<Expr>, Span)>) {
         // `Error` is a recovery placeholder the parser emits for malformed input; a program
         // containing one is already reported elsewhere. Neither can hold a call.
         EK::Continue | EK::Error => {}
+        // A range `lo..hi` can contain calls in its bounds.
+        EK::Range(lo, hi) => {
+            walk_expr_for_calls(lo, out);
+            walk_expr_for_calls(hi, out);
+        }
     }
 }
 

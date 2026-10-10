@@ -1,0 +1,68 @@
+// Trillion-parameter LLM — model kernels for WGSL compute backend
+// 
+// Architecture constraints for WGSL compute:
+// - All tensor params in a kernel must share the same extent
+// - Inner accumulation uses reduce_sum! over a `for` loop
+// - Quint8 weights are packed (4 per u32) and dequantized via dequantize! macro
+// - Output extent matches input extent
+
+// FFN expert forward: output[i] = activation(scale * (W2 @ activation(W1 @ input)))
+// Each expert has: W1: [D_MODEL, D_FF], W2: [D_FF, D_MODEL]
+// We process one output element per GPU invocation.
+//
+// For WGSL, we use the same extent N for all tensors.
+// W1 is accessed as W1[i * D_MODEL + k] — flattened 2D access.
+// The weight tensor has extent D_MODEL * D_FF, which differs from D_MODEL.
+//
+// Constraint: all tensors must share extent N. So we set:
+//   N = D_MODEL * D_FF (the largest)
+//   input is broadcast (accessed via modulo)
+//   output is accessed via division
+
+fn ffn_expert_a(
+    input: [*] Tensor[quint8, 180273152],   // D_MODEL * D_FF = 8192 * 22016  
+    weight: [*] Tensor[quint8, 180273152],  // same extent
+    scale: f32,
+    zp: f32,
+    output: inout [1] Tensor[f32, 180273152]
+) {
+    forall i in 0..180273152 {
+        let row = i / 22016;  // which output neuron (0..8191)
+        let col = i % 22016;  // not needed for this variant
+        // Each output neuron: reduce over 22016 input elements
+        let input_idx = i % 8192;
+        let acc = reduce_sum!(acc, 0.0, k, 0, 8192,
+            dequantize!(input, input_idx, scale, zp) * 
+            dequantize!(weight, k * 22016 + (i % 22016), scale, zp));
+        output[i] = acc;
+    }
+}
+
+// Simplified FFN: elementwise quantized matmul with same extent
+// output[i] = dequantize!(input, i, scale, zp) * dequantize!(weight, i, scale, zp)
+fn ffn_expert_simple(
+    input: [*] Tensor[quint8, 8196],
+    weight: [*] Tensor[quint8, 8196],
+    scale: f32,
+    zp: f32,
+    output: inout [1] Tensor[f32, 8196]
+) {
+    forall i in 0..8196 {
+        output[i] = dequantize!(input, i, scale, zp) * dequantize!(weight, i, scale, zp);
+    }
+}
+
+// Quantized matmul: output[i] = sum_k(a[i] * b[i]) — same extent for all
+fn ffn_matmul(
+    a: [*] Tensor[quint8, 1024],
+    b: [*] Tensor[quint8, 1024],
+    scale: f32,
+    zp: f32,
+    output: inout [1] Tensor[f32, 1024]
+) {
+    forall i in 0..1024 {
+        let sum = reduce_sum!(sum, 0.0, k, 0, 4,
+            dequantize!(a, i, scale, zp) * dequantize!(b, i, scale, zp));
+        output[i] = sum;
+    }
+}

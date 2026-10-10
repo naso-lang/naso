@@ -37,6 +37,10 @@ pub struct Type {
     /// backend emit a correct bounds guard. `None` means "not a known constant",
     /// which is what a generic `N` or a bare `Nat` is.
     pub nat_value: Option<u64>,
+    /// If true, the tensor is a sparse tensor. Only applies to `TypeKind::Tensor`.
+    /// A sparse tensor allocates one `u32` mask word per 32 elements (1 bit set
+    /// if the element is non-zero) plus the dense allocation for non-zero elements.
+    pub sparse: bool,
 }
 
 impl Type {
@@ -47,6 +51,7 @@ impl Type {
             span,
             nat_value: None,
             int_width: None,
+            sparse: false,
         }
     }
 
@@ -58,6 +63,7 @@ impl Type {
             span,
             nat_value: None,
             int_width: Some(width),
+            sparse: false,
         }
     }
 
@@ -69,6 +75,7 @@ impl Type {
             span,
             nat_value: None,
             int_width: Some(width),
+            sparse: false,
         }
     }
 
@@ -80,6 +87,7 @@ impl Type {
             span,
             nat_value: Some(value),
             int_width: None,
+            sparse: false,
         }
     }
 
@@ -104,6 +112,11 @@ impl Type {
         Self::new(TypeKind::Nat, Quantity::Many, span)
     }
 
+    /// `quint8` — 8-bit unsigned quantized integer, stored packed as u32.
+    pub fn quint8(span: Span) -> Self {
+        Self::new(TypeKind::Quint8, Quantity::Many, span)
+    }
+
     pub fn qubit(span: Span) -> Self {
         Self::new(TypeKind::Qubit, Quantity::One, span)
     }
@@ -113,11 +126,25 @@ impl Type {
     }
 
     pub fn tensor(dims: Vec<Type>, span: Span) -> Self {
-        Self::new(TypeKind::Tensor(dims), Quantity::Many, span)
+        Self {
+            kind: TypeKind::Tensor(dims),
+            quantity: Quantity::Many,
+            span,
+            nat_value: None,
+            int_width: None,
+            sparse: false,
+        }
     }
 
     pub fn function(params: Vec<Type>, ret: Box<Type>, span: Span) -> Self {
-        Self::new(TypeKind::Function(params, ret), Quantity::Many, span)
+        Self {
+            kind: TypeKind::Function(params, ret),
+            quantity: Quantity::Many,
+            span,
+            nat_value: None,
+            int_width: None,
+            sparse: false,
+        }
     }
 
     pub fn with_quantity(mut self, qty: Quantity) -> Self {
@@ -146,6 +173,10 @@ pub enum TypeKind {
     Int,
     /// Unsigned integer
     UInt,
+    /// 8-bit unsigned quantized integer (stored as u32, 4 per word)
+    /// Used for trillion-parameter model compression: 1T params × 1 byte = 1TB raw,
+    /// packed as u32 storage gives 4× density, dequantized on-demand to f32.
+    Quint8,
     /// Float
     Float,
     /// String
@@ -286,6 +317,7 @@ impl fmt::Display for TypeKind {
             TypeKind::String => write!(f, "String"),
             TypeKind::Char => write!(f, "Char"),
             TypeKind::Nat => write!(f, "Nat"),
+            TypeKind::Quint8 => write!(f, "quint8"),
             TypeKind::Qubit => write!(f, "Qubit"),
             TypeKind::QRegister(dims) => write!(
                 f,

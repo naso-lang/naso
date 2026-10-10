@@ -279,7 +279,335 @@ impl<'a> Parser<'a> {
     fn parse_var(&mut self) -> Expr {
         let start = self.pos;
         let name = self.parse_ident();
+        // Check for macro-call syntax: `reduce_sum!(...)` or `reduce_max!(...)`
+        if self.eat(TK::Not) {
+            // Check which macro is being called.
+            return if name.name == "reduce_sum" || name.name == "reduce_max" {
+                self.parse_reduce_macro(&name, start)
+            } else if name.name == "dequantize" {
+                self.parse_dequantize_macro(&name, start)
+            } else {
+                self.fail(
+                    format!("unknown macro `!{}`", name.name),
+                    self.span_from(start),
+                )
+            };
+        }
         Expr::new(ExprKind::Var(name), self.span_from(start), next_id())
+    }
+
+    /// Parse a `dequantize!(tensor, index, scale, zero_point)` macro.
+    /// Expands to the arithmetic identity for 8-bit dequantization:
+    ///   f32((tensor[index >> 2] >> ((index & 3) * 8)) & 0xFF) * scale - zero_point * scale
+    /// This unpacks a packed u32 (4 × 8-bit values) and applies symmetric dequantization.
+    fn parse_dequantize_macro(&mut self, _name: &Ident, start: usize) -> Expr {
+        self.expect(TK::LParen);
+        let tensor = self.parse_expr();
+        self.expect(TK::Comma);
+        let index = self.parse_expr();
+        self.expect(TK::Comma);
+        let scale = self.parse_expr();
+        self.expect(TK::Comma);
+        let zero_point = self.parse_expr();
+        self.expect(TK::RParen);
+
+        let span = self.span_from(start);
+
+        // Cast index to u32 for WGSL-compatible bitwise operations.
+        // The quint8 tensor is stored as array<u32> in WGSL, so the word index
+        // and lane offset must be u32 to match.
+        let u32_ty = Type::new(TypeKind::UInt, Quantity::Many, span);
+        let index_u32 = Expr::new(
+            ExprKind::Ascribe(Box::new(index.clone()), u32_ty.clone()),
+            span,
+            next_id(),
+        );
+
+        // Build: (index >> 2) — which u32 word contains the element
+        let word_index = Expr::new(
+            ExprKind::Binary(
+                BinOp::Shr,
+                Box::new(index_u32.clone()),
+                Box::new(Expr::new(
+                    ExprKind::Literal(Literal::UInt(2)),
+                    span,
+                    next_id(),
+                )),
+            ),
+            span,
+            next_id(),
+        );
+
+        // Build: tensor[word_index] — load the packed u32
+        let packed = Expr::new(
+            ExprKind::Index(Box::new(tensor), Box::new(word_index)),
+            span,
+            next_id(),
+        );
+
+        // Build: (index & 3) * 8 — bit position of the 8-bit element within the u32
+        let lane = Expr::new(
+            ExprKind::Binary(
+                BinOp::BitAnd,
+                Box::new(index_u32.clone()),
+                Box::new(Expr::new(
+                    ExprKind::Literal(Literal::UInt(3)),
+                    span,
+                    next_id(),
+                )),
+            ),
+            span,
+            next_id(),
+        );
+        let bit_pos = Expr::new(
+            ExprKind::Binary(
+                BinOp::Mul,
+                Box::new(lane),
+                Box::new(Expr::new(
+                    ExprKind::Literal(Literal::UInt(8)),
+                    span,
+                    next_id(),
+                )),
+            ),
+            span,
+            next_id(),
+        );
+
+        // Build: (packed >> bit_pos) & 0xFF — extract the 8-bit value
+        let shifted = Expr::new(
+            ExprKind::Binary(BinOp::Shr, Box::new(packed), Box::new(bit_pos.clone())),
+            span,
+            next_id(),
+        );
+        let mask = Expr::new(ExprKind::Literal(Literal::UInt(255)), span, next_id());
+        let byte_val = Expr::new(
+            ExprKind::Binary(BinOp::BitAnd, Box::new(shifted), Box::new(mask)),
+            span,
+            next_id(),
+        );
+
+        // Build: (byte_val as f32 - zero_point as f32) * scale
+        // Dequantization formula: real = scale * (quantized - zero_point)
+        // Use Ascribe (cast) instead of function call for type conversion.
+        let f32_ty = Type::new(TypeKind::Float, Quantity::Many, span);
+        let float_val = Expr::new(
+            ExprKind::Ascribe(Box::new(byte_val), f32_ty.clone()),
+            span,
+            next_id(),
+        );
+        let zp_f32 = Expr::new(
+            ExprKind::Ascribe(Box::new(zero_point), f32_ty.clone()),
+            span,
+            next_id(),
+        );
+        let sub = Expr::new(
+            ExprKind::Binary(BinOp::Sub, Box::new(float_val), Box::new(zp_f32)),
+            span,
+            next_id(),
+        );
+        let result = Expr::new(
+            ExprKind::Binary(BinOp::Mul, Box::new(sub), Box::new(scale)),
+            span,
+            next_id(),
+        );
+
+        result
+    }
+
+    /// Parse a `reduce_sum!(...)` or `reduce_max!(...)` macro and expand it
+    /// to a block expression: `{ let mut acc = init; for k in lo..hi { acc = acc OP body }; acc }`
+    /// (for `reduce_max!`, the assignment uses `((acc - body) + abs(acc - body)) * 0.5 + body`).
+    fn parse_reduce_macro(&mut self, name: &Ident, start: usize) -> Expr {
+        let is_max = name.name == "reduce_max";
+        if !is_max && name.name != "reduce_sum" {
+            return self.fail(
+                format!("unknown macro `!{}`", name.name),
+                self.span_from(start),
+            );
+        }
+
+        self.expect(TK::LParen);
+        // Parse: acc_var, init, loop_var, lo, hi, body[, stride]
+        let acc_var = self.parse_ident();
+        self.expect(TK::Comma);
+        let init = self.parse_expr();
+        self.expect(TK::Comma);
+        let loop_var = self.parse_ident();
+        self.expect(TK::Comma);
+        let lo = self.parse_expr();
+        self.expect(TK::Comma);
+        let hi = self.parse_expr();
+        self.expect(TK::Comma);
+        let body = self.parse_expr();
+
+        // Optional stride: when present, the reduction iterates over a per-invocation
+        // strided range so work is distributed across the workgroup instead of being
+        // a sequential K-element loop on a single thread.
+        //   stride = N  =>  loop_var in (i * N) .. (i * N + (hi - lo))
+        // where `i` is the invocation index (global_invocation_id.x).
+        // When absent, the loop is the simple lo..hi form (per-invocation full range).
+        let stride = if self.at(TK::Comma) {
+            self.eat(TK::Comma); // consume comma
+            Some(self.parse_expr())
+        } else {
+            None
+        };
+        self.expect(TK::RParen);
+
+        let span = self.span_from(start);
+
+        // Create the accumulator variable reference
+        let acc_expr = || Expr::new(ExprKind::Var(acc_var.clone()), span, next_id());
+
+        // Build the assignment RHS.
+        // For reduce_sum: acc + body
+        // For reduce_max: ((acc - body) + abs(acc - body)) * 0.5 + body
+        //   This is the arithmetic identity for max(a, b) that avoids if/else.
+        //   max(a, b) = ((a - b) + abs(a - b)) * 0.5 + b
+        let assign_rhs = if is_max {
+            // acc - body
+            let diff = Expr::new(
+                ExprKind::Binary(BinOp::Sub, Box::new(acc_expr()), Box::new(body.clone())),
+                span,
+                next_id(),
+            );
+            // abs(acc - body)
+            let abs_diff = Expr::new(
+                ExprKind::Call(
+                    Box::new(Expr::new(
+                        ExprKind::Var(Ident::new("abs", span)),
+                        span,
+                        next_id(),
+                    )),
+                    vec![diff.clone()],
+                ),
+                span,
+                next_id(),
+            );
+            // (diff + abs_diff) * 0.5 + body
+            // = ((acc - body) + abs(acc - body)) * 0.5 + body
+            let sum = Expr::new(
+                ExprKind::Binary(BinOp::Add, Box::new(diff), Box::new(abs_diff)),
+                span,
+                next_id(),
+            );
+            let half = Expr::new(ExprKind::Literal(Literal::Float(0.5)), span, next_id());
+            let half_sum = Expr::new(
+                ExprKind::Binary(BinOp::Mul, Box::new(sum), Box::new(half)),
+                span,
+                next_id(),
+            );
+            Expr::new(
+                ExprKind::Binary(BinOp::Add, Box::new(half_sum), Box::new(body)),
+                span,
+                next_id(),
+            )
+        } else {
+            // acc + body
+            Expr::new(
+                ExprKind::Binary(BinOp::Add, Box::new(acc_expr()), Box::new(body)),
+                span,
+                next_id(),
+            )
+        };
+
+        // Assignment statement: acc = assign_rhs
+        let assign = Expr::new(
+            ExprKind::Assign(Box::new(acc_expr()), Box::new(assign_rhs)),
+            span,
+            next_id(),
+        );
+
+        // For loop: for k in lo..hi { acc = ... }
+        //
+        // When `stride` is present, the reduction iterates over a per-invocation
+        // strided range so work distributes across the workgroup:
+        //   for k in (i * stride)..(i * stride + (hi - lo)) { ... }
+        // where `i` is the invocation index (the `forall` loop variable).
+        // This lets 64 invocations each handle stride/max_iterations of the
+        // reduction instead of one thread doing all max_iterations sequentially.
+        let (eff_lo, eff_hi) = if let Some(stride) = &stride {
+            // i * stride  (invocation offset)
+            let i_var = Expr::new(ExprKind::Var(Ident::new("i", span)), span, next_id());
+            let offset = Expr::new(
+                ExprKind::Binary(BinOp::Mul, Box::new(i_var), Box::new(stride.clone())),
+                span,
+                next_id(),
+            );
+            // (hi - lo): the count of elements this thread processes
+            let range_count = Expr::new(
+                ExprKind::Binary(BinOp::Sub, Box::new(hi.clone()), Box::new(lo.clone())),
+                span,
+                next_id(),
+            );
+            // (i * stride) + (hi - lo)
+            let upper = Expr::new(
+                ExprKind::Binary(BinOp::Add, Box::new(offset.clone()), Box::new(range_count)),
+                span,
+                next_id(),
+            );
+            (offset, upper)
+        } else {
+            (lo, hi)
+        };
+
+        let stmt_assign =
+            crate::ast::Stmt::new(crate::ast::StmtKind::Expr(assign), span, next_id());
+        let for_body = crate::ast::Block::new(vec![stmt_assign], None, span);
+        let for_loop = crate::ast::ForLoop {
+            var: loop_var,
+            iter: Expr::new(
+                ExprKind::Range(Box::new(eff_lo), Box::new(eff_hi)),
+                span,
+                next_id(),
+            ),
+            body: for_body,
+            span,
+        };
+
+        // let mut acc = init
+        let pattern = crate::ast::Pattern::new(
+            crate::ast::PatternKind::Ident(acc_var.clone()),
+            span,
+            next_id(),
+        );
+        let let_stmt = crate::ast::Stmt::new(
+            crate::ast::StmtKind::Let(crate::ast::LetStmt {
+                pattern,
+                ty: None,
+                quantity: crate::ast::Quantity::Many,
+                mutability: crate::ast::Mutability::Mut,
+                value: init,
+                span,
+            }),
+            span,
+            next_id(),
+        );
+
+        // Tail expression: acc
+        let tail = acc_expr();
+
+        // Block: { let mut acc = init; for k in ... { ... }; acc }
+        Expr::new(
+            ExprKind::Block(Box::new(crate::ast::Block::new(
+                vec![
+                    let_stmt,
+                    crate::ast::Stmt::new(
+                        crate::ast::StmtKind::Expr(Expr::new(
+                            ExprKind::For(Box::new(for_loop)),
+                            span,
+                            next_id(),
+                        )),
+                        span,
+                        next_id(),
+                    ),
+                ],
+                Some(tail),
+                span,
+            ))),
+            span,
+            next_id(),
+        )
     }
 
     /// Parse either a struct literal `TypeName { ... }` or a plain variable
@@ -455,7 +783,19 @@ impl<'a> Parser<'a> {
             self.unexpected::<()>(r"`in`");
         }
         self.bump();
-        let iter = self.parse_expr();
+        let lower = self.parse_range_bound();
+        // `for k in 0..N { .. }` parses a range; `for k in n { .. }` parses a count.
+        // A range produces ExprKind::Range(lower, upper); a bare count is just `lower`.
+        let iter = if self.eat(TK::DotDot) {
+            let upper = self.parse_range_bound();
+            Expr::new(
+                ExprKind::Range(Box::new(lower), Box::new(upper)),
+                self.span_from(start),
+                next_id(),
+            )
+        } else {
+            lower
+        };
         let body = self.parse_block_expr();
         let body = match body.kind {
             ExprKind::Block(b) => *b,

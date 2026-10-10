@@ -47,6 +47,10 @@ web-sys = { version = "0.3", features = ["console"], optional = true }
 # never declared here -- so the file never compiled, and nothing ran. Tests that do not build
 # are not tests.
 proptest = "1"
+# naga validates generated WGSL through wgpu's front-end: parse + validate is what a GPU
+# driver checks first. Using it as the test oracle catches miscompilation (e.g. if/else
+# silently emitting `/* unsupported */`) that string-matching cannot.
+naga = { version = "25", features = ["wgsl-in"] }
 
 [[bin]]
 name = "naso"

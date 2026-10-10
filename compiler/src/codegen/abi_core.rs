@@ -120,6 +120,7 @@ pub fn lower_pir_module_types(
             span: Span::default(),
             nat_value: None,
             int_width: None,
+            sparse: false,
         };
         let lowered = lower_pir_type(&ty, &module.quantities)?;
         result.insert(name.clone(), lowered);
@@ -219,6 +220,7 @@ fn lower_type_kind_to_aggregate(
             QuantityAwareType::Linear(LlvmAggregateType::Int(IntWidth::I64)),
         ])),
         TypeKind::Char => Ok(LlvmAggregateType::Int(IntWidth::I32)),
+        TypeKind::Quint8 => Ok(LlvmAggregateType::Int(IntWidth::I32)),
     }
 }
 

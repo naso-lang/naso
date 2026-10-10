@@ -1052,7 +1052,12 @@ pub(crate) fn wgsl_binop(op: &BinOp) -> Option<&'static str> {
         BinOp::Ge => ">=",
         BinOp::And => "&&",
         BinOp::Or => "||",
-        _ => return None,
+        BinOp::BitAnd => "&",
+        BinOp::BitOr => "|",
+        BinOp::BitXor => "^",
+        BinOp::Shl => "<<",
+        BinOp::Shr => ">>",
+        BinOp::Assign => return None,
     })
 }
 

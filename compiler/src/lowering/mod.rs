@@ -1680,7 +1680,12 @@ impl LoweringContext {
             // function's quantity map, because `[1]` markings are recorded there and a
             // synthesised binding must not appear unaccounted for.
             crate::ast::ExprKind::For(fl) => {
-                let count = self.lower_expr(&fl.iter)?;
+                // `for k in 0..N { body }` parses iter as Range(0, N).
+                // `for k in n   { body }` parses iter as a bare count expression n.
+                let count = match &fl.iter.kind {
+                    crate::ast::ExprKind::Range(_, upper) => self.lower_expr(upper)?,
+                    _ => self.lower_expr(&fl.iter)?,
+                };
                 let mut parts: Vec<crate::ir::PirExpr> = Vec::new();
 
                 //

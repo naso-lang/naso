@@ -181,6 +181,8 @@ pub enum TokenKind {
     UInt32,
     #[regex("[uU]64", priority = 3)]
     UInt64,
+    #[regex("[qQ][uU][iI][nN][tT]8", priority = 3)]
+    Quint8,
     #[regex("[uU][sS][iI][zZ][eE]", priority = 3)]
     USize,
     #[regex("[fF]32", priority = 3)]
@@ -381,6 +383,7 @@ impl TokenKind {
             TokenKind::UInt16 => "'u16'",
             TokenKind::UInt32 => "'u32'",
             TokenKind::UInt64 => "'u64'",
+            TokenKind::Quint8 => "'quint8'",
             TokenKind::USize => "'usize'",
             TokenKind::Float32 => "'f32'",
             TokenKind::Float64 => "'f64'",

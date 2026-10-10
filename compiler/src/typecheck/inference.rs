@@ -32,7 +32,7 @@ fn infer_cast(
     let is_numeric = |k: &TypeKind| {
         matches!(
             k,
-            TypeKind::Int | TypeKind::UInt | TypeKind::Float | TypeKind::Nat
+            TypeKind::Int | TypeKind::UInt | TypeKind::Float | TypeKind::Nat | TypeKind::Quint8
         )
     };
 
@@ -89,6 +89,12 @@ pub fn infer_expr(checker: &mut TypeChecker, expr: &Expr) -> Result<Type, TypeEr
         ExprKind::Projection(base) => infer_projection(checker, base, expr.span),
         ExprKind::QuantumOp(qop) => infer_quantum_op(checker, qop, expr.span),
         ExprKind::Ascribe(inner, ty) => infer_cast(checker, inner, ty, expr.span),
+        ExprKind::Range(lo, hi) => {
+            let lo_ty = infer_expr(checker, lo)?;
+            let hi_ty = infer_expr(checker, hi)?;
+            let _ = (lo_ty, hi_ty);
+            Ok(Type::new(TypeKind::Int, Quantity::Many, expr.span))
+        }
         ExprKind::Break(opt_expr) => infer_break(checker, opt_expr.as_deref(), expr.span),
         ExprKind::Continue => infer_continue(expr.span),
         ExprKind::Error => Ok(Type::new(TypeKind::Error, Quantity::Many, expr.span)),
@@ -230,7 +236,12 @@ fn refuse_if_bool_op_undefined(
 /// the silent-wrong-answer shape this rule exists to prevent.
 fn numeric_common(lhs: &Type, rhs: &Type) -> Option<Type> {
     use crate::ast::ty::TypeKind;
-    let is_int = |t: &Type| matches!(t.kind, TypeKind::Int | TypeKind::UInt | TypeKind::Nat);
+    let is_int = |t: &Type| {
+        matches!(
+            t.kind,
+            TypeKind::Int | TypeKind::UInt | TypeKind::Nat | TypeKind::Quint8
+        )
+    };
     if matches!(lhs.kind, TypeKind::Float) && is_int(rhs) {
         return Some(lhs.clone());
     }

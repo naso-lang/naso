@@ -1,0 +1,31 @@
+// Trillion-parameter LLM — sparse mixture of experts
+// Each expert is a 2-layer FFN in quint8 quantized storage.
+
+// Quantized FFN expert — stored as packed quint8
+fn ffn_expert_a(
+    input: [*] Tensor[quint8, 8192],
+    weight: [*] Tensor[quint8, 180273152],
+    scale: f32,
+    zp: f32,
+    output: inout [1] Tensor[f32, 22016]
+) {
+    forall i in 0..22016 {
+        let sum = reduce_sum!(sum, 0.0, k, 0, 8192,
+            dequantize!(input, k, scale, zp) * dequantize!(weight, i * 8192 + k, scale, zp));
+        output[i] = sum;
+    }
+}
+
+fn ffn_expert_b(
+    input: [*] Tensor[f32, 22016],
+    weight: [*] Tensor[quint8, 180273152],
+    scale: f32,
+    zp: f32,
+    output: inout [1] Tensor[f32, 8192]
+) {
+    forall i in 0..8192 {
+        let sum = reduce_sum!(sum, 0.0, k, 0, 22016,
+            input[k] * dequantize!(weight, i * 22016 + k, scale, zp));
+        output[i] = sum;
+    }
+}

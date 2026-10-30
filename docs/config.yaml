@@ -33,29 +33,38 @@ params:
       alt: "Naso Logo"
     nav:
       - name: "Docs"
-        url: "/docs/"
+        url: "/"
         weight: 1
-      - name: "Language Spec"
-        url: "/docs/spec/"
+      - name: "Whitepaper"
+        url: "/whitepaper/"
         weight: 2
-      - name: "Standard Library"
-        url: "/docs/stdlib/"
+      - name: "QTT"
+        url: "/qtt/"
         weight: 3
-      - name: "Verification"
-        url: "/docs/verification/"
+      - name: "Philosophy"
+        url: "/philosophy/"
         weight: 4
+      - name: "Spec"
+        url: "/spec/"
+        weight: 5
+      - name: "Stdlib"
+        url: "/stdlib/"
+        weight: 6
+      - name: "Verification"
+        url: "/verification/"
+        weight: 7
       - name: "Playground"
         url: "https://play.nasolang.org/"
-        weight: 5
+        weight: 8
       - name: Search
         params:
           type: search
-        weight: 6
+        weight: 100
       - name: GitHub
         url: "https://github.com/naso-lang/naso"
         params:
           icon: github
-        weight: 7
+        weight: 101
 
   search:
     enable: true
@@ -78,20 +87,29 @@ params:
 menu:
   main:
     - name: Docs
-      pageRef: /docs
+      pageRef: /
       weight: 1
-    - name: Language Spec
-      pageRef: /docs/spec
+    - name: Whitepaper
+      pageRef: /whitepaper
       weight: 2
-    - name: Standard Library
-      pageRef: /docs/stdlib
+    - name: QTT
+      pageRef: /qtt
       weight: 3
-    - name: Verification
-      pageRef: /docs/verification
+    - name: Philosophy
+      pageRef: /philosophy
       weight: 4
+    - name: Spec
+      pageRef: /spec
+      weight: 5
+    - name: Stdlib
+      pageRef: /stdlib
+      weight: 6
+    - name: Verification
+      pageRef: /verification
+      weight: 7
     - name: Playground
       url: "https://play.nasolang.org/"
-      weight: 5
+      weight: 8
     - name: Search
       params:
         type: search

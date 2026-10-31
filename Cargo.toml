@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+
 members = [
     "compiler",
     "stdlib",
@@ -7,6 +8,7 @@ members = [
     "crates/naso-gates",
     "crates/naso-verify",
     "crates/nasoc-wasm",
+    "crates/naso-ffi",
 ]
 
 [workspace.package]
@@ -16,35 +18,22 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/naso-lang/naso"
 
 [workspace.dependencies]
-# Parsing
 logos = { version = "0.13" }
-thiserror = "2.0"
+thiserror = { version = "2.0" }
 naso-compiler = { path = "compiler" }
-
-# LSP
+tokio = { version = "1.35", features = ["rt", "net", "io-util"] }
 tower-lsp = { version = "0.20", features = ["runtime-tokio"] }
-tokio = { version = "1.35", features = ["full"] }
-dashmap = "6.1"
-
-# SMT Verification
+dashmap = { version = "6.1" }
 z3 = { version = "0.21", features = ["vendored"] }
-
-# AST / IR
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-indexmap = "2.0"
-smallvec = "1.0"
-
-# Testing
-# (proptest / criterion intentionally unused for now; they require a mingw
-# dlltool on this host, so they were removed to keep `cargo test` buildable)
-
-# Utilities
-anyhow = "1.0"
-tracing = "0.1"
+serde_json = { version = "1.0" }
+indexmap = { version = "2.0" }
+smallvec = { version = "1.0" }
+anyhow = { version = "1.0" }
+tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4.5" }
-colored = "2.0"
+colored = { version = "2.0" }
 url = { version = "2.4" }
 naso-gates = { path = "crates/naso-gates" }
 naso-verify = { path = "crates/naso-verify" }
@@ -60,9 +49,5 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
-# The wasm cdylib wants a size-tuned release build rather than the workspace's
-# speed-tuned `opt-level = 3`. Its own `[profile.release]` lived in the member's
-# Cargo.toml, where cargo ignores it (with a warning), so the intent never took
-# effect; per-package overrides belong here at the workspace root instead.
 [profile.release.package.nasoc-wasm]
 opt-level = "s"

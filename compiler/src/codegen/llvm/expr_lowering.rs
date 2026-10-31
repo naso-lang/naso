@@ -33,6 +33,7 @@
 use crate::ast::Quantity;
 use crate::codegen::abi::IntWidth;
 use crate::codegen::error::{CodegenError, CodegenResult};
+use crate::codegen::ffi_integration::resolve_symbol;
 use crate::codegen::llvm::value_builder::LlvmValueBuilder;
 use crate::ir::pir_types::{BinaryOp, ParamKind, PirExpr, UnaryOp};
 use inkwell::module::Module;
@@ -473,12 +474,38 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 // `callee_params` (a hand-built module with a `functions` list the call
                 // site did not see), so the diagnostic below names both spellings
                 // rather than only the one that was tried.
+                // Check if this is an FFI function that needs symbol resolution
+                let ffi_symbol = resolve_symbol(name);
+                let call_name = if let Some(sym) = ffi_symbol {
+                    sym
+                } else {
+                    name
+                };
+
+                // Resolve the callee.
+                //
+                // A NASO FUNCTION is emitted under `naso_<name>`, so a Naso-to-Naso
+                // call has to be rewritten to that symbol. Resolution goes through
+                // `function_emission::symbol_for` -- the SAME function emission used to
+                // name the definition -- so the two cannot disagree about the
+                // convention. A second guess here, spelled `format!("naso_{name}")`,
+                // would compile cleanly right up until a call landed on a symbol that
+                // happened to exist and meant something else.
+                //
+                // By the time control reaches here the callee is NOT a Naso function in
+                // this module -- those returned above through `build_naso_call`. What is
+                // left is a prelude intrinsic or a declared `extern`, both of which are
+                // emitted under their own name. The prefixed fallback is kept as a
+                // safety net for a callee that IS a generated function but was not in
+                // `callee_params` (a hand-built module with a `functions` list the call
+                // site did not see), so the diagnostic below names both spellings
+                // rather than only the one that was tried.
                 let func = self
                     .module
-                    .get_function(name)
+                    .get_function(call_name)
                     .or_else(|| {
                         self.module.get_function(
-                            &crate::codegen::llvm::function_emission::symbol_for(name),
+                            &crate::codegen::llvm::function_emission::symbol_for(call_name),
                         )
                     })
                     .ok_or_else(|| {
@@ -487,8 +514,8 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                              A Naso function is emitted under `naso_<name>`, so a call \
                              to a function that is neither this module's nor a declared \
                              `extern` has no target. Nothing is substituted for it.",
-                            name,
-                            crate::codegen::llvm::function_emission::symbol_for(name),
+                            call_name,
+                            crate::codegen::llvm::function_emission::symbol_for(call_name),
                         ))
                     })?;
 

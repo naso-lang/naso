@@ -416,8 +416,28 @@ fn infer_call(
             }
 
             // Check each argument against parameter type
+            // Function parameters are contravariant: we need arg_type >= param_type
+            // i.e., param_type <= arg_type (param is subtype of arg)
             for (param, arg) in params.iter().zip(args) {
-                checker.check_expr(arg, param)?;
+                let arg_ty = infer_expr(checker, arg)?;
+                
+                // Unify type kinds (covariant - structure must match)
+                unify::unify_kinds(checker, &arg_ty.kind, &param.kind)?;
+                
+                // Check quantities contravariantly: param_qty <= arg_qty
+                // This allows passing Many where One is expected (consuming a Many value linearly)
+                if !crate::typecheck::unify::qty_subtype(param.quantity, arg_ty.quantity) {
+                    return Err(crate::typecheck::error::TypeError::QuantityMismatch {
+                        expected: param.quantity,
+                        found: arg_ty.quantity,
+                        span: arg.span,
+                    });
+                }
+                
+                // Record the use of the argument (for linear checking)
+                // The argument is consumed by the call - for now we rely on the
+                // existing use tracking in infer_expr/check_expr
+                let _ = arg_ty;
             }
 
             Ok(*ret.clone())
@@ -451,11 +471,26 @@ fn infer_call(
 fn infer_method_call(
     checker: &mut TypeChecker,
     receiver: &Expr,
-    _method: &Ident,
+    method: &Ident,
     _args: &[Expr],
     span: Span,
 ) -> Result<Type, TypeError> {
-    let _receiver_ty = infer_expr(checker, receiver)?;
+    let receiver_ty = infer_expr(checker, receiver)?;
+
+    // Special case: .unwrap() on Result<T> returns T
+    if method.name == "unwrap" {
+        if let TypeKind::Named(name, args) = &receiver_ty.kind {
+            if name.name == "Result" {
+                if let Some(TypeArg::Type(inner_ty)) = args.first() {
+                    return Ok(Type::new(
+                        inner_ty.kind.clone(),
+                        inner_ty.quantity,
+                        span,
+                    ));
+                }
+            }
+        }
+    }
 
     // Look up method on receiver type
     // For now, stub - would need type class / trait system
@@ -1012,7 +1047,7 @@ fn infer_for(checker: &mut TypeChecker, for_loop: &ForLoop, span: Span) -> Resul
         Mutability::Immutable,
     );
 
-    check_block(checker, &for_loop.body)?;
+    check_block(checker, &for_loop.body, None)?;
     checker.env.exit_scope(guard)?;
 
     Ok(Type::unit(span))
@@ -1042,7 +1077,7 @@ fn infer_forall(
             .bind_var(var.clone(), bound_ty, Quantity::Many, Mutability::Immutable);
     }
 
-    check_block(checker, &forall_loop.body)?;
+    check_block(checker, &forall_loop.body, None)?;
     checker.env.exit_scope(guard)?;
 
     Ok(Type::unit(span))

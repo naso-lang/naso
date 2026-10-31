@@ -1,0 +1,25 @@
+// Test handle_connection
+fn test_handle() -> () {
+    let stream = dummy_stream();
+    handle_connection(stream);
+    ()
+}
+
+fn dummy_stream() -> [1] Stream {
+    let _: [1] Stream = panic();
+    panic()
+}
+
+fn handle_connection(stream: [1] Stream) -> () {
+    let result = parse_request(stream);
+    let _: Result[(Request, [1] Stream)] = result;
+    let (req, stream) = result.unwrap();
+    let resp = route(req);
+    let _ = send_response(stream, resp);
+    ()
+}
+
+fn route(req: Request) -> Response {
+    let body = [104, 101, 108, 108, 111];
+    ok(body)
+}

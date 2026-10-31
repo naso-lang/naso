@@ -1,0 +1,20 @@
+// Test parse_request + send_response
+fn test_parse_send() -> () {
+    let stream = dummy_stream();
+    let result = parse_request(stream);
+    let _: Result[(Request, [1] Stream)] = result;
+    let (req, stream) = result.unwrap();
+    let _ = req;
+    let _ = send_response(stream, dummy_response());
+    ()
+}
+
+fn dummy_stream() -> [1] Stream {
+    let _: [1] Stream = panic();
+    panic()
+}
+
+fn dummy_response() -> Response {
+    let _: Response = panic();
+    panic()
+}

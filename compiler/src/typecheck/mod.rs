@@ -126,8 +126,8 @@ impl TypeChecker {
     }
 
     /// Check a block
-    pub fn check_block(&mut self, block: &Block) -> Result<(), error::TypeError> {
-        check::check_block(self, block)
+    pub fn check_block(&mut self, block: &Block, expected_ret: Option<&Type>) -> Result<(), error::TypeError> {
+        check::check_block(self, block, expected_ret)
     }
 
     /// Check a function definition
@@ -398,12 +398,23 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
         attributes: Vec::new(),
     });
 
-    // Tensor type and operations
+    // sys.net types (FFI)
     env.insert_type_def(TypeDef {
-        name: Ident::new("Tensor", Span::default()),
+        name: Ident::new("Listener", Span::default()),
         generics: Vec::new(),
         kind: TypeDefKind::Alias(Type::new(
-            TypeKind::Named(Ident::new("Tensor", Span::default()), Vec::new()),
+            TypeKind::Named(Ident::new("Listener", Span::default()), Vec::new()),
+            Quantity::One,
+            Span::default(),
+        )),
+        span: Span::default(),
+        attributes: Vec::new(),
+    });
+    env.insert_type_def(TypeDef {
+        name: Ident::new("Stream", Span::default()),
+        generics: Vec::new(),
+        kind: TypeDefKind::Alias(Type::new(
+            TypeKind::Named(Ident::new("Stream", Span::default()), Vec::new()),
             Quantity::Many,
             Span::default(),
         )),
@@ -411,18 +422,279 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
         attributes: Vec::new(),
     });
 
-    // alloc_tensor function
+    // http types
+    env.insert_type_def(TypeDef {
+        name: Ident::new("Request", Span::default()),
+        generics: Vec::new(),
+        kind: TypeDefKind::Alias(Type::new(
+            TypeKind::Named(Ident::new("Request", Span::default()), Vec::new()),
+            Quantity::One,
+            Span::default(),
+        )),
+        span: Span::default(),
+        attributes: Vec::new(),
+    });
+    env.insert_type_def(TypeDef {
+        name: Ident::new("Response", Span::default()),
+        generics: Vec::new(),
+        kind: TypeDefKind::Alias(Type::new(
+            TypeKind::Named(Ident::new("Response", Span::default()), Vec::new()),
+            Quantity::One,
+            Span::default(),
+        )),
+        span: Span::default(),
+        attributes: Vec::new(),
+    });
+
+    // sys.net.bind(addr: String) -> Result<Listener>
     PreludeFn {
-        name: "alloc_tensor",
+        name: "bind",
         params: vec![Param {
-            name: Ident::new("shape", Span::default()),
-            ty: Type::new(TypeKind::Int, Quantity::Many, Span::default()),
+            name: Ident::new("addr", Span::default()),
+            ty: Type::new(TypeKind::String, Quantity::Many, Span::default()),
             quantity: Quantity::Many,
             mutability: Mutability::Immutable,
             span: Span::default(),
         }],
         ret_ty: Some(Type::new(
-            TypeKind::Named(Ident::new("Tensor", Span::default()), Vec::new()),
+            TypeKind::Named(Ident::new("Result", Span::default()), vec![
+                TypeArg::Type(Type::new(
+                    TypeKind::Named(Ident::new("Listener", Span::default()), Vec::new()),
+                    Quantity::One,
+                    Span::default(),
+                ))
+            ]),
+            Quantity::Many,
+            Span::default(),
+        )),
+        quantity: Quantity::Many,
+        is_reversible: false,
+    }
+    .insert(env);
+
+    // accept(l: [1] Listener) -> [1] Stream
+    PreludeFn {
+        name: "accept",
+        params: vec![Param {
+            name: Ident::new("l", Span::default()),
+            ty: Type::new(
+                TypeKind::Named(Ident::new("Listener", Span::default()), Vec::new()),
+                Quantity::One,
+                Span::default(),
+            ),
+            quantity: Quantity::One,
+            mutability: Mutability::Consume,
+            span: Span::default(),
+        }],
+        ret_ty: Some(Type::new(
+            TypeKind::Named(Ident::new("Stream", Span::default()), Vec::new()),
+            Quantity::One,
+            Span::default(),
+        )),
+        quantity: Quantity::Many,
+        is_reversible: false,
+    }
+    .insert(env);
+
+    // sys.net.read(s: Stream, buf: [N] u8) -> Result<usize>
+    PreludeFn {
+        name: "read",
+        params: vec![
+            Param {
+                name: Ident::new("s", Span::default()),
+                ty: Type::new(
+                    TypeKind::Named(Ident::new("Stream", Span::default()), Vec::new()),
+                    Quantity::Many,
+                    Span::default(),
+                ),
+                quantity: Quantity::Many,
+                mutability: Mutability::Immutable,
+                span: Span::default(),
+            },
+            Param {
+                name: Ident::new("buf", Span::default()),
+                ty: Type::new(
+                    TypeKind::Array(Box::new(Type::new(TypeKind::UInt, Quantity::Many, Span::default())), None),
+                    Quantity::One,
+                    Span::default(),
+                ),
+                quantity: Quantity::One,
+                mutability: Mutability::Immutable,
+                span: Span::default(),
+            },
+        ],
+        ret_ty: Some(Type::new(
+            TypeKind::Named(Ident::new("Result", Span::default()), vec![
+                TypeArg::Type(Type::new(TypeKind::Int, Quantity::Many, Span::default()))
+            ]),
+            Quantity::Many,
+            Span::default(),
+        )),
+        quantity: Quantity::Many,
+        is_reversible: false,
+    }
+    .insert(env);
+
+    // sys.net.write(s: Stream, buf: [N] u8) -> Result<usize>
+    PreludeFn {
+        name: "write",
+        params: vec![
+            Param {
+                name: Ident::new("s", Span::default()),
+                ty: Type::new(
+                    TypeKind::Named(Ident::new("Stream", Span::default()), Vec::new()),
+                    Quantity::Many,
+                    Span::default(),
+                ),
+                quantity: Quantity::Many,
+                mutability: Mutability::Immutable,
+                span: Span::default(),
+            },
+            Param {
+                name: Ident::new("buf", Span::default()),
+                ty: Type::new(
+                    TypeKind::Array(Box::new(Type::new(TypeKind::UInt, Quantity::Many, Span::default())), None),
+                    Quantity::One,
+                    Span::default(),
+                ),
+                quantity: Quantity::One,
+                mutability: Mutability::Immutable,
+                span: Span::default(),
+            },
+        ],
+        ret_ty: Some(Type::new(
+            TypeKind::Named(Ident::new("Result", Span::default()), vec![
+                TypeArg::Type(Type::new(TypeKind::Int, Quantity::Many, Span::default()))
+            ]),
+            Quantity::Many,
+            Span::default(),
+        )),
+        quantity: Quantity::Many,
+        is_reversible: false,
+    }
+    .insert(env);
+
+    // sys.net.last_error() -> String
+    PreludeFn {
+        name: "last_error",
+        params: vec![],
+        ret_ty: Some(Type::new(TypeKind::String, Quantity::Many, Span::default())),
+        quantity: Quantity::Many,
+        is_reversible: false,
+    }
+    .insert(env);
+
+    // http.parse_request(stream: [1] Stream) -> Result<(Request, Stream)>
+    // Consumes the stream, returns it back along with the parsed request
+    PreludeFn {
+        name: "parse_request",
+        params: vec![Param {
+            name: Ident::new("stream", Span::default()),
+            ty: Type::new(
+                TypeKind::Named(Ident::new("Stream", Span::default()), Vec::new()),
+                Quantity::One,
+                Span::default(),
+            ),
+            quantity: Quantity::One,
+            mutability: Mutability::Consume,
+            span: Span::default(),
+        }],
+        ret_ty: Some(Type::new(
+            TypeKind::Named(Ident::new("Result", Span::default()), vec![
+                TypeArg::Type(Type::new(
+                    TypeKind::Tuple(vec![
+                        Type::new(
+                            TypeKind::Named(Ident::new("Request", Span::default()), Vec::new()),
+                            Quantity::One,
+                            Span::default(),
+                        ),
+                        Type::new(
+                            TypeKind::Named(Ident::new("Stream", Span::default()), Vec::new()),
+                            Quantity::One,
+                            Span::default(),
+                        ),
+                    ]),
+                    Quantity::One,
+                    Span::default(),
+                ))
+            ]),
+            Quantity::Many,
+            Span::default(),
+        )),
+        quantity: Quantity::Many,
+        is_reversible: false,
+    }
+    .insert(env);
+
+    // http.send_response(stream: [1] Stream, resp: Response) -> Result<()>
+    PreludeFn {
+        name: "send_response",
+        params: vec![
+            Param {
+                name: Ident::new("stream", Span::default()),
+                ty: Type::new(
+                    TypeKind::Named(Ident::new("Stream", Span::default()), Vec::new()),
+                    Quantity::One,
+                    Span::default(),
+                ),
+                quantity: Quantity::One,
+                mutability: Mutability::Consume,
+                span: Span::default(),
+            },
+            Param {
+                name: Ident::new("resp", Span::default()),
+                ty: Type::new(
+                    TypeKind::Named(Ident::new("Response", Span::default()), Vec::new()),
+                    Quantity::One,
+                    Span::default(),
+                ),
+                quantity: Quantity::One,
+                mutability: Mutability::Consume,
+                span: Span::default(),
+            },
+        ],
+        ret_ty: Some(Type::new(
+            TypeKind::Named(Ident::new("Result", Span::default()), vec![
+                TypeArg::Type(Type::unit(Span::default()))
+            ]),
+            Quantity::Many,
+            Span::default(),
+        )),
+        quantity: Quantity::Many,
+        is_reversible: false,
+    }
+    .insert(env);
+
+    // http.ok(body: [N] Int) -> Response
+    PreludeFn {
+        name: "ok",
+        params: vec![Param {
+            name: Ident::new("body", Span::default()),
+            ty: Type::new(
+                TypeKind::Array(Box::new(Type::new(TypeKind::Int, Quantity::Many, Span::default())), None),
+                Quantity::Many,
+                Span::default(),
+            ),
+            quantity: Quantity::One,
+            mutability: Mutability::Consume,
+            span: Span::default(),
+        }],
+        ret_ty: Some(Type::new(
+            TypeKind::Named(Ident::new("Response", Span::default()), Vec::new()),
+            Quantity::One,
+            Span::default(),
+        )),
+        quantity: Quantity::Many,
+        is_reversible: false,
+    }
+    .insert(env);
+
+    // http.not_found() -> Response
+    PreludeFn {
+        name: "not_found",
+        params: vec![],
+        ret_ty: Some(Type::new(
+            TypeKind::Named(Ident::new("Response", Span::default()), Vec::new()),
             Quantity::One,
             Span::default(),
         )),

@@ -1,0 +1,17 @@
+// Test send_response only
+fn test_send() -> () {
+    let stream = dummy_stream();
+    let resp = dummy_response();
+    let _ = send_response(stream, resp);
+    ()
+}
+
+fn dummy_stream() -> [1] Stream {
+    let _: [1] Stream = panic();
+    panic()
+}
+
+fn dummy_response() -> Response {
+    let _: Response = panic();
+    panic()
+}

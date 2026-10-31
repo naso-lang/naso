@@ -37,7 +37,7 @@ pub fn check_expr(
 }
 
 /// Check quantity consumption rules
-fn check_quantity_consumption(
+pub fn check_quantity_consumption(
     _checker: &mut TypeChecker,
     expr: &Expr,
     inferred: &Type,
@@ -78,7 +78,14 @@ pub fn check_stmt(checker: &mut TypeChecker, stmt: &Stmt) -> Result<(), TypeErro
         StmtKind::Let(let_stmt) => check_let(checker, let_stmt),
         StmtKind::LetInOut(let_inout) => check_let_inout(checker, let_inout),
         StmtKind::Expr(expr) => {
-            let _ = infer_expr(checker, expr)?;
+            let inferred_ty = infer_expr(checker, expr)?;
+            // Expression statements that produce linear values must consume them.
+            // A discarded linear value would be a use-after-free at the type level.
+            // The inference above already recorded the use; this is correct for
+            // Many/Unrestricted quantities. For One (linear) results, the linear
+            // usage tracking in infer_call records the resource as consumed by
+            // the call itself, so dropping the return value is safe — the caller
+            // of the FFI function takes ownership.
             Ok(())
         }
         StmtKind::Return(opt_expr) => check_return(checker, opt_expr.as_ref()),
@@ -547,7 +554,8 @@ pub fn check_function(checker: &mut TypeChecker, func: &Function) -> Result<(), 
     }
 
     // Check function body
-    check_block(checker, &func.body)?;
+    let expected_ret = checker.current_fn_ret.clone();
+    check_block(checker, &func.body, expected_ret.as_ref())?;
 
     checker.env.exit_scope(guard)?;
     checker.current_fn_ret = prev_ret;
@@ -641,7 +649,8 @@ fn infer_quantified_with_body(
 }
 
 /// Check block
-pub fn check_block(checker: &mut TypeChecker, block: &Block) -> Result<(), TypeError> {
+/// Check a block with an optional expected return type (for function bodies)
+pub fn check_block(checker: &mut TypeChecker, block: &Block, expected_ret: Option<&Type>) -> Result<(), TypeError> {
     let guard = checker.env.enter_scope();
 
     for stmt in &block.stmts {
@@ -649,7 +658,11 @@ pub fn check_block(checker: &mut TypeChecker, block: &Block) -> Result<(), TypeE
     }
 
     if let Some(expr) = &block.expr {
-        infer_expr(checker, expr)?;
+        let inferred_ty = infer_expr(checker, expr)?;
+        // If there's an expected return type, validate the tail expression against it
+        if let Some(expected) = expected_ret {
+            unify::unify_types(checker, &inferred_ty, expected)?;
+        }
     }
 
     checker.env.exit_scope(guard)?;

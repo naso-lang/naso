@@ -44,7 +44,7 @@ pub fn unify_types(checker: &mut TypeChecker, ty1: &Type, ty2: &Type) -> Result<
 }
 
 /// Unify two type kinds
-fn unify_kinds(
+pub fn unify_kinds(
     checker: &mut TypeChecker,
     k1: &TypeKind,
     k2: &TypeKind,
@@ -159,6 +159,20 @@ fn unify_kinds(
         (TypeKind::Lambda(param1, body1), TypeKind::Lambda(_param2, body2)) => {
             let unified_body = unify_types(checker, body1, body2)?;
             Ok(TypeKind::Lambda(param1.clone(), Box::new(unified_body)))
+        }
+
+        // Array types
+        (TypeKind::Array(elem1, size1), TypeKind::Array(elem2, size2)) => {
+            let unified_elem = unify_types(checker, elem1, elem2)?;
+            // For sizes, require exact match for now (could be relaxed later)
+            if size1 != size2 {
+                return Err(TypeError::TypeMismatch {
+                    expected: Type::new(k1.clone(), Quantity::Many, Span::default()),
+                    found: Type::new(k2.clone(), Quantity::Many, Span::default()),
+                    span: Span::default(),
+                });
+            }
+            Ok(TypeKind::Array(Box::new(unified_elem), size1.clone()))
         }
 
         // Type application

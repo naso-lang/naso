@@ -147,57 +147,75 @@ impl<'a> Parser<'a> {
 
     fn parse_postfix(&mut self) -> Expr {
         let mut expr = self.parse_primary();
-        while !self.loop_should_stop() {
-            if self.at(TK::LParen) {
-                self.bump();
-                let args = self.parse_args_until(TK::RParen);
-                self.expect(TK::RParen);
-                let span = expr.span;
-                expr = Expr::new(ExprKind::Call(Box::new(expr), args), span, next_id());
-            } else if self.at(TK::Dot) {
-                self.bump();
-                let name = self.parse_ident();
+        // Control flow expressions (if, while, for, etc.) cannot be called.
+        // Prevents `while cond { ... }()` from being parsed as a call.
+        let is_control_flow = matches!(
+            &expr.kind,
+            ExprKind::If(..)
+                | ExprKind::Match(..)
+                | ExprKind::For(..)
+                | ExprKind::While(..)
+                | ExprKind::Forall(..)
+                | ExprKind::Quantified(..)
+                | ExprKind::Break(..)
+                | ExprKind::Continue
+                | ExprKind::Return(..)
+                | ExprKind::Reversible(..)
+                | ExprKind::QuantumOp(..)
+        );
+        if !is_control_flow {
+            while !self.loop_should_stop() {
                 if self.at(TK::LParen) {
                     self.bump();
                     let args = self.parse_args_until(TK::RParen);
                     self.expect(TK::RParen);
                     let span = expr.span;
+                    expr = Expr::new(ExprKind::Call(Box::new(expr), args), span, next_id());
+                } else if self.at(TK::Dot) {
+                    self.bump();
+                    let name = self.parse_ident();
+                    if self.at(TK::LParen) {
+                        self.bump();
+                        let args = self.parse_args_until(TK::RParen);
+                        self.expect(TK::RParen);
+                        let span = expr.span;
+                        expr = Expr::new(
+                            ExprKind::MethodCall(Box::new(expr), name, args),
+                            span,
+                            next_id(),
+                        );
+                    } else {
+                        let span = expr.span;
+                        expr = Expr::new(ExprKind::Field(Box::new(expr), name), span, next_id());
+                    }
+                } else if self.at(TK::LBracket) {
+                    self.bump();
+                    // Parse comma-separated indices (supporting multi-dimensional indexing)
+                    let indices = self.parse_args_until(TK::RBracket);
+                    self.expect(TK::RBracket);
+                    let span = expr.span;
+                    // If multiple indices, wrap in a tuple
+                    let idx_expr = if indices.len() == 1 {
+                        indices.into_iter().next().unwrap()
+                    } else {
+                        Expr::new(ExprKind::Tuple(indices), span, next_id())
+                    };
                     expr = Expr::new(
-                        ExprKind::MethodCall(Box::new(expr), name, args),
+                        ExprKind::Index(Box::new(expr), Box::new(idx_expr)),
                         span,
                         next_id(),
                     );
-                } else {
+                } else if self.at(TK::As) {
+                    // Numeric cast: `expr as i8`. Reuses ExprKind::Ascribe, which
+                    // already existed in the AST and was wired into visiting and
+                    // inference but never parsed.
+                    self.bump();
+                    let ty = self.parse_type();
                     let span = expr.span;
-                    expr = Expr::new(ExprKind::Field(Box::new(expr), name), span, next_id());
-                }
-            } else if self.at(TK::LBracket) {
-                self.bump();
-                // Parse comma-separated indices (supporting multi-dimensional indexing)
-                let indices = self.parse_args_until(TK::RBracket);
-                self.expect(TK::RBracket);
-                let span = expr.span;
-                // If multiple indices, wrap in a tuple
-                let idx_expr = if indices.len() == 1 {
-                    indices.into_iter().next().unwrap()
+                    expr = Expr::new(ExprKind::Ascribe(Box::new(expr), ty), span, next_id());
                 } else {
-                    Expr::new(ExprKind::Tuple(indices), span, next_id())
-                };
-                expr = Expr::new(
-                    ExprKind::Index(Box::new(expr), Box::new(idx_expr)),
-                    span,
-                    next_id(),
-                );
-            } else if self.at(TK::As) {
-                // Numeric cast: `expr as i8`. Reuses ExprKind::Ascribe, which
-                // already existed in the AST and was wired into visiting and
-                // inference but never parsed.
-                self.bump();
-                let ty = self.parse_type();
-                let span = expr.span;
-                expr = Expr::new(ExprKind::Ascribe(Box::new(expr), ty), span, next_id());
-            } else {
-                break;
+                    break;
+                }
             }
         }
         expr

@@ -1,0 +1,124 @@
+; ModuleID = 'teleport'
+source_filename = "teleport.naso"
+target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
+target triple = "x86_64-unknown-linux-gnu"
+
+; QIR Profile: Base Profile
+; Quantum Intermediate Representation for quantum teleportation
+
+; Quantum runtime intrinsics
+declare void @__quantum__rt__initialize(i64)
+declare void @__quantum__rt__result_record_output(i64, i64)
+declare i8* @__quantum__rt__qubit_allocate()
+declare void @__quantum__rt__qubit_release(i8*)
+declare i64 @__quantum__rt__array_get_size_1d(i8*)
+declare i8* @__quantum__rt__array_allocate_1d(i64, i64)
+declare void @__quantum__rt__array_update_reference_count(i8*, i64)
+declare void @__quantum__rt__array_update_alias_count(i8*, i64)
+
+; Quantum instruction intrinsics
+declare void @__quantum__qis__h__body(i8*)
+declare void @__quantum__qis__x__body(i8*)
+declare void @__quantum__qis__z__body(i8*)
+declare void @__quantum__qis__cnot__body(i8*, i8*)
+declare i64 @__quantum__qis__mz__body(i8*)
+declare void @__quantum__qis__reset__body(i8*)
+
+; Entry point for quantum teleportation
+define void @teleport() {
+entry:
+  ; Initialize quantum runtime
+  call void @__quantum__rt__initialize(i64 3)
+
+  ; Allocate 3 qubits: q[0] = |ψ⟩ (state to teleport), q[1] = Alice's Bell, q[2] = Bob's Bell
+  %q0 = call i8* @__quantum__rt__qubit_allocate()
+  %q1 = call i8* @__quantum__rt__qubit_allocate()
+  %q2 = call i8* @__quantum__rt__qubit_allocate()
+
+  ; Prepare Bell pair |Φ⁺⟩ = (|00⟩ + |11⟩)/√2 between q[1] and q[2]
+  call void @__quantum__qis__h__body(i8* %q1)
+  call void @__quantum__qis__cnot__body(i8* %q1, i8* %q2)
+
+  ; Alice's operations on q[0] and q[1]
+  call void @__quantum__qis__cnot__body(i8* %q0, i8* %q1)
+  call void @__quantum__qis__h__body(i8* %q0)
+
+  ; Alice measures in Bell basis (2 classical bits)
+  %b0 = call i64 @__quantum__qis__mz__body(i8* %q0)
+  %b1 = call i64 @__quantum__qis__mz__body(i8* %q1)
+
+  ; Record measurement results for output
+  call void @__quantum__rt__result_record_output(i64 0, i64 %b0)
+  call void @__quantum__rt__result_record_output(i64 1, i64 %b1)
+
+  ; Bob applies corrections based on measurement results
+  ; if b1 { X q[2] }
+  %apply_x = icmp ne i64 %b1, 0
+  br i1 %apply_x, label %x_correction, label %check_z
+
+x_correction:                                     ; preds = %entry
+  call void @__quantum__qis__x__body(i8* %q2)
+  br label %check_z
+
+check_z:                                          ; preds = %x_correction, %entry
+  ; if b0 { Z q[2] }
+  %apply_z = icmp ne i64 %b0, 0
+  br i1 %apply_z, label %z_correction, label %cleanup
+
+z_correction:                                     ; preds = %check_z
+  call void @__quantum__qis__z__body(i8* %q2)
+  br label %cleanup
+
+cleanup:                                          ; preds = %z_correction, %check_z
+  ; Release qubits
+  call void @__quantum__rt__qubit_release(i8* %q0)
+  call void @__quantum__rt__qubit_release(i8* %q1)
+  call void @__quantum__rt__qubit_release(i8* %q2)
+
+  ret void
+}
+
+; Alternative entry point with explicit state preparation
+define void @teleport_with_state(i8* %psi) {
+entry:
+  call void @__quantum__rt__initialize(i64 3)
+
+  %q1 = call i8* @__quantum__rt__qubit_allocate()
+  %q2 = call i8* @__quantum__rt__qubit_allocate()
+
+  ; Prepare Bell pair
+  call void @__quantum__qis__h__body(i8* %q1)
+  call void @__quantum__qis__cnot__body(i8* %q1, i8* %q2)
+
+  ; Alice's operations
+  call void @__quantum__qis__cnot__body(i8* %psi, i8* %q1)
+  call void @__quantum__qis__h__body(i8* %psi)
+
+  ; Alice measures
+  %b0 = call i64 @__quantum__qis__mz__body(i8* %psi)
+  %b1 = call i64 @__quantum__qis__mz__body(i8* %q1)
+
+  call void @__quantum__rt__result_record_output(i64 0, i64 %b0)
+  call void @__quantum__rt__result_record_output(i64 1, i64 %b1)
+
+  ; Bob corrections
+  %apply_x = icmp ne i64 %b1, 0
+  br i1 %apply_x, label %x_corr, label %check_z2
+
+x_corr:
+  call void @__quantum__qis__x__body(i8* %q2)
+  br label %check_z2
+
+check_z2:
+  %apply_z = icmp ne i64 %b0, 0
+  br i1 %apply_z, label %z_corr, label %cleanup2
+
+z_corr:
+  call void @__quantum__qis__z__body(i8* %q2)
+  br label %cleanup2
+
+cleanup2:
+  call void @__quantum__rt__qubit_release(i8* %q1)
+  call void @__quantum__rt__qubit_release(i8* %q2)
+  ret void
+}

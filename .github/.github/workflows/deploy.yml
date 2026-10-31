@@ -1,0 +1,102 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+env:
+  # The repo is served from a /naso/ subpath on GitHub Pages.
+  BASE_URL: /naso/
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: |
+            app/package-lock.json
+            play/package-lock.json
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Install Hugo
+        uses: peaceiris/actions-hugo@v3
+        with:
+          hugo-version: "0.146.0"
+
+      # ---- 1. Build the docs site (Hugo) ----
+      - name: Build docs site
+        run: hugo --gc --minify --baseURL "${{ env.BASE_URL }}docs/"
+        working-directory: docs
+
+      # ---- 2. Build the playground site (Vite + wasm-pack) ----
+      - name: Build wasm playground module
+        run: wasm-pack build ../crates/nasoc-wasm --target web --out-dir ../../play/pkg
+        working-directory: play
+
+      - name: Build playground site
+        run: npm ci && npm run build
+        working-directory: play
+        env:
+          BASE_URL: ${{ env.BASE_URL }}play/
+
+      # ---- 3. Build the app (Nuxt 3) ----
+      - name: Inject COOP/COEP ServiceWorker for SharedArrayBuffer
+        run: |
+          mkdir -p app/public
+          curl -sL https://raw.githubusercontent.com/gzuidhof/coi-serviceworker/master/coi-serviceworker.js -o app/public/coi-serviceworker.js
+
+      - name: Generate Nuxt 3 Static Site
+        run: npm ci && npm run generate
+        working-directory: app
+        env:
+          NUXT_APP_BASE_URL: ${{ env.BASE_URL }}app/
+          NUXT_PUBLIC_BASE_URL: ${{ env.BASE_URL }}app/
+
+      # ---- 4. Assemble all three into a single pages directory ----
+      - name: Assemble pages directory
+        run: |
+          mkdir -p pages/docs pages/play pages/app
+          # Copy Hugo output
+          cp -r docs/public/* pages/docs/
+          # Copy Vite output
+          cp -r play/dist/* pages/play/
+          # Copy Nuxt output
+          cp -r app/.output/public/* pages/app/
+          # Create a top-level index.html redirect
+          printf '%s\n' '<!DOCTYPE html>' '<html>' '<head><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=./docs/"><link rel="canonical" href="./docs/"><title>Naso</title></head>' '<body><p>Redirecting to <a href="./docs/">documentation</a>...</p><ul><li><a href="./docs/">Documentation</a></li><li><a href="./play/">Playground</a></li><li><a href="./app/">App</a></li></ul></body>' '</html>' > pages/index.html
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: pages
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

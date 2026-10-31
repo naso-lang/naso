@@ -1,0 +1,20 @@
+// Test full chain: parse_request -> route(ok) -> send_response
+fn test_full() -> () {
+    let stream = dummy_stream();
+    let result = parse_request(stream);
+    let _: Result[(Request, [1] Stream)] = result;
+    let (req, stream) = result.unwrap();
+    let resp = route(req);
+    let _ = send_response(stream, resp);
+    ()
+}
+
+fn dummy_stream() -> [1] Stream {
+    let _: [1] Stream = panic();
+    panic()
+}
+
+fn route(req: Request) -> Response {
+    let body = [104, 101, 108, 108, 111];
+    ok(body)
+}

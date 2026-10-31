@@ -1,0 +1,14 @@
+// Test unwrap on Result tuple
+fn test_unwrap_tuple() -> () {
+    let result = parse_request_dummy();
+    let (a, b) = result.unwrap();
+    let _ = a + b;
+    ()
+}
+
+// Dummy function
+fn parse_request_dummy() -> Result[([1] Int, [1] Int)] {
+    // Can't construct Result, but we can test the unwrap type
+    let _: Result[([1] Int, [1] Int)] = unreachable();
+    unreachable()
+}

@@ -1,0 +1,11 @@
+[package]
+name = "naso_std"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+naso-compiler = { workspace = true }
+
+[features]
+default = []
+std = []

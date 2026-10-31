@@ -1,0 +1,57 @@
+[package]
+name = "naso-compiler"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+llvm = ["dep:inkwell"]
+cranelift = ["dep:cranelift", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native"]
+# Enables `runtime::jit`, which declares extern "C" symbols that no library in this
+# repository provides. OFF by default because `--features cranelift` otherwise fails
+# to link; see `src/runtime/jit/mod.rs` for what implementing it would require.
+naso-jit-ffi = []
+serde = ["serde/derive"]
+wasm-debug = ["dep:web-sys"]
+
+[dependencies]
+# Gate matrices and the verified adjoint relation, in a leaf crate with no dependencies.
+#
+# This is what Phase A was for: `naso-verify` depends on this crate, so the adjoint table
+# could not live there and still be reachable from lowering and codegen.
+naso-gates = { workspace = true }
+
+logos = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+indexmap = { workspace = true }
+smallvec = { workspace = true }
+anyhow = { workspace = true }
+
+# Use inkwell 0.10.x which supports LLVM 17
+inkwell = { version = "0.10", features = ["llvm17-0"], optional = true }
+cranelift = { version = "0.115", features = ["jit"], optional = true }
+cranelift-jit = { version = "0.115", optional = true }
+cranelift-module = { version = "0.115", optional = true }
+cranelift-native = { version = "0.115", optional = true }
+target-lexicon = "0.12"
+clap = { version = "4.5", default-features = false, features = ["derive", "std", "help", "usage", "suggestions", "error-context"] }
+num-complex = "0.4"
+rand = { version = "0.8", features = ["std", "small_rng"] }
+walkdir = "2.5"
+web-sys = { version = "0.3", features = ["console"], optional = true }
+
+[dev-dependencies]
+# compiler/tests/codegen_property_tests.rs has used proptest since it was written, but it was
+# never declared here -- so the file never compiled, and nothing ran. Tests that do not build
+# are not tests.
+proptest = "1"
+# naga validates generated WGSL through wgpu's front-end: parse + validate is what a GPU
+# driver checks first. Using it as the test oracle catches miscompilation (e.g. if/else
+# silently emitting `/* unsupported */`) that string-matching cannot.
+naga = { version = "25", features = ["wgsl-in"] }
+
+[[bin]]
+name = "naso"
+path = "src/main.rs"

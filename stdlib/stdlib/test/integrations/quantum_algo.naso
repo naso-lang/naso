@@ -1,0 +1,45 @@
+// stdlib/test/integrations/quantum_algo.naso
+// Integration test: Quantum algorithms using std::quantum
+// Demonstrates Bell pair creation, QFT, and Grover's algorithm
+
+use std::quantum::*;
+
+fn main() {
+    // Test 1: Bell pair creation and measurement
+    println!("Test 1: Bell pair creation");
+    let bell = bell_pair();
+    let m0 = measure(bell[0]);
+    let m1 = measure(bell[1]);
+    assert(m0 == m1, "Bell pair measurements should be correlated");
+    qfree(bell);
+    println!("  Bell pair test passed: m0={}, m1={}", m0, m1);
+    
+    // Test 2: Superposition and CNOT
+    println!("Test 2: Superposition + CNOT");
+    let qs = qalloc(2);
+    hadamard(qs[0]);
+    cnot(qs[0], qs[1]);
+    let r0 = measure(qs[0]);
+    let r1 = measure(qs[1]);
+    qfree(qs);
+    println!("  Superposition test passed: r0={}, r1={}", r0, r1);
+    
+    // Test 3: Quantum Fourier Transform
+    println!("Test 3: Quantum Fourier Transform");
+    let qft_qs = qalloc(4);
+    qft(&mut qft_qs);
+    let qft_result = measure(qft_qs[0]);
+    qfree(qft_qs);
+    println!("  QFT test passed: result={}", qft_result);
+    
+    // Test 4: Grover's search oracle
+    println!("Test 4: Grover oracle");
+    let grover_qs = qalloc(3);
+    let oracle = grover_oracle(|x: u32| x == 5);
+    oracle(&grover_qs);
+    let grover_result = measure(grover_qs[0]);
+    qfree(grover_qs);
+    println!("  Grover oracle test passed: result={}", grover_result);
+    
+    println!("All quantum algorithm tests passed!");
+}

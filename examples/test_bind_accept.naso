@@ -1,0 +1,7 @@
+// Test only bind and accept
+fn test_bind_accept() -> () {
+    let listener = bind("0.0.0.0:8080").unwrap();
+    let stream = accept(listener);
+    let _ = stream;
+    ()
+}

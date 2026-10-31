@@ -17,7 +17,8 @@ pub fn ok(body: [N] u16) -> Response {
 }
 
 pub fn not_found() -> Response {
-    let msg: [13] u8 = b"Not Found";
+    // Naso doesn't have byte string literals; use array literal
+    let msg: [13] u8 = [78, 111, 116, 32, 70, 111, 117, 110, 100, 13, 10, 13, 10];
     Response { status: 404, body: msg }
 }
 

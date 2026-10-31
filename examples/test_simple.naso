@@ -1,0 +1,18 @@
+// Test parse_request minimal
+fn test_parse_request() -> () {
+    let stream = dummy_stream();
+    let result = parse_request(stream);
+    let unwrapped: (Request, [1] Stream) = result.unwrap();
+    let (req, stream) = unwrapped;
+    let _ = req;
+    let _ = stream;
+    ()
+}
+
+// extern "C" { fn dummy_stream() -> [1] Stream; }
+// Can't use extern, so use a function that type-checks
+fn dummy_stream() -> [1] Stream {
+    // This won't actually run, but type-checks
+    let _: [1] Stream = panic();
+    panic()
+}

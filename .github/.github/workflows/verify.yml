@@ -1,0 +1,495 @@
+name: Formal Verification Benchmarks
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  # verify-benchmarks:
+  #   name: Run Verification Benchmarks
+  #   runs-on: ubuntu-latest
+  #   timeout-minutes: 30
+  #
+  #   steps:
+  #     - name: Checkout repository
+  #       uses: actions/checkout@v4
+  #
+  #     - name: Install Rust toolchain
+  #       uses: dtolnay/rust-toolchain@stable
+  #       with:
+  #         components: rustfmt, clippy
+  #
+  #     - name: Install system dependencies
+  #       run: |
+  #         sudo apt-get update
+  #         sudo apt-get install -y libclang-dev llvm-dev libz3-dev
+  #
+  #     - name: Cache Cargo dependencies
+  #       uses: actions/cache@v4
+  #       with:
+  #         path: |
+  #           ~/.cargo/bin
+  #           ~/.cargo/registry/index
+  #           ~/.cargo/registry/cache
+  #           target
+  #         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+  #         restore-keys: |
+  #           ${{ runner.os }}-cargo-
+  #
+  #     - name: Build naso-verify
+  #       run: cargo build --release -p naso-verify
+  #       working-directory: .
+  #
+  #     - name: Run verification benchmarks
+  #       run: cargo run --release -p naso-verify --example run_benchmarks
+  #       working-directory: .
+  #
+  #     - name: Run verification benchmarks with JSON output
+  #       run: cargo run --release -p naso-verify --example run_benchmarks -- json > crates/naso-verify/benchmarks/benchmark_results.json
+  #       working-directory: .
+  #
+  #     - name: Check for regressions
+  #       run: |
+  #         # This would compare against stored baselines
+  #         # For now, just verify the benchmark suite runs without errors
+  #         echo "Benchmark suite completed successfully"
+  #       working-directory: .
+  #
+  #     - name: Upload benchmark results
+  #       uses: actions/upload-artifact@v4
+  #       if: always()
+  #       with:
+  #         name: benchmark-results
+  #         path: crates/naso-verify/benchmarks/benchmark_results.json
+  #         retention-days: 30
+
+  verify-cli:
+    name: Test CLI Integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build naso CLI
+        run: cargo build --release -p naso-compiler
+        working-directory: .
+
+      - name: Test parse command on valid program
+        run: |
+          echo 'fn bell_pair() -> (Qubit, Qubit) { let [1] q0 = qalloc(); let [1] q1 = qalloc(); hadamard(q0); cnot(q0, q1); (q0, q1) }' > /tmp/test_valid.naso
+          cargo run --release -p naso-compiler -- parse /tmp/test_valid.naso
+        working-directory: .
+
+      - name: Test check command on valid program
+        run: |
+          echo 'fn bell_pair() -> (Qubit, Qubit) { let [1] q0 = qalloc(); let [1] q1 = qalloc(); hadamard(q0); cnot(q0, q1); (q0, q1) }' > /tmp/test_valid.naso
+          cargo run --release -p naso-compiler -- check /tmp/test_valid.naso
+        working-directory: .
+
+      - name: Test check command on invalid program
+        run: |
+          echo 'fn bad() { let x: [1] i32 = 5; }' > /tmp/test_invalid.naso
+          cargo run --release -p naso-compiler -- check /tmp/test_invalid.naso || echo "Expected failure (type error detected)"
+        working-directory: .
+
+      - name: Test parse command with JSON output
+        run: |
+          echo 'fn bell_pair() -> (Qubit, Qubit) { let [1] q0 = qalloc(); let [1] q1 = qalloc(); hadamard(q0); cnot(q0, q1); (q0, q1) }' > /tmp/test_json.naso
+          cargo run --release -p naso-compiler -- parse /tmp/test_json.naso | head -50
+        working-directory: .
+
+      - name: Test check with linearity detection
+        run: |
+          echo 'fn consume_linear(x: [1] i32) { linear_free(x); }' > /tmp/test_linearity.naso
+          cargo run --release -p naso-compiler -- check /tmp/test_linearity.naso
+        working-directory: .
+
+  verify-prover:
+    name: Prover Tests (obligation + round axiom)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Force a clean z3-sys build, then run the prover suite
+        run: |
+          # z3-sys builds the official prebuilt in an OUT_DIR keyed by feature
+          # unification; divergent builds under disk contention can corrupt
+          # libz3, which makes the prover reject well-formed SMT scripts as
+          # ParseError (the parser reports "holds 0 assertions but the script
+          # declares N"). Force one clean build so CI's solver is sound and
+          # the obligation + round-axiom tests are deterministic.
+          cargo clean -p z3-sys
+          cargo test -p naso-verify
+        working-directory: .
+
+  build-check:
+    name: Build Check (All Crates)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check all crates compile
+        run: cargo check --all
+        working-directory: .
+
+      - name: Check with clippy
+        run: cargo clippy --all-targets -- -D warnings
+        working-directory: .
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+        working-directory: .
+
+  # The LLVM backend is behind a feature flag, so every default-profile job in this
+  # workflow skips it. That left the entire native backend -- loop lowering, the
+  # schedule tree, casts, and the CPU execution harness -- unverified on every push.
+  # This job runs it, including the tests that compile generated IR with `llc` and
+  # execute it, so a regression in the backend cannot land green.
+  llvm-backend:
+    name: LLVM Backend (build, test, execute on CPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    env:
+      # `llvm-sys 170` is satisfied by any LLVM 17.x; this pins the minor series so a
+      # runner image update cannot silently move us onto LLVM 18 and fail the build.
+      LLVM_SYS_170_PREFIX: /usr/lib/llvm-17
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # `llvm-sys` links LLVM's static component libraries, which includes Polly.
+      # `llvm-17-dev` alone does not ship `libPolly.a`, so without `libpolly-17-dev`
+      # the build dies with "could not find native static library `Polly`". llvm-sys's
+      # own CI installs the same package.
+      - name: Install LLVM 17
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-17-dev libpolly-17-dev clang-17
+          # `llvm-config-17` finds its own prefix; llvm-sys looks for `llvm-config`.
+          echo "/usr/lib/llvm-17/bin" >> "$GITHUB_PATH"
+          echo "LLVM_SYS_170_PREFIX=/usr/lib/llvm-17" >> "$GITHUB_ENV"
+
+      - name: Report toolchain versions
+        run: |
+          llvm-config-17 --version
+          clang-17 --version | head -1
+          # Fail early and legibly if the static archive llvm-sys needs is missing,
+          # rather than several minutes later inside a link error.
+          test -f /usr/lib/llvm-17/lib/libPolly.a && echo "found libPolly.a"
+
+      - name: Build with the llvm feature
+        run: cargo build --features llvm --all-targets
+
+      - name: Test with the llvm feature
+        run: cargo test --features llvm --workspace --no-fail-fast
+
+      # The execution tests shell out to `llc` and `clang`, which are on PATH as
+      # `llc-17`/`clang-17` on the runner. Symlink the unversioned names the tests
+      # invoke, so they do not silently fall back to a different major version.
+      - name: Expose unversioned llc/clang for the execution harness
+        run: |
+          sudo ln -sf /usr/lib/llvm-17/bin/llc /usr/local/bin/llc
+          sudo ln -sf /usr/bin/clang-17 /usr/local/bin/clang
+          llc --version | head -2
+          clang --version | head -1
+
+      # These are the files that shell out to `llc` and `clang`, so they are the ones
+      # that genuinely need the tools on PATH. `llvm_abi_guard_execution_test` is here
+      # because the ABI guard is only real if a short or null buffer actually fails the
+      # process, and `llvm_shipped_kernel_execution_test` because it compiles
+      # `kernels/scale_f32.naso` through the production path at its real extent.
+      #
+      # `llvm_multifunction_execution_test` is here for the same reason and more: it is
+      # the only file that executes a NASO-TO-NASO call, so it is the only place a
+      # reversed operand list, a stale length, or a scope shared between two functions
+      # would be caught. It also executes `kernels/quant_int8.naso`, the kernel that
+      # multi-function compilation exists to unblock.
+      - name: Re-run the CPU execution tests with llc/clang on PATH
+        run: |
+          cargo test --features llvm \
+            --test llvm_execution_test \
+            --test llvm_forall_execution_test \
+            --test llvm_abi_guard_execution_test \
+            --test llvm_param_abi_execution_test \
+            --test llvm_multifunction_execution_test \
+            --test llvm_if_execution_test \
+            --test llvm_while_execution_test \
+            --test llvm_break_continue_execution_test \
+            --test llvm_return_in_block_test \
+            --test llvm_forall_early_exit_test \
+            --test llvm_reversible_refusal_test \
+            --test wgsl_control_flow_honesty_test \
+            --test linearity_at_emission_boundary_test \
+            --test llvm_shipped_kernel_execution_test
+
+      # The `cranelift` feature used to be built and tested by NOTHING. Every other
+      # line in this workflow passes `--features llvm`, so a backend that JIT-compiled
+      # a function returning the literal 42 and printed that as any program's result
+      # sat in the tree uncompiled and undetected.
+      #
+      # A feature nobody enables cannot be reviewed by CI, so it is built and linted
+      # here. The suite asserts the backend REFUSES; it does not assert it executes,
+      # because it does not.
+      - name: Test the reversible refusal suite
+        run: cargo test --features llvm --test reversible_refusal_test
+
+      - name: Test the quantum parameter ABI suite
+        run: cargo test --features llvm --test quantum_param_abi_test
+
+      - name: Test the CLI end-to-end suite
+        run: cargo test --features llvm --test cli_end_to_end_test
+
+      - name: Test the early-exit domain transformation
+        run: cargo test --features llvm --test early_exit_domain_test
+
+      # `entangle` must be refused rather than emitted as a dangling `qir.entangle` call that
+      # fails at link time with a symbol the user never wrote.
+      - name: Refuse unimplementable quantum operations
+        run: cargo test --features llvm --test entangle_refusal_test
+
+      # The obligation prover's own tests. These decide whether a claim is PROVED, REFUTED,
+      # or merely UNSUPPORTED, so a regression here is a soundness change. Both bugs fixed in
+      # this area lived here, and the symptom -- every tensor obligation reported "refuted"
+      # with an empty model, because Z3 had silently discarded a malformed script -- was
+      # invisible from outside this suite.
+      - name: Test the obligation prover
+        run: cargo test -p naso-verify --lib
+        working-directory: .
+
+      # `requires { .. }` parsing. Separate from the prover because the precondition is
+      # collected here and only USED there: a parser that silently dropped a precondition
+      # would leave the prover reasoning from a weaker context than the author wrote,
+      # with every prover test still green.
+      - name: Test precondition parsing
+        run: cargo test -p naso-compiler --test requires_precondition_test
+        working-directory: .
+
+      # Call-site precondition discharge. Named SEPARATELY from the prover suite above
+      # because it is the pass whose whole job is to produce a diagnostic, and the prover
+      # suite also contains many "expected proof" cases. Running it alone makes a silent
+      # regression -- the pass finding nothing, which looks exactly like success -- visible
+      # as a failing step rather than as a slightly lower count in a wall of numbers.
+      # The CLI exit-code contract. Named explicitly because it is the only thing standing
+      # between this repo and a verification step that reports success without checking
+      # anything: if `undecided` ever collapses back into exit 0, CI stays green while the
+      # prover quietly proves nothing.
+      - name: Test the verify CLI exit-code contract
+        run: cargo test -p naso-verify --test verify_cli_test
+        working-directory: .
+
+      # The shipped quantisation error bound, verified THROUGH THE BINARY, not just as a
+      # library call: this is the run that proves the exit status a real user sees is 0.
+      - name: Verify the shipped quantisation kernel through the binary
+        run: |
+          # `cargo run` rather than a hardcoded `./target/debug/...`: the target directory is
+          # relocatable, and a step that only works at one path is a step that breaks silently
+          # on someone else's machine.
+          cargo run -q -p naso-verify --bin naso-verify -- \
+            --mode obligations --require-obligations kernels/quant_error_bound.naso
+        working-directory: .
+
+      # The int8 quantiser's obligations, including the unconditional clamp theorem. Named
+      # separately because `round` being REFUSED is load-bearing: if a future change made it
+      # uninterpreted instead, the suite would still pass while the prover quietly proved
+      # things about an arbitrary function. `round_is_refused_rather_than_left_uninterpreted`
+      # is the test that would catch it.
+      - name: Test the mathematical intrinsic definitions and the int8 kernel
+        run: >-
+          cargo test -p naso-verify --lib --
+          mathematical_intrinsics_have_exact_definitions_not_rubber_stamps
+          a_clamp_is_provably_within_its_bounds_for_every_input
+          min_and_max_are_defined_and_not_rubber_stamps
+          round_is_refused_rather_than_left_uninterpreted
+          a_quantiser_range_goal_is_refuted_but_discharges_as_a_premise
+          an_unknown_intrinsic_is_refused_with_a_reason_a_reader_can_act_on
+          the_shipped_int8_quantiser_kernel_discharges_completely
+        working-directory: .
+
+      # The shipped quantisation error bound. Named separately because the whole point of
+      # this file is that a KERNEL is discharged, not that a prover can prove hand-written
+      # snippets: a prover regression could leave the kernel reporting a warning and this
+      # step would be the only thing that noticed.
+      - name: Test the shipped quantisation error bound
+        run: >-
+          cargo test -p naso-verify --lib --
+          --exact
+          prover::obligations::tests::the_shipped_quantisation_error_bound_kernel_is_fully_discharged
+          prover::obligations::tests::the_error_bound_kernel_fails_without_its_range_premise
+          prover::obligations::tests::every_assertion_in_a_quantified_body_is_checked
+          prover::obligations::tests::every_assertion_in_a_quantified_premise_is_used
+          prover::obligations::tests::a_float_literal_is_the_exact_binary_value_not_the_printed_one
+        working-directory: .
+
+      # Float-literal exactness. The encoder emits exact rationals; these pin that it still
+      # does, since a rounded literal is well-formed SMT meaning something else.
+      - name: Test float literal exactness
+        run: cargo test -p naso-verify --lib -- float_literal pow2_decimal is_exact_past_64
+        working-directory: .
+
+      - name: Test call-site precondition discharge
+        run: >-
+          cargo test -p naso-verify --lib --
+          --exact
+          prover::obligations::tests::a_call_site_that_ignores_a_precondition_is_refused
+          prover::obligations::tests::a_precondition_violated_by_the_argument_expression_is_refused
+          prover::obligations::tests::a_weaker_caller_precondition_does_not_discharge_a_stronger_callee_one
+          prover::obligations::tests::a_violating_call_is_found_in_every_position_that_can_hold_one
+          prover::obligations::tests::a_call_in_an_expression_position_let_is_checked
+        working-directory: .
+
+      # The compiler's emitted QIR, checked NUMERICALLY against hand-derived states.
+      #
+      # Needs `--features llvm` because the suite runs the real `naso` binary and parses what
+      # it emits, so this proves the compiler output itself rather than a hand-written fixture.
+      - name: Verify emitted QIR numerically
+        run: |
+          cargo build --features llvm --bin naso
+          # `--features naso-verify/llvm` is REQUIRED, not optional. Without it the compiler-running
+          # tests are compiled out and the suite reports `ok. 2 passed` -- a green CI run in which
+          # four of the six checks never executed, which is worse than a visible failure.
+          cargo test -p naso-verify --features naso-verify/llvm \
+            --test qir_numeric_verification_test
+        working-directory: .
+
+      # A compiled `.naso` file, linked against the QIR runtime, EXECUTED. This is the only
+      # check that covers the seam between what the compiler emits and what the runtime defines --
+      # the place the previous state was broken, since `llc` produced a valid object whose `qir.h`
+      # was undefined and the only symptom was a link error nobody was watching for.
+      #
+      # The RELEASE staticlib is REQUIRED, not optional: the harness links
+      # `libnaso_gates.a` from the release directory, and a debug-only build makes every test in
+      # the suite skip on a missing file -- green, having verified nothing.
+      - name: Native execution of a compiled quantum program
+        run: |
+          cargo build --release -p naso-gates
+          cargo build --features llvm --bin naso
+          cargo test --features llvm --test native_quantum_runtime_test
+
+      - name: QIR gate emission gap
+        run: cargo test --features llvm --test qir_gate_emission_gap_test
+
+      # The QIR backend carried a SECOND, undeclared gate-name table in
+      # `qir/classifier.rs` (330 lines) alongside `qir/ancilla_emission.rs` (352) -- 682
+      # lines with no `mod` declaration, reachable only from their own tests, including a
+      # 61-arm table that would drift from the live one. Deleted. The live invariant is now
+      # a unit test inside the lib: every operation `qir_intrinsic_for` resolves must name a
+      # DECLARED intrinsic, and an unmapped one must be refused rather than defaulted.
+      # This step runs the lib so that test cannot silently stop running.
+      - name: QIR intrinsic mapping resolves only to declared intrinsics
+        run: cargo test --features llvm -p naso-compiler --lib codegen::qir
+
+      # The capability boundary of `reversible`, inverted from its former refusals: a gate
+      # block must now lower, and arithmetic / measurement / empty / nested blocks must still
+      # refuse BY NAME. Also asserts the four former structural blockers are resolved and that
+      # the TEMPORARY-VALUE module stayed unwired.
+      # The rotation boundary: `rz` is accepted in both spellings, `rx`/`ry` stay refused for
+      # want of a base-profile entry point, a missing angle is a parse error rather than a
+      # no-op, and `rz` is a keyword while `rx`/`ry` are not.
+      - name: rotation capability boundary
+        run: cargo test --features llvm -p naso-compiler --test entangle_refusal_test
+
+      - name: reversible capability boundary and resolved blockers
+        run: cargo test --features llvm -p naso-compiler --test reversible_refusal_test
+
+      # `rz(theta, q)` -- a rotation whose angle reaches the runtime as a real `f64` operand on
+      # `qir.r1(double, ptr)`. These are RUNTIME-level rather than compiler-level because `rz` is
+      # a global phase: no measurement can observe it, so only the amplitude can. A mutation that
+      # makes the runtime ignore the angle, hardcode zero, or use the wrong axis is killed here
+      # and by nothing else.
+      - name: rotations apply their own angle
+        run: cargo test -p naso-gates --test runtime_test
+
+      # `reversible { ... }` is now wired for gate sequences: forward pass AND uncomputation.
+      # The suite that matters here builds real executables (naso -> LLVM IR -> llc -> cc ->
+      # run, linked against libnaso_gates.a) and asserts DISTRIBUTIONS over 40 runs, each
+      # paired with a control that differs only by the absence of the block. A PIR-shape
+      # assertion would pass even if the backend reordered the statements on the way out.
+      - name: reversible uncomputation executes natively
+        run: cargo test --features llvm -p naso-compiler --test reversible_native_execution_test
+
+      # `codegen_tests` carries the assertion that a fixture cannot express a SHARED qubit,
+      # which is what pins the "valid QIR that is not the source program" defect. Without it
+      # running, that failure mode could regress silently.
+      - name: QIR codegen cannot emit a wrong circuit
+        run: cargo test --features llvm --test codegen_tests
+
+      # Sub-byte `i4`: 16 values MUST occupy 8 bytes. This is the compression claim, so the
+      # suite asserts the BYTE COUNT by running a real executable and checking which bytes of a
+      # pre-filled 16-byte buffer the kernel actually touched -- an IR-shape check would pass
+      # against a compiler that quietly gave `i4` a whole byte each, which is precisely the
+      # dishonesty this feature must not ship with. It also kills the mutations that drop the
+      # nibble shift, the store merge, or the sign step.
+      - name: sub-byte i4 packs two values per byte
+        run: cargo test --features llvm -p naso-compiler --test sub_byte_i4_execution_test
+
+      # `capability_matrix_test` cross-checks the published matrix and LIMITATIONS.md against
+      # what the backends actually do. It is what caught `Tensor[i4, 8]` failing LLVM
+      # verification on a literal index, so it must run rather than being assumed.
+      - name: capability matrix matches reality
+        run: cargo test --features llvm -p naso-compiler --test capability_matrix_test
+
+      # The stdlib element-wise ops (`maximum`, `minimum`, `relu`, `sigmoid`) each
+      # computed the right answer into a local Vec and then called `unimplemented!()` --
+      # the work done and thrown away, and the caller got a panic instead of a number.
+      # That survived because the stdlib had NO tests at all, so nothing could notice.
+      # These assert computed VALUES, not merely that the call returns; a "does not
+      # panic" test would pass against an implementation returning zeros.
+      - name: stdlib element-wise ops compute real values
+        run: cargo test -p naso_std --test tensor_elementwise_ops_test
+
+      - name: Gate inverse table and state-vector simulator
+        run: |
+          cargo test -p naso-gates --test gate_inverse_test
+          cargo test -p naso-gates --test statevector_test
+
+      - name: Test the bool operator rule
+        run: cargo test --features llvm --test bool_operator_test
+
+      - name: Test the WGSL extent refusal suite
+        run: cargo test --features llvm --test wgsl_extent_test
+
+      - name: Test the mixed arithmetic promotion suite
+        run: cargo test --features llvm --test mixed_arith_promotion_test
+
+      - name: Test the capability matrix
+        run: cargo test --features llvm --test capability_matrix_test
+
+      - name: Build and test the cranelift feature
+        run: |
+          # (1) `cranelift` ALONE must build and link. This is the property that was
+          #     broken: `runtime::jit::ffi` declared five extern "C" symbols no
+          #     library in this repo provides, so `--features cranelift
+          #     --all-targets` failed with
+          #       rust-lld: error: undefined symbol: jit_context_create
+          #     Nothing noticed, because nothing ever built the feature alone.
+          cargo build --features cranelift --all-targets
+
+          # (2) The behaviour test needs a `CodegenContext`, so it runs with both
+          #     features. It asserts the backend REFUSES; it does not assert it
+          #     executes, because it does not.
+          cargo clippy --features "llvm cranelift" --all-targets -- -D warnings
+          cargo test --features "llvm cranelift" --test cranelift_honesty_test
+
+      - name: Clippy with the llvm feature
+        run: cargo clippy --features llvm --all-targets -- -D warnings

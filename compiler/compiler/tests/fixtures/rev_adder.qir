@@ -1,0 +1,215 @@
+; ModuleID = 'rev_adder'
+source_filename = "rev_adder.naso"
+target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
+target triple = "x86_64-unknown-linux-gnu"
+
+; QIR Profile: Base Profile
+; Reversible ripple-carry adder using Toffoli and CNOT gates
+; Computes a + b -> a (reversible), requires ancilla for carry
+
+; Quantum runtime intrinsics
+declare void @__quantum__rt__initialize(i64)
+declare void @__quantum__rt__result_record_output(i64, i64)
+declare i8* @__quantum__rt__qubit_allocate()
+declare void @__quantum__rt__qubit_release(i8*)
+declare i8* @__quantum__rt__qubit_allocate_array(i64)
+declare void @__quantum__rt__qubit_release_array(i8*)
+
+; Quantum instruction intrinsics
+declare void @__quantum__qis__h__body(i8*)
+declare void @__quantum__qis__x__body(i8*)
+declare void @__quantum__qis__cx__body(i8*, i8*)
+declare void @__quantum__qis__ccx__body(i8*, i8*, i8*)
+declare i64 @__quantum__qis__mz__body(i8*)
+declare void @__quantum__qis__reset__body(i8*)
+
+; Toffoli gate (CCNOT) - 3-qubit gate
+declare void @__quantum__qis__ccx__body(i8*, i8*, i8*)
+
+; Entry point for 8-bit reversible adder
+define void @rev_adder_8bit() {
+entry:
+  ; Initialize quantum runtime for 8-bit adder
+  ; 8 a-qubits + 8 b-qubits + 8 sum-qubits + 9 carry ancilla = 33 qubits
+  call void @__quantum__rt__initialize(i64 33)
+
+  ; Allocate qubit arrays
+  %a_array = call i8* @__quantum__rt__qubit_allocate_array(i64 8)
+  %b_array = call i8* @__quantum__rt__qubit_allocate_array(i64 8)
+  %sum_array = call i8* @__quantum__rt__qubit_allocate_array(i64 8)
+  %carry_array = call i8* @__quantum__rt__qubit_allocate_array(i64 9)
+
+  ; Forward pass: compute sum and carry
+  br label %forward_loop
+
+forward_loop:                                     ; preds = %forward_loop, %entry
+  %i = phi i64 [ 0, %entry ], [ %i_next, %forward_loop ]
+  %i_next = add nuw nsw i64 %i, 1
+  %i_cond = icmp slt i64 %i_next, 8
+
+  ; Get qubits for this bit position
+  %a_i = call i8* @get_qubit_at(i8* %a_array, i64 %i)
+  %b_i = call i8* @get_qubit_at(i8* %b_array, i64 %i)
+  %sum_i = call i8* @get_qubit_at(i8* %sum_array, i64 %i)
+  %carry_i = call i8* @get_qubit_at(i8* %carry_array, i64 %i)
+  %carry_ip1 = call i8* @get_qubit_at(i8* %carry_array, i64 %i_next)
+
+  ; sum[i] = a[i] ^ b[i] ^ carry[i] (using CNOTs)
+  call void @__quantum__qis__cx__body(i8* %a_i, i8* %sum_i)
+  call void @__quantum__qis__cx__body(i8* %b_i, i8* %sum_i)
+  call void @__quantum__qis__cx__body(i8* %carry_i, i8* %sum_i)
+
+  ; carry[i+1] = majority(a[i], b[i], carry[i]) using Toffoli gates
+  ; Majority = (a & b) | (a & c) | (b & c)
+  ; Implemented with Toffoli gates
+  call void @__quantum__qis__ccx__body(i8* %a_i, i8* %b_i, i8* %carry_ip1)
+  call void @__quantum__qis__ccx__body(i8* %a_i, i8* %carry_i, i8* %carry_ip1)
+  call void @__quantum__qis__ccx__body(i8* %b_i, i8* %carry_i, i8* %carry_ip1)
+
+  br i1 %i_cond, label %forward_loop, label %uncompute_loop
+
+uncompute_loop:                                   ; preds = %uncompute_loop, %forward_loop
+  %i_rev = phi i64 [ 7, %forward_loop ], [ %i_rev_next, %uncompute_loop ]
+  %i_rev_next = sub nuw nsw i64 %i_rev, 1
+  %i_rev_cond = icmp sge i64 %i_rev_next, 0
+
+  ; Uncompute carry ancilla (reverse of forward pass)
+  %a_i_rev = call i8* @get_qubit_at(i8* %a_array, i64 %i_rev)
+  %b_i_rev = call i8* @get_qubit_at(i8* %b_array, i64 %i_rev)
+  %carry_i_rev = call i8* @get_qubit_at(i8* %carry_array, i64 %i_rev)
+  %carry_ip1_rev = call i8* @get_qubit_at(i8* %carry_array, i64 %i_next)
+
+  ; Reverse the Toffoli gates to uncompute carry
+  call void @__quantum__qis__ccx__body(i8* %b_i_rev, i8* %carry_i_rev, i8* %carry_ip1_rev)
+  call void @__quantum__qis__ccx__body(i8* %a_i_rev, i8* %carry_i_rev, i8* %carry_ip1_rev)
+  call void @__quantum__qis__ccx__body(i8* %a_i_rev, i8* %b_i_rev, i8* %carry_ip1_rev)
+
+  br i1 %i_rev_cond, label %uncompute_loop, label %cleanup
+
+cleanup:                                          ; preds = %uncompute_loop
+  ; Release all qubits
+  call void @__quantum__rt__qubit_release_array(i8* %a_array)
+  call void @__quantum__rt__qubit_release_array(i8* %b_array)
+  call void @__quantum__rt__qubit_release_array(i8* %sum_array)
+  call void @__quantum__rt__qubit_release_array(i8* %carry_array)
+
+  ret void
+}
+
+; Helper function to get qubit at index from array
+declare i8* @get_qubit_at(i8*, i64)
+
+; Alternative: inline version with explicit qubits for testing
+define void @rev_adder_explicit(i8* %a0, i8* %a1, i8* %a2, i8* %a3, i8* %a4, i8* %a5, i8* %a6, i8* %a7,
+                                 i8* %b0, i8* %b1, i8* %b2, i8* %b3, i8* %b4, i8* %b5, i8* %b6, i8* %b7,
+                                 i8* %sum0, i8* %sum1, i8* %sum2, i8* %sum3, i8* %sum4, i8* %sum5, i8* %sum6, i8* %sum7,
+                                 i8* %c0, i8* %c1, i8* %c2, i8* %c3, i8* %c4, i8* %c5, i8* %c6, i8* %c7, i8* %c8) {
+entry:
+  ; Forward pass for each bit
+  ; Bit 0
+  call void @__quantum__qis__cx__body(i8* %a0, i8* %sum0)
+  call void @__quantum__qis__cx__body(i8* %b0, i8* %sum0)
+  call void @__quantum__qis__cx__body(i8* %c0, i8* %sum0)
+  call void @__quantum__qis__ccx__body(i8* %a0, i8* %b0, i8* %c1)
+  call void @__quantum__qis__ccx__body(i8* %a0, i8* %c0, i8* %c1)
+  call void @__quantum__qis__ccx__body(i8* %b0, i8* %c0, i8* %c1)
+
+  ; Bit 1
+  call void @__quantum__qis__cx__body(i8* %a1, i8* %sum1)
+  call void @__quantum__qis__cx__body(i8* %b1, i8* %sum1)
+  call void @__quantum__qis__cx__body(i8* %c1, i8* %sum1)
+  call void @__quantum__qis__ccx__body(i8* %a1, i8* %b1, i8* %c2)
+  call void @__quantum__qis__ccx__body(i8* %a1, i8* %c1, i8* %c2)
+  call void @__quantum__qis__ccx__body(i8* %b1, i8* %c1, i8* %c2)
+
+  ; Bit 2
+  call void @__quantum__qis__cx__body(i8* %a2, i8* %sum2)
+  call void @__quantum__qis__cx__body(i8* %b2, i8* %sum2)
+  call void @__quantum__qis__cx__body(i8* %c2, i8* %sum2)
+  call void @__quantum__qis__ccx__body(i8* %a2, i8* %b2, i8* %c3)
+  call void @__quantum__qis__ccx__body(i8* %a2, i8* %c2, i8* %c3)
+  call void @__quantum__qis__ccx__body(i8* %b2, i8* %c2, i8* %c3)
+
+  ; Bit 3
+  call void @__quantum__qis__cx__body(i8* %a3, i8* %sum3)
+  call void @__quantum__qis__cx__body(i8* %b3, i8* %sum3)
+  call void @__quantum__qis__cx__body(i8* %c3, i8* %sum3)
+  call void @__quantum__qis__ccx__body(i8* %a3, i8* %b3, i8* %c4)
+  call void @__quantum__qis__ccx__body(i8* %a3, i8* %c3, i8* %c4)
+  call void @__quantum__qis__ccx__body(i8* %b3, i8* %c3, i8* %c4)
+
+  ; Bit 4
+  call void @__quantum__qis__cx__body(i8* %a4, i8* %sum4)
+  call void @__quantum__qis__cx__body(i8* %b4, i8* %sum4)
+  call void @__quantum__qis__cx__body(i8* %c4, i8* %sum4)
+  call void @__quantum__qis__ccx__body(i8* %a4, i8* %b4, i8* %c5)
+  call void @__quantum__qis__ccx__body(i8* %a4, i8* %c4, i8* %c5)
+  call void @__quantum__qis__ccx__body(i8* %b4, i8* %c4, i8* %c5)
+
+  ; Bit 5
+  call void @__quantum__qis__cx__body(i8* %a5, i8* %sum5)
+  call void @__quantum__qis__cx__body(i8* %b5, i8* %sum5)
+  call void @__quantum__qis__cx__body(i8* %c5, i8* %sum5)
+  call void @__quantum__qis__ccx__body(i8* %a5, i8* %b5, i8* %c6)
+  call void @__quantum__qis__ccx__body(i8* %a5, i8* %c5, i8* %c6)
+  call void @__quantum__qis__ccx__body(i8* %b5, i8* %c5, i8* %c6)
+
+  ; Bit 6
+  call void @__quantum__qis__cx__body(i8* %a6, i8* %sum6)
+  call void @__quantum__qis__cx__body(i8* %b6, i8* %sum6)
+  call void @__quantum__qis__cx__body(i8* %c6, i8* %sum6)
+  call void @__quantum__qis__ccx__body(i8* %a6, i8* %b6, i8* %c7)
+  call void @__quantum__qis__ccx__body(i8* %a6, i8* %c6, i8* %c7)
+  call void @__quantum__qis__ccx__body(i8* %b6, i8* %c6, i8* %c7)
+
+  ; Bit 7
+  call void @__quantum__qis__cx__body(i8* %a7, i8* %sum7)
+  call void @__quantum__qis__cx__body(i8* %b7, i8* %sum7)
+  call void @__quantum__qis__cx__body(i8* %c7, i8* %sum7)
+  call void @__quantum__qis__ccx__body(i8* %a7, i8* %b7, i8* %c8)
+  call void @__quantum__qis__ccx__body(i8* %a7, i8* %c7, i8* %c8)
+  call void @__quantum__qis__ccx__body(i8* %b7, i8* %c7, i8* %c8)
+
+  ; Uncompute carry in reverse order
+  ; Bit 7 uncompute
+  call void @__quantum__qis__ccx__body(i8* %b7, i8* %c7, i8* %c8)
+  call void @__quantum__qis__ccx__body(i8* %a7, i8* %c7, i8* %c8)
+  call void @__quantum__qis__ccx__body(i8* %a7, i8* %b7, i8* %c8)
+
+  ; Bit 6 uncompute
+  call void @__quantum__qis__ccx__body(i8* %b6, i8* %c6, i8* %c7)
+  call void @__quantum__qis__ccx__body(i8* %a6, i8* %c6, i8* %c7)
+  call void @__quantum__qis__ccx__body(i8* %a6, i8* %b6, i8* %c7)
+
+  ; Bit 5 uncompute
+  call void @__quantum__qis__ccx__body(i8* %b5, i8* %c5, i8* %c6)
+  call void @__quantum__qis__ccx__body(i8* %a5, i8* %c5, i8* %c6)
+  call void @__quantum__qis__ccx__body(i8* %a5, i8* %b5, i8* %c6)
+
+  ; Bit 4 uncompute
+  call void @__quantum__qis__ccx__body(i8* %b4, i8* %c4, i8* %c5)
+  call void @__quantum__qis__ccx__body(i8* %a4, i8* %c4, i8* %c5)
+  call void @__quantum__qis__ccx__body(i8* %a4, i8* %b4, i8* %c5)
+
+  ; Bit 3 uncompute
+  call void @__quantum__qis__ccx__body(i8* %b3, i8* %c3, i8* %c4)
+  call void @__quantum__qis__ccx__body(i8* %a3, i8* %c3, i8* %c4)
+  call void @__quantum__qis__ccx__body(i8* %a3, i8* %b3, i8* %c4)
+
+  ; Bit 2 uncompute
+  call void @__quantum__qis__ccx__body(i8* %b2, i8* %c2, i8* %c3)
+  call void @__quantum__qis__ccx__body(i8* %a2, i8* %c2, i8* %c3)
+  call void @__quantum__qis__ccx__body(i8* %a2, i8* %b2, i8* %c3)
+
+  ; Bit 1 uncompute
+  call void @__quantum__qis__ccx__body(i8* %b1, i8* %c1, i8* %c2)
+  call void @__quantum__qis__ccx__body(i8* %a1, i8* %c1, i8* %c2)
+  call void @__quantum__qis__ccx__body(i8* %a1, i8* %b1, i8* %c2)
+
+  ; Bit 0 uncompute
+  call void @__quantum__qis__ccx__body(i8* %b0, i8* %c0, i8* %c1)
+  call void @__quantum__qis__ccx__body(i8* %a0, i8* %c0, i8* %c1)
+  call void @__quantum__qis__ccx__body(i8* %a0, i8* %b0, i8* %c1)
+
+  ret void
+}

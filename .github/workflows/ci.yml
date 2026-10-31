@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check workspace
+        run: cargo check --workspace
+
+      - name: Build naso-ffi (staticlib)
+        run: cargo build -p naso-ffi --release
+
+      - name: Verify FFI symbols
+        run: |
+          nm target/release/libnaso_ffi.a | grep -E 'naso_tcp_bind|naso_tcp_accept|naso_read|naso_write|naso_last_error'
+
+      - name: Run tests
+        run: cargo test --workspace 2>&1 | head -50

@@ -1,0 +1,54 @@
+// TCP sockets via FFI to Rust standard library
+// [1] Quantity ensures single ownership — no fd leaks
+
+use core::Result;
+
+extern "C" {
+    // #[link_name] maps Naso calls to Rust symbols from libnaso_ffi.a
+    #[link_name = "naso_tcp_bind"]
+    fn naso_tcp_bind(addr_ptr: *const u8, len: usize) -> u64;
+    #[link_name = "naso_tcp_accept"]
+    fn naso_tcp_accept(fd: u64, out: *mut u64) -> u64;
+    #[link_name = "naso_read"]
+    fn naso_read(fd: u64, buf: *mut u8, max_len: usize) -> usize;
+    #[link_name = "naso_write"]
+    fn naso_write(fd: u64, buf: *const u8, len: usize) -> usize;
+}
+
+/// Wraps a raw fd with QTT single-ownership tracking
+pub struct Listener {
+    fd: [1] u64,
+}
+
+/// Wraps a stream fd — must be consumed at read/write
+pub struct Stream {
+    fd: [1] u64,
+}
+
+/// Bind to "addr:port" — returns Err if bind fails (fd == 0)
+pub fn bind(addr: String) -> Result<Listener> {
+    let bytes = addr.bytes();
+    let fd = naso_tcp_bind(bytes.ptr, bytes.len);
+    if fd == 0 { Err("naso: bind failed") } else { Ok(Listener { fd }) }
+}
+
+/// Accept one connection — consumes listener, returns new listener + stream
+pub fn accept(l: Listener) -> Result<(Listener, Stream)> {
+    let mut out: [2] u64 = [0, 0];
+    let result = naso_tcp_accept(l.fd, out.ptr);
+    if result == 0 { Err("naso: accept failed") } else {
+        Ok((Listener { fd: out[0] }, Stream { fd: out[1] }))
+    }
+}
+
+/// Read from stream into buffer — consumes stream per QTT
+pub fn read(s: Stream, buf: [N] u8) -> Result<usize> {
+    let result = naso_read(s.fd, buf.ptr, buf.len);
+    if result == 0 { Err("naso: read EOF") } else { Ok(result) }
+}
+
+/// Write buffer to stream — consumes stream per QTT
+pub fn write(s: Stream, buf: [N] u8) -> Result<usize> {
+    let result = naso_write(s.fd, buf.ptr, buf.len);
+    if result == 0 { Err("naso: write failed") } else { Ok(result) }
+}

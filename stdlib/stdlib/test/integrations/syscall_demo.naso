@@ -1,0 +1,66 @@
+// stdlib/test/integrations/syscall_demo.naso
+// Integration test: System calls using std::sys
+// Demonstrates bare-metal runtime hooks, memory operations, and barriers
+
+use std::sys::*;
+
+fn main() {
+    // Test 1: Process exit hook
+    println!("Test 1: Process exit registration");
+    // In a real implementation, this would register an exit handler
+    // For now, we just verify the function exists and is callable
+    let _exit_code = process_exit(0);
+    println!("  Process exit hook callable");
+    
+    // Test 2: Signal handler registration
+    println!("Test 2: Signal handler");
+    let handler = signal_handler(Signal::SIGINT, || {
+        println!("  SIGINT received");
+    });
+    println!("  Signal handler registered");
+    
+    // Test 3: Volatile memory operations
+    println!("Test 3: Volatile load/store");
+    let mut buffer = [0u8; 64];
+    let ptr = buffer.as_mut_ptr();
+    
+    // Write via volatile store
+    unsafe { volatile_store(ptr, 0xDEADBEEFu32) };
+    // Read via volatile load
+    let val = unsafe { volatile_load::<u32>(ptr) };
+    assert(val == 0xDEADBEEFu32, "Volatile load/store mismatch");
+    println!("  Volatile load/store test passed: 0x{:x}", val);
+    
+    // Test 4: Quantum memory allocation via syscalls
+    println!("Test 4: Quantum memory syscalls");
+    let qptr = unsafe { sys_qalloc(1024, 16) };
+    // In a real implementation, this would return a valid quantum memory pointer
+    // For now, we just verify the function is callable
+    unsafe { sys_qfree(qptr, 1024, 16) };
+    println!("  Quantum memory syscalls callable");
+    
+    // Test 5: Memory barrier
+    println!("Test 5: Memory barrier");
+    sys_barrier();
+    println!("  Memory barrier executed");
+    
+    // Test 6: Measurement trap
+    println!("Test 6: Measurement trap");
+    let result = unsafe { sys_measure_trap(std::ptr::null_mut()) };
+    assert(result == 0 || result == 1, "Measurement trap should return 0 or 1");
+    println!("  Measurement trap result: {}", result);
+    
+    // Test 7: Multiple barriers for ordering
+    println!("Test 7: Multiple barriers for ordering");
+    for i in 0..4 {
+        unsafe { volatile_store(ptr.add(i * 4), i as u32) };
+    }
+    sys_barrier();
+    for i in 0..4 {
+        let val = unsafe { volatile_load::<u32>(ptr.add(i * 4)) };
+        assert(val == i as u32, "Barrier ordering failed at index {}", i);
+    }
+    println!("  Barrier ordering test passed");
+    
+    println!("All syscall demo tests passed!");
+}

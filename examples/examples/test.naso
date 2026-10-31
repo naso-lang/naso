@@ -1,0 +1,41 @@
+// The quantitative type transform from DISCUSSION.md.
+fn entangle_transform[Rows: type, Cols: type](
+    matrix: [0] Matrix[Rows, Cols],
+    inout state: QRegister[Cols],
+    ancilla: consume Qubit,
+) -> QRegister[Rows] {
+    reversible {
+        let phase_shift = compute_phase(state, ancilla);
+        apply_hamiltonian(state, phase_shift);
+    }
+    return project_register(state);
+}
+
+struct Point {
+    x: Float,
+    y: Float,
+}
+
+enum Color {
+    Red,
+    Green,
+    Blue,
+}
+
+type Length = Int;
+
+const MAX_SIZE = 1024;
+
+fn add(a: Int, b: Int) -> Int {
+    return a + b * 2;
+}
+
+fn main() {
+    let p = Point { x: 1.0, y: 2.0 };
+    if p.x > 0.0 {
+        foo(1, 2, 3);
+    } else {
+        bar();
+    }
+    return;
+}

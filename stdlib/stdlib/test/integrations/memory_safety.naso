@@ -1,0 +1,128 @@
+// stdlib/test/integrations/memory_safety.naso
+// Integration test: Memory safety using std::alloc
+// Demonstrates linear allocators, QTT quantity semantics, and lifetime guarantees
+
+use std::alloc::*;
+
+fn main() {
+    // Test 1: LinearAllocator basic operations
+    println!("Test 1: LinearAllocator basic operations");
+    let mut buffer1 = [0u8; 1024];
+    let mut allocator = LinearAllocator::new(&mut buffer1);
+    
+    // Allocate several objects
+    let layout16 = Layout::from_size_align(16, 8).unwrap();
+    let layout32 = Layout::from_size_align(32, 8).unwrap();
+    
+    let ptr1 = allocator.alloc(layout16);
+    assert(!ptr1.is_null(), "First allocation failed");
+    let ptr2 = allocator.alloc(layout16);
+    assert(!ptr2.is_null(), "Second allocation failed");
+    let ptr3 = allocator.alloc(layout32);
+    assert(!ptr3.is_null(), "Third allocation failed");
+    
+    // Verify linear allocation order (no fragmentation gaps beyond alignment)
+    assert(ptr2 as usize > ptr1 as usize, "Allocations not linear");
+    assert(ptr3 as usize > ptr2 as usize, "Allocations not linear");
+    println!("  Linear allocation order verified");
+    
+    // Reset and reuse - should be able to allocate from start again
+    allocator.reset();
+    let ptr_after = allocator.alloc(layout16);
+    assert(!ptr_after.is_null(), "Allocation after reset failed");
+    assert(ptr_after as usize == buffer1.as_ptr() as usize, "Reset did not return to start");
+    println!("  LinearAllocator reset and reuse verified");
+    
+    // Test 2: QttArena with [0] quantity (zero-cost proof)
+    println!("Test 2: QttArena [0] quantity");
+    let mut buffer2 = [0u8; 1024];
+    let mut arena = QttArena::new(&mut buffer2);
+    
+    let layout0 = Layout::from_size_align(0, 1).unwrap();
+    let ptr0 = arena.alloc(0, layout0);
+    // [0] quantity should return a valid pointer (convention: start of buffer)
+    assert(!ptr0.is_null(), "[0] allocation returned null");
+    arena.dealloc(0, ptr0, layout0);
+    println!("  [0] quantity allocation/deallocation verified");
+    
+    // Test 3: QttArena with [1] quantity (linear region)
+    println!("Test 3: QttArena [1] quantity");
+    let ptr1_1 = arena.alloc(1, layout16);
+    assert(!ptr1_1.is_null(), "[1] first allocation failed");
+    let ptr1_2 = arena.alloc(1, layout16);
+    assert(!ptr1_2.is_null(), "[1] second allocation failed");
+    assert(ptr1_2 as usize > ptr1_1 as usize, "[1] allocations not linear");
+    
+    // Dealloc [1] is no-op until reset
+    arena.dealloc(1, ptr1_1, layout16);
+    arena.dealloc(1, ptr1_2, layout16);
+    
+    // Reset reclaims all [1] memory
+    arena.reset();
+    let ptr1_after = arena.alloc(1, layout16);
+    assert(!ptr1_after.is_null(), "[1] allocation after reset failed");
+    assert(ptr1_after as usize == buffer2.as_ptr() as usize, "[1] reset did not return to start");
+    println!("  [1] quantity linear allocation and reset verified");
+    
+    // Test 4: QttArena with [*] quantity (heap fallback - returns null in this impl)
+    println!("Test 4: QttArena [*] quantity");
+    let ptr_star = arena.alloc(2, layout16); // 2 represents [*]
+    // In this implementation, [*] returns null (no heap configured)
+    assert(ptr_star.is_null(), "[*] should return null in arena-only mode");
+    println!("  [*] quantity correctly returns null (no heap fallback)");
+    
+    // Test 5: Linear lifetime guarantees (simulated)
+    println!("Test 5: Linear lifetime guarantees");
+    let mut buffer3 = [0u8; 256];
+    let mut allocator2 = LinearAllocator::new(&mut buffer3);
+    let layout8 = Layout::from_size_align(8, 8).unwrap();
+    
+    // Simulate a linear value: allocate, use exactly once, then scope ends
+    let linear_ptr = allocator2.alloc(layout8);
+    assert(!linear_ptr.is_null(), "Linear value allocation failed");
+    
+    // In Naso, the type system ensures this is used exactly once
+    // Here we simulate by writing to it
+    unsafe { *(linear_ptr as *mut u64) = 0x42 };
+    let read_back = unsafe { *(linear_ptr as *const u64) };
+    assert(read_back == 0x42, "Linear value read/write failed");
+    
+    // Scope ends - allocator reset reclaims memory
+    allocator2.reset();
+    println!("  Linear lifetime (single allocation, single use, reclaim) verified");
+    
+    // Test 6: Zero fragmentation property
+    println!("Test 6: Zero fragmentation property");
+    let mut buffer4 = [0u8; 512];
+    let mut allocator3 = LinearAllocator::new(&mut buffer4);
+    let layout = Layout::from_size_align(16, 8).unwrap();
+    
+    // Allocate until full
+    let mut allocations = 0;
+    loop {
+        let ptr = allocator3.alloc(layout);
+        if ptr.is_null() {
+            break;
+        }
+        allocations += 1;
+    }
+    
+    println!("  Allocated {} objects of 16 bytes in 512 byte buffer", allocations);
+    assert(allocations > 0, "Should allocate at least one object");
+    
+    // Reset and allocate again - should get same number of allocations
+    allocator3.reset();
+    let mut allocations2 = 0;
+    loop {
+        let ptr = allocator3.alloc(layout);
+        if ptr.is_null() {
+            break;
+        }
+        allocations2 += 1;
+    }
+    
+    assert(allocations2 == allocations, "Reset did not reclaim full capacity");
+    println!("  Zero fragmentation: {} allocations before and after reset", allocations);
+    
+    println!("All memory safety tests passed!");
+}

@@ -1,0 +1,61 @@
+// stdlib/test/integrations/tensor_contraction.naso
+// Integration test: Tensor contractions using std::tensor
+// Demonstrates matrix multiplication, tensor operations, and contractions
+
+use std::tensor::*;
+
+fn main() {
+    // Test 1: Matrix multiplication
+    println!("Test 1: Matrix multiplication");
+    let a = Tensor::new([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let b = Tensor::new([3, 2], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let c = matmul(&a, &b);
+    assert(c.shape() == [2, 2], "Matrix multiplication shape mismatch");
+    println!("  Matmul result shape: {:?}", c.shape());
+    println!("  Matmul result: {:?}", c.data());
+    
+    // Test 2: Element-wise operations
+    println!("Test 2: Element-wise add/sub/scale");
+    let x = Tensor::new([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let y = Tensor::new([2, 3], [0.5, 1.5, 2.5, 3.5, 4.5, 5.5]);
+    let sum = add(&x, &y);
+    let diff = sub(&x, &y);
+    let scaled = scale(&x, 2.0);
+    assert(sum.shape() == [2, 3], "Add shape mismatch");
+    assert(diff.shape() == [2, 3], "Sub shape mismatch");
+    assert(scaled.shape() == [2, 3], "Scale shape mismatch");
+    println!("  Element-wise operations passed");
+    
+    // Test 3: Transpose
+    println!("Test 3: Transpose");
+    let t = transpose(&x);
+    assert(t.shape() == [3, 2], "Transpose shape mismatch");
+    println!("  Transpose shape: {:?}", t.shape());
+    
+    // Test 4: Outer product
+    println!("Test 4: Outer product");
+    let v1 = Tensor::new([3], [1.0, 2.0, 3.0]);
+    let v2 = Tensor::new([2], [1.0, 2.0]);
+    let outer = outer_product(&v1, &v2);
+    assert(outer.shape() == [3, 2], "Outer product shape mismatch");
+    println!("  Outer product shape: {:?}", outer.shape());
+    
+    // Test 5: Tensor contraction
+    println!("Test 5: Tensor contraction");
+    let t1 = Tensor::new([2, 3, 4], [1.0; 24]);
+    let t2 = Tensor::new([4, 5], [1.0; 20]);
+    let contracted = contract(&t1, &t2, [(2, 0)]); // Contract t1's last dim with t2's first dim
+    assert(contracted.shape() == [2, 3, 5], "Contraction shape mismatch");
+    println!("  Contraction shape: {:?}", contracted.shape());
+    
+    // Test 6: Chained operations (fusion opportunity)
+    println!("Test 6: Chained operations");
+    let m1 = Tensor::new([4, 4], [1.0; 16]);
+    let m2 = Tensor::new([4, 4], [2.0; 16]);
+    let m3 = Tensor::new([4, 4], [0.5; 16]);
+    let result = matmul(&add(&m1, &m2), &m3);
+    assert(result.shape() == [4, 4], "Chained ops shape mismatch");
+    println!("  Chained operations passed");
+    
+    println!("All tensor contraction tests passed!");
+}

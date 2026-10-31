@@ -1,0 +1,61 @@
+// stdlib/prelude.naso - Automatic prelude for Naso source files
+// This file is automatically imported when no explicit prelude is given.
+// Re-exports core types, std::quantum, std::tensor, std::sys, and std::alloc.
+
+// Core types
+pub use core::bool;
+pub use core::u8;
+pub use core::u16;
+pub use core::u32;
+pub use core::u64;
+pub use core::i8;
+pub use core::i16;
+pub use core::i32;
+pub use core::i64;
+pub use core::f32;
+pub use core::f64;
+pub use core::char;
+pub use core::str;
+pub use core::Option;
+pub use core::Result;
+pub use core::Vec;
+pub use core::String;
+pub use core::Array;
+
+// Quantum primitives
+pub use std::quantum::qalloc;
+pub use std::quantum::qfree;
+pub use std::quantum::hadamard;
+pub use std::quantum::cnot;
+pub use std::quantum::measure;
+pub use std::quantum::bell_pair;
+pub use std::quantum::qft;
+pub use std::quantum::grover_oracle;
+
+// Tensor operations
+pub use std::tensor::Tensor;
+pub use std::tensor::matmul;
+pub use std::tensor::add;
+pub use std::tensor::sub;
+pub use std::tensor::scale;
+pub use std::tensor::transpose;
+pub use std::tensor::contract;
+pub use std::tensor::outer_product;
+
+// System calls
+pub use std::sys::sys_qalloc;
+pub use std::sys::sys_qfree;
+pub use std::sys::sys_barrier;
+pub use std::sys::sys_measure_trap;
+pub use std::sys::process_exit;
+pub use std::sys::signal_handler;
+pub use std::sys::volatile_load;
+pub use std::sys::volatile_store;
+
+// Allocators
+pub use std::alloc::LinearAllocator;
+pub use std::alloc::QttArena;
+pub use std::alloc::linear_alloc;
+pub use std::alloc::alloc_zero;
+pub use std::alloc::alloc_bounded;
+pub use std::alloc::linear_free;

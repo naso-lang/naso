@@ -294,6 +294,18 @@ impl<'a> Parser<'a> {
         Expr::new(ExprKind::Literal(lit), span, next_id())
     }
 
+    /// Parse a string literal token and return the string value.
+    pub fn parse_string_literal(&mut self) -> Option<String> {
+        let tok = self.bump()?;
+        match &tok.kind {
+            TK::Str(s) => Some(s.clone()),
+            _ => {
+                self.pos -= 1;
+                None
+            }
+        }
+    }
+
     fn parse_var(&mut self) -> Expr {
         let start = self.pos;
         let name = self.parse_ident();

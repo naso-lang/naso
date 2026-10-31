@@ -32,7 +32,7 @@ fn infer_cast(
     let is_numeric = |k: &TypeKind| {
         matches!(
             k,
-            TypeKind::Int | TypeKind::UInt | TypeKind::Float | TypeKind::Nat | TypeKind::Quint8
+            TypeKind::Int | TypeKind::UInt | TypeKind::Float | TypeKind::Nat | TypeKind::Quint8 | TypeKind::Pointer(_)
         )
     };
 

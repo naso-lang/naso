@@ -126,6 +126,11 @@ pub fn unify_kinds(
             let unified = unify_types(checker, inner1, inner2)?;
             Ok(TypeKind::Projection(Box::new(unified)))
         }
+        // Pointer types
+        (TypeKind::Pointer(inner1), TypeKind::Pointer(inner2)) => {
+            let unified = unify_types(checker, inner1, inner2)?;
+            Ok(TypeKind::Pointer(Box::new(unified)))
+        }
 
         // Reversible types
         (TypeKind::Reversible(inner1), TypeKind::Reversible(inner2)) => {

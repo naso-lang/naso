@@ -133,6 +133,8 @@ pub enum TokenKind {
     Mod,
     #[regex("[iI][mM][pP][oO][rR][tT]", priority = 3)]
     Import,
+    #[regex("[eE][xX][tT][eE][rR][nN]", priority = 3)]
+    Extern,
     #[regex("[cC][oO][nN][sS][tT]", priority = 3)]
     Const,
     // `proof` introduces a proof block: obligations that the verifier must
@@ -315,6 +317,8 @@ pub enum TokenKind {
     Assign,
     #[token("@")]
     At,
+    #[token("#")]
+    Hash,
 
     // ===== Punctuation =====
     #[token(":")]
@@ -367,6 +371,7 @@ impl TokenKind {
             TokenKind::Type => "'type'",
             TokenKind::Mod => "'mod'",
             TokenKind::Import => "'import'",
+            TokenKind::Extern => "'extern'",
             TokenKind::Const => "'const'",
             TokenKind::Proof => "'proof'",
             TokenKind::Requires => "'requires'",
@@ -442,6 +447,7 @@ impl TokenKind {
             TokenKind::LBrace => "'{'",
             TokenKind::RBrace => "'}'",
             TokenKind::At => "'@'",
+            TokenKind::Hash => "'#'",
             TokenKind::Newline => "newline",
             TokenKind::Comment => "comment",
             TokenKind::IntKw => "'int'",

@@ -136,6 +136,7 @@ pub mod walk {
             Item::Module(m) => visitor.visit_module(m),
             Item::Import(_) => Ok(VisitOutcome::Continue),
             Item::Const(c) => visitor.visit_const(c),
+            Item::Extern(_) => Ok(VisitOutcome::Continue),
         }
     }
 
@@ -529,6 +530,7 @@ pub mod walk {
             | TypeKind::Nat
             | TypeKind::Quint8
             | TypeKind::Qubit
+            | TypeKind::Pointer(_)
             | TypeKind::Universe(_)
             | TypeKind::Var(_)
             | TypeKind::Meta(_)

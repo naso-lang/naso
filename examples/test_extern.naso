@@ -1,0 +1,4 @@
+// Test extern block parsing with pointer types
+extern "C" {
+    fn naso_tcp_bind(addr_ptr: *u8, len: usize) -> u64;
+}

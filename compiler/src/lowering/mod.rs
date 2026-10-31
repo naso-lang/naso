@@ -78,6 +78,8 @@ pub struct LoweringContext {
     /// function. `statements`, `schedule_nodes`, `quantities` and `function_params`
     /// remain as the flat concatenation for the compatibility surface.
     functions: Vec<crate::ir::pir_types::PirFunction>,
+    /// External functions declared in extern blocks
+    extern_functions: Vec<crate::ir::pir_types::ExternFunction>,
     /// The `StmtId` of the most recent `return e` this function lowered.
     ///
     /// `lower_stmt` turns `return e` into an ordinary statement, which is right for a
@@ -274,6 +276,7 @@ impl LoweringContext {
             param_names: Vec::new(),
             function_params: Vec::new(),
             functions: Vec::new(),
+            extern_functions: Vec::new(),
             pending_return_stmt: None,
         }
     }
@@ -322,6 +325,7 @@ impl LoweringContext {
         );
         pir.function_params = std::mem::take(&mut self.function_params);
         pir.functions = std::mem::take(&mut self.functions);
+        pir.extern_functions = std::mem::take(&mut self.extern_functions);
 
         // Validate the generated PIR
         validate_pir(&pir).map_err(|e| LoweringError::ValidationError(format!("{:?}", e)))?;
@@ -753,9 +757,35 @@ impl LoweringContext {
                     span: Some(func.span),
                 });
             }
+            Item::Extern(extern_block) => {
+                self.lower_extern_block(extern_block)?;
+            }
             _ => {
                 // Skip other items for now
             }
+        }
+        Ok(())
+    }
+
+    /// Lower an extern block into PIR extern functions
+    fn lower_extern_block(&mut self, extern_block: &crate::ast::ExternBlock) -> Result<(), LoweringError> {
+        for extern_fn in &extern_block.functions {
+            let params: Vec<crate::ir::pir_types::ExternParam> = extern_fn
+                .params
+                .iter()
+                .map(|p| crate::ir::pir_types::ExternParam {
+                    name: p.name.name.clone(),
+                    ty: format!("{:?}", p.ty),
+                    quantity: p.quantity,
+                    mutability: p.mutability,
+                })
+                .collect();
+            let return_type = extern_fn.ret_ty.as_ref().map(|t| format!("{:?}", t));
+            self.extern_functions.push(crate::ir::pir_types::ExternFunction {
+                name: extern_fn.name.name.clone(),
+                params,
+                return_type,
+            });
         }
         Ok(())
     }

@@ -159,6 +159,8 @@ pub enum Item {
     Import(Import),
     /// Constant definition
     Const(ConstDef),
+    /// External function block (extern "C" { ... })
+    Extern(ExternBlock),
 }
 
 impl Item {
@@ -169,8 +171,37 @@ impl Item {
             Item::Module(m) => m.span,
             Item::Import(i) => i.span,
             Item::Const(c) => c.span,
+            Item::Extern(e) => e.span,
         }
     }
+}
+
+/// External function block: extern "C" { fn name(...); ... }
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExternBlock {
+    pub abi: String,
+    pub functions: Vec<ExternFn>,
+    pub span: Span,
+}
+
+/// External function declaration within extern block
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExternFn {
+    pub name: Ident,
+    pub params: Vec<ExternParam>,
+    pub ret_ty: Option<Type>,
+    pub link_name: Option<String>,
+    pub span: Span,
+}
+
+/// Parameter of an external function
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExternParam {
+    pub name: Ident,
+    pub ty: Type,
+    pub quantity: Quantity,
+    pub mutability: Mutability,
+    pub span: Span,
 }
 
 /// Function definition with quantitative parameters

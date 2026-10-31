@@ -201,6 +201,8 @@ pub enum TypeKind {
     Function(Vec<Type>, Box<Type>),
     /// Reference/projection type (for inout)
     Projection(Box<Type>),
+    /// Raw pointer type (for FFI)
+    Pointer(Box<Type>),
     /// Reversible computation type
     Reversible(Box<Type>),
     /// Dependent function type (Pi type)
@@ -387,6 +389,7 @@ impl fmt::Display for TypeKind {
             TypeKind::Universe(level) => write!(f, "Type{}", level),
             TypeKind::Var(v) => write!(f, "{}", v),
             TypeKind::Meta(m) => write!(f, "{}", m),
+            TypeKind::Pointer(inner) => write!(f, "*{}", inner),
             TypeKind::Error => write!(f, "<error>"),
         }
     }

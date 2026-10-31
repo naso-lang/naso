@@ -297,6 +297,15 @@ impl<'a> Parser<'a> {
                 Type::int(Span::default())
             }
             Some(TK::TypeIdent(_)) | Some(TK::QRegister) => self.parse_named_type(),
+            Some(TK::Star) => {
+                self.bump();
+                let inner = self.parse_type();
+                Type::new(
+                    TypeKind::Pointer(Box::new(inner)),
+                    Quantity::Many,
+                    Span::default(),
+                )
+            }
             Some(TK::Ident(_)) if self.at_ident("int") => {
                 self.bump();
                 Type::int(Span::default())

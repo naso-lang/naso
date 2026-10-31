@@ -221,6 +221,7 @@ fn lower_type_kind_to_aggregate(
         ])),
         TypeKind::Char => Ok(LlvmAggregateType::Int(IntWidth::I32)),
         TypeKind::Quint8 => Ok(LlvmAggregateType::Int(IntWidth::I32)),
+        TypeKind::Pointer(_) => Ok(LlvmAggregateType::Int(IntWidth::I64)),
     }
 }
 

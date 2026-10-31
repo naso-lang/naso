@@ -1,0 +1,3 @@
+fn bind(addr: String) -> Result[Listener] {
+    ()
+}

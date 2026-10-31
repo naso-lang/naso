@@ -1,0 +1,3 @@
+fn ok(body: [N] u8) -> Response {
+    ()
+}

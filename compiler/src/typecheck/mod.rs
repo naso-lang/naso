@@ -422,6 +422,23 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
         attributes: Vec::new(),
     });
 
+    // Result type (generic enum for error handling)
+    env.insert_type_def(TypeDef {
+        name: Ident::new("Result", Span::default()),
+        generics: vec![GenericParam {
+            name: Ident::new("T", Span::default()),
+            kind: GenericKind::Type,
+            span: Span::default(),
+        }],
+        kind: TypeDefKind::Alias(Type::new(
+            TypeKind::Named(Ident::new("Result", Span::default()), Vec::new()),
+            Quantity::Many,
+            Span::default(),
+        )),
+        span: Span::default(),
+        attributes: Vec::new(),
+    });
+
     // http types
     env.insert_type_def(TypeDef {
         name: Ident::new("Request", Span::default()),
@@ -767,6 +784,187 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
             },
         ],
         ret_ty: Some(Type::new(TypeKind::Float, Quantity::Many, Span::default())),
+        quantity: Quantity::Many,
+        is_reversible: false,
+    }
+    .insert(env);
+
+    // Result constructors: Ok(T) -> Result[T], Err(String) -> Result[T]
+    // These are compiler intrinsics with empty bodies - codegen emits them directly
+    PreludeFn {
+        name: "Ok",
+        params: vec![Param {
+            name: Ident::new("value", Span::default()),
+            ty: Type::new(TypeKind::Int, Quantity::Many, Span::default()),
+            quantity: Quantity::Many,
+            mutability: Mutability::Immutable,
+            span: Span::default(),
+        }],
+        ret_ty: Some(Type::new(
+            TypeKind::Named(Ident::new("Result", Span::default()), vec![
+                TypeArg::Type(Type::new(TypeKind::Int, Quantity::Many, Span::default()))
+            ]),
+            Quantity::Many,
+            Span::default(),
+        )),
+        quantity: Quantity::Many,
+        is_reversible: false,
+    }
+    .insert(env);
+
+    PreludeFn {
+        name: "Err",
+        params: vec![Param {
+            name: Ident::new("msg", Span::default()),
+            ty: Type::new(TypeKind::String, Quantity::Many, Span::default()),
+            quantity: Quantity::Many,
+            mutability: Mutability::Immutable,
+            span: Span::default(),
+        }],
+        ret_ty: Some(Type::new(
+            TypeKind::Named(Ident::new("Result", Span::default()), vec![
+                TypeArg::Type(Type::new(TypeKind::Int, Quantity::Many, Span::default()))
+            ]),
+            Quantity::Many,
+            Span::default(),
+        )),
+        quantity: Quantity::Many,
+        is_reversible: false,
+    }
+    .insert(env);
+
+    // Concrete Ok constructors for common types (typechecker doesn't do generic instantiation yet)
+    // Ok for Listener
+    PreludeFn {
+        name: "ok_listener",
+        params: vec![Param {
+            name: Ident::new("value", Span::default()),
+            ty: Type::new(
+                TypeKind::Named(Ident::new("Listener", Span::default()), Vec::new()),
+                Quantity::Many,
+                Span::default(),
+            ),
+            quantity: Quantity::Many,
+            mutability: Mutability::Immutable,
+            span: Span::default(),
+        }],
+        ret_ty: Some(Type::new(
+            TypeKind::Named(Ident::new("Result", Span::default()), vec![
+                TypeArg::Type(Type::new(
+                    TypeKind::Named(Ident::new("Listener", Span::default()), Vec::new()),
+                    Quantity::Many,
+                    Span::default(),
+                ))
+            ]),
+            Quantity::Many,
+            Span::default(),
+        )),
+        quantity: Quantity::Many,
+        is_reversible: false,
+    }
+    .insert(env);
+
+    // Ok for (Listener, Stream) tuple
+    PreludeFn {
+        name: "ok_tuple",
+        params: vec![
+            Param {
+                name: Ident::new("value", Span::default()),
+                ty: Type::new(
+                    TypeKind::Tuple(vec![
+                        Type::new(
+                            TypeKind::Named(Ident::new("Listener", Span::default()), Vec::new()),
+                            Quantity::Many,
+                            Span::default(),
+                        ),
+                        Type::new(
+                            TypeKind::Named(Ident::new("Stream", Span::default()), Vec::new()),
+                            Quantity::Many,
+                            Span::default(),
+                        ),
+                    ]),
+                    Quantity::Many,
+                    Span::default(),
+                ),
+                quantity: Quantity::Many,
+                mutability: Mutability::Immutable,
+                span: Span::default(),
+            },
+        ],
+        ret_ty: Some(Type::new(
+            TypeKind::Named(Ident::new("Result", Span::default()), vec![
+                TypeArg::Type(Type::new(
+                    TypeKind::Tuple(vec![
+                        Type::new(
+                            TypeKind::Named(Ident::new("Listener", Span::default()), Vec::new()),
+                            Quantity::Many,
+                            Span::default(),
+                        ),
+                        Type::new(
+                            TypeKind::Named(Ident::new("Stream", Span::default()), Vec::new()),
+                            Quantity::Many,
+                            Span::default(),
+                        ),
+                    ]),
+                    Quantity::Many,
+                    Span::default(),
+                ))
+            ]),
+            Quantity::Many,
+            Span::default(),
+        )),
+        quantity: Quantity::Many,
+        is_reversible: false,
+    }
+    .insert(env);
+
+    // Ok for Response
+    PreludeFn {
+        name: "ok_response",
+        params: vec![Param {
+            name: Ident::new("value", Span::default()),
+            ty: Type::new(
+                TypeKind::Named(Ident::new("Response", Span::default()), Vec::new()),
+                Quantity::Many,
+                Span::default(),
+            ),
+            quantity: Quantity::Many,
+            mutability: Mutability::Immutable,
+            span: Span::default(),
+        }],
+        ret_ty: Some(Type::new(
+            TypeKind::Named(Ident::new("Result", Span::default()), vec![
+                TypeArg::Type(Type::new(
+                    TypeKind::Named(Ident::new("Response", Span::default()), Vec::new()),
+                    Quantity::Many,
+                    Span::default(),
+                ))
+            ]),
+            Quantity::Many,
+            Span::default(),
+        )),
+        quantity: Quantity::Many,
+        is_reversible: false,
+    }
+    .insert(env);
+
+    // Ok for Int
+    PreludeFn {
+        name: "ok_int",
+        params: vec![Param {
+            name: Ident::new("value", Span::default()),
+            ty: Type::new(TypeKind::Int, Quantity::Many, Span::default()),
+            quantity: Quantity::Many,
+            mutability: Mutability::Immutable,
+            span: Span::default(),
+        }],
+        ret_ty: Some(Type::new(
+            TypeKind::Named(Ident::new("Result", Span::default()), vec![
+                TypeArg::Type(Type::new(TypeKind::Int, Quantity::Many, Span::default()))
+            ]),
+            Quantity::Many,
+            Span::default(),
+        )),
         quantity: Quantity::Many,
         is_reversible: false,
     }

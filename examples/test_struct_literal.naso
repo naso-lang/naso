@@ -1,0 +1,9 @@
+struct Response {
+    status: Int,
+    body: Int,
+}
+
+fn test() -> Response {
+    let r = Response { status: 200, body: 0 };
+    r
+}

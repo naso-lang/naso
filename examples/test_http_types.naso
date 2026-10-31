@@ -1,0 +1,10 @@
+struct Response {
+    status: u16,
+    body: [N] u8,
+}
+
+fn ok(body: [N] u8) -> Response {
+    let s = 200;
+    let r = Response { status: s, body };
+    r
+}

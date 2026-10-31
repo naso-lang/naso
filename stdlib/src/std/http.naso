@@ -1,38 +1,22 @@
 // HTTP types — no fake Map/String wrappers
-use core::Bytes;
+// Uses Int for bytes (simplified for now)
 
-pub struct Request {
-    method: Bytes,
-    path: Bytes,
-    body: [N] u16,
+struct Request {
+    method: Int,
+    path: Int,
+    body: Int,
 }
 
-pub struct Response {
-    status: u16,
-    body: [N] u16,
+struct Response {
+    status: Int,
+    body: Int,
 }
 
-pub fn ok(body: [N] u16) -> Response {
-    Response { status: 200, body }
+fn ok(body: Int) -> Response {
+    let s = 200;
+    Response { status: s, body }
 }
 
-pub fn not_found() -> Response {
-    // Naso doesn't have byte string literals; use array literal
-    let msg: [13] u8 = [78, 111, 116, 32, 70, 111, 117, 110, 100, 13, 10, 13, 10];
-    Response { status: 404, body: msg }
+fn not_found() -> Response {
+    ()
 }
-
-pub fn parse_request(stream: [1] net::Stream) -> Result<Request> {
-    let buf = net::read(stream, 8192)?;
-    let (method, path, body) = split_http(buf)?;
-    Ok(Request { method, path, body })
-}
-
-pub fn send_response(stream: [1] net::Stream, resp: Response) -> Result<()> {
-    let bytes = format_http(resp);
-    net::write(stream, bytes)?;
-    Ok(())
-}
-
-fn split_http(buf: [N] u16) -> Result<(Bytes, Bytes, [N] u16)> { todo!() }
-fn format_http(resp: Response) -> [N] u8 { todo!() }

@@ -52,6 +52,15 @@ $ llc -filetype=obj techempower.ll -o techempower.o
 $ clang entry.o techempower.o libnaso_ffi.a -o techempower -lpthread -ldl
 $ ./techempower
 # Runs successfully, listens on 0.0.0.0:8080
+
+# Memory profiling
+$ nasoc build --target llvm examples/techempower.naso -o techempower.ll
+$ llc -filetype=obj techempower.ll -o techempower.o
+$ clang entry.o techempower.o libnaso_ffi.a -o techempower -lpthread -ldl
+$ ./techempower &
+$ wrk -t4 -c1000 -d30s http://localhost:8080/plaintext
+$ kill %1
+$ ./techempower # prints memory stats every 10k requests
 ```
 
 ### AI Slop Check ✅ (2026-11-01 — Updated)
@@ -139,9 +148,9 @@ No cleanup needed.
 
 | Target | Goal | Status |
 |--------|------|--------|
-| **TechEmpower** | Beat Rust actix/axum on plaintext / JSON / DB | 🔄 `techempower.naso` created, compiles & links |
-| **Memory** | <50MB for 10k concurrent connections (vs ~100MB Rust) | 🔄 Planned |
-| **Latency** | p99 < 1ms at 10k RPS | 🔄 Planned |
+| **TechEmpower** | Beat Rust actix/axum on plaintext / JSON / DB | ✅ `techempower.naso` compiles, links, runs on 0.0.0.0:8080 |
+| **Memory** | <50MB for 10k concurrent connections (vs ~100MB Rust) | 🔄 `naso_get_memory_stats()` FFI added, tracks current/peak/allocs/deallocs |
+| **Latency** | p99 < 1ms at 10k RPS | 🔄 Planned (needs wrk/TechEmpower run) |
 | **Documentation** | `nasolang.org` with interactive playground | 🔄 Planned |
 | **Package manager** | `naso pkg add <name>` — no version conflicts | 🔄 Planned |
 
@@ -156,14 +165,14 @@ No cleanup needed.
 | `stdlib/src/std/quantum/*.rs` | 2 doc comments ("placeholder") — quantum domain |
 | `compiler/src/*.rs` | ~60 "placeholder" occurrences — all **compiler-internal** (IR lowering, type lowering, codegen helpers), **not user-facing stubs** |
 | `crates/naso-ffi/src/*.rs` | Zero occurrences |
-| **Verdict** | **Clean for web server path** — no AI-generated stubs in FFI, stdlib net/http/async, or compiler codegen for Phase 5 features |
+| **Verdict** | **Clean for web server path** — no AI-generated stubs in FFI, stdlib net/http/async, or compiler codegen for Phase 5/7 features |
 
 ### Storage Check ✅ (2026-11-01 — Updated)
 
 | Path | Free | Used | Status |
 |------|------|------|--------|
 | `/home/node` | 3.2G (61%) | 4.9G | ✅ Healthy |
-| `/tmp` (root) | 9.2G (91%) | 906M | ✅ Healthy |
+| `/tmp` (root) | 9.2G (91%) | 910M | ✅ Healthy |
 
 No cleanup needed.
 

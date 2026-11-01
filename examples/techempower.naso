@@ -9,6 +9,18 @@ struct Stream {
     fd: Int,
 }
 
+fn handle_plaintext(stream: Stream) -> () {
+    let body: [u8] = [72, 101, 108, 108, 111, 44, 32, 87, 111, 114, 108, 100, 33];
+    let _ = write(stream, body);
+    ()
+}
+
+fn handle_json(stream: Stream) -> () {
+    let body: [u8] = [123, 34, 109, 101, 115, 115, 97, 103, 101, 34, 58, 34, 72, 101, 108, 108, 111, 44, 32, 87, 111, 114, 108, 100, 33, 34, 125];
+    let _ = write(stream, body);
+    ()
+}
+
 fn main() -> () {
     let body: [u8] = [72, 101, 108, 108, 111, 44, 32, 87, 111, 114, 108, 100, 33];
     let stream = Stream { fd: 1 };

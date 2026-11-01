@@ -9,10 +9,72 @@
 use std::collections::HashMap;
 use std::net::TcpListener;
 use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Returned to Naso as resource handle
 #[repr(C)]
 pub struct ResourceID(pub u64);
+
+/// Memory statistics for benchmarking
+#[repr(C)]
+pub struct MemoryStats {
+    pub current_bytes: usize,
+    pub peak_bytes: usize,
+    pub total_allocations: usize,
+    pub total_deallocations: usize,
+}
+
+/// Global memory statistics
+static MEMORY_STATS: OnceLock<MemoryTracker> = OnceLock::new();
+
+struct MemoryTracker {
+    current: AtomicUsize,
+    peak: AtomicUsize,
+    allocations: AtomicUsize,
+    deallocations: AtomicUsize,
+}
+
+impl MemoryTracker {
+    fn new() -> Self {
+        Self {
+            current: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            allocations: AtomicUsize::new(0),
+            deallocations: AtomicUsize::new(0),
+        }
+    }
+    
+    fn record_alloc(&self, size: usize) {
+        let current = self.current.fetch_add(size, Ordering::Relaxed) + size;
+        self.allocations.fetch_add(1, Ordering::Relaxed);
+        // Update peak
+        let mut peak = self.peak.load(Ordering::Relaxed);
+        while current > peak {
+            match self.peak.compare_exchange_weak(peak, current, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(p) => peak = p,
+            }
+        }
+    }
+    
+    fn record_dealloc(&self, size: usize) {
+        self.current.fetch_sub(size, Ordering::Relaxed);
+        self.deallocations.fetch_add(1, Ordering::Relaxed);
+    }
+    
+    fn get_stats(&self) -> MemoryStats {
+        MemoryStats {
+            current_bytes: self.current.load(Ordering::Relaxed),
+            peak_bytes: self.peak.load(Ordering::Relaxed),
+            total_allocations: self.allocations.load(Ordering::Relaxed),
+            total_deallocations: self.deallocations.load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn memory_tracker() -> &'static MemoryTracker {
+    MEMORY_STATS.get_or_init(|| MemoryTracker::new())
+}
 
 /// Global fd table for tracking listeners and streams
 static FD_TABLE: OnceLock<Mutex<FdTable>> = OnceLock::new();
@@ -103,14 +165,19 @@ pub extern "C" fn naso_tcp_accept(listener_fd: u64, out: *mut u64) -> u64 {
 /// Returns bytes read (0 = EOF or error).
 #[unsafe(no_mangle)]
 pub extern "C" fn naso_read(fd: u64, buf: *mut u8, max_len: usize) -> usize {
-    if buf.is_null() || max_len == 0 { return 0; }
+    if buf.is_null() || max_len == 0 {
+        return 0;
+    }
     let mut table = fd_table().lock().unwrap();
     let Some(stream) = table.get_stream(fd) else {
         return 0;
     };
     let buf_slice = unsafe { std::slice::from_raw_parts_mut(buf, max_len) };
     match std::io::Read::read(stream, buf_slice) {
-        Ok(n) => n,
+        Ok(n) => {
+            memory_tracker().record_alloc(n);
+            n
+        }
         Err(_) => 0,
     }
 }
@@ -119,16 +186,34 @@ pub extern "C" fn naso_read(fd: u64, buf: *mut u8, max_len: usize) -> usize {
 /// Returns bytes written (0 = error).
 #[unsafe(no_mangle)]
 pub extern "C" fn naso_write(fd: u64, buf: *const u8, len: usize) -> usize {
-    if buf.is_null() || len == 0 { return 0; }
+    if buf.is_null() || len == 0 {
+        return 0;
+    }
     let mut table = fd_table().lock().unwrap();
     let Some(stream) = table.get_stream(fd) else {
         return 0;
     };
     let buf_slice = unsafe { std::slice::from_raw_parts(buf, len) };
     match std::io::Write::write(stream, buf_slice) {
-        Ok(n) => n,
+        Ok(n) => {
+            memory_tracker().record_alloc(n);
+            n
+        }
         Err(_) => 0,
     }
+}
+
+/// Get memory statistics for benchmarking
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_get_memory_stats(stats_ptr: *mut MemoryStats) -> u64 {
+    if stats_ptr.is_null() {
+        return 0;
+    }
+    let stats = memory_tracker().get_stats();
+    unsafe {
+        std::ptr::write(stats_ptr, stats);
+    }
+    1
 }
 
 /// Get last error message (Naso reads this when FFI returns 0)

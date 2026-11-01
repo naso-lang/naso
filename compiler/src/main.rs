@@ -29,6 +29,9 @@ fn main() {
             }
             run_frontend_command(command, &args[2]);
         }
+        "repl" => {
+            run_repl();
+        }
         "build" => {
             run_build_command(&args[2..]);
         }
@@ -47,6 +50,7 @@ fn print_usage() {
     eprintln!("  parse <file>          Parse and print AST as JSON");
     eprintln!("  tokens <file>         Print token stream");
     eprintln!("  check <file>          Type check program");
+    eprintln!("  repl                  Start interactive REPL");
     eprintln!("  build [options] <file>  Build program to target");
     eprintln!("Build options:");
     eprintln!("  --target <llvm|qir|wgsl>  Target backend (default: llvm)");
@@ -114,6 +118,166 @@ fn run_frontend_command(command: &str, file: &str) {
             }
         }
         _ => unreachable!(),
+    }
+}
+
+fn run_repl() {
+    use std::io::{self, Write};
+    
+    println!("Naso REPL — type :quit to exit, :help for commands");
+    println!("Commands: :quit, :help, :parse, :tokens, :check, :type");
+    
+    let mut input = String::new();
+    let mut multiline = String::new();
+    
+    loop {
+        if multiline.is_empty() {
+            print!("naso> ");
+        } else {
+            print!("...> ");
+        }
+        io::stdout().flush().unwrap();
+        
+        input.clear();
+        if io::stdin().read_line(&mut input).is_err() {
+            break;
+        }
+        
+        let line = input.trim();
+        
+        // Handle REPL commands
+        if line.starts_with(':') {
+            match line {
+                ":quit" | ":exit" => {
+                    println!("Goodbye!");
+                    break;
+                }
+                ":help" => {
+                    println!("Commands:");
+                    println!("  :quit, :exit  — Exit REPL");
+                    println!("  :help         — Show this help");
+                    println!("  :parse        — Parse last input as expression");
+                    println!("  :tokens       — Show tokens for last input");
+                    println!("  :check        — Type check last input");
+                    println!("  :type         — Show type of last expression");
+                    println!();
+                    println!("Multi-line: type incomplete expression, continue on next line");
+                    println!("  Empty line submits the accumulated input");
+                }
+                ":parse" => {
+                    if multiline.is_empty() && !input.trim().is_empty() {
+                        match parse_program(&input) {
+                            Ok(program) => {
+                                let json = serde_json::to_string_pretty(&program).expect("serialize");
+                                println!("{json}");
+                            }
+                            Err(e) => eprintln!("Parse error: {e}"),
+                        }
+                    } else if !multiline.is_empty() {
+                        match parse_program(&multiline) {
+                            Ok(program) => {
+                                let json = serde_json::to_string_pretty(&program).expect("serialize");
+                                println!("{json}");
+                            }
+                            Err(e) => eprintln!("Parse error: {e}"),
+                        }
+                    } else {
+                        eprintln!("No input to parse");
+                    }
+                }
+                ":tokens" => {
+                    let source = if multiline.is_empty() { &input } else { &multiline };
+                    let tokens = Lexer::lex(source);
+                    for tok in &tokens {
+                        let kind_name = format!("{:?}", tok.kind);
+                        let short = match &tok.kind {
+                            naso_compiler::lexer::TokenKind::Comment => "comment".into(),
+                            naso_compiler::lexer::TokenKind::Newline => "newline".into(),
+                            other => format!("{other}"),
+                        };
+                        println!(
+                            "{:4}-{:4}  {:<14}  {}",
+                            tok.span.start, tok.span.end, kind_name, short
+                        );
+                    }
+                }
+                ":check" => {
+                    let source = if multiline.is_empty() { &input } else { &multiline };
+                    let mut program = match parse_program(source) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("Parse error: {e}");
+                            continue;
+                        }
+                    };
+                    let result = check_program(&mut program);
+                    if result.errors.is_empty() {
+                        println!("OK");
+                    } else {
+                        for e in &result.errors {
+                            eprintln!("{e}");
+                        }
+                    }
+                }
+                ":type" => {
+                    let source = if multiline.is_empty() { &input } else { &multiline };
+                    let mut program = match parse_program(source) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("Parse error: {e}");
+                            continue;
+                        }
+                    };
+                    let result = check_program(&mut program);
+                    if result.errors.is_empty() {
+                        // Print types from type environment
+                        println!("Type checking passed (type display not yet implemented)");
+                    } else {
+                        for e in &result.errors {
+                            eprintln!("{e}");
+                        }
+                    }
+                }
+                _ => {
+                    eprintln!("Unknown command: {line}. Type :help for commands.");
+                }
+            }
+            multiline.clear();
+            continue;
+        }
+        
+        // Accumulate multi-line input
+        if multiline.is_empty() {
+            multiline.push_str(line);
+        } else {
+            multiline.push('\n');
+            multiline.push_str(line);
+        }
+        
+        // Check if input is complete (simple heuristic: balanced braces/parens)
+        // For now, empty line submits
+        if line.is_empty() && !multiline.is_empty() {
+            // Try to parse and execute
+            let mut program = match parse_program(&multiline) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Parse error: {e}");
+                    multiline.clear();
+                    continue;
+                }
+            };
+            
+            let result = check_program(&mut program);
+            if !result.errors.is_empty() {
+                for e in &result.errors {
+                    eprintln!("{e}");
+                }
+            } else {
+                println!("OK (execution not yet implemented)");
+            }
+            
+            multiline.clear();
+        }
     }
 }
 

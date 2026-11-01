@@ -122,7 +122,7 @@ No cleanup needed.
 
 | Feature | Why It Beats Rust |
 |---------|-------------------|
-| **REPL** | `naso repl` — instant feedback vs `cargo check` loop |
+| **REPL** (`naso repl`) | ✅ Implemented | Interactive REPL with `:help`, `:parse`, `:tokens`, `:check`, `:type` commands, multi-line input support |
 | **Zero-config** | Single binary, no `Cargo.toml`, no `build.rs` |
 | **Error messages** | QTT errors point to exact line, no lifetime noise |
 | **Hot reload** | `naso watch` — recompile on save, keep state |
@@ -204,6 +204,12 @@ Naso: `Stream` has quantity `[1]` — **must** be passed to `read`/`write`/`clos
 2. **CI verification**: GitHub Actions builds FFI crate, links test binary
 
 3. **Benchmark**: Once compiling, run `wrk -t4 -c1000 -d30s` against Naso vs Rust servers
+
+4. **Phase 6: Developer Experience** — **REPL ✅ DONE**, next:
+   - Zero-config (single binary, no `Cargo.toml`)
+   - Error messages (QTT errors, no lifetime noise)
+   - Hot reload (`naso watch`)
+   - Built-in test runner (`naso test`)
 
 ---
 

@@ -1,0 +1,11 @@
+fn write(s: Int, buf_ptr: *u8, buf_len: Int) -> Int {
+    1
+}
+
+fn main() -> () {
+    let body: [Int] = [104, 101, 108, 108, 111];
+    let len: Int = body.len();
+    let ptr = body as *u8;
+    let _ = write(1, ptr, len);
+    ()
+}

@@ -1,0 +1,9 @@
+extern "C" {
+    fn naso_tcp_bind(addr_ptr: *u8, len: usize) -> u64;
+}
+
+struct Listener { fd: u64 }
+
+fn test() -> Result[Listener, String] {
+    Result::Ok(Listener { fd: 1 })
+}

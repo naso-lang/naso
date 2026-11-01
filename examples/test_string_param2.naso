@@ -1,0 +1,8 @@
+fn foo(addr: Int) -> Int {
+    1
+}
+
+fn main() -> () {
+    let x = foo(1);
+    ()
+}

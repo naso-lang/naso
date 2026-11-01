@@ -20,6 +20,8 @@ pub enum PirExpr {
     IntLit(i64),
     /// Float literal (uses string to avoid Eq issue with f64)
     FloatLit(String),
+    /// String literal
+    StringLit(String),
     /// Boolean literal
     BoolLit(bool),
     /// Variable reference
@@ -41,6 +43,10 @@ pub enum PirExpr {
     },
     /// Struct field access
     Field { base: Box<PirExpr>, field: String },
+    /// Struct literal - tuple of fields
+    Struct { fields: Vec<PirExpr> },
+    /// Array literal
+    Array { items: Vec<PirExpr> },
     /// Let binding (for SSA form)
     Let {
         name: String,
@@ -717,6 +723,7 @@ impl PirModule {
                     || indices.iter().any(|i| self.expr_contains_var(i, var))
             }
             PirExpr::Field { base, .. } => self.expr_contains_var(base, var),
+            PirExpr::StringLit(_) => false,
             // A sequence's contents must be searched. Returning `false` here would
             // make every statement inside a loop body invisible to linearity
             // checking, so a linear value used only inside a loop would pass -- a
@@ -754,6 +761,8 @@ impl PirModule {
                 args.iter().any(|a| self.expr_contains_var(a, var))
                     || qubits.iter().any(|q| self.expr_contains_var(q, var))
             }
+            PirExpr::Array { items } => items.iter().any(|a| self.expr_contains_var(a, var)),
+            PirExpr::Struct { fields } => fields.iter().any(|f| self.expr_contains_var(f, var)),
             PirExpr::IntLit(_) | PirExpr::FloatLit(_) | PirExpr::BoolLit(_) => false,
         }
     }
@@ -952,6 +961,7 @@ fn pir_expr_to_string(expr: &PirExpr, _indent: usize) -> String {
         PirExpr::IntLit(v) => format!("{}", v),
         PirExpr::FloatLit(v) => format!("{}", v),
         PirExpr::BoolLit(v) => format!("{}", v),
+        PirExpr::StringLit(s) => format!("\"{}\"", s),
         PirExpr::Var(v) => v.clone(),
         // The `Stmts` arm flattens the body into the same expression, because a
         // `while` produces no value and dropping the body here would make a printed
@@ -1025,6 +1035,14 @@ fn pir_expr_to_string(expr: &PirExpr, _indent: usize) -> String {
                     .collect::<Vec<_>>()
                     .join(", ")
             )
+        }
+        PirExpr::Array { items } => {
+            let inner: Vec<String> = items.iter().map(|a| pir_expr_to_string(a, 0)).collect();
+            format!("[{}]", inner.join(", "))
+        }
+        PirExpr::Struct { fields } => {
+            let inner: Vec<String> = fields.iter().map(|f| pir_expr_to_string(f, 0)).collect();
+            format!("{{{}}}", inner.join(", "))
         }
         PirExpr::Index { base, indices } => {
             format!(

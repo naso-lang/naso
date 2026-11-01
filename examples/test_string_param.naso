@@ -1,0 +1,8 @@
+fn foo(addr: String) -> Int {
+    1
+}
+
+fn main() -> () {
+    let x = foo("test");
+    ()
+}

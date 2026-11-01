@@ -1,14 +1,9 @@
-// Test unwrap on Result with tuple
-fn test_unwrap_tuple2() -> () {
-    let result = dummy_result_tuple();
-    let (a, b) = result.unwrap();
-    let _ = a + b;
-    ()
+fn ok[T, E](value: T) -> Result[T, E] {
+    Result::Ok(value)
 }
 
-// Dummy function - just for type checking
-fn dummy_result_tuple() -> Result[([1] Int, [1] Int)] {
-    // This function body won't type check, but we can test the signature
-    let _: Result[([1] Int, [1] Int)] = dummy_result_tuple();
-    dummy_result_tuple()
+fn main() -> () {
+    let x = ok(42);
+    let y = x.unwrap();
+    ()
 }

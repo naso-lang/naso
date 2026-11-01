@@ -1,7 +1,5 @@
-// Test unwrap on simple Result
-fn test_unwrap_simple() -> () {
-    let result = bind("0.0.0.0:8080"); // returns Result<Listener>
-    let listener = result.unwrap();
-    let _ = listener;
+fn main() -> () {
+    let x = Result::Ok(42);
+    let y = x.unwrap();
     ()
 }

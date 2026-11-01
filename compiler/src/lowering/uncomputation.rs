@@ -383,7 +383,7 @@ fn describe(expr: &PirExpr) -> &'static str {
         PirExpr::If { .. } => "a conditional",
         PirExpr::Assign { .. } => "an assignment",
         PirExpr::Return { .. } => "a return",
-        PirExpr::IntLit(_) | PirExpr::FloatLit(_) | PirExpr::BoolLit(_) => "a literal",
+        PirExpr::IntLit(_) | PirExpr::FloatLit(_) | PirExpr::BoolLit(_) | PirExpr::StringLit(_) => "a literal",
         PirExpr::Var(_) => "a variable reference",
         PirExpr::Cast { .. } => "a cast",
         PirExpr::Reversible { .. } => "a nested reversible block",
@@ -394,6 +394,8 @@ fn describe(expr: &PirExpr) -> &'static str {
         PirExpr::Break { .. } => "a `break`",
         PirExpr::Continue => "a `continue`",
         PirExpr::While { .. } => "a `while` loop",
+        PirExpr::Array { .. } => "an array literal",
+        PirExpr::Struct { .. } => "a struct literal",
     }
 }
 

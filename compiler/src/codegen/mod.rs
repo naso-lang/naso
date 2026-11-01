@@ -26,6 +26,8 @@ pub mod cranelift;
 pub mod llvm;
 #[cfg(feature = "llvm")]
 pub mod qir;
+#[cfg(feature = "llvm")]
+pub mod ffi_integration;
 
 use crate::ir::pir_types::PirModule;
 

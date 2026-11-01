@@ -296,6 +296,10 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Type::int(Span::default())
             }
+            Some(TK::TypeIdent(s)) if s == "String" => {
+                self.bump();
+                Type::new(TypeKind::String, Quantity::Many, Span::default())
+            }
             Some(TK::TypeIdent(_)) | Some(TK::QRegister) => self.parse_named_type(),
             Some(TK::Star) => {
                 self.bump();
@@ -321,6 +325,14 @@ impl<'a> Parser<'a> {
             Some(TK::Ident(_)) if self.at_ident("uint") => {
                 self.bump();
                 Type::new(TypeKind::UInt, Quantity::Many, Span::default())
+            }
+            Some(TK::Ident(_)) if self.at_ident("string") => {
+                self.bump();
+                Type::new(TypeKind::String, Quantity::Many, Span::default())
+            }
+            Some(TK::TypeIdent(s)) if s == "String" => {
+                self.bump();
+                Type::new(TypeKind::String, Quantity::Many, Span::default())
             }
             None => self.unexpected("a type"),
             Some(_) => self.unexpected("a type"),

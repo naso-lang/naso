@@ -203,6 +203,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
         ret_ty: Option<Type>,
         quantity: Quantity,
         is_reversible: bool,
+        generics: Vec<GenericParam>,
     }
 
     impl PreludeFn {
@@ -210,7 +211,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
             let fname = Ident::new(self.name, Span::default());
             let func = Function {
                 name: fname.clone(),
-                generics: Vec::new(),
+                generics: self.generics.clone(),
                 params: self.params,
                 ret_ty: self.ret_ty.clone(),
                 body: Block::new(Vec::new(), None, Span::default()),
@@ -239,6 +240,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
 
     // Quantum primitives
     PreludeFn {
+        generics: Vec::new(),
         name: "qalloc",
         params: vec![],
         ret_ty: Some(Type::qubit(Span::default())),
@@ -248,6 +250,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
     .insert(env);
 
     PreludeFn {
+        generics: Vec::new(),
         name: "hadamard",
         params: vec![Param {
             name: Ident::new("q", Span::default()),
@@ -275,6 +278,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
     // goes through the dedicated node. Grep for the AST construction before
     // assuming a prelude entry is the live one.
     PreludeFn {
+        generics: Vec::new(),
         name: "cnot",
         params: vec![
             Param {
@@ -312,6 +316,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
     // properly consumed, and the leftover classical bit is not a resource.
     // The return is `[*]`.
     PreludeFn {
+        generics: Vec::new(),
         name: "measure",
         params: vec![Param {
             name: Ident::new("q", Span::default()),
@@ -331,6 +336,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
     // a fresh linear value the caller must consume, from a function whose
     // entire purpose is to get rid of one.
     PreludeFn {
+        generics: Vec::new(),
         name: "linear_free",
         params: vec![Param {
             name: Ident::new("x", Span::default()),
@@ -346,6 +352,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
     .insert(env);
 
     PreludeFn {
+        generics: Vec::new(),
         name: "linear_alloc",
         params: vec![Param {
             name: Ident::new("value", Span::default()),
@@ -361,6 +368,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
     .insert(env);
 
     PreludeFn {
+        generics: Vec::new(),
         name: "qfree",
         params: vec![Param {
             name: Ident::new("q", Span::default()),
@@ -422,22 +430,200 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
         attributes: Vec::new(),
     });
 
-    // Result type (generic enum for error handling)
+    // Option type (generic enum for optional values)
     env.insert_type_def(TypeDef {
-        name: Ident::new("Result", Span::default()),
+        name: Ident::new("Option", Span::default()),
         generics: vec![GenericParam {
             name: Ident::new("T", Span::default()),
             kind: GenericKind::Type,
             span: Span::default(),
         }],
-        kind: TypeDefKind::Alias(Type::new(
-            TypeKind::Named(Ident::new("Result", Span::default()), Vec::new()),
-            Quantity::Many,
-            Span::default(),
-        )),
+        kind: TypeDefKind::Enum(vec![
+            Variant {
+                name: Ident::new("Some", Span::default()),
+                fields: vec![Field {
+                    name: Ident::new("value", Span::default()),
+                    ty: Type::new(TypeKind::Var(TypeVar(0)), Quantity::Many, Span::default()),
+                    quantity: Quantity::Many,
+                    span: Span::default(),
+                    attributes: Vec::new(),
+                }],
+                span: Span::default(),
+                attributes: Vec::new(),
+            },
+            Variant {
+                name: Ident::new("None", Span::default()),
+                fields: vec![],
+                span: Span::default(),
+                attributes: Vec::new(),
+            },
+        ]),
         span: Span::default(),
         attributes: Vec::new(),
     });
+
+    // Result type (generic enum for error handling) - two type params: T (ok) and E (err)
+    env.insert_type_def(TypeDef {
+        name: Ident::new("Result", Span::default()),
+        generics: vec![
+            GenericParam {
+                name: Ident::new("T", Span::default()),
+                kind: GenericKind::Type,
+                span: Span::default(),
+            },
+            GenericParam {
+                name: Ident::new("E", Span::default()),
+                kind: GenericKind::Type,
+                span: Span::default(),
+            },
+        ],
+        kind: TypeDefKind::Enum(vec![
+            Variant {
+                name: Ident::new("Ok", Span::default()),
+                fields: vec![Field {
+                    name: Ident::new("value", Span::default()),
+                    ty: Type::new(TypeKind::Var(TypeVar(0)), Quantity::Many, Span::default()),
+                    quantity: Quantity::Many,
+                    span: Span::default(),
+                    attributes: Vec::new(),
+                }],
+                span: Span::default(),
+                attributes: Vec::new(),
+            },
+            Variant {
+                name: Ident::new("Err", Span::default()),
+                fields: vec![Field {
+                    name: Ident::new("error", Span::default()),
+                    ty: Type::new(TypeKind::Var(TypeVar(1)), Quantity::Many, Span::default()),
+                    quantity: Quantity::Many,
+                    span: Span::default(),
+                    attributes: Vec::new(),
+                }],
+                span: Span::default(),
+                attributes: Vec::new(),
+            },
+        ]),
+        span: Span::default(),
+        attributes: Vec::new(),
+    });
+
+    // Option variant constructors as prelude functions
+    // Some(value: T) -> Option<T>
+    PreludeFn {
+        name: "Option::Some",
+        params: vec![Param {
+            name: Ident::new("value", Span::default()),
+            ty: Type::new(TypeKind::Named(Ident::new("T", Span::default()), Vec::new()), Quantity::Many, Span::default()),
+            quantity: Quantity::Many,
+            mutability: Mutability::Immutable,
+            span: Span::default(),
+        }],
+        ret_ty: Some(Type::new(
+            TypeKind::Named(Ident::new("Option", Span::default()), vec![
+                TypeArg::Type(Type::new(TypeKind::Named(Ident::new("T", Span::default()), Vec::new()), Quantity::Many, Span::default())),
+            ]),
+            Quantity::Many,
+            Span::default(),
+        )),
+        quantity: Quantity::Many,
+        is_reversible: false,
+        generics: vec![GenericParam {
+            name: Ident::new("T", Span::default()),
+            kind: GenericKind::Type,
+            span: Span::default(),
+        }],
+    }
+    .insert(env);
+    // None -> Option<T>
+    PreludeFn {
+        name: "Option::None",
+        params: vec![],
+        ret_ty: Some(Type::new(
+            TypeKind::Named(Ident::new("Option", Span::default()), vec![
+                TypeArg::Type(Type::new(TypeKind::Named(Ident::new("T", Span::default()), Vec::new()), Quantity::Many, Span::default())),
+            ]),
+            Quantity::Many,
+            Span::default(),
+        )),
+        quantity: Quantity::Many,
+        is_reversible: false,
+        generics: vec![GenericParam {
+            name: Ident::new("T", Span::default()),
+            kind: GenericKind::Type,
+            span: Span::default(),
+        }],
+    }
+    .insert(env);
+
+    // Result variant constructors as prelude functions
+    // Ok(value: T) -> Result<T, E>
+    PreludeFn {
+        name: "Result::Ok",
+        params: vec![Param {
+            name: Ident::new("value", Span::default()),
+            ty: Type::new(TypeKind::Named(Ident::new("T", Span::default()), Vec::new()), Quantity::Many, Span::default()),
+            quantity: Quantity::Many,
+            mutability: Mutability::Immutable,
+            span: Span::default(),
+        }],
+        ret_ty: Some(Type::new(
+            TypeKind::Named(Ident::new("Result", Span::default()), vec![
+                TypeArg::Type(Type::new(TypeKind::Named(Ident::new("T", Span::default()), Vec::new()), Quantity::Many, Span::default())),
+                TypeArg::Type(Type::new(TypeKind::Named(Ident::new("E", Span::default()), Vec::new()), Quantity::Many, Span::default())),
+            ]),
+            Quantity::Many,
+            Span::default(),
+        )),
+        quantity: Quantity::Many,
+        is_reversible: false,
+        generics: vec![
+            GenericParam {
+                name: Ident::new("T", Span::default()),
+                kind: GenericKind::Type,
+                span: Span::default(),
+            },
+            GenericParam {
+                name: Ident::new("E", Span::default()),
+                kind: GenericKind::Type,
+                span: Span::default(),
+            },
+        ],
+    }
+    .insert(env);
+    // Err(error: E) -> Result<T, E>
+    PreludeFn {
+        name: "Result::Err",
+        params: vec![Param {
+            name: Ident::new("error", Span::default()),
+            ty: Type::new(TypeKind::Named(Ident::new("E", Span::default()), Vec::new()), Quantity::Many, Span::default()),
+            quantity: Quantity::Many,
+            mutability: Mutability::Immutable,
+            span: Span::default(),
+        }],
+        ret_ty: Some(Type::new(
+            TypeKind::Named(Ident::new("Result", Span::default()), vec![
+                TypeArg::Type(Type::new(TypeKind::Named(Ident::new("T", Span::default()), Vec::new()), Quantity::Many, Span::default())),
+                TypeArg::Type(Type::new(TypeKind::Named(Ident::new("E", Span::default()), Vec::new()), Quantity::Many, Span::default())),
+            ]),
+            Quantity::Many,
+            Span::default(),
+        )),
+        quantity: Quantity::Many,
+        is_reversible: false,
+        generics: vec![
+            GenericParam {
+                name: Ident::new("T", Span::default()),
+                kind: GenericKind::Type,
+                span: Span::default(),
+            },
+            GenericParam {
+                name: Ident::new("E", Span::default()),
+                kind: GenericKind::Type,
+                span: Span::default(),
+            },
+        ],
+    }
+    .insert(env);
 
     // http types
     env.insert_type_def(TypeDef {
@@ -465,6 +651,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
 
     // sys.net.bind(addr: String) -> Result<Listener>
     PreludeFn {
+        generics: Vec::new(),
         name: "bind",
         params: vec![Param {
             name: Ident::new("addr", Span::default()),
@@ -491,6 +678,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
 
     // accept(l: [1] Listener) -> [1] Stream
     PreludeFn {
+        generics: Vec::new(),
         name: "accept",
         params: vec![Param {
             name: Ident::new("l", Span::default()),
@@ -515,6 +703,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
 
     // sys.net.read(s: Stream, buf: [N] u8) -> Result<usize>
     PreludeFn {
+        generics: Vec::new(),
         name: "read",
         params: vec![
             Param {
@@ -554,6 +743,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
 
     // sys.net.write(s: Stream, buf: [N] u8) -> Result<usize>
     PreludeFn {
+        generics: Vec::new(),
         name: "write",
         params: vec![
             Param {
@@ -593,6 +783,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
 
     // sys.net.last_error() -> String
     PreludeFn {
+        generics: Vec::new(),
         name: "last_error",
         params: vec![],
         ret_ty: Some(Type::new(TypeKind::String, Quantity::Many, Span::default())),
@@ -604,6 +795,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
     // http.parse_request(stream: [1] Stream) -> Result<(Request, Stream)>
     // Consumes the stream, returns it back along with the parsed request
     PreludeFn {
+        generics: Vec::new(),
         name: "parse_request",
         params: vec![Param {
             name: Ident::new("stream", Span::default()),
@@ -645,6 +837,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
 
     // http.send_response(stream: [1] Stream, resp: Response) -> Result<()>
     PreludeFn {
+        generics: Vec::new(),
         name: "send_response",
         params: vec![
             Param {
@@ -684,6 +877,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
 
     // http.ok(body: [N] Int) -> Response
     PreludeFn {
+        generics: Vec::new(),
         name: "ok",
         params: vec![Param {
             name: Ident::new("body", Span::default()),
@@ -708,6 +902,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
 
     // http.not_found() -> Response
     PreludeFn {
+        generics: Vec::new(),
         name: "not_found",
         params: vec![],
         ret_ty: Some(Type::new(
@@ -740,6 +935,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
     for (name, arg_ty, ret_ty) in math_funcs {
         PreludeFn {
             name,
+            generics: Vec::new(),
             params: vec![Param {
                 name: Ident::new("x", Span::default()),
                 ty: Type::new(arg_ty, Quantity::Many, Span::default()),
@@ -759,6 +955,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
     // are float literals in every valid use, and threading a quantity here
     // would let a caller pass a linear value into a numeric bound.
     PreludeFn {
+        generics: Vec::new(),
         name: "clamp",
         params: vec![
             Param {
@@ -792,6 +989,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
     // Result constructors: Ok(T) -> Result[T], Err(String) -> Result[T]
     // These are compiler intrinsics with empty bodies - codegen emits them directly
     PreludeFn {
+        generics: Vec::new(),
         name: "Ok",
         params: vec![Param {
             name: Ident::new("value", Span::default()),
@@ -813,6 +1011,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
     .insert(env);
 
     PreludeFn {
+        generics: Vec::new(),
         name: "Err",
         params: vec![Param {
             name: Ident::new("msg", Span::default()),
@@ -836,6 +1035,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
     // Concrete Ok constructors for common types (typechecker doesn't do generic instantiation yet)
     // Ok for Listener
     PreludeFn {
+        generics: Vec::new(),
         name: "ok_listener",
         params: vec![Param {
             name: Ident::new("value", Span::default()),
@@ -866,6 +1066,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
 
     // Ok for (Listener, Stream) tuple
     PreludeFn {
+        generics: Vec::new(),
         name: "ok_tuple",
         params: vec![
             Param {
@@ -920,6 +1121,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
 
     // Ok for Response
     PreludeFn {
+        generics: Vec::new(),
         name: "ok_response",
         params: vec![Param {
             name: Ident::new("value", Span::default()),
@@ -950,6 +1152,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
 
     // Ok for Int
     PreludeFn {
+        generics: Vec::new(),
         name: "ok_int",
         params: vec![Param {
             name: Ident::new("value", Span::default()),

@@ -1,22 +1,65 @@
-// HTTP types — no fake Map/String wrappers
-// Uses Int for bytes (simplified for now)
+// HTTP types — minimal HTTP/1.1 parsing for web services
 
 struct Request {
-    method: Int,
-    path: Int,
-    body: Int,
+    method: [N] u8,
+    path: [N] u8,
+    body: [N] u8,
 }
 
 struct Response {
     status: Int,
-    body: Int,
+    body: [N] u8,
 }
 
-fn ok(body: Int) -> Response {
-    let s = 200;
-    Response { status: s, body }
+fn ok(body: [N] u8) -> Response {
+    Response { status: 200, body }
 }
 
 fn not_found() -> Response {
-    ()
+    Response { status: 404, body: [] }
+}
+
+/// Parse HTTP request from buffer
+/// Returns (method, path, body_start, body_len)
+fn split_http(buf: [N] u16) -> Result[(Int, Int, Int, Int)] {
+    // Simplified: look for \r\n\r\n to find body
+    let len = buf.len();
+    let mut i = 0;
+    let mut body_start = -1;
+    while i + 3 < len {
+        if buf[i] == 13 && buf[i+1] == 10 && buf[i+2] == 13 && buf[i+3] == 10 {
+            body_start = i + 4;
+            break;
+        }
+        i += 1;
+    }
+    if body_start == -1 { return err("incomplete request"); }
+    
+    // Parse first line: METHOD PATH HTTP/1.1
+    let mut method_end = 0;
+    while method_end < len && buf[method_end] != 32 { method_end += 1; } // space
+    let mut path_start = method_end + 1;
+    let mut path_end = path_start;
+    while path_end < len && buf[path_end] != 32 { path_end += 1; }
+    
+    // Convert u16 to u8 for method/path (ASCII only for now)
+    let method_len = method_end;
+    let path_len = path_end - path_start;
+    
+    // Return method/path as byte offsets into buffer (simplified)
+    ok((method_end as Int, path_start as Int, body_start as Int, (len - body_start) as Int))
+}
+
+/// Format HTTP response to bytes
+fn format_http(resp: Response) -> [N] u8 {
+    let status_line = "HTTP/1.1 ";
+    let status_str = if resp.status == 200 { "200 OK\r\n" } else { "404 Not Found\r\n" };
+    let header = "Content-Length: ";
+    let clen = resp.body.len();
+    let clen_str = clen.to_string(); // This needs Int -> String, simplified
+    
+    // Build response: status + headers + \r\n + body
+    let mut out = []u8;
+    // This is a placeholder - real impl needs proper string concatenation
+    out
 }

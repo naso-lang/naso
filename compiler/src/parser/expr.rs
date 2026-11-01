@@ -188,6 +188,117 @@ impl<'a> Parser<'a> {
                         let span = expr.span;
                         expr = Expr::new(ExprKind::Field(Box::new(expr), name), span, next_id());
                     }
+                } else if self.at(TK::ColonColon) {
+                    // Qualified path: Type::Variant or Module::function
+                    self.bump();
+                    let name = self.parse_ident();
+                    // Clone name.name early to avoid move issues
+                    let type_name = name.name.clone();
+                    if self.at(TK::LParen) {
+                        // Call: Type::method() or Module::function()
+                        self.bump();
+                        let args = self.parse_args_until(TK::RParen);
+                        self.expect(TK::RParen);
+                        let span = expr.span;
+                        // Treat as a Call with qualified name
+                        let _qualified_name = match &expr.kind {
+                            ExprKind::Var(v) => format!("{}::{}", v, type_name),
+                            _ => type_name.clone(),
+                        };
+                        expr = Expr::new(
+                            ExprKind::Call(
+                                Box::new(Expr::new(
+                                    ExprKind::Var(Ident::new(_qualified_name, expr.span)),
+                                    expr.span,
+                                    next_id(),
+                                )),
+                                args,
+                            ),
+                            span,
+                            next_id(),
+                        );
+                    } else {
+                        // Variant construction: Type::Variant { ... } or Type::Variant(...)
+                        if self.at(TK::LBrace) {
+                            // Struct-like variant: Result::Ok { value }
+                            self.bump();
+                            let mut fields = Vec::new();
+                            while !self.loop_should_stop() {
+                                if self.at(TK::RBrace) {
+                                    break;
+                                }
+                                fields.push(self.parse_field_expr());
+                                if self.at(TK::RBrace) {
+                                    break;
+                                }
+                                self.expect(TK::Comma);
+                                if self.at(TK::RBrace) {
+                                    break;
+                                }
+                            }
+                            self.expect(TK::RBrace);
+                            let span = expr.span;
+                            let _qualified_name = match &expr.kind {
+                                ExprKind::Var(v) => format!("{}::{}", v, type_name),
+                                _ => type_name.clone(),
+                            };
+                            expr = Expr::new(
+                                ExprKind::Struct(Ident::new(_qualified_name, expr.span), fields),
+                                span,
+                                next_id(),
+                            );
+                        } else if self.at(TK::LParen) {
+                            // Tuple-like variant: Result::Ok(value)
+                            self.bump();
+                            let mut args = Vec::new();
+                            while !self.loop_should_stop() {
+                                if self.at(TK::RParen) {
+                                    break;
+                                }
+                                args.push(self.parse_expr());
+                                if self.at(TK::RParen) {
+                                    break;
+                                }
+                                self.expect(TK::Comma);
+                                if self.at(TK::RParen) {
+                                    break;
+                                }
+                            }
+                            self.expect(TK::RParen);
+                            let span = expr.span;
+                            let _qualified_name = match &expr.kind {
+                                ExprKind::Var(v) => format!("{}::{}", v, type_name),
+                                _ => type_name.clone(),
+                            };
+                            expr = Expr::new(
+                                ExprKind::Variant(
+                                    Ident::new(
+                                        match &expr.kind {
+                                            ExprKind::Var(v) => v.name.clone(),
+                                            _ => "unknown".to_string(),
+                                        },
+                                        expr.span,
+                                    ),
+                                    Ident::new(name.name.clone(), span),
+                                    args,
+                                ),
+                                span,
+                                next_id(),
+                            );
+                        } else {
+                            // Just a reference to the variant (like a constant)
+                            let _qualified_name = match &expr.kind {
+                                ExprKind::Var(v) => format!("{}::{}", v, type_name),
+                                _ => type_name,
+                            };
+                            let span = expr.span;
+                            expr = Expr::new(
+                                ExprKind::Var(Ident::new(_qualified_name, expr.span)),
+                                span,
+                                next_id(),
+                            );
+                        }
+                    }
                 } else if self.at(TK::LBracket) {
                     self.bump();
                     // Parse comma-separated indices (supporting multi-dimensional indexing)

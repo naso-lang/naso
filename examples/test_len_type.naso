@@ -1,0 +1,6 @@
+fn main() -> () {
+    let body: [Int] = [104, 101, 108, 108, 111];
+    let len: Int = body.len();
+    let _ = len;
+    ()
+}

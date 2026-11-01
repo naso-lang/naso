@@ -2,7 +2,7 @@
 //
 // High-level wrapper around inkwell::module::Module for building LLVM IR.
 
-use crate::ast::{Span, Type, TypeKind};
+use crate::ast::{Quantity, Span, Type, TypeKind};
 use crate::codegen::context::CodegenContext;
 use crate::codegen::error::{CodegenError, CodegenResult};
 use crate::codegen::llvm::function_emission;
@@ -942,10 +942,29 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
             .params
             .iter()
             .map(|p| {
-                // Extern params only carry a source-level type name plus their
-                // quantity; the name is not resolvable here, so the declared
-                // param type is the quantity-lowered `int` placeholder.
-                let ty = Type::new(TypeKind::Int, p.quantity, Span::default());
+                // Lower the actual parameter type from the extern declaration
+                // The ty field now stores just the TypeKind for easier matching
+                let ty_str = &p.ty;
+                // Parse the type string to get the correct LLVM type
+                // For scalar types (UInt, Int), we need Quantity::One to get i64, not a pointer
+                let scalar_qty = if ty_str.contains("usize") || ty_str.contains("isize") || ty_str.contains("u64") || ty_str.contains("i64") || ty_str.contains("u32") || ty_str.contains("i32") || ty_str.contains("UInt") || ty_str.contains("Int") {
+                    Quantity::One
+                } else {
+                    p.quantity
+                };
+                let ty = if ty_str.contains("Pointer") {
+                    // Pointer type - i64
+                    Type::new(TypeKind::Pointer(Box::new(Type::new(TypeKind::UInt, Quantity::Many, Span::default()))), p.quantity, Span::default())
+                } else if ty_str.contains("usize") || ty_str.contains("isize") || ty_str.contains("u64") || ty_str.contains("i64") || ty_str.contains("UInt") {
+                    Type::new(TypeKind::UInt, scalar_qty, Span::default())
+                } else if ty_str.contains("u32") || ty_str.contains("i32") || ty_str.contains("Int") {
+                    Type::new(TypeKind::Int, scalar_qty, Span::default())
+                } else if ty_str.contains("String") {
+                    Type::new(TypeKind::String, p.quantity, Span::default())
+                } else {
+                    // Default to Int for unknown types
+                    Type::new(TypeKind::Int, scalar_qty, Span::default())
+                };
                 self.type_lowering
                     .lower_quantity_aware(&crate::codegen::abi::lower_pir_type(
                         &ty,
@@ -956,10 +975,19 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
 
         let param_types = param_types?;
 
-        // `ExternFunction::return_type` is a source-level type name which cannot
-        // be lowered to an LLVM type at declaration time, so the declaration
-        // uses the void return signature (`None` == void for `fn_type`).
-        let ret_type: Option<BasicTypeEnum<'ctx>> = None;
+        // Use the declared return type if available
+        let ret_type: Option<BasicTypeEnum<'ctx>> = extern_fn.return_type.as_ref().and_then(|ret_ty| {
+            let ty = if ret_ty.contains("usize") || ret_ty.contains("isize") || ret_ty.contains("u64") || ret_ty.contains("i64") || ret_ty.contains("UInt") {
+                Type::new(TypeKind::UInt, Quantity::One, Span::default())  // Use One for scalar return (i64)
+            } else if ret_ty.contains("u32") || ret_ty.contains("i32") || ret_ty.contains("Int") {
+                Type::new(TypeKind::Int, Quantity::One, Span::default())  // Use One for scalar return (i64)
+            } else {
+                // Default to Int for unknown types
+                Type::new(TypeKind::Int, Quantity::One, Span::default())  // Use One for scalar return
+            };
+            let qa = crate::codegen::abi::lower_pir_type(&ty, &HashMap::new());
+            qa.ok().and_then(|q| self.type_lowering.lower_quantity_aware(&q).ok())
+        });
 
         let fn_type = self.type_lowering.fn_type(ret_type, &param_types, false);
         self.module.add_function(&extern_fn.name, fn_type, None);

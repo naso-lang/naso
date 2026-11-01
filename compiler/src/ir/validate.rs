@@ -196,6 +196,7 @@ fn expr_contains_var(expr: &PirExpr, var: &str) -> bool {
             expr_contains_var(base, var) || indices.iter().any(|i| expr_contains_var(i, var))
         }
         PirExpr::Field { base, .. } => expr_contains_var(base, var),
+        PirExpr::StringLit(_) => false,
         // A sequence's contents MUST be searched. Returning `false` would hide
         // every statement in a loop body from linearity validation, so a linear
         // value consumed only inside a loop would never be seen.
@@ -249,6 +250,8 @@ fn expr_contains_var(expr: &PirExpr, var: &str) -> bool {
             args.iter().any(|a| expr_contains_var(a, var))
                 || qubits.iter().any(|q| expr_contains_var(q, var))
         }
+        PirExpr::Array { items } => items.iter().any(|a| expr_contains_var(a, var)),
+        PirExpr::Struct { fields } => fields.iter().any(|f| expr_contains_var(f, var)),
         PirExpr::IntLit(_) | PirExpr::FloatLit(_) | PirExpr::BoolLit(_) => false,
     }
 }

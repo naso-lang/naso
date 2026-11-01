@@ -1,0 +1,12 @@
+fn ok[T, E](value: T) -> Result[T, E] {
+    Result::Ok(value)
+}
+
+fn bind(addr: String) -> Result[Int, String] {
+    ok(1)
+}
+
+fn main() -> () {
+    let listener = bind("0.0.0.0:8080").unwrap();
+    ()
+}

@@ -321,6 +321,8 @@ pub enum TokenKind {
     Hash,
 
     // ===== Punctuation =====
+    #[token("::")]
+    ColonColon,
     #[token(":")]
     Colon,
     #[token(";")]
@@ -446,6 +448,7 @@ impl TokenKind {
             TokenKind::RBracket => "']'",
             TokenKind::LBrace => "'{'",
             TokenKind::RBrace => "'}'",
+            TokenKind::ColonColon => "'::'",
             TokenKind::At => "'@'",
             TokenKind::Hash => "'#'",
             TokenKind::Newline => "newline",

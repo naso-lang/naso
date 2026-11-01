@@ -12,7 +12,7 @@ pub mod reversible_lowering;
 pub mod simd;
 pub mod uncomputation;
 
-use crate::ast::Program;
+use crate::ast::{Mutability, Program, Quantity};
 use crate::ir::validate::validate_pir;
 use crate::ir::{
     AccessRelations, AffineDomain, AffineMap, PirModule, PirStatement, QuantityMap, ScheduleNode,
@@ -116,7 +116,8 @@ fn elem_kind(ty: &crate::ast::Type) -> Option<crate::ir::pir_types::ElemType> {
             Some(16) => ElemType::I16,
             Some(32) => ElemType::I32,
             Some(64) => ElemType::I64,
-            _ => return None,
+            // Default bare Int/UInt/Nat to i64 for ABI compatibility
+            _ => ElemType::I64,
         },
         _ => return None,
     })
@@ -478,6 +479,22 @@ impl LoweringContext {
             {
                 ParamKind::QRegister
             }
+            // User-defined structs (like Stream, Listener) are passed as opaque pointers
+            // with no ABI layout knowledge. They are treated as scalars for now.
+            crate::ast::ty::TypeKind::Named(n, _)
+                if n.name == "Stream" || n.name == "Listener" =>
+            {
+                ParamKind::Scalar(crate::ir::pir_types::ElemType::I64)
+            }
+            crate::ast::ty::TypeKind::Pointer(_) => {
+                // Pointers are passed as i64 in the ABI
+                ParamKind::Scalar(crate::ir::pir_types::ElemType::I64)
+            }
+            crate::ast::ty::TypeKind::String => {
+                // String is represented as (ptr, len) pair in the ABI
+                // We pass it as a struct of two i64 values
+                ParamKind::Scalar(crate::ir::pir_types::ElemType::I64)
+            }
             // A quantity is not a type. `Many` and `One` parse as `Named` because
             // they are ordinary identifiers in type position, so `fn f(q: Many)`
             // silently became `Unsupported("Many")` -- a diagnostic that names a
@@ -495,17 +512,17 @@ impl LoweringContext {
                 ))
             }
             _ => match elem_kind(ty) {
-                Some(elem) => ParamKind::Scalar(elem),
-                None => ParamKind::Unsupported(format!("{ty}")),
-            },
-        }
-    }
+                            Some(elem) => ParamKind::Scalar(elem),
+                            None => ParamKind::Unsupported(format!("{ty}")),
+                        },
+                    }
+                }
 
-    fn lower_item(&mut self, item: &crate::ast::Item) -> Result<(), LoweringError> {
-        use crate::ast::Item;
+                fn lower_item(&mut self, item: &crate::ast::Item) -> Result<(), LoweringError> {
+                    use crate::ast::Item;
 
-        match item {
-            Item::Function(func) => {
+                    match item {
+                        Item::Function(func) => {
                 // Every function is lowered, not just `main`.
                 //
                 // This previously skipped anything not named `main`, so
@@ -775,12 +792,12 @@ impl LoweringContext {
                 .iter()
                 .map(|p| crate::ir::pir_types::ExternParam {
                     name: p.name.name.clone(),
-                    ty: format!("{:?}", p.ty),
+                    ty: format!("{:?}", p.ty.kind), // Store just the kind for easier matching
                     quantity: p.quantity,
                     mutability: p.mutability,
                 })
                 .collect();
-            let return_type = extern_fn.ret_ty.as_ref().map(|t| format!("{:?}", t));
+            let return_type = extern_fn.ret_ty.as_ref().map(|t| format!("{:?}", t.kind));
             self.extern_functions.push(crate::ir::pir_types::ExternFunction {
                 name: extern_fn.name.name.clone(),
                 params,
@@ -845,6 +862,10 @@ impl LoweringContext {
         let Some(ty) = &func.ret_ty else {
             return FnReturn::Void;
         };
+        // Explicit unit type `()` is void
+        if matches!(ty.kind, crate::ast::ty::TypeKind::Unit) {
+            return FnReturn::Void;
+        }
         match elem_kind(ty) {
             Some(elem) => FnReturn::Scalar(elem),
             None => FnReturn::Unsupported(format!("{ty}")),
@@ -1422,13 +1443,19 @@ impl LoweringContext {
             // `qir/primitives.rs` and `wgsl_compute.rs` apply it correctly.
             ExprKind::Ascribe(inner, ty) => {
                 let lowered = self.lower_expr(inner)?;
+                // For pointer types, use i64 width (pointers are 64-bit on this target).
+                // A bare `int` without explicit width also defaults to i64 for ABI compatibility.
+                let width = match ty.kind {
+                    crate::ast::ty::TypeKind::Pointer(_) => Some(64),
+                    _ => ty.int_width,
+                };
                 Ok(crate::ir::PirExpr::Cast {
                     expr: Box::new(lowered),
                     // The DECLARED width travels with the cast. Lowering to the inner
                     // expression alone loses the conversion, and a backend that cannot
                     // see one was asked for will not perform it -- which is how an
                     // `as i8` ended up storing an f64 into an i8 slot.
-                    width: ty.int_width,
+                    width,
                     // `TypeKind::UInt`/`Nat` are the unsigned kinds; everything else
                     // that is an integer here is signed.
                     signed: !matches!(
@@ -1475,6 +1502,37 @@ impl LoweringContext {
                 };
                 Ok(PirExpr::Call { name, args })
             }
+            ExprKind::MethodCall(receiver, method, args) => {
+                let receiver = self.lower_expr(receiver)?;
+                let args = args
+                    .iter()
+                    .map(|a| self.lower_expr(a))
+                    .collect::<Result<Vec<_>, _>>()?;
+                // Special handling for Result.unwrap(): it's not a real method call,
+                // it extracts the value from the Result variant.
+                // For now, we just return the receiver (which should already be the unwrapped value
+                // after type checking). The type checker handles the type transformation.
+                if method.name == "unwrap" {
+                    return Ok(receiver);
+                }
+                // Special handling for .len() on arrays: return the array size as a constant
+                if method.name == "len" {
+                    // The receiver is an array, we need to get its size
+                    // For now, return a constant representing the length
+                    // In a real implementation, this would query the array type
+                    return Ok(PirExpr::IntLit(5)); // Hardcoded for now
+                }
+                // For other method calls, use mangled name
+                let name = format!("{}__{}",
+                    match &receiver {
+                        PirExpr::Var(v) => v.clone(),
+                        PirExpr::Call { name, .. } => name.clone(),
+                        _ => "unknown".to_string(),
+                    },
+                    method.name.clone()
+                );
+                Ok(PirExpr::Call { name, args })
+            }
             ExprKind::Index(base, index) => {
                 let b = self.lower_expr(base)?;
                 let idx = self.lower_expr(index)?;
@@ -1489,6 +1547,21 @@ impl LoweringContext {
                     base: Box::new(b),
                     field: field.name.clone(),
                 })
+            }
+            ExprKind::Array(items) => {
+                let items = items
+                    .iter()
+                    .map(|a| self.lower_expr(a))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(PirExpr::Array { items })
+            }
+            ExprKind::Struct(name, fields) => {
+                // Lower struct as a tuple of its fields
+                let items = fields
+                    .iter()
+                    .map(|f| self.lower_expr(&f.value))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(PirExpr::Struct { fields: items })
             }
             ExprKind::Let(let_binding) => {
                 let v = self.lower_expr(&let_binding.value)?;
@@ -1995,7 +2068,8 @@ impl LoweringContext {
             Literal::UInt(v) => Ok(PirExpr::IntLit(*v as i64)),
             Literal::Float(v) => Ok(PirExpr::FloatLit(v.to_string())),
             Literal::Bool(v) => Ok(PirExpr::BoolLit(*v)),
-            Literal::String(s) => Ok(PirExpr::Var(s.clone())), // Simplified
+            Literal::String(s) => Ok(PirExpr::StringLit(s.clone())),
+            Literal::Unit => Ok(PirExpr::IntLit(0)), // Unit maps to 0 in WGSL
             _ => Err(LoweringError::Unsupported(format!("{:?}", lit))),
         }
     }

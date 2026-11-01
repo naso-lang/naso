@@ -2,13 +2,11 @@ extern "C" {
     fn naso_tcp_bind(addr_ptr: *u8, len: usize) -> u64;
 }
 
-/// Wraps a raw fd with QTT single-ownership tracking
 struct Listener {
-    fd: u64,
+    fd: Int,
 }
 
-/// Bind to "addr:port" — returns Err if bind fails (fd == 0)
-fn bind(addr: String) -> Result[Listener] {
-    let x = 1;
-    Ok(Listener { fd: x })
+fn bind(addr: String) -> Result[Listener, String] {
+    let fd = naso_tcp_bind(addr as *u8, 0);
+    if fd == 0 { Err("naso: bind failed") } else { Ok(Listener { fd }) }
 }

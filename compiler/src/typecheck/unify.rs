@@ -63,6 +63,13 @@ pub fn unify_kinds(
         (TypeKind::Char, TypeKind::Char) => Ok(TypeKind::Char),
         (TypeKind::Error, _) | (_, TypeKind::Error) => Ok(TypeKind::Error),
 
+        // Int/UInt coercion: allow small integer literals to coerce to UInt when
+        // the target is explicitly unsigned (e.g., struct field fd: u64 = 1).
+        // We return UInt because that's the "more specific" type - the target
+        // expects unsigned. This is safe for small positive literals.
+        (TypeKind::Int, TypeKind::UInt) => Ok(TypeKind::UInt),
+        (TypeKind::UInt, TypeKind::Int) => Ok(TypeKind::UInt),
+
         // Named types
         (TypeKind::Named(name1, args1), TypeKind::Named(name2, args2)) => {
             if name1.name != name2.name {
@@ -169,15 +176,9 @@ pub fn unify_kinds(
         // Array types
         (TypeKind::Array(elem1, size1), TypeKind::Array(elem2, size2)) => {
             let unified_elem = unify_types(checker, elem1, elem2)?;
-            // For sizes, require exact match for now (could be relaxed later)
-            if size1 != size2 {
-                return Err(TypeError::TypeMismatch {
-                    expected: Type::new(k1.clone(), Quantity::Many, Span::default()),
-                    found: Type::new(k2.clone(), Quantity::Many, Span::default()),
-                    span: Span::default(),
-                });
-            }
-            Ok(TypeKind::Array(Box::new(unified_elem), size1.clone()))
+            // For sizes, try to unify them
+            let unified_size = unify_nat_expr(size1, size2)?;
+            Ok(TypeKind::Array(Box::new(unified_elem), unified_size))
         }
 
         // Type application
@@ -208,6 +209,28 @@ pub fn unify_kinds(
             found: Type::new(k2.clone(), Quantity::Many, Span::default()),
             span: Span::default(),
         }),
+    }
+}
+
+/// Unify two NatExpr options
+fn unify_nat_expr(
+    size1: &Option<crate::ast::ty::NatExpr>,
+    size2: &Option<crate::ast::ty::NatExpr>,
+) -> Result<Option<crate::ast::ty::NatExpr>, TypeError> {
+    match (size1, size2) {
+        (None, None) => Ok(None),
+        (Some(n1), None) | (None, Some(n1)) => Ok(Some(n1.clone())),
+        (Some(n1), Some(n2)) => {
+            if n1 == n2 {
+                Ok(Some(n1.clone()))
+            } else {
+                Err(TypeError::TypeMismatch {
+                    expected: Type::new(TypeKind::Nat, Quantity::Many, Span::default()),
+                    found: Type::new(TypeKind::Nat, Quantity::Many, Span::default()),
+                    span: Span::default(),
+                })
+            }
+        }
     }
 }
 

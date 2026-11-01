@@ -194,8 +194,29 @@ fn check_let(checker: &mut TypeChecker, let_stmt: &LetStmt) -> Result<(), TypeEr
     // tries to consume the qubit a SECOND time — the first `infer_expr` (above)
     // already moved it, so the second hits `use of moved value`. Unifying the
     // inferred type against the annotation is cheaper and avoids the double-use.
+    //
+    // However, we need to allow implicit casts that are valid in Naso, like
+    // String -> Pointer (for C string literals) and Array -> Pointer (for buffer passing).
+    // These are handled in `infer_cast` but not in direct unification.
     if let Some(ann_ty) = &let_stmt.ty {
-        unify::unify_types(checker, &init_ty, ann_ty)?;
+        // Check if this is a valid implicit cast case (String/Array -> Pointer)
+        let is_string_to_ptr = matches!(
+            (&init_ty.kind, &ann_ty.kind),
+            (TypeKind::String, TypeKind::Pointer(_))
+        );
+        let is_array_to_ptr = matches!(
+            (&init_ty.kind, &ann_ty.kind),
+            (TypeKind::Array(_, _), TypeKind::Pointer(_))
+        );
+        
+        if is_string_to_ptr || is_array_to_ptr {
+            // These are valid implicit casts - check_expr would handle them but
+            // would double-infer. Since they're not consuming operations (just string/array
+            // literals), we can safely skip the direct unification and allow the cast.
+            // The codegen will emit the proper pointer cast.
+        } else {
+            unify::unify_types(checker, &init_ty, ann_ty)?;
+        }
     }
 
     // Bind each variable in the pattern (use pattern quantity for each binding)

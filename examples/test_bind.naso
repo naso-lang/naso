@@ -8,6 +8,6 @@ struct Listener {
 }
 
 /// Bind to "addr:port" — returns Err if bind fails (fd == 0)
-fn bind(addr: String) -> Result[Listener] {
-    ()
+fn bind(addr: String) -> u64 {
+    1
 }

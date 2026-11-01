@@ -1,0 +1,13 @@
+fn ok[T, E](value: T) -> Result[T, E] {
+    Result::Ok(value)
+}
+
+fn test() -> Result[Int, String] {
+    ok(42)
+}
+
+fn main() -> () {
+    let x = test();
+    let y = x.unwrap();
+    ()
+}

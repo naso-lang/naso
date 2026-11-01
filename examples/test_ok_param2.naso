@@ -1,0 +1,13 @@
+fn ok[T](value: T) -> Result[T, String] {
+    Result::Ok(value)
+}
+
+fn bind(_addr: String) -> Result[Int, String] {
+    ok(1)
+}
+
+fn main() -> () {
+    let x = bind("test");
+    let y = x.unwrap();
+    ()
+}

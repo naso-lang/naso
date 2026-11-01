@@ -8,6 +8,7 @@ struct Listener {
 }
 
 /// Bind to "addr:port" — returns Err if bind fails (fd == 0)
-fn bind(addr: String) -> Result[Listener] {
+fn bind(addr: String) -> Result[Listener, String] {
+    let fd = naso_tcp_bind(addr as *u8, 0);
     if fd == 0 { Err("naso: bind failed") } else { Ok(Listener { fd }) }
 }

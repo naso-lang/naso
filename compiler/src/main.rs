@@ -42,6 +42,9 @@ fn main() {
             }
             run_watch(&args[2]);
         }
+        "test" => {
+            run_test(&args[2..]);
+        }
         "build" => {
             run_build_command(&args[2..]);
         }
@@ -63,6 +66,7 @@ fn print_usage() {
     eprintln!("  repl                  Start interactive REPL");
     eprintln!("  init                  Create new Naso project (zero-config)");
     eprintln!("  watch <file>          Hot reload — recompile on file change");
+    eprintln!("  test                  Run tests in current directory");
     eprintln!("  build [options] <file>  Build program to target");
     eprintln!("Build options:");
     eprintln!("  --target <llvm|qir|wgsl>  Target backend (default: llvm)");
@@ -603,6 +607,229 @@ fn build_and_run(file_path: &PathBuf, output_name: &str) {
             eprintln!("Failed to run naso build: {}", e);
         }
     }
+}
+
+/// `naso test` — Built-in test runner: discovers and runs test functions
+fn run_test(args: &[String]) {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::Command;
+    
+    let mut test_file = None;
+    let mut verbose = false;
+    
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-v" | "--verbose" => verbose = true,
+            arg if arg.starts_with('-') => {
+                eprintln!("Unknown option: {arg}");
+                std::process::exit(1);
+            }
+            path => {
+                if test_file.is_none() {
+                    test_file = Some(PathBuf::from(path));
+                } else {
+                    eprintln!("Multiple test files not supported");
+                    std::process::exit(1);
+                }
+            }
+        }
+        i += 1;
+    }
+    
+    // Default to current directory if no file specified
+    let test_file = test_file.unwrap_or_else(|| PathBuf::from("."));
+    
+    println!("🧪 Naso Test Runner");
+    println!("===================");
+    
+    if test_file.is_dir() {
+        // Find all .naso files in tests/ directory or *.test.naso files
+        let test_files = find_test_files(&test_file);
+        if test_files.is_empty() {
+            println!("No test files found in {}", test_file.display());
+            return;
+        }
+        
+        let mut passed = 0;
+        let mut failed = 0;
+        
+        for file in &test_files {
+            println!("\n📝 Testing {}...", file.display());
+            
+            // Build and run test
+            let output_name = file
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("test_out");
+            
+            let build_status = Command::new("/tmp/cargo-target/debug/naso")
+                .args(["build", file.to_str().unwrap(), "-o", output_name])
+                .status();
+            
+            match build_status {
+                Ok(status) if status.success() => {
+                    // Compile and link
+                    let _ = Command::new("/home/node/llvm17/bin/llc")
+                        .args(["-filetype=obj", output_name, "-o", &format!("{}.o", output_name)])
+                        .status();
+                    
+                    let _ = Command::new("/home/node/llvm17/bin/clang")
+                        .args(["-c", "/tmp/entry.c", "-o", "/tmp/entry.o"])
+                        .status();
+                    
+                    let link_status = Command::new("/home/node/llvm17/bin/clang")
+                        .args([
+                            &format!("{}.o", output_name),
+                            "/tmp/entry.o",
+                            "/tmp/cargo-target/release/libnaso_ffi.a",
+                            "-o", output_name,
+                            "-lpthread", "-ldl"
+                        ])
+                        .status();
+                    
+                    match link_status {
+                        Ok(status) if status.success() => {
+                            let run_status = Command::new(format!("./{}", output_name))
+                                .status();
+                            
+                            match run_status {
+                                Ok(status) if status.success() => {
+                                    println!("  ✅ PASSED");
+                                    passed += 1;
+                                }
+                                Ok(status) => {
+                                    println!("  ❌ FAILED (exit code: {})", status.code().unwrap_or(-1));
+                                    failed += 1;
+                                }
+                                Err(e) => {
+                                    println!("  ❌ FAILED (run error: {})", e);
+                                    failed += 1;
+                                }
+                            }
+                        }
+                        _ => {
+                            println!("  ❌ FAILED (link failed)");
+                            failed += 1;
+                        }
+                    }
+                }
+                _ => {
+                    println!("  ❌ FAILED (build failed)");
+                    failed += 1;
+                }
+            }
+        }
+        
+        println!("\n===================");
+        println!("Results: {} passed, {} failed", passed, failed);
+        
+        if failed > 0 {
+            std::process::exit(1);
+        }
+    } else {
+        // Single test file
+        let output_name = test_file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("test_out");
+        
+        let build_status = Command::new("/tmp/cargo-target/debug/naso")
+            .args(["build", test_file.to_str().unwrap(), "-o", output_name])
+            .status();
+        
+        match build_status {
+            Ok(status) if status.success() => {
+                let _ = Command::new("/home/node/llvm17/bin/llc")
+                    .args(["-filetype=obj", output_name, "-o", &format!("{}.o", output_name)])
+                    .status();
+                
+                let _ = Command::new("/home/node/llvm17/bin/clang")
+                    .args(["-c", "/tmp/entry.c", "-o", "/tmp/entry.o"])
+                    .status();
+                
+                let link_status = Command::new("/home/node/llvm17/bin/clang")
+                    .args([
+                        &format!("{}.o", output_name),
+                        "/tmp/entry.o",
+                        "/tmp/cargo-target/release/libnaso_ffi.a",
+                        "-o", output_name,
+                        "-lpthread", "-ldl"
+                    ])
+                    .status();
+                
+                match link_status {
+                    Ok(status) if status.success() => {
+                        let run_status = Command::new(format!("./{}", output_name))
+                            .status();
+                        
+                        match run_status {
+                            Ok(status) if status.success() => {
+                                println!("✅ TEST PASSED");
+                            }
+                            Ok(status) => {
+                                println!("❌ TEST FAILED (exit code: {})", status.code().unwrap_or(-1));
+                                std::process::exit(1);
+                            }
+                            Err(e) => {
+                                println!("❌ TEST FAILED (run error: {})", e);
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                    _ => {
+                        println!("❌ TEST FAILED (link failed)");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            _ => {
+                println!("❌ TEST FAILED (build failed)");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+fn find_test_files(dir: &PathBuf) -> Vec<PathBuf> {
+    use std::fs;
+    let mut files = Vec::new();
+    
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(ext) = path.extension() {
+                    if ext == "naso" {
+                        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                        if name.contains("test") || name.ends_with("_test") {
+                            files.push(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Also check tests/ subdirectory
+    let tests_dir = dir.join("tests");
+    if tests_dir.is_dir() {
+        if let Ok(entries) = fs::read_dir(&tests_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(ext) = path.extension() {
+                        if ext == "naso" {
+                            files.push(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    files
 }
 
 /// Emit WGSL for `--target wgsl`.

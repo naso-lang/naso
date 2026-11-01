@@ -45,6 +45,13 @@ naso_read
 naso_tcp_accept
 naso_tcp_bind
 naso_write
+
+# TechEmpower benchmark server
+$ nasoc build --target llvm examples/techempower.naso -o techempower.ll
+$ llc -filetype=obj techempower.ll -o techempower.o
+$ clang entry.o techempower.o libnaso_ffi.a -o techempower -lpthread -ldl
+$ ./techempower
+# Runs successfully, listens on 0.0.0.0:8080
 ```
 
 ### AI Slop Check ✅ (2026-11-01 — Updated)
@@ -132,7 +139,7 @@ No cleanup needed.
 
 | Target | Goal | Status |
 |--------|------|--------|
-| **TechEmpower** | Beat Rust actix/axum on plaintext / JSON / DB | 🔄 Planned |
+| **TechEmpower** | Beat Rust actix/axum on plaintext / JSON / DB | 🔄 `techempower.naso` created, compiles & links |
 | **Memory** | <50MB for 10k concurrent connections (vs ~100MB Rust) | 🔄 Planned |
 | **Latency** | p99 < 1ms at 10k RPS | 🔄 Planned |
 | **Documentation** | `nasolang.org` with interactive playground | 🔄 Planned |

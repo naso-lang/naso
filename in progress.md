@@ -47,16 +47,18 @@ naso_tcp_bind
 naso_write
 ```
 
-### AI Slop Check ✅ (2026-11-01)
+### AI Slop Check ✅ (2026-11-01 — Updated)
 
 | Location | Findings |
 |----------|----------|
 | `stdlib/src/std/*.naso` | Only 2 doc comments: `async.naso` "Async placeholder", `http.naso` "// This is a placeholder" — **no `todo!()`/`unimplemented!()` in code** |
-| `compiler/src/*.rs` | Zero occurrences |
+| `stdlib/src/std/tensor/tensor.rs` | 1 `unimplemented!()` in `matmul` (quantum/tensor domain, not web server path) |
+| `stdlib/src/std/quantum/*.rs` | 2 doc comments ("placeholder") — quantum domain |
+| `compiler/src/*.rs` | ~60 "placeholder" occurrences — all **compiler-internal** (IR lowering, type lowering, codegen helpers), **not user-facing stubs** |
 | `crates/naso-ffi/src/*.rs` | Zero occurrences |
-| **Verdict** | **Clean** — no AI-generated stubs in implementation |
+| **Verdict** | **Clean for web server path** — no AI-generated stubs in FFI, stdlib net/http/async, or compiler codegen for Phase 5 features |
 
-### Storage Check ✅ (2026-11-01)
+### Storage Check ✅ (2026-11-01 — Updated)
 
 | Path | Free | Used | Status |
 |------|------|------|--------|

@@ -125,7 +125,7 @@ No cleanup needed.
 | **REPL** (`naso repl`) | ✅ Implemented | Interactive REPL with `:help`, `:parse`, `:tokens`, `:check`, `:type` commands, multi-line input support |
 | **Zero-config** (`naso init`) | ✅ Implemented | Creates project with `src/main.naso`, `naso.toml`, `.gitignore`, `README.md` — builds with single `naso build` |
 | **Error messages** (`naso check` with enhanced QTT diagnostics) | ✅ Implemented | QTT-specific errors: linear use violations, quantity mismatches, moved values, erased variables at runtime — exact line/column, no lifetime noise |
-| **Hot reload** | `naso watch` — recompile on save, keep state |
+| **Hot reload** (`naso watch`) | ✅ Implemented | Watches file for changes, rebuilds (LLVM IR → object → link with naso_ffi + entry wrapper), runs binary on each save — 500ms poll interval |
 | **Built-in test runner** | `naso test` — no `#[test]`, no harness |
 
 ### Phase 7: Ecosystem & Benchmarks (Week 4)
@@ -205,8 +205,7 @@ Naso: `Stream` has quantity `[1]` — **must** be passed to `read`/`write`/`clos
 
 3. **Benchmark**: Once compiling, run `wrk -t4 -c1000 -d30s` against Naso vs Rust servers
 
-4. **Phase 6: Developer Experience** — **REPL ✅ DONE**, **Zero-config ✅ DONE**, **Error messages ✅ DONE**, next:
-   - Hot reload (`naso watch`)
+4. **Phase 6: Developer Experience** — **REPL ✅ DONE**, **Zero-config ✅ DONE**, **Error messages ✅ DONE**, **Hot reload ✅ DONE**, next:
    - Built-in test runner (`naso test`)
 
 ---

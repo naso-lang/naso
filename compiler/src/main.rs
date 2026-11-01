@@ -35,6 +35,13 @@ fn main() {
         "init" => {
             run_init(&args[2..]);
         }
+        "watch" => {
+            if args.len() < 3 {
+                eprintln!("Usage: naso watch <file>");
+                std::process::exit(1);
+            }
+            run_watch(&args[2]);
+        }
         "build" => {
             run_build_command(&args[2..]);
         }
@@ -55,6 +62,7 @@ fn print_usage() {
     eprintln!("  check <file>          Type check program");
     eprintln!("  repl                  Start interactive REPL");
     eprintln!("  init                  Create new Naso project (zero-config)");
+    eprintln!("  watch <file>          Hot reload — recompile on file change");
     eprintln!("  build [options] <file>  Build program to target");
     eprintln!("Build options:");
     eprintln!("  --target <llvm|qir|wgsl>  Target backend (default: llvm)");
@@ -466,6 +474,135 @@ naso build src/main.naso -o {}
     println!("  cd {}", project_name);
     println!("  naso build src/main.naso -o {}", project_name);
     println!("  ./{}", project_name);
+}
+
+/// `naso watch` — Hot reload: recompile on file change
+fn run_watch(file: &str) {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::Duration;
+    
+    let file_path = PathBuf::from(file);
+    if !file_path.exists() {
+        eprintln!("File '{}' does not exist", file);
+        std::process::exit(1);
+    }
+    
+    let output_name = file_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("out");
+    
+    println!("Watching {} for changes... (Ctrl+C to stop)", file);
+    println!("Output: {}", output_name);
+    
+    // Initial build
+    build_and_run(&file_path, output_name);
+    
+    // Watch for changes
+    let mut last_modified = fs::metadata(&file_path)
+        .and_then(|m| m.modified())
+        .ok();
+    
+    loop {
+        std::thread::sleep(Duration::from_millis(500));
+        
+        if let Ok(metadata) = fs::metadata(&file_path) {
+            if let Ok(modified) = metadata.modified() {
+                if last_modified.map_or(true, |last| modified > last) {
+                    last_modified = Some(modified);
+                    println!("\n🔄 File changed, rebuilding...");
+                    build_and_run(&file_path, output_name);
+                }
+            }
+        }
+    }
+}
+
+fn build_and_run(file_path: &PathBuf, output_name: &str) {
+    use std::process::Command;
+    
+    // Build to LLVM IR
+    let build_status = Command::new("/tmp/cargo-target/debug/naso")
+        .args(["build", file_path.to_str().unwrap(), "-o", output_name])
+        .status();
+    
+    match build_status {
+        Ok(status) if status.success() => {
+            println!("✅ Build successful (LLVM IR)");
+            
+            // Compile IR to object file
+            let llc_status = Command::new("/home/node/llvm17/bin/llc")
+                .args([
+                    "-filetype=obj",
+                    output_name,
+                    "-o",
+                    &format!("{}.o", output_name),
+                ])
+                .status();
+            
+            match llc_status {
+                Ok(status) if status.success() => {
+                    // Compile entry point wrapper
+                    let entry_c = "/tmp/entry.c";
+                    let entry_o = "/tmp/entry.o";
+                    if std::path::Path::new(entry_c).exists() {
+                        let _ = Command::new("/home/node/llvm17/bin/clang")
+                            .args(["-c", entry_c, "-o", entry_o])
+                            .status();
+                    }
+                    
+                    // Link with naso_ffi + entry point
+                    let link_status = Command::new("/home/node/llvm17/bin/clang")
+                        .args([
+                            &format!("{}.o", output_name),
+                            entry_o,
+                            "/tmp/cargo-target/release/libnaso_ffi.a",
+                            "-o", output_name,
+                            "-lpthread", "-ldl"
+                        ])
+                        .status();
+                    
+                    match link_status {
+                        Ok(status) if status.success() => {
+                            println!("🔗 Linked successfully");
+                            
+                            // Run the binary
+                            let run_status = Command::new(format!("./{}", output_name))
+                                .status();
+                            
+                            match run_status {
+                                Ok(status) => {
+                                    println!("🏁 Process exited with code: {}", status.code().unwrap_or(-1));
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to run binary: {}", e);
+                                }
+                            }
+                        }
+                        Ok(status) => {
+                            eprintln!("❌ Link failed with exit code: {}", status.code().unwrap_or(-1));
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to run linker: {}", e);
+                        }
+                    }
+                }
+                Ok(status) => {
+                    eprintln!("❌ llc failed with exit code: {}", status.code().unwrap_or(-1));
+                }
+                Err(e) => {
+                    eprintln!("Failed to run llc: {}", e);
+                }
+            }
+        }
+        Ok(status) => {
+            eprintln!("❌ Build failed with exit code: {}", status.code().unwrap_or(-1));
+        }
+        Err(e) => {
+            eprintln!("Failed to run naso build: {}", e);
+        }
+    }
 }
 
 /// Emit WGSL for `--target wgsl`.

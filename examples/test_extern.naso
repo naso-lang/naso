@@ -1,7 +1,0 @@
-// Test extern block parsing with pointer types
-extern "C" {
-    fn naso_tcp_bind(addr_ptr: *u8, len: usize) -> u64;
-    fn naso_tcp_accept(fd: u64, out: *u64) -> u64;
-    fn naso_read(fd: u64, buf: *u8, max_len: usize) -> usize;
-    fn naso_write(fd: u64, buf: *u8, len: usize) -> usize;
-}

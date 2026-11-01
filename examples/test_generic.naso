@@ -1,4 +1,0 @@
-// Test generic types
-fn test() -> Result[Listener] {
-    ()
-}

@@ -1,3 +1,0 @@
-fn test_accept(l: [1] Listener) -> Stream {
-    accept(l)
-}

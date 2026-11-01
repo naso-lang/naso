@@ -1,5 +1,0 @@
-fn main() -> () {
-    let x = Result::Ok(42);
-    let y = x.unwrap();
-    ()
-}

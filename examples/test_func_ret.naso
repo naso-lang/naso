@@ -1,9 +1,0 @@
-fn make_result() -> Result[Int, String] {
-    Result::Ok(42)
-}
-
-fn main() -> () {
-    let x = make_result();
-    let y = x.unwrap();
-    ()
-}

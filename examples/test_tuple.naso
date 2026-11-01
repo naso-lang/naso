@@ -1,6 +1,0 @@
-// Test tuple pattern
-fn test_tuple() -> () {
-    let (a, b) = (1, 2);
-    let _ = a + b;
-    ()
-}

@@ -1,8 +1,0 @@
-fn my_bind(addr: String) -> Int {
-    1
-}
-
-fn main() -> () {
-    let x = my_bind("test");
-    ()
-}

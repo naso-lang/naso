@@ -1,9 +1,0 @@
-fn ok[T, E](value: T) -> Result[T, E] {
-    Result::Ok(value)
-}
-
-fn main() -> () {
-    let x = ok(42);
-    let y = x.unwrap();
-    ()
-}

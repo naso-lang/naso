@@ -1,9 +1,0 @@
-/// Wraps a raw fd with QTT single-ownership tracking
-struct Listener {
-    fd: u64,
-}
-
-/// Wraps a stream fd — must be consumed at read/write
-struct Stream {
-    fd: u64,
-}

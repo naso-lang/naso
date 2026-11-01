@@ -1,6 +1,0 @@
-fn main() -> () {
-    let x = "test";
-    let y: String = x;
-    let z = y;
-    ()
-}

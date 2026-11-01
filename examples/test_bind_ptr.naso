@@ -1,9 +1,0 @@
-extern "C" {
-    fn naso_tcp_bind(addr_ptr: *u8, len: usize) -> u64;
-}
-
-fn main() -> () {
-    let addr = "0.0.0.0:8080";
-    let fd = naso_tcp_bind(addr as *u8, 0);
-    ()
-}

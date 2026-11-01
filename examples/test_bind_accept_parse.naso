@@ -1,8 +1,0 @@
-// Test bind, accept, parse_request
-fn test_bind_accept_parse() -> () {
-    let listener = bind("0.0.0.0:8080").unwrap();
-    let stream = accept(listener);
-    let req = parse_request(stream).unwrap();
-    let _ = req;
-    ()
-}

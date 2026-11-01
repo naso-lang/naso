@@ -1,9 +1,0 @@
-// Test main function with while
-fn main() -> () {
-    let listener = bind("0.0.0.0:8080").unwrap();
-    while 1 == 1 {
-        let x = 1;
-        ()
-    }
-    ()
-}

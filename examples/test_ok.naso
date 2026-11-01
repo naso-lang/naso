@@ -1,6 +1,0 @@
-// Test ok function
-fn test_ok() -> () {
-    let body = [104, 101, 108, 108, 111];
-    let _ = ok(body);
-    ()
-}

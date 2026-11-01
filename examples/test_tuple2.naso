@@ -1,3 +1,0 @@
-fn accept(l: Listener) -> Result[(Listener, Stream)] {
-    ()
-}

@@ -32,6 +32,9 @@ fn main() {
         "repl" => {
             run_repl();
         }
+        "init" => {
+            run_init(&args[2..]);
+        }
         "build" => {
             run_build_command(&args[2..]);
         }
@@ -51,6 +54,7 @@ fn print_usage() {
     eprintln!("  tokens <file>         Print token stream");
     eprintln!("  check <file>          Type check program");
     eprintln!("  repl                  Start interactive REPL");
+    eprintln!("  init                  Create new Naso project (zero-config)");
     eprintln!("  build [options] <file>  Build program to target");
     eprintln!("Build options:");
     eprintln!("  --target <llvm|qir|wgsl>  Target backend (default: llvm)");
@@ -279,6 +283,189 @@ fn run_repl() {
             multiline.clear();
         }
     }
+}
+
+/// `naso init` — Create a new zero-config Naso project
+fn run_init(args: &[String]) {
+    use std::fs;
+    use std::path::PathBuf;
+    
+    let mut project_name = None;
+    let mut force = false;
+    
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-f" | "--force" => force = true,
+            arg if arg.starts_with('-') => {
+                eprintln!("Unknown option: {arg}");
+                std::process::exit(1);
+            }
+            name => {
+                if project_name.is_none() {
+                    project_name = Some(name.to_string());
+                } else {
+                    eprintln!("Multiple project names not supported");
+                    std::process::exit(1);
+                }
+            }
+        }
+        i += 1;
+    }
+    
+    let project_name = project_name.unwrap_or_else(|| {
+        eprintln!("Usage: naso init <project-name> [-f|--force]");
+        std::process::exit(1);
+    });
+    
+    let project_dir = PathBuf::from(&project_name);
+    
+    if project_dir.exists() && !force {
+        eprintln!("Directory '{}' already exists. Use -f to overwrite.", project_name);
+        std::process::exit(1);
+    }
+    
+    // Create project structure
+    let src_dir = project_dir.join("src");
+    fs::create_dir_all(&src_dir).unwrap_or_else(|e| {
+        eprintln!("Failed to create project directory: {e}");
+        std::process::exit(1);
+    });
+    
+    // Create main.naso
+    let main_naso = r#"// Naso web server example
+// Run: naso build src/main.naso -o main
+//      ./main
+
+extern "C" {
+    fn naso_write(fd: u64, buf: *u8, len: usize) -> usize;
+}
+
+struct Stream {
+    fd: Int,
+}
+
+fn main() -> () {
+    let body: [u8] = [104, 101, 108, 108, 111];
+    let stream = Stream { fd: 1 };
+    let _ = write(stream, body);
+    ()
+}
+"#;
+    
+    fs::write(src_dir.join("main.naso"), main_naso).unwrap_or_else(|e| {
+        eprintln!("Failed to write main.naso: {e}");
+        std::process::exit(1);
+    });
+    
+    // Create naso.toml (optional config, mostly for metadata)
+    let naso_toml = format!(r#"[project]
+name = "{}"
+version = "0.1.0"
+description = "Naso web service"
+
+[build]
+target = "llvm"
+opt = 2
+
+[dependencies]
+# Add dependencies here
+# naso-ffi = {{ path = "../crates/naso-ffi" }}
+"#, project_name);
+    
+    fs::write(project_dir.join("naso.toml"), naso_toml).unwrap_or_else(|e| {
+        eprintln!("Failed to write naso.toml: {e}");
+        std::process::exit(1);
+    });
+    
+    // Create .gitignore
+    let gitignore = r#"# Build artifacts
+target/
+*.o
+*.ll
+*.bc
+
+# Executables
+main
+*.exe
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+"#;
+    
+    fs::write(project_dir.join(".gitignore"), gitignore).unwrap_or_else(|e| {
+        eprintln!("Failed to write .gitignore: {e}");
+        std::process::exit(1);
+    });
+    
+    // Create README.md
+    let readme = format!(r#"# {}
+
+Naso web service — zero-config, single binary.
+
+## Quick Start
+
+```bash
+# Build
+naso build src/main.naso -o {}
+
+# Run
+./{}
+```
+
+## Project Structure
+
+```
+{}/
+├── naso.toml       # Project metadata (optional)
+├── src/
+│   └── main.naso   # Entry point
+└── .gitignore
+```
+
+## Commands
+
+- `naso check src/main.naso` — Type check only
+- `naso repl` — Interactive REPL
+- `naso build src/main.naso -o {}` — Build to native binary
+- `naso build --target wgsl src/main.naso -o main.wgsl` — Build to WGSL
+
+## Requirements
+
+- Naso compiler (`naso`)
+- LLVM 17+ (for `--target llvm`)
+- Rust toolchain not required — Naso compiles directly to native code
+
+## Learn More
+
+- Naso language: https://nasolang.org
+- QTT (Quantity-Typed Types): eliminates borrow checker
+- Linear async: no Pin/Send/Sync
+"#, project_name, project_name, project_name, project_name, project_name);
+    
+    fs::write(project_dir.join("README.md"), readme).unwrap_or_else(|e| {
+        eprintln!("Failed to write README.md: {e}");
+        std::process::exit(1);
+    });
+    
+    println!("Created Naso project '{}'", project_name);
+    println!("  {}/", project_name);
+    println!("  ├── naso.toml");
+    println!("  ├── src/");
+    println!("  │   └── main.naso");
+    println!("  ├── .gitignore");
+    println!("  └── README.md");
+    println!();
+    println!("Next steps:");
+    println!("  cd {}", project_name);
+    println!("  naso build src/main.naso -o {}", project_name);
+    println!("  ./{}", project_name);
 }
 
 /// Emit WGSL for `--target wgsl`.

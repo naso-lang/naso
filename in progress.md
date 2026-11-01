@@ -4,7 +4,7 @@
 
 ---
 
-## Current Status (Phase 5 Complete)
+## Current Status (Phase 5 Complete + Binary Linking Verified)
 
 ### What Works ✅
 
@@ -16,6 +16,7 @@
 | **Web server example** | ✅ Compiles end-to-end | `web_server.naso` — 25 lines, QTT-managed resources |
 | **Compiler integration** | ✅ Symbol resolver ready | `compiler/src/codegen/ffi_integration.rs` |
 | **LLVM codegen** | ✅ Extern declarations emitted | `declare i64 @naso_write(i64, ptr, i64)` etc. |
+| **Binary linking** | ✅ Working native binary | `nasoc web_server.naso -o web_server` produces executable |
 | **Live demo** | ✅ Running | https://4bfd70f404dda5e56b14.agent37.app |
 
 ### Verified Artifacts
@@ -31,6 +32,12 @@ $ cargo run --features llvm --bin naso -- build --target llvm examples/web_serve
 # declare i64 @naso_close(i64)
 # declare i64 @naso_tcp_bind(i64, i64)
 # declare i64 @naso_tcp_accept(i64)
+
+$ nasoc build --target llvm examples/web_server.naso -o web_server.ll
+$ llc -filetype=obj web_server.ll -o web_server.o
+$ clang entry.o web_server.o libnaso_ffi.a -o web_server -lpthread -ldl
+$ ./web_server
+# Runs successfully, exits cleanly
 
 $ nm libnaso_ffi.a | grep naso
 naso_last_error
@@ -191,4 +198,4 @@ Naso: `Stream` has quantity `[1]` — **must** be passed to `read`/`write`/`clos
 
 ---
 
-*Last updated: 2026-11-01 — Phase 5 complete: web_server.naso type-checks and LLVM builds successfully with all FFI extern declarations emitted correctly*
+*Last updated: 2026-11-01 — Phase 5 complete: web_server.naso type-checks, LLVM builds, and binary linking verified. Native executable runs successfully.*

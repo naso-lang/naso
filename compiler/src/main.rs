@@ -536,7 +536,7 @@ fn build_and_run(file_path: &PathBuf, output_name: &str) {
             println!("✅ Build successful (LLVM IR)");
             
             // Compile IR to object file
-            let llc_status = Command::new("/home/node/llvm17/bin/llc")
+            let llc_status = Command::new("/tmp/llvm17/bin/llc")
                 .args([
                     "-filetype=obj",
                     output_name,
@@ -551,13 +551,13 @@ fn build_and_run(file_path: &PathBuf, output_name: &str) {
                     let entry_c = "/tmp/entry.c";
                     let entry_o = "/tmp/entry.o";
                     if std::path::Path::new(entry_c).exists() {
-                        let _ = Command::new("/home/node/llvm17/bin/clang")
+                        let _ = Command::new("/tmp/llvm17/bin/clang")
                             .args(["-c", entry_c, "-o", entry_o])
                             .status();
                     }
                     
                     // Link with naso_ffi + entry point
-                    let link_status = Command::new("/home/node/llvm17/bin/clang")
+                    let link_status = Command::new("/tmp/llvm17/bin/clang")
                         .args([
                             &format!("{}.o", output_name),
                             entry_o,
@@ -671,15 +671,15 @@ fn run_test(args: &[String]) {
             match build_status {
                 Ok(status) if status.success() => {
                     // Compile and link
-                    let _ = Command::new("/home/node/llvm17/bin/llc")
+                    let _ = Command::new("/tmp/llvm17/bin/llc")
                         .args(["-filetype=obj", output_name, "-o", &format!("{}.o", output_name)])
                         .status();
                     
-                    let _ = Command::new("/home/node/llvm17/bin/clang")
+                    let _ = Command::new("/tmp/llvm17/bin/clang")
                         .args(["-c", "/tmp/entry.c", "-o", "/tmp/entry.o"])
                         .status();
                     
-                    let link_status = Command::new("/home/node/llvm17/bin/clang")
+                    let link_status = Command::new("/tmp/llvm17/bin/clang")
                         .args([
                             &format!("{}.o", output_name),
                             "/tmp/entry.o",
@@ -741,15 +741,15 @@ fn run_test(args: &[String]) {
         
         match build_status {
             Ok(status) if status.success() => {
-                let _ = Command::new("/home/node/llvm17/bin/llc")
+                let _ = Command::new("/tmp/llvm17/bin/llc")
                     .args(["-filetype=obj", output_name, "-o", &format!("{}.o", output_name)])
                     .status();
                 
-                let _ = Command::new("/home/node/llvm17/bin/clang")
+                let _ = Command::new("/tmp/llvm17/bin/clang")
                     .args(["-c", "/tmp/entry.c", "-o", "/tmp/entry.o"])
                     .status();
                 
-                let link_status = Command::new("/home/node/llvm17/bin/clang")
+                let link_status = Command::new("/tmp/llvm17/bin/clang")
                     .args([
                         &format!("{}.o", output_name),
                         "/tmp/entry.o",

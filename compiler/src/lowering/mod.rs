@@ -569,7 +569,17 @@ impl LoweringContext {
                 // So the LAST statement, when it is control flow and there is no
                 // `body.expr` after it, is lowered as the return value. `lower_stmt`
                 // cannot do this: it discards an expression's value by contract.
+                //
+                // BUT only for functions that ACTUALLY RETURN A VALUE. A `void`
+                // function's last statement is an ordinary statement -- its value
+                // is discarded and it runs for side effects. Without this check,
+                // `fn main() { if x { ... } }` incorrectly treats the `if` as a
+                // tail return, sets `tail_value_override`, and the codegen then
+                // skips it from the schedule (thinking it emits at `ret`), but a
+                // void function emits `ret void` without running it. The whole
+                // body vanishes silently.
                 let stmts_len = func.body.stmts.len();
+                let returns_value = !matches!(self.return_type(func), crate::ir::pir_types::FnReturn::Void);
                 //
                 // `forall` is EXCLUDED. `is_control_flow_stmt` includes it, because a
                 // `forall` statement also needs no trailing semicolon, but a `forall` is
@@ -578,7 +588,8 @@ impl LoweringContext {
                 // bare `Forall(...)` debug dump. That broke 15 lowering and
                 // schedule-consumer tests. So the condition here is `if`/`match` only --
                 // the constructs that are EXPRESSIONS whose value is the block's tail.
-                let last_is_control_flow = func.body.expr.is_none()
+                let last_is_control_flow = returns_value
+                    && func.body.expr.is_none()
                     && stmts_len > 0
                     && matches!(&func.body.stmts[stmts_len - 1].kind, crate::ast::StmtKind::Expr(e)
                         if matches!(e.kind, crate::ast::expr::ExprKind::If(..)));

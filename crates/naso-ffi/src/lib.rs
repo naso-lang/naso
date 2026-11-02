@@ -229,6 +229,28 @@ pub extern "C" fn naso_last_error(out_ptr: *mut u8, max_len: usize) -> usize {
     copy_len
 }
 
+/// Close a stream fd and remove it from the fd table
+/// Returns 1 on success, 0 on failure
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_close(fd: u64) -> u64 {
+    let mut table = fd_table().lock().unwrap();
+    if table.streams.remove(&fd).is_some() {
+        1
+    } else {
+        0
+    }
+}
+
+/// Extract client_fd from accept out array (out[1])
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_accept_get_client(out: *const u64) -> u64 {
+    if out.is_null() {
+        return 0;
+    }
+    let out_slice = unsafe { std::slice::from_raw_parts(out, 2) };
+    out_slice[1]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,5 +313,16 @@ mod tests {
         // but we can verify the bind works and the fd is tracked
         let mut table = fd_table().lock().unwrap();
         assert!(table.listeners.contains_key(&listener_fd));
+    }
+}
+#[cfg(test)]
+mod test_accept_get_client {
+    use super::*;
+    
+    #[test]
+    fn test_accept_get_client() {
+        let mut out = [1234u64, 5678u64];
+        let result = naso_accept_get_client(out.as_ptr());
+        assert_eq!(result, 5678);
     }
 }

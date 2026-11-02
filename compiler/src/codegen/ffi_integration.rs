@@ -12,7 +12,10 @@ pub static FFI_SYMBOLS: &[(&str, &str)] = &[
     ("naso_tcp_accept", "naso_tcp_accept"),
     ("naso_read", "naso_read"),
     ("naso_write", "naso_write"),
+    ("naso_close", "naso_close"),
+    ("naso_get_memory_stats", "naso_get_memory_stats"),
     ("naso_last_error", "naso_last_error"),
+    ("naso_accept_get_client", "naso_accept_get_client"),
 ];
 
 /// Returns the Rust symbol name for a Naso extern function

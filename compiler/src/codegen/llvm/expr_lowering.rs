@@ -494,6 +494,7 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 // rather than only the one that was tried.
                 // Check if this is an FFI function that needs symbol resolution
                 let ffi_symbol = resolve_symbol(name);
+                let is_ffi_call = ffi_symbol.is_some();
                 let call_name = if let Some(sym) = ffi_symbol {
                     sym
                 } else {
@@ -538,7 +539,6 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                     })?;
 
                 // inkwell 0.10 takes call arguments as `BasicMetadataValueEnum`.
-                //
                 // The operand ORDER is arguments first, callee LAST: operands
                 // `0 .. num_operands - 1` are the arguments and the last one is the
                 // function pointer. `build_call` takes them as a slice in that order and
@@ -546,10 +546,52 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 // passing the callee in the slice -- produces IR that parses, verifies,
                 // and computes the wrong thing. There is no way to catch that by reading
                 // the IR; it is caught by executing the callee and checking the value.
-                let arg_metadata: Vec<BasicMetadataValueEnum<'ctx>> = arg_values
-                    .into_iter()
-                    .map(BasicMetadataValueEnum::from)
-                    .collect();
+                
+                // For FFI extern calls, convert i64 pointer arguments back to ptr type
+                // Different FFI functions have different signatures:
+                // - naso_tcp_bind(ptr, usize): first arg is pointer
+                // - naso_write(u64, ptr, usize): second arg is pointer
+                // - naso_read(u64, ptr, usize): second arg is pointer
+                // - naso_tcp_accept(u64, ptr): second arg is pointer
+                // - naso_close(u64): no pointers
+                let arg_metadata: Vec<BasicMetadataValueEnum<'ctx>> = if is_ffi_call {
+                    arg_values
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, v)| {
+                            let is_pointer_arg = match call_name {
+                                "naso_tcp_bind" => i == 0,
+                                "naso_write" | "naso_read" | "naso_tcp_accept" => i == 1,
+                                "naso_accept_get_client" => i == 0,
+                                _ => false,
+                            };
+                            if is_pointer_arg {
+                                if let BasicValueEnum::IntValue(_) = v {
+                                    let builder = self.value_builder.builder();
+                                    let ptr_type = self
+                                        .value_builder
+                                        .type_lowering()
+                                        .context()
+                                        .ptr_type(inkwell::AddressSpace::default());
+                                    match builder.build_int_to_ptr(v.into_int_value(), ptr_type, &format!("ffi_arg_ptr_{i}")) {
+                                        Ok(ptr_val) => BasicMetadataValueEnum::from(ptr_val),
+                                        Err(_) => BasicMetadataValueEnum::from(v),
+                                    }
+                                } else {
+                                    BasicMetadataValueEnum::from(v)
+                                }
+                            } else {
+                                // Other args (fd, len, etc.) stay as-is (i64)
+                                BasicMetadataValueEnum::from(v)
+                            }
+                        })
+                        .collect()
+                } else {
+                    arg_values
+                        .into_iter()
+                        .map(BasicMetadataValueEnum::from)
+                        .collect()
+                };
 
                 // inkwell 0.10 takes call arguments as `BasicMetadataValueEnum`.
                 let call = self
@@ -1290,6 +1332,22 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 float_target,
             } => {
                 let v = self.build_expr(expr, quantities)?;
+
+                // Special handling: Array -> Pointer cast (tensor struct to raw pointer)
+                // The array literal lowers to a tensor struct { ptr: i64, len: i64 }
+                // Casting to *u8 (width=64) should extract the ptr field, not convert the struct
+                let source_ty = v.get_type();
+                if let BasicTypeEnum::StructType(_) = source_ty {
+                    // Check if this is a tensor struct (ptr, len) and target is a pointer
+                    if *width == Some(64) || width.is_none() {
+                        let builder = self.value_builder.builder();
+                        // Extract the first field (ptr) from the tensor struct
+                        let ptr_val = builder
+                            .build_extract_value(v.into_struct_value(), 0, "tensor_ptr_cast")
+                            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                        return Ok(ptr_val.into());
+                    }
+                }
 
                 // A FLOAT TARGET: `sitofp`/`uitofp`.
                 //

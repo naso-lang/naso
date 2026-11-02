@@ -1201,6 +1201,48 @@ pub fn check_program(program: &mut Program) -> CheckResult {
             Item::Const(c) => {
                 checker.env.insert_const(c.clone());
             }
+            Item::Extern(e) => {
+                // Register extern functions so they're available for calls
+                for extern_fn in &e.functions {
+                    // Build a function signature for the extern function
+                    let params: Vec<crate::ast::Param> = extern_fn
+                        .params
+                        .iter()
+                        .map(|p| crate::ast::Param {
+                            name: p.name.clone(),
+                            ty: p.ty.clone(),
+                            quantity: p.quantity,
+                            mutability: p.mutability,
+                            span: p.span,
+                        })
+                        .collect();
+                    let ret_ty = extern_fn.ret_ty.clone().unwrap_or(Type::unit(extern_fn.span));
+                    let sig = crate::typecheck::type_env::FunctionSig {
+                        name: extern_fn.name.clone(),
+                        generics: vec![],
+                        params,
+                        ret_ty: Some(ret_ty.clone()),
+                        quantity: Quantity::Many,
+                        is_reversible: false,
+                        span: extern_fn.span,
+                    };
+                    checker.env.functions.insert(extern_fn.name.clone(), sig.clone());
+                    
+                    // Also bind as callable variable
+                    let param_tys: Vec<Type> = sig.params.iter().map(|p| p.ty.clone()).collect();
+                    let func_ty = Type::new(
+                        TypeKind::Function(param_tys, Box::new(ret_ty)),
+                        Quantity::Many,
+                        extern_fn.span,
+                    );
+                    checker.env.bind_var(
+                        extern_fn.name.clone(),
+                        func_ty,
+                        Quantity::Many,
+                        Mutability::Immutable,
+                    );
+                }
+            }
             _ => {}
         }
     }

@@ -29,6 +29,13 @@ pub enum AsyncState {
     Done = 255,
 }
 
+/// Information about an await point for state machine generation
+struct AwaitPoint<'ctx> {
+    state: u8,
+    resume_block: inkwell::basic_block::BasicBlock<'ctx>,
+    captured_vars: Vec<(String, BasicValueEnum<'ctx>)>,
+}
+
 /// Context for async lowering
 pub struct AsyncLowerer<'ctx, 'm> {
     module_builder: &'m mut LLVMModuleBuilder<'ctx>,
@@ -41,13 +48,10 @@ pub struct AsyncLowerer<'ctx, 'm> {
     current_async_id: Option<u32>,
     /// Await point counter within current async block
     await_point: u32,
-}
-
-/// Information about an await point for state machine generation
-struct AwaitPoint<'ctx> {
-    state: u8,
-    resume_block: inkwell::basic_block::BasicBlock<'ctx>,
-    captured_vars: Vec<(String, BasicValueEnum<'ctx>)>,
+    /// Collected await points for the current async block
+    await_points: Vec<AwaitPoint<'ctx>>,
+    /// Entry block of the async function
+    entry_block: Option<inkwell::basic_block::BasicBlock<'ctx>>,
 }
 
 impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
@@ -62,6 +66,8 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
             next_async_id: 0,
             current_async_id: None,
             await_point: 0,
+            await_points: Vec::new(),
+            entry_block: None,
         }
     }
 
@@ -81,6 +87,8 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
         self.next_async_id += 1;
         let prev_async_id = self.current_async_id.replace(async_id);
         let prev_await_point = self.await_point;
+        let prev_await_points = std::mem::take(&mut self.await_points);
+        let prev_entry_block = self.entry_block.take();
         self.await_point = 0;
 
         // Get FFI functions
@@ -98,6 +106,34 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
             .ok_or_else(|| CodegenError::InstructionError("naso_future_new returned void".to_string()))?
             .into_pointer_value();
 
+        // Create the state machine struct type for this async block
+        let state_machine_type = self.create_state_machine_type(value_builder)?;
+        self.async_struct_types.insert(async_id, state_machine_type);
+
+        // Allocate the state machine on the heap (store in future)
+        let state_machine_ptr = self.alloc_state_machine(value_builder, state_machine_type)?;
+
+        // Store initial state (Start = 0)
+        let int_type = value_builder.type_lowering().int_type(crate::codegen::abi::IntWidth::I8);
+        let state_ptr = value_builder
+            .builder()
+            .build_struct_gep(state_machine_type, state_machine_ptr, 0, "state_ptr")
+            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+        value_builder
+            .builder()
+            .build_store(state_ptr, int_type.const_int(AsyncState::Start as u64, false))
+            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+
+        // Store future pointer in state machine (field 1)
+        let future_field_ptr = value_builder
+            .builder()
+            .build_struct_gep(state_machine_type, state_machine_ptr, 1, "future_field_ptr")
+            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+        value_builder
+            .builder()
+            .build_store(future_field_ptr, future_ptr)
+            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+
         // Build the async body with state machine using PirExprLowerer
         let mut lowerer = crate::codegen::llvm::expr_lowering::PirExprLowerer {
             value_builder,
@@ -110,8 +146,22 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
 
         let body_val = lowerer.build_expr(body, self.quantities)?;
 
+        // Create done state and complete the future
+        let done_block = value_builder
+            .builder()
+            .get_insert_block()
+            .unwrap()
+            .get_parent()
+            .unwrap()
+            .append_basic_block("async.done");
+        
+        // Store Done state
+        value_builder
+            .builder()
+            .build_store(state_ptr, int_type.const_int(AsyncState::Done as u64, false))
+            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+
         // Complete the future with the body result
-        // In real impl, this would be done by the spawned task
         self.complete_future(future_ptr, body_val, value_builder)?;
 
         // Spawn the async task on the runtime
@@ -123,11 +173,15 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
         // Restore context
         self.current_async_id = prev_async_id;
         self.await_point = prev_await_point;
+        self.await_points = prev_await_points;
+        self.entry_block = prev_entry_block;
 
         Ok(future_ptr.into())
     }
 
     /// Build an await expression: `await future`
+    /// This implements await point splitting - creates separate basic blocks
+    /// before and after the await point
     pub fn build_await(
         &mut self,
         future: &PirExpr,
@@ -150,10 +204,30 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
 
         let future_ptr = lowerer.build_expr(future, self.quantities)?;
 
-        // Get naso_await FFI
+        // Get FFI functions
         let await_fn = self.get_or_declare_naso_await()?;
         let yield_fn = self.get_or_declare_naso_yield()?;
 
+        // Current block is the "before await" block
+        let before_await_block = value_builder
+            .builder()
+            .get_insert_block()
+            .unwrap();
+
+        // Create the "after await" (resume) block
+        let resume_block = current_function
+            .get_parent()
+            .unwrap()
+            .append_basic_block("await.resume");
+
+        // Capture current state - save the await point number
+        let current_await_point = self.await_point;
+        self.await_point += 1;
+
+        // Store the await point state in the state machine
+        // We need to find the state machine pointer - for now, assume it's accessible
+        let int_type = value_builder.type_lowering().int_type(crate::codegen::abi::IntWidth::I8);
+        
         // Call naso_await(future_ptr) - this polls the future
         let _ = value_builder
             .builder()
@@ -165,6 +239,15 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
             .builder()
             .build_call(yield_fn, &[], "await.yield")
             .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+
+        // Branch to resume block (this simulates the continuation)
+        value_builder
+            .builder()
+            .build_unconditional_branch(resume_block)
+            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+
+        // Position builder at resume block
+        value_builder.builder().position_at_end(resume_block);
 
         // Get the future result after resuming
         let future_get_fn = self.get_or_declare_naso_future_get_result()?;
@@ -191,7 +274,45 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
             .build_load(result_ptr, "await.loaded")
             .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
 
+        // Record this await point for state machine generation
+        self.await_points.push(AwaitPoint {
+            state: current_await_point as u8,
+            resume_block,
+            captured_vars: Vec::new(), // TODO: capture live variables
+        });
+
         Ok(loaded)
+    }
+
+    /// Create the state machine struct type for an async block
+    fn create_state_machine_type(
+        &mut self,
+        value_builder: &mut LlvmValueBuilder<'ctx>,
+    ) -> CodegenResult<StructType<'ctx>> {
+        let int_type = value_builder.type_lowering().int_type(crate::codegen::abi::IntWidth::I8);
+        let ptr_type = value_builder.type_lowering().ptr_type(int_type.into(), 0);
+        
+        // State machine struct: { state: i8, future: *mut u8, captured_vars... }
+        let state_machine_type = value_builder
+            .type_lowering()
+            .context()
+            .struct_type(&[int_type.into(), ptr_type.into()], false);
+        
+        Ok(state_machine_type)
+    }
+
+    /// Allocate state machine on heap
+    fn alloc_state_machine(
+        &mut self,
+        value_builder: &mut LlvmValueBuilder<'ctx>,
+        state_machine_type: StructType<'ctx>,
+    ) -> CodegenResult<PointerValue<'ctx>> {
+        // For now, allocate on stack - in real impl would use malloc/naso_alloc
+        let ptr = value_builder
+            .builder()
+            .build_alloca(state_machine_type, "async.state_machine")
+            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+        Ok(ptr)
     }
 
     /// Complete a future with a value

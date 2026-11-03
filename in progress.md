@@ -327,7 +327,7 @@ The async runtime and FFI layer are complete. The next phase is **compiler codeg
 5. ✅ Wire FFI calls (`naso_future_new`, `naso_await`, `naso_future_complete`, `naso_future_get_result`) to codegen
 6. ✅ Parser support: async/await keywords in all contexts (extern blocks, top-level fn, expressions)
 7. ✅ Spawn/yield FFI wiring: `build_async` calls `naso_spawn`, `build_await` calls `naso_yield`
-8. ⬜ Implement `await` point splitting (separate basic blocks before/after each await)
+8. ✅ Implement `await` point splitting (separate basic blocks before/after each await)
 9. ⬜ Generate state machine struct with future storage for each async function
 10. ⬜ Test: compile async Naso code end-to-end
 

@@ -320,14 +320,17 @@ Naso: `Stream` has quantity `[1]` — **must** be passed to `read`/`write`/`clos
 
 The async runtime and FFI layer are complete. The next phase is **compiler codegen for async/await lowering**:
 
-1. ~~Create `compiler/src/codegen/llvm/async_lowering.rs` for state machine generation~~ ✅ Created (stub)
-2. ~~Add `PirExpr::Async` and `PirExpr::Await` match arms in expr_lowering returning `UnsupportedFeature`~~ ✅
-3. Implement `await` point splitting (separate basic blocks before/after each await)
-4. Wire FFI calls (`naso_spawn`, `naso_yield`, `naso_future_*`, `naso_channel_*`) to codegen
-5. Generate state machine struct with future storage for each async function
-6. Test: compile async Naso code end-to-end
+1. ✅ Create `compiler/src/codegen/llvm/async_lowering.rs` with `AsyncLowerer`
+2. ✅ Add `PirExpr::Async` and `PirExpr::Await` match arms in expr_lowering (delegates to AsyncLowerer)
+3. ✅ Implement `build_async` — calls `naso_future_new`, builds body via `PirExprLowerer`, completes via `naso_future_complete`
+4. ✅ Implement `build_await` — calls `naso_await`, retrieves result via `naso_future_get_result`
+5. ✅ Wire FFI calls (`naso_future_new`, `naso_await`, `naso_future_complete`, `naso_future_get_result`) to codegen
+6. ⬜ Implement `await` point splitting (separate basic blocks before/after each await)
+7. ⬜ Add `naso_spawn`, `naso_yield`, `naso_channel_*` FFI wiring
+8. ⬜ Generate state machine struct with future storage for each async function
+9. ⬜ Test: compile async Naso code end-to-end
 
-**Note**: LLVM backend currently has inkwell/LLVM 14 API mismatches in existing codegen (abi_guard, abi_llvm, access_emission, value_builder, type_lowering, qir/module_builder). Compiler compiles cleanly without `--features llvm`. The async lowering is a stub returning `UnsupportedFeature` — ready for incremental implementation once LLVM backend is fixed.
+**Note**: LLVM backend currently has inkwell/LLVM 14 API mismatches in existing codegen (abi_guard, abi_llvm, access_emission, value_builder, type_lowering, qir/module_builder). Compiler compiles cleanly without `--features llvm`. The async lowering is implemented (not just stubbed) but requires working LLVM backend for full testing.
 
 This will enable native Naso async servers that can finally compete with Rust's multi-threaded async model.
 

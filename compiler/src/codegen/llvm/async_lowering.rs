@@ -43,6 +43,13 @@ pub struct AsyncLowerer<'ctx, 'm> {
     await_point: u32,
 }
 
+/// Information about an await point for state machine generation
+struct AwaitPoint<'ctx> {
+    state: u8,
+    resume_block: inkwell::basic_block::BasicBlock<'ctx>,
+    captured_vars: Vec<(String, BasicValueEnum<'ctx>)>,
+}
+
 impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
     pub fn new(
         module_builder: &'m mut LLVMModuleBuilder<'ctx>,
@@ -78,6 +85,8 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
 
         // Get FFI functions
         let future_new_fn = self.get_or_declare_naso_future_new()?;
+        let spawn_fn = self.get_or_declare_naso_spawn()?;
+        let yield_fn = self.get_or_declare_naso_yield()?;
 
         // Create future struct: call naso_future_new()
         let future_ptr = value_builder
@@ -104,6 +113,12 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
         // Complete the future with the body result
         // In real impl, this would be done by the spawned task
         self.complete_future(future_ptr, body_val, value_builder)?;
+
+        // Spawn the async task on the runtime
+        let _ = value_builder
+            .builder()
+            .build_call(spawn_fn, &[future_ptr.into()], "async.spawn")
+            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
 
         // Restore context
         self.current_async_id = prev_async_id;
@@ -137,21 +152,21 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
 
         // Get naso_await FFI
         let await_fn = self.get_or_declare_naso_await()?;
+        let yield_fn = self.get_or_declare_naso_yield()?;
 
-        // Call naso_await(future_ptr)
-        let result = value_builder
+        // Call naso_await(future_ptr) - this polls the future
+        let _ = value_builder
             .builder()
-            .build_call(await_fn, &[future_ptr.into()], "await.result")
-            .map_err(|e| CodegenError::InstructionError(e.to_string()))?
-            .try_as_basic_value()
-            .basic()
-            .ok_or_else(|| CodegenError::InstructionError("naso_await returned void".to_string()))?;
+            .build_call(await_fn, &[future_ptr.into()], "await.poll")
+            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
 
-        // naso_await returns: 0=pending, 1=ready, 2=error
-        // If pending, we'd yield here. For now, assume ready and get result.
-        // In real impl, we'd split the function at this await point.
+        // Call naso_yield() to yield control back to the runtime
+        let _ = value_builder
+            .builder()
+            .build_call(yield_fn, &[], "await.yield")
+            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
 
-        // Get the future result
+        // Get the future result after resuming
         let future_get_fn = self.get_or_declare_naso_future_get_result()?;
         let result_ptr = value_builder.builder().build_alloca(
             value_builder.type_lowering().int_type(crate::codegen::abi::IntWidth::I8).into(),

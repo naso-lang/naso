@@ -1140,15 +1140,39 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
             // unreachable, and a mutation restoring the old behaviour survived every
             // other test in the file.
             PirExpr::Reversible { .. } => Err(CodegenError::UnsupportedFeature(
-                "a `Reversible` block reached codegen, and this backend does not \
-                 perform uncomputation. The INVERSE is not optional -- it is the part \
-                 that undoes the computation -- so emitting the body alone would leave \
-                 the state the block existed to erase. Refused rather than half-run."
-                    .to_string(),
-            )),
-            PirExpr::Async { .. } => Err(CodegenError::UnsupportedFeature(
-                "async block lowering not yet implemented".to_string(),
-            )),
+                            "a `Reversible` block reached codegen, and this backend does not \\\n                 perform uncomputation. The INVERSE is not optional -- it is the part \\\n                 that undoes the computation -- so emitting the body alone would leave \\\n                 the state the block existed to erase. Refused rather than half-run."
+                                .to_string(),
+                        )),
+                        PirExpr::Async { body } => {
+                            let mut async_lowerer = crate::codegen::llvm::async_lowering::AsyncLowerer::new(
+                                self.module_builder,
+                                self.quantities,
+                            );
+                            async_lowerer.build_async(
+                                body,
+                                self.value_builder,
+                                self.module,
+                                self.current_function,
+                                self.callee_params,
+                                self.in_statement_position,
+                                self.loop_stack,
+                            )
+                        }
+                        PirExpr::Await { future } => {
+                            let mut async_lowerer = crate::codegen::llvm::async_lowering::AsyncLowerer::new(
+                                self.module_builder,
+                                self.quantities,
+                            );
+                            async_lowerer.build_await(
+                                future,
+                                self.value_builder,
+                                self.module,
+                                self.current_function,
+                                self.callee_params,
+                                self.in_statement_position,
+                                self.loop_stack,
+                            )
+                        }
             PirExpr::Await { .. } => Err(CodegenError::UnsupportedFeature(
                 "await expression lowering not yet implemented".to_string(),
             )),

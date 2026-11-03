@@ -7,6 +7,8 @@ pub mod abi_guard;
 #[cfg(feature = "llvm")]
 pub mod access_emission;
 #[cfg(feature = "llvm")]
+pub mod async_lowering;
+#[cfg(feature = "llvm")]
 pub mod expr_lowering;
 #[cfg(feature = "llvm")]
 pub mod function_emission;
@@ -27,6 +29,8 @@ pub mod value_builder;
 
 #[cfg(feature = "llvm")]
 pub use access_emission::AccessEmitter;
+#[cfg(feature = "llvm")]
+pub use async_lowering::{AsyncLowerer, AsyncLoweringExt};
 #[cfg(feature = "llvm")]
 pub use expr_lowering::PirExprLowerer;
 #[cfg(feature = "llvm")]

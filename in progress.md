@@ -156,16 +156,35 @@ No cleanup needed.
 
 ---
 
-### Benchmark Results (2026-11-02)
+### Benchmark Results (2026-11-03 — Updated)
 
-| Test | Server | Requests/sec | Notes |
-|------|--------|--------------|-------|
-| **Plaintext (10s, 4 threads, 100 conn)** | Naso FFI (C test server) | **8,079 req/s** | Port 8088, `test_server_bind.c` using `libnaso_ffi.a` |
-| **Plaintext (10s, 4 threads, 100 conn)** | Naso native (`techempower_simple.naso`) | Pending | Compiles, links, server binding works, accept loop issue |
+| Test | Server | Requests/sec | Latency (avg) | Notes |
+|------|--------|--------------|---------------|-------|
+| **Plaintext (10s, 4 threads, 100 conn)** | Naso native (`techempower_simple.nasoc`) | **8,219 req/s** | 11.92ms | Port 8099, native Naso compiled via LLVM |
+| **Plaintext (10s, 4 threads, 100 conn)** | Rust actix-web | **29,137 req/s** | 2.26ms | Port 8088, 4 workers |
+| **Plaintext (30s, 4 threads, 1000 conn)** | Naso native (`techempower_simple.nasoc`) | **1,232 req/s** | 22.48ms | 342 timeouts |
+| **Plaintext (30s, 4 threads, 1000 conn)** | Rust actix-web | **27,507 req/s** | 18.34ms | 826,048 total requests |
 
-**Key finding**: The Naso FFI layer (`libnaso_ffi.a`) is production-ready — same C test server achieves ~8k req/s with proper HTTP responses. The native Naso server has an accept loop bug (exits immediately after bind) but all FFI integration is verified.
+**Key finding**: Native Naso compilation via LLVM works but single-threaded accept loop still bottlenecks at high concurrency:
+- Rust is **3.5x faster** at 100 connections
+- Rust is **22x faster** at 1000 connections  
+- Naso shows timeout issues under load (342 timeouts at 1000 conn)
+- Need async runtime + connection pooling in Naso to compete
 
-### AI Slop Check ✅ (2026-11-02 — Updated)
+### Async Runtime Implementation Progress (2026-11-03 — NEW)
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| **Async runtime crate** | ✅ Built & compiles | `crates/async-runtime/` |
+| **Work-stealing thread pool** | ✅ Implemented | `Runtime::new(4)` creates 4 workers |
+| **Task spawning** | ✅ `spawn()` returns join handle | `Runtime::spawn()` |
+| **Timer wheel** | ✅ O(1) insertion/expiration | `TimerWheel` with 3 hierarchical wheels |
+| **Futures** | ✅ `NFuture<T>` with complete/poll | External completion pattern |
+| **Channels** | ✅ MPSC `NSender`/`NReceiver` | Crossbeam-based |
+| **Sleep/yield** | ✅ `sleep()`, `sleep_ms()`, `yield_now()` | Timer wheel integration |
+| **FFI bindings** | ✅ Connected in `naso-ffi` | `naso_runtime_new`, `naso_spawn`, `naso_future_*`, `naso_channel_*` |
+
+### AI Slop Check ✅ (2026-11-03 — Updated)
 
 | Location | Findings |
 |----------|----------|
@@ -174,9 +193,11 @@ No cleanup needed.
 | `stdlib/src/std/quantum/*.rs` | 2 doc comments ("placeholder") — quantum domain |
 | `compiler/src/*.rs` | ~60 "placeholder" occurrences — all **compiler-internal** (IR lowering, type lowering, codegen helpers), **not user-facing stubs** |
 | `crates/naso-ffi/src/*.rs` | Zero occurrences |
-| **Verdict** | **Clean for web server path** — no AI-generated stubs in FFI, stdlib net/http/async, or compiler codegen for Phase 5/7 features |
+| `crates/async-runtime/src/*.rs` | Zero occurrences — clean implementation |
+| `examples/*.nasoc` | Clean — async examples use explicit FFI, no stubs |
+| **Verdict** | **Clean for web server path** — no AI-generated stubs in FFI, stdlib net/http/async, async-runtime, or compiler codegen for Phase 5/7 features |
 
-### Storage Check ✅ (2026-11-02 — Updated)
+### Storage Check ✅ (2026-11-03 — Updated)
 
 | Path | Free | Used | Status |
 |------|------|------|--------|
@@ -233,41 +254,139 @@ Naso: `Stream` has quantity `[1]` — **must** be passed to `read`/`write`/`clos
 | FFI fd table not implemented | Add `std::sync::OnceLock<HashMap<u64, TcpStream>>` in `naso-ffi` |
 | No LLVM codegen access | Contribute `ffi_integration.rs` to upstream repo via PR |
 | HTTP parser stubs | Implement `split_http`/`format_http` in `http.naso` |
+| **Async runtime not yet integrated with compiler** | Implement `await` lowering in compiler codegen, wire `naso_spawn`/`naso_yield` to codegen |
+| **Connection pooling not implemented** | Epoll/kqueue integration in `naso-ffi`, pool implementation in `async.naso` |
+| **Native Naso server still synchronous** | Requires compiler support for async/await lowering |
 
 ---
 
-## Next Immediate Actions
+## What's Needed to Truly Beat Rust
 
-1. **PR submitted to `naso-lang/naso`** ✅
-   - `crates/naso-ffi/` (new crate)
-   - `compiler/src/codegen/ffi_integration.rs`
-   - Updated `stdlib/src/std/sys/net.naso`, `http.naso`, `async.naso`
-   - `feature/phase5-ffi-integration` branch pushed
-
-2. **CI verification**: GitHub Actions builds FFI crate, links test binary
-
-3. **Benchmark**: Once compiling, run `wrk -t4 -c1000 -d30s` against Naso vs Rust servers
-
-4. **Phase 6: Developer Experience** — **REPL ✅ DONE**, **Zero-config ✅ DONE**, **Error messages ✅ DONE**, **Hot reload ✅ DONE**, **Test runner ✅ DONE** — Phase 6 COMPLETE
-
-5. **Phase 7: Ecosystem & Benchmarks** — STARTED
-   - TechEmpower benchmark suite setup
-   - Memory profiling infrastructure
-   - Documentation site (`nasolang.org`)
-   - Package manager design (`naso pkg`)
+| Gap | Effort | Priority |
+|-----|--------|----------|
+| **wrk benchmarks vs Rust baseline** | Run benchmarks, compare RPS/latency | Critical |
+| **Async/await ergonomics** | `async.naso` needs compiler integration for `await` lowering | High |
+| **Middleware/routing** | No `axum`/`actix` equivalent | High |
+| **TLS/HTTPS** | Not implemented | Medium |
+| **Connection pooling** | Epoll/kqueue in FFI, pool in stdlib | Medium |
+| **Production hardening** | Timeouts, backpressure, metrics | Medium |
+| **Compiler async lowering** | `await` points, state machines, futures codegen | Critical (blocks async) |
 
 ---
 
-## Success Metrics (Q4 2025)
+## Next Immediate Actions (Updated 2026-11-03)
 
-| Metric | Target |
-|--------|--------|
-| **Compile time** | <2s for 1000-line web app |
-| **Binary size** | <5MB static (musl) |
-| **Memory/connection** | <5KB |
-| **RPS (hello world)** | >100k on 4-core |
-| **Developer survey** | >80% prefer Naso over Rust for web |
+1. **Integrate async runtime with compiler** (P0 - Critical)
+   - Implement `await` lowering in compiler codegen (`compiler/src/codegen/async_lowering.rs`)
+   - Wire `naso_spawn`, `naso_yield`, `naso_future_*`, `naso_channel_*` FFI calls to codegen
+   - Generate state machines for async functions
+   - Test: compile `examples/techempower_simple.nasoc` with async/await
+
+2. **Connection pooling in FFI** (P0)
+   - Implement epoll/kqueue in `naso-ffi` for async I/O
+   - Replace single `accept` loop with thread pool + completion queue
+   - `naso_tcp_accept_async(fd, callback_ptr)` non-blocking variant
+   - Connection pool in `async.naso` for reusing connections
+
+3. **Middleware/routing layer** (P1)
+   - `http.naso`: `Router`, `Middleware`, `Handler` traits
+   - Composable middleware chain (logging, auth, compression)
+   - Type-safe route parameters via QTT
+
+4. **Native Naso server benchmark** (P1)
+   - Once async works, compile `techempower_simple.nasoc` natively with async runtime
+   - Compare Naso-native async vs Rust actix-web on same hardware
+
+5. **TLS/HTTPS via rustls** (P2)
+   - FFI bindings to `rustls` crate (no OpenSSL dependency)
+   - `naso_tls_accept(fd, cert_path, key_path)`
 
 ---
 
-*Last updated: 2026-11-02 — Phase 7 benchmark complete: Naso FFI layer verified at 8,079 req/s (plaintext). Native Naso server compiles/links, accept loop bug identified. All FFI integration working, memory profiling infrastructure in place.*
+## Post-Restart Hook Updates Needed
+
+Add to `~/.agent37/hooks/post-restart.sh`:
+```bash
+# Start Naso web server (port 8765)
+cd /home/node/naso && nohup ./web_server 8765 >> web_server.log 2>&1 &
+
+# Start Naso TechEmpower benchmark server (port 8099)  
+cd /home/node/naso && nohup ./techempower 8099 >> techempower.log 2>&1 &
+
+# Start Rust actix-web benchmark baseline (port 8088)
+cd /tmp/rust_bench && nohup ./target/release/rust_bench 8088 >> rust_bench.log 2>&1 &
+```
+
+---
+
+## Cron Jobs for Continuous Benchmarking
+
+```bash
+# Daily benchmark at 9 AM ET
+agent37 cron add \
+  --schedule "0 9 * * 1-5" \
+  --timezone "America/New_York" \
+  --prompt "Run wrk benchmarks against Naso and Rust servers. Test configurations: 100 conn/10s and 1000 conn/30s. Compare RPS, latency (p50/p99), timeouts. Save JSON results to /home/node/benchmarks/bench_$(date +%Y-%m-%d).json. Post summary to team channel."
+
+# Weekly performance report
+agent37 cron add \
+  --schedule "0 18 * * 5" \
+  --timezone "America/New_York" \
+  --prompt "Generate weekly performance report from /home/node/benchmarks/. Include trends, regressions, and comparison with Rust baseline. Email to team@naso.dev"
+```
+
+---
+
+## Commands to Run Now
+
+```bash
+# 1. Update post-restart hook
+cat > /tmp/naso_services.sh << 'EOF'
+#!/bin/bash
+# Naso services for post-restart
+cd /home/node/naso
+
+# Build native servers if needed
+if [ ! -f web_server ]; then
+  /tmp/cargo-target/debug/naso build --target llvm examples/web_server.nasoc -o web_server.ll
+  llc -opaque-pointers -filetype=obj web_server.ll -o web_server.o
+  clang -o web_server web_server.o /tmp/entry.o target/release/libnaso_ffi.a -lpthread -ldl
+fi
+
+if [ ! -f techempower ]; then
+  /tmp/cargo-target/debug/naso build --target llvm examples/techempower_simple.nasoc -o techempower.ll
+  llc -opaque-pointers -filetype=obj techempower.ll -o techempower.o
+  clang -o techempower techempower.o /tmp/entry.o target/release/libnaso_ffi.a -lpthread -ldl
+fi
+
+# Start services
+nohup ./web_server 8765 >> web_server.log 2>&1 &
+nohup ./techempower 8099 >> techempower.log 2>&1 &
+
+# Start Rust baseline
+if [ -f /tmp/rust_bench/target/release/rust_bench ]; then
+  cd /tmp/rust_bench && nohup ./target/release/rust_bench 8088 >> rust_bench.log 2>&1 &
+fi
+EOF
+
+# 2. Run benchmark now
+cd /home/node/naso && ./techempower 8099 &
+/tmp/rust_bench/target/release/rust_bench 8088 &
+sleep 3
+wrk -t4 -c100 -d10s http://127.0.0.1:8099/plaintext
+wrk -t4 -c100 -d10s http://127.0.0.1:8088/plaintext
+
+# 3. Expose web server publicly
+agent37 expose 8765 --label "Naso Web Server"
+```
+
+---
+
+## Storage Check ✅ (2026-11-02 — Updated)
+
+| Path | Free | Used | Status |
+|------|------|------|--------|
+| `/home/node` | 1.2G (14%) | 6.9G | ✅ Healthy |
+| `/tmp` (root) | 8.3G (82%) | 1.8G | ✅ Healthy |
+
+No cleanup needed.

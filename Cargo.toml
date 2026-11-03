@@ -8,6 +8,8 @@ members = [
     "crates/naso-gates",
     "crates/nasoc-wasm",
     "crates/naso-ffi",
+    "crates/async-runtime",
+    "bench_rust",
 ]
 
 [workspace.package]

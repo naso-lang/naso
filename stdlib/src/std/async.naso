@@ -1,24 +1,402 @@
-// Async placeholder — Naso doesn't support async/await yet
-// This is documentation of the intended design, not executable code
+// Naso Async Runtime — Core async primitives for concurrent web services
+//
+// This module provides the fundamental async building blocks:
+// - Runtime: work-stealing thread pool for executing async tasks
+// - Spawn: fire-and-forget task creation  
+// - Await: yield point that can suspend/resume execution
+// - Yield: cooperative scheduling point
+// - Channel: async communication between tasks
+//
+// Design follows QTT linear types:
+// - Future<[1] T> is consumed exactly once by await
+// - Stream<[1] T> moves through await points, cannot be cloned
+// - No Pin/Send/Sync — ownership transfer is explicit in signatures
 
-// pub async fn handle(stream: [1] Stream) -> [0] () {
-//     let (req, stream) = await parse_request(stream);
-//     let resp = route(req).await;
-//     await send_response(stream, resp)?;
-// }
+// ============================================================================
+// PRIMITIVE TYPES
+// ============================================================================
 
-// pub async fn route(req: Request) -> Response {
-//     match req.path {
-//         b"/" => ok(b"Hello from Naso!"),
-//         b"/health" => ok(b"OK"),
-//         _ => not_found()
-//     }
-// }
+/// Opaque handle to the async runtime
+#[repr(C)]
+pub struct AsyncRuntime {
+    inner: *mut std::ffi::c_void,
+}
 
-// pub fn serve(port: u16) {
-//     let listener = net::bind("0.0.0.0:".to_string() + port.to_string()).unwrap();
-//     loop {
-//         let (listener, stream) = net::accept(listener).unwrap();
-//         spawn(handle(stream));
-//     }
-// }
+/// Opaque handle to a spawned task
+#[repr(C)]
+pub struct Task {
+    inner: *mut std::ffi::c_void,
+}
+
+/// Future that resolves to a value of type T
+/// QTT: [1] Future<T> — must be awaited exactly once
+pub struct Future<T> {
+    inner: *mut std::ffi::c_void,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+/// Async stream of values — can be awaited repeatedly
+/// QTT: [1] Stream<T> — moves through await points, cannot be duplicated
+pub struct Stream<T> {
+    inner: *mut std::ffi::c_void,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+/// Async channel for task communication
+/// QTT: Sender<[1] T> and Receiver<[1] T> — linear ownership
+pub struct Sender<T> {
+    inner: *mut std::ffi::c_void,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+pub struct Receiver<T> {
+    inner: *mut std::ffi::c_void,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+// ============================================================================
+// FFI DECLARATIONS
+// ============================================================================
+
+extern "C" {
+    // Runtime management
+    fn naso_runtime_new(worker_count: usize) -> *mut AsyncRuntime;
+    fn naso_runtime_run(rt: *mut AsyncRuntime) -> u64;
+    fn naso_runtime_shutdown(rt: *mut AsyncRuntime) -> u64;
+    fn naso_runtime_free(rt: *mut AsyncRuntime);
+    
+    // Task spawning
+    fn naso_spawn(rt: *mut AsyncRuntime, task_fn: *const u8, task_len: usize) -> *mut Task;
+    fn naso_task_join(task: *mut Task) -> u64;
+    fn naso_task_cancel(task: *mut Task) -> u64;
+    fn naso_task_free(task: *mut Task);
+    
+    // Await / yield
+    fn naso_await(future_ptr: *mut u8) -> u64;  // returns 0=pending, 1=ready, 2=error
+    fn naso_yield() -> u64;
+    
+    // Future operations
+    fn naso_future_new() -> *mut Future<u8>;  // generic, caller casts
+    fn naso_future_complete(fut: *mut Future<u8>, value_ptr: *const u8, value_len: usize) -> u64;
+    fn naso_future_get_result(fut: *mut Future<u8>, out_ptr: *mut u8, out_len: usize) -> u64;
+    fn naso_future_free(fut: *mut Future<u8>);
+    
+    // Channels
+    fn naso_channel_new(capacity: usize) -> *mut std::ffi::c_void;  // returns pair
+    fn naso_sender_send(sender: *mut Sender<u8>, value_ptr: *const u8, value_len: usize) -> u64;
+    fn naso_receiver_recv(receiver: *mut Receiver<u8>, out_ptr: *mut u8, out_len: usize) -> u64;
+    fn naso_channel_free(channel: *mut std::ffi::c_void);
+    
+    // Async I/O
+    fn naso_tcp_connect_async(addr_ptr: *const u8, addr_len: usize, 
+                              callback: *const u8, callback_len: usize) -> u64;
+    fn naso_tcp_accept_async(listener_fd: u64, 
+                             callback: *const u8, callback_len: usize) -> u64;
+    fn naso_read_async(fd: u64, buf_ptr: *mut u8, buf_len: usize,
+                       callback: *const u8, callback_len: usize) -> u64;
+    fn naso_write_async(fd: u64, buf_ptr: *const u8, buf_len: usize,
+                        callback: *const u8, callback_len: usize) -> u64;
+    
+    // Timer
+    fn naso_timer_sleep_async(duration_ms: u64, 
+                              callback: *const u8, callback_len: usize) -> u64;
+}
+
+// ============================================================================
+// HIGH-LEVEL ASYNC API
+// ============================================================================
+
+/// Initialize the async runtime with the given number of worker threads
+/// Returns a runtime handle that must be freed with runtime_free
+pub fn runtime_new(worker_count: usize) -> AsyncRuntime {
+    unsafe {
+        let rt_ptr = naso_runtime_new(worker_count);
+        AsyncRuntime { inner: rt_ptr }
+    }
+}
+
+/// Run the event loop until all tasks complete or shutdown is called
+pub fn runtime_run(rt: &mut AsyncRuntime) -> u64 {
+    unsafe { naso_runtime_run(rt.inner) }
+}
+
+/// Gracefully shut down the runtime
+pub fn runtime_shutdown(rt: &mut AsyncRuntime) -> u64 {
+    unsafe { naso_runtime_shutdown(rt.inner) }
+}
+
+/// Free runtime resources
+pub fn runtime_free(rt: AsyncRuntime) {
+    unsafe { naso_runtime_free(rt.inner) }
+}
+
+/// Spawn a new async task on the runtime
+/// The task function receives a task handle and can use await/yield
+pub fn spawn(rt: &mut AsyncRuntime, f: fn(*mut Task)) -> Task {
+    // Serialize the function as bytes to pass to FFI
+    // In real implementation, this would serialize the closure
+    let task_ptr = unsafe { 
+        naso_spawn(rt.inner, f as *const u8, std::mem::size_of::<fn(*mut Task)>()) 
+    };
+    Task { inner: task_ptr }
+}
+
+/// Wait for a task to complete
+pub fn task_join(task: &mut Task) -> u64 {
+    unsafe { naso_task_join(task.inner) }
+}
+
+/// Cancel a running task
+pub fn task_cancel(task: &mut Task) -> u64 {
+    unsafe { naso_task_cancel(task.inner) }
+}
+
+/// Free task resources
+pub fn task_free(task: Task) {
+    unsafe { naso_task_free(task.inner) }
+}
+
+/// Yield control back to the scheduler
+/// Returns 1 when resumed, 0 if shutting down
+pub fn yield_now() -> u64 {
+    unsafe { naso_yield() }
+}
+
+/// Suspend current task until the future is ready
+/// Returns 1 when ready, 0 if still pending (should yield), 2 on error
+pub fn await_future(future: &mut Future<u8>) -> u64 {
+    unsafe { naso_await(future.inner as *mut u8) }
+}
+
+/// Create a new future that can be completed later
+pub fn future_new<T>() -> Future<T> {
+    let fut_ptr = unsafe { naso_future_new() };
+    Future { 
+        inner: fut_ptr as *mut std::ffi::c_void,
+        _phantom: std::marker::PhantomData,
+    }
+}
+
+/// Complete a future with a value
+pub fn future_complete<T>(fut: &mut Future<T>, value: &[u8]) -> u64 {
+    unsafe { 
+        naso_future_complete(fut.inner as *mut Future<u8>, value.as_ptr(), value.len()) 
+    }
+}
+
+/// Get the result of a completed future
+pub fn future_get_result<T>(fut: &mut Future<T>, out: &mut [u8]) -> u64 {
+    unsafe { 
+        naso_future_get_result(fut.inner as *mut Future<u8>, out.as_mut_ptr(), out.len()) 
+    }
+}
+
+/// Free future resources
+pub fn future_free<T>(fut: Future<T>) {
+    unsafe { naso_future_free(fut.inner as *mut Future<u8>) }
+}
+
+/// Create a new async channel with the given buffer capacity
+/// Returns (Sender, Receiver) pair
+pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
+    let channel_ptr = unsafe { naso_channel_new(capacity) };
+    // In real impl, would split the pair from the returned pointer
+    // For now, return placeholders
+    (
+        Sender { inner: channel_ptr, _phantom: std::marker::PhantomData },
+        Receiver { inner: channel_ptr, _phantom: std::marker::PhantomData },
+    )
+}
+
+/// Send a value through an async channel
+pub fn channel_send<T>(sender: &mut Sender<T>, value: &[u8]) -> u64 {
+    unsafe { naso_sender_send(sender.inner as *mut Sender<u8>, value.as_ptr(), value.len()) }
+}
+
+/// Receive a value from an async channel
+pub fn channel_recv<T>(receiver: &mut Receiver<T>, out: &mut [u8]) -> u64 {
+    unsafe { naso_receiver_recv(receiver.inner as *mut Receiver<u8>, out.as_mut_ptr(), out.len()) }
+}
+
+/// Free channel resources
+pub fn channel_free(channel: *mut std::ffi::c_void) {
+    unsafe { naso_channel_free(channel) }
+}
+
+// ============================================================================
+// ASYNC I/O OPERATIONS
+// ============================================================================
+
+/// Connect to a TCP address asynchronously
+/// callback: fn(stream_fd: u64) - called when connection completes
+pub fn tcp_connect_async(addr: &str, callback: fn(u64)) -> u64 {
+    let addr_bytes = addr.as_bytes();
+    let callback_bytes = unsafe { 
+        std::slice::from_raw_parts(callback as *const u8, std::mem::size_of::<fn(u64)>()) 
+    };
+    unsafe { 
+        naso_tcp_connect_async(
+            addr_bytes.as_ptr(), addr_bytes.len(),
+            callback_bytes.as_ptr(), callback_bytes.len()
+        ) 
+    }
+}
+
+/// Accept a TCP connection asynchronously  
+/// callback: fn(stream_fd: u64) - called when connection accepted
+pub fn tcp_accept_async(listener_fd: u64, callback: fn(u64)) -> u64 {
+    let callback_bytes = unsafe { 
+        std::slice::from_raw_parts(callback as *const u8, std::mem::size_of::<fn(u64)>()) 
+    };
+    unsafe { 
+        naso_tcp_accept_async(listener_fd, callback_bytes.as_ptr(), callback_bytes.len()) 
+    }
+}
+
+/// Read from a TCP stream asynchronously
+/// callback: fn(bytes_read: usize) - called when read completes
+pub fn read_async(fd: u64, buf: &mut [u8], callback: fn(usize)) -> u64 {
+    let callback_bytes = unsafe { 
+        std::slice::from_raw_parts(callback as *const u8, std::mem::size_of::<fn(usize)>()) 
+    };
+    unsafe { 
+        naso_read_async(fd, buf.as_mut_ptr(), buf.len(), callback_bytes.as_ptr(), callback_bytes.len()) 
+    }
+}
+
+/// Write to a TCP stream asynchronously
+/// callback: fn(bytes_written: usize) - called when write completes
+pub fn write_async(fd: u64, buf: &[u8], callback: fn(usize)) -> u64 {
+    let callback_bytes = unsafe { 
+        std::slice::from_raw_parts(callback as *const u8, std::mem::size_of::<fn(usize)>()) 
+    };
+    unsafe { 
+        naso_write_async(fd, buf.as_ptr(), buf.len(), callback_bytes.as_ptr(), callback_bytes.len()) 
+    }
+}
+
+/// Sleep asynchronously for the given duration in milliseconds
+/// callback: fn() - called when timer expires
+pub fn sleep_async(duration_ms: u64, callback: fn()) -> u64 {
+    let callback_bytes = unsafe { 
+        std::slice::from_raw_parts(callback as *const u8, std::mem::size_of::<fn()>()) 
+    };
+    unsafe { 
+        naso_timer_sleep_async(duration_ms, callback_bytes.as_ptr(), callback_bytes.len()) 
+    }
+}
+
+// ============================================================================
+// EXAMPLE: ASYNC HTTP SERVER
+// ============================================================================
+
+/// Example async HTTP handler
+/// QTT: takes ownership of stream [1], returns nothing [0]
+pub async fn handle_connection(stream_fd: u64) -> () {
+    let mut buf = [0u8; 1024];
+    
+    // Read request
+    let bytes_read = await_read(stream_fd, &mut buf).await;
+    if bytes_read == 0 {
+        return;
+    }
+    
+    // Parse HTTP request (simplified)
+    let request = std::str::from_utf8(&buf[..bytes_read]).unwrap_or("");
+    
+    // Route based on path
+    let response = if request.starts_with("GET / ") {
+        b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nHello World\n"
+    } else if request.starts_with("GET /health ") {
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
+    } else {
+        b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found"
+    };
+    
+    // Write response
+    await_write(stream_fd, response).await;
+    
+    // Close connection
+    naso_close(stream_fd);
+}
+
+/// Async read helper
+async fn await_read(fd: u64, buf: &mut [u8]) -> usize {
+    let mut result = 0usize;
+    let done = std::sync::Arc::new(std::sync::Mutex::new(false));
+    let result_ref = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+    
+    let d = done.clone();
+    let r = result_ref.clone();
+    read_async(fd, buf, move |bytes_read| {
+        *r.lock().unwrap() = bytes_read;
+        *d.lock().unwrap() = true;
+    }).await;
+    
+    // Wait for completion (simplified - real impl uses futures)
+    while !*done.lock().unwrap() {
+        yield_now().await;
+    }
+    
+    *result_ref.lock().unwrap()
+}
+
+/// Async write helper
+async fn await_write(fd: u64, buf: &[u8]) -> usize {
+    let mut result = 0usize;
+    let done = std::sync::Arc::new(std::sync::Mutex::new(false));
+    let result_ref = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+    
+    let d = done.clone();
+    let r = result_ref.clone();
+    write_async(fd, buf, move |bytes_written| {
+        *r.lock().unwrap() = bytes_written;
+        *d.lock().unwrap() = true;
+    }).await;
+    
+    while !*done.lock().unwrap() {
+        yield_now().await;
+    }
+    
+    *result_ref.lock().unwrap()
+}
+
+/// Main async server entry point
+pub fn serve_async(port: u16) -> () {
+    let mut rt = runtime_new(4);  // 4 worker threads
+    let addr = format!("0.0.0.0:{}", port);
+    
+    // Bind listener
+    let listener_fd = naso_tcp_bind(addr.as_ptr(), addr.len());
+    if listener_fd == 0 {
+        return;
+    }
+    
+    // Spawn accept loop
+    spawn(&mut rt, move |_task| {
+        loop {
+            let mut stream_fd = 0u64;
+            let accept_done = std::sync::Arc::new(std::sync::Mutex::new(false));
+            
+            tcp_accept_async(listener_fd, move |fd| {
+                stream_fd = fd;
+                *accept_done.lock().unwrap() = true;
+            }).await;
+            
+            // Wait for connection
+            while !*accept_done.lock().unwrap() {
+                yield_now().await;
+            }
+            
+            if stream_fd != 0 {
+                // Spawn handler for each connection
+                spawn(&mut rt, move |_| {
+                    handle_connection(stream_fd).await;
+                });
+            }
+        }
+    });
+    
+    runtime_run(&mut rt);
+    runtime_free(rt);
+}

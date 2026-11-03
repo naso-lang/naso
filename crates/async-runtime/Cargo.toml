@@ -1,0 +1,9 @@
+[package]
+name = "async-runtime"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossbeam = "0.8"
+parking_lot = "0.12"
+futures = "0.3"

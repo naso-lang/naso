@@ -325,10 +325,11 @@ The async runtime and FFI layer are complete. The next phase is **compiler codeg
 3. ✅ Implement `build_async` — calls `naso_future_new`, builds body via `PirExprLowerer`, completes via `naso_future_complete`
 4. ✅ Implement `build_await` — calls `naso_await`, retrieves result via `naso_future_get_result`
 5. ✅ Wire FFI calls (`naso_future_new`, `naso_await`, `naso_future_complete`, `naso_future_get_result`) to codegen
-6. ⬜ Implement `await` point splitting (separate basic blocks before/after each await)
-7. ⬜ Add `naso_spawn`, `naso_yield`, `naso_channel_*` FFI wiring
-8. ⬜ Generate state machine struct with future storage for each async function
-9. ⬜ Test: compile async Naso code end-to-end
+6. ✅ Parser support: async/await keywords in all contexts (extern blocks, top-level fn, expressions)
+7. ⬜ Implement `await` point splitting (separate basic blocks before/after each await)
+8. ⬜ Add `naso_spawn`, `naso_yield`, `naso_channel_*` FFI wiring
+9. ⬜ Generate state machine struct with future storage for each async function
+10. ⬜ Test: compile async Naso code end-to-end
 
 **Note**: LLVM backend currently has inkwell/LLVM 14 API mismatches in existing codegen (abi_guard, abi_llvm, access_emission, value_builder, type_lowering, qir/module_builder). Compiler compiles cleanly without `--features llvm`. The async lowering is implemented (not just stubbed) but requires working LLVM backend for full testing.
 

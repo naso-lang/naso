@@ -116,6 +116,10 @@ pub enum ExprKind {
     Ascribe(Box<Expr>, crate::ast::ty::Type),
     /// Range expression `start..end` (exclusive)
     Range(Box<Expr>, Box<Expr>),
+    /// Async block: `async { ... }` - creates a future
+    Async(Box<crate::ast::Block>),
+    /// Await expression: `await future` - suspends until future completes
+    Await(Box<Expr>),
     /// Error placeholder
     Error,
 }

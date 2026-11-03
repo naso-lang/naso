@@ -252,6 +252,8 @@ fn expr_contains_var(expr: &PirExpr, var: &str) -> bool {
         }
         PirExpr::Array { items } => items.iter().any(|a| expr_contains_var(a, var)),
         PirExpr::Struct { fields } => fields.iter().any(|f| expr_contains_var(f, var)),
+        PirExpr::Async(inner) => expr_contains_var(inner, var),
+        PirExpr::Await(inner) => expr_contains_var(inner, var),
         PirExpr::IntLit(_) | PirExpr::FloatLit(_) | PirExpr::BoolLit(_) => false,
     }
 }

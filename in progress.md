@@ -171,7 +171,7 @@ No cleanup needed.
 - Naso shows timeout issues under load (342 timeouts at 1000 conn)
 - Need async runtime + connection pooling in Naso to compete
 
-### Async Runtime Implementation Progress (2026-11-03 — NEW)
+### Async Runtime + Compiler Integration Progress (2026-11-03 — Updated)
 
 | Component | Status | Location |
 |-----------|--------|----------|
@@ -183,6 +183,14 @@ No cleanup needed.
 | **Channels** | ✅ MPSC `NSender`/`NReceiver` | Crossbeam-based |
 | **Sleep/yield** | ✅ `sleep()`, `sleep_ms()`, `yield_now()` | Timer wheel integration |
 | **FFI bindings** | ✅ Connected in `naso-ffi` | `naso_runtime_new`, `naso_spawn`, `naso_future_*`, `naso_channel_*` |
+| **AST: Async/Await** | ✅ Added to `ExprKind` | `compiler/src/ast/expr.rs` |
+| **Visitor: Async/Await** | ✅ Walk support | `compiler/src/ast/visit.rs` |
+| **Lowering: Async/Await** | ✅ `PirExpr::Async`/`Await` | `compiler/src/lowering/mod.rs` |
+| **PIR: Async/Await** | ✅ Variants added | `compiler/src/ir/pir_types.rs` |
+| **Type checking: Async/Await** | ✅ Inference rules | `compiler/src/typecheck/inference.rs` |
+| **Pretty print: Async/Await** | ✅ Display support | `compiler/src/ir/pretty_print.rs` |
+| **Validation: Async/Await** | ✅ Variable tracking | `compiler/src/ir/validate.rs` |
+| **Uncomputation: Async/Await** | ✅ Description support | `compiler/src/lowering/uncomputation.rs` |
 
 ### AI Slop Check ✅ (2026-11-03 — Updated)
 
@@ -277,7 +285,9 @@ Naso: `Stream` has quantity `[1]` — **must** be passed to `read`/`write`/`clos
 ## Next Immediate Actions (Updated 2026-11-03)
 
 1. **Integrate async runtime with compiler** (P0 - Critical)
-   - Implement `await` lowering in compiler codegen (`compiler/src/codegen/async_lowering.rs`)
+   - Add `Async` and `Await` expression kinds to AST (`compiler/src/ast/expr.rs`)
+   - Implement async/await lowering in `compiler/src/lowering/mod.rs`
+   - Implement state machine codegen in `compiler/src/codegen/llvm/` (async_lowering.rs)
    - Wire `naso_spawn`, `naso_yield`, `naso_future_*`, `naso_channel_*` FFI calls to codegen
    - Generate state machines for async functions
    - Test: compile `examples/techempower_simple.nasoc` with async/await

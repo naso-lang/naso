@@ -396,6 +396,8 @@ fn describe(expr: &PirExpr) -> &'static str {
         PirExpr::While { .. } => "a `while` loop",
         PirExpr::Array { .. } => "an array literal",
         PirExpr::Struct { .. } => "a struct literal",
+        PirExpr::Async(_) => "an async block",
+        PirExpr::Await(_) => "an await expression",
     }
 }
 

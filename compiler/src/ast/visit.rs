@@ -460,6 +460,8 @@ pub mod walk {
                 Ok(VisitOutcome::Continue)
             }
             ExprKind::Ascribe(e, _) => visitor.visit_expr(e),
+            ExprKind::Async(block) => walk_block(visitor, block),
+            ExprKind::Await(e) => visitor.visit_expr(e),
         }
     }
 

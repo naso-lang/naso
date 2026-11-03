@@ -181,6 +181,12 @@ pub enum PirExpr {
     /// No value: there is nowhere for a value to go, since the loop has not finished.
     Continue,
 
+    /// Async block: `async { ... }` - creates a future
+    Async(Box<PirExpr>),
+
+    /// Await expression: `await future` - suspends until future completes
+    Await(Box<PirExpr>),
+
     /// A `while` loop: evaluate `cond`, and while it is true run `body`.
     ///
     /// This is NOT sugar for `Forall`. A `forall` has a statically known,
@@ -763,6 +769,8 @@ impl PirModule {
             }
             PirExpr::Array { items } => items.iter().any(|a| self.expr_contains_var(a, var)),
             PirExpr::Struct { fields } => fields.iter().any(|f| self.expr_contains_var(f, var)),
+            PirExpr::Async(inner) => self.expr_contains_var(inner, var),
+            PirExpr::Await(inner) => self.expr_contains_var(inner, var),
             PirExpr::IntLit(_) | PirExpr::FloatLit(_) | PirExpr::BoolLit(_) => false,
         }
     }
@@ -1108,6 +1116,8 @@ fn pir_expr_to_string(expr: &PirExpr, _indent: usize) -> String {
                     .join(", ")
             )
         }
+        PirExpr::Async(inner) => format!("async {}", pir_expr_to_string(inner, 0)),
+        PirExpr::Await(inner) => format!("await {}", pir_expr_to_string(inner, 0)),
     }
 }
 

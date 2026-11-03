@@ -221,6 +221,8 @@ fn pir_expr_to_string(expr: &PirExpr, _indent: usize) -> String {
             let inner: Vec<String> = fields.iter().map(|f| pir_expr_to_string(f, 0)).collect();
             format!("{{{}}}", inner.join(", "))
         }
+        PirExpr::Async(inner) => format!("async {}", pir_expr_to_string(inner, 0)),
+        PirExpr::Await(inner) => format!("await {}", pir_expr_to_string(inner, 0)),
         PirExpr::StringLit(s) => format!("\"{}\"", s),
     }
 }

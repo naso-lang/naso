@@ -103,6 +103,21 @@ pub fn infer_expr(checker: &mut TypeChecker, expr: &Expr) -> Result<Type, TypeEr
         }
         ExprKind::Break(opt_expr) => infer_break(checker, opt_expr.as_deref(), expr.span),
         ExprKind::Continue => infer_continue(expr.span),
+        ExprKind::Async(block) => {
+            // async { ... } creates a future
+            let block_ty = infer_block(checker, block, expr.span)?;
+            // The result is a Future<[0] T> where T is the block's type
+            // For now, return the block type wrapped as an async computation
+            // In a full implementation, this would be Future<block_ty>
+            Ok(block_ty.with_quantity(Quantity::Many))
+        }
+        ExprKind::Await(future) => {
+            // await future - extracts the value from the future
+            let future_ty = infer_expr(checker, future)?;
+            // Await unwraps the future - return the inner type
+            // For now, return the future type with quantity One (consumed by await)
+            Ok(future_ty.with_quantity(Quantity::One))
+        }
         ExprKind::Error => Ok(Type::new(TypeKind::Error, Quantity::Many, expr.span)),
     }
 }

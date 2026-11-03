@@ -2063,6 +2063,32 @@ impl LoweringContext {
                     value: Box::new(v),
                 })
             }
+            ExprKind::Async(block) => {
+                // async { ... } creates a future
+                // Lower the block body as a sequence of statements
+                let first_new = self.statements.len();
+                let first_sched = self.schedule_nodes.len();
+                let mut parts: Vec<crate::ir::PirExpr> = Vec::new();
+                for st in &block.stmts {
+                    self.lower_stmt(st)?;
+                    parts.extend(self.statements[first_new..].iter().map(|s| s.body.clone()));
+                    self.statements.truncate(first_new);
+                    self.schedule_nodes.truncate(first_sched);
+                }
+                if let Some(tail) = &block.expr {
+                    parts.push(self.lower_expr(tail)?);
+                }
+                let body_value = match parts.len() {
+                    0 => crate::ir::PirExpr::Stmts(Vec::new()),
+                    1 => parts.pop().expect("len checked"),
+                    _ => crate::ir::PirExpr::Stmts(parts),
+                };
+                Ok(crate::ir::PirExpr::Async(Box::new(body_value)))
+            }
+            ExprKind::Await(future) => {
+                let f = self.lower_expr(future)?;
+                Ok(crate::ir::PirExpr::Await(Box::new(f)))
+            }
             _ => Err(LoweringError::Unsupported(format!("{:?}", expr.kind))),
         }
     }

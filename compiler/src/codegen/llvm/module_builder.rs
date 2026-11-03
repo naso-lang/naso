@@ -516,6 +516,11 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
         &self.module
     }
 
+    // Get the underlying LLVM module (mutable reference for async lowering)
+    pub fn module_mut(&mut self) -> &mut LlvmModule<'ctx> {
+        &mut self.module
+    }
+
     // Get the LLVM context
     pub fn llvm_context(&self) -> &inkwell::context::Context {
         self.context.llvm_context()
@@ -867,16 +872,18 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
         // `self.module` and `self.value_builder` are borrowed separately because the
         // callee needs the module immutably and the value builder mutably, and both are
         // fields of the same `&mut self`.
-        let module = &self.module;
-        let value_builder = self
+        let context = &self.context;
+        // Take callee_params out to avoid borrow conflict with module_builder (self)
+        let callee_params = self.callee_params.as_ref().cloned();
+        // Take value_builder out temporarily to avoid borrow conflict with module_builder (self)
+        let mut value_builder = self
             .value_builder
-            .as_mut()
+            .take()
             .expect("value_builder not initialized");
         lower_schedule_tree_into(
-            self.context,
-            module,
+            context,
             function,
-            value_builder,
+            &mut value_builder,
             &view.schedule,
             view,
             &view.quantities,
@@ -884,8 +891,10 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
             abi,
             return_value,
             return_source,
-            self.callee_params.as_ref(),
+            callee_params.as_ref(),
+            Some(self),
         )?;
+        self.value_builder = Some(value_builder);
         Ok(())
     }
 

@@ -1,0 +1,56 @@
+extern "C" {
+    fn naso_write(fd: u64, buf: *u8, len: usize) -> usize;
+    fn naso_read(fd: u64, buf: *u8, max_len: usize) -> usize;
+    fn naso_tcp_bind(addr: *u8, len: usize) -> u64;
+    fn naso_tcp_accept_async(fd: u64, out: *u64) -> u64;
+    fn naso_accept_get_client(out: *u64) -> u64;
+    fn naso_close(fd: u64) -> u64;
+    fn naso_spawn(future_ptr: u64) -> u64;
+    fn naso_yield() -> u64;
+    fn naso_future_new() -> u64;
+    fn naso_future_complete(future_ptr: u64, buf: *u8, len: usize) -> u64;
+    fn naso_await(future_ptr: u64) -> u64;
+    fn naso_future_get_result(future_ptr: u64, buf: *u8, len: usize) -> u64;
+    fn naso_runtime_new(workers: u64) -> u64;
+    fn naso_runtime_run(runtime: u64) -> u64;
+    fn naso_channel_new() -> u64;
+    fn naso_channel_sender_send(sender: u64, val: u64) -> u64;
+    fn naso_channel_receiver_recv(receiver: u64, out: *u64) -> u64;
+}
+
+async fn handle_client(client_fd: u64) -> () {
+    let buf = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let response = [72, 116, 116, 112, 47, 49, 46, 49, 32, 50, 48, 48, 32, 79, 75, 13, 10, 67, 111, 110, 116, 101, 110, 116, 45, 76, 101, 110, 103, 116, 104, 58, 32, 49, 51, 13, 10, 13, 10, 72, 101, 108, 108, 111, 32, 87, 111, 114, 108, 100, 10];
+    let _ = naso_read(client_fd, buf as *u8, buf.len());
+    let _ = naso_write(client_fd, response as *u8, 57);
+    let _ = naso_close(client_fd);
+}
+
+async fn accept_loop(fd: u64) -> () {
+    let mut running = 1;
+    let out = [0, 0];
+    let out_ptr = out as *u64;
+    
+    while running != 0 {
+        if naso_tcp_accept_async(fd, out_ptr) != 0 {
+            let client_fd = naso_accept_get_client(out_ptr);
+            let future = naso_future_new();
+            let _ = naso_future_complete(future, 0 as *u8, 0);
+            let _ = naso_spawn(future);
+        }
+        await naso_yield();
+    }
+}
+
+fn main() -> () {
+    let addr = [49, 50, 55, 46, 48, 46, 48, 46, 49, 58, 56, 48, 57, 57]; // "127.0.0.1:8099"
+    let fd = naso_tcp_bind(addr as *u8, 14);
+    
+    let runtime = naso_runtime_new(4);
+    
+    let future = naso_future_new();
+    let _ = naso_future_complete(future, 0 as *u8, 0);
+    let _ = naso_spawn(future);
+    
+    let _ = naso_runtime_run(runtime);
+}

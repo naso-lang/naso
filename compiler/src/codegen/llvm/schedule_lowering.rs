@@ -64,7 +64,6 @@ pub fn lower_schedule_tree<'ctx>(
     let abi = build_entry_signature(&mut LlvmTypeLowering::new(llvm_context), pir_module)?;
     lower_schedule_tree_into(
         ctx,
-        module,
         function,
         &mut value_builder,
         schedule,
@@ -72,6 +71,7 @@ pub fn lower_schedule_tree<'ctx>(
         quantities,
         access_relations,
         abi.as_slice(),
+        None,
         None,
         None,
         None,
@@ -102,7 +102,6 @@ pub fn lower_schedule_tree<'ctx>(
 #[allow(clippy::too_many_arguments)]
 pub fn lower_schedule_tree_into<'ctx>(
     ctx: &'ctx CodegenContext,
-    module: &inkwell::module::Module<'ctx>,
     function: FunctionValue<'ctx>,
     value_builder: &mut LlvmValueBuilder<'ctx>,
     schedule: &ScheduleTree,
@@ -113,14 +112,27 @@ pub fn lower_schedule_tree_into<'ctx>(
     return_value: Option<&PirExpr>,
     return_source: Option<ReturnSource>,
     callee_params: Option<&HashMap<String, Vec<ParamKind>>>,
+    mut module_builder: Option<&mut LLVMModuleBuilder<'ctx>>,
 ) -> CodegenResult<()> {
     let llvm_context = ctx.llvm_context();
-
-    // A schedule tree has no `let` step of its own, so a band body's only nameable
-    // storage is what already exists in the module. Bind the module's globals by name
-    // before lowering, so `counter = counter + 1` has somewhere to write. A name that
-    // is not a global stays unbound and an assignment to it is still refused.
+    
+    // Take module_builder out at the start to extract the module for all uses
+    let mb = module_builder.take().expect("module_builder must be provided when lowering with async");
+    let module = mb.module_mut();
+    
+    // Register module globals
     value_builder.register_module_globals(module)?;
+    
+    // Emit ABI guard
+    crate::codegen::llvm::abi_guard::emit_abi_guard(
+        value_builder.type_lowering(),
+        module,
+        function,
+        value_builder.builder(),
+        abi,
+    )?;
+    
+    // We don't need to put module_builder back - ScheduleLowering will extract module as needed
 
     // Create entry block
     let entry = llvm_context.append_basic_block(function, "entry");
@@ -236,24 +248,21 @@ pub fn lower_schedule_tree_into<'ctx>(
     // open and unterminated, so `ScheduleLowering` appends the body into it. A module
     // with no tensor parameter emits nothing here and the builder stays in `entry`, so
     // a scalar-only kernel's block structure is unchanged.
-    crate::codegen::llvm::abi_guard::emit_abi_guard(
-        value_builder.type_lowering(),
-        module,
-        function,
-        value_builder.builder(),
-        abi,
-    )?;
+    // abi_guard already called above with module from module_builder
 
-    // Create schedule lowering context
+    // Create entry block
+    let entry = llvm_context.append_basic_block(function, "entry");
+    value_builder.builder().position_at_end(entry);
+
+    // Create schedule lowering context - pass module_builder so it can extract module internally
     let mut lowering = ScheduleLowering::new(
         value_builder,
-        module,
         function,
         pir_module,
         quantities,
         access_relations,
         callee_params,
-        None,
+        module_builder,
     )?;
 
     // Lower the root schedule node
@@ -483,14 +492,18 @@ pub struct ScheduleLowering<'ctx, 'a> {
 impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
     pub fn new(
         value_builder: &'a mut LlvmValueBuilder<'ctx>,
-        module: &'a inkwell::module::Module<'ctx>,
         function: FunctionValue<'ctx>,
         pir_module: &'a PirModule,
         quantities: &'a QuantityMap,
         access_relations: &'a AccessRelations,
         callee_params: Option<&'a HashMap<String, Vec<ParamKind>>>,
-        module_builder: Option<&'a mut LLVMModuleBuilder<'ctx>>,
+        mut module_builder: Option<&'a mut LLVMModuleBuilder<'ctx>>,
     ) -> CodegenResult<Self> {
+        // Extract module from module_builder
+        let mb = module_builder.take().expect("module_builder must be provided");
+        let module = mb.module_mut();
+
+        // Don't put module_builder back - ScheduleLowering will use the extracted module
         let loop_emitter = LoopEmitter::new(value_builder.type_lowering().context())?;
         let access_emitter = AccessEmitter::new(value_builder.type_lowering().context())?;
         let optimizer = PolyhedralOptimizer::new();
@@ -630,7 +643,6 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
                 |lowering| {
                     let mut inner = ScheduleLowering::new(
                         lowering.value_builder(),
-                        module,
                         function,
                         pir_module,
                         quantities,
@@ -665,7 +677,6 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
                 |lowering| {
                     let mut inner = ScheduleLowering::new(
                         lowering.value_builder(),
-                        module,
                         function,
                         pir_module,
                         quantities,

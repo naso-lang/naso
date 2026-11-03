@@ -268,6 +268,11 @@ impl<'a> Parser<'a> {
         self.tokens.get(self.pos).map(|t| &t.kind)
     }
 
+    /// Look ahead n tokens.
+    pub fn peek_n(&self, n: usize) -> Option<&TK> {
+        self.tokens.get(self.pos + n).map(|t| &t.kind)
+    }
+
     /// Look at the current token without consuming it.
     fn peek_token(&self) -> Option<&Token> {
         self.tokens.get(self.pos)
@@ -479,6 +484,7 @@ impl<'a> Parser<'a> {
     pub fn parse_item(&mut self) -> Item {
         match self.peek() {
             Some(TK::Fn) => Item::Function(self.parse_fn()),
+            Some(TK::Async) if self.peek_n(1) == Some(&TK::Fn) => Item::Function(self.parse_fn()),
             Some(TK::Struct) => Item::TypeDef(self.parse_struct()),
             Some(TK::Enum) => Item::TypeDef(self.parse_enum()),
             Some(TK::Type) => Item::TypeDef(self.parse_type_alias()),
@@ -492,9 +498,10 @@ impl<'a> Parser<'a> {
 
     // ===== Functions =====
 
-    /// Parse a `fn` item.
+    /// Parse a `fn` item (optionally preceded by `async`).
     pub fn parse_fn(&mut self) -> Function {
         let start = self.pos;
+        let is_async = self.eat(TK::Async);
         self.expect(TK::Fn);
 
         // Check for reversible modifier
@@ -555,6 +562,7 @@ impl<'a> Parser<'a> {
             span,
             attributes: Vec::new(),
             is_reversible,
+            is_async,
             quantity,
             requires,
         }
@@ -938,6 +946,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        let is_async = self.eat(TK::Async);
         self.expect(TK::Fn);
         let name = self.parse_ident();
         self.expect(TK::LParen);
@@ -960,6 +969,7 @@ impl<'a> Parser<'a> {
             ret_ty,
             link_name,
             span: self.span_from(start),
+            is_async,
         }
     }
 

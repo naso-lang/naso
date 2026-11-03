@@ -218,6 +218,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
                 span: Span::default(),
                 attributes: Vec::new(),
                 is_reversible: self.is_reversible,
+                is_async: false,
                 quantity: self.quantity,
                 // A prelude intrinsic is not a NASO source function and cannot carry a
                 // `requires` clause. Saying so explicitly beats a default that might later

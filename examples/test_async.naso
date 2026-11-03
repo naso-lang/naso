@@ -1,0 +1,15 @@
+extern "C" {
+    fn naso_write(fd: u64, buf: * u8, len: usize) -> usize;
+    fn naso_read(fd: u64, buf: * u8, max_len: usize) -> usize;
+    fn naso_tcp_bind(addr: * u8, len: usize) -> u64;
+    fn naso_tcp_accept(fd: u64, out: * u64) -> u64;
+    fn naso_accept_get_client(out: * u64) -> u64;
+    fn naso_close(fd: u64) -> u64;
+}
+
+async fn test_async() -> () {
+    let x = 1;
+}
+
+fn main() -> () {
+}

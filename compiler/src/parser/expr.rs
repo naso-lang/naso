@@ -23,6 +23,8 @@ pub(crate) fn is_control_flow_stmt(kind: &ExprKind) -> bool {
             | ExprKind::For(..)
             | ExprKind::While(..)
             | ExprKind::Forall(..)
+            | ExprKind::Async(..)
+            | ExprKind::Await(..)
             // `return` is control flow, not a value.
             //
             // Without this, a trailing `return 2;` inside a block -- written without
@@ -156,6 +158,8 @@ impl<'a> Parser<'a> {
                 | ExprKind::For(..)
                 | ExprKind::While(..)
                 | ExprKind::Forall(..)
+                | ExprKind::Async(..)
+                | ExprKind::Await(..)
                 | ExprKind::Quantified(..)
                 | ExprKind::Break(..)
                 | ExprKind::Continue
@@ -364,6 +368,8 @@ impl<'a> Parser<'a> {
             Some(TK::Continue) => self.parse_continue(),
             Some(TK::Return) => self.parse_return(),
             Some(TK::Reversible) => self.parse_reversible_expr(),
+            Some(TK::Async) => self.parse_async_expr(),
+            Some(TK::Await) => self.parse_await_expr(),
             Some(TK::Measure) => self.parse_measure(),
             Some(TK::Entangle) => self.parse_entangle(),
             Some(TK::QAlloc) => self.parse_qalloc(),
@@ -849,6 +855,29 @@ impl<'a> Parser<'a> {
         let b = self.parse_block();
         let span = b.span;
         Expr::new(ExprKind::Block(Box::new(b)), span, next_id())
+    }
+
+    // ===== Async/Await =====
+
+    fn parse_async_expr(&mut self) -> Expr {
+        let start = self.pos;
+        self.expect(TK::Async);
+        let body = self.parse_block_expr(); // parse_block_expr returns ExprKind::Block
+        // Extract the inner Block from the Block expression
+        let block = match body.kind {
+            ExprKind::Block(b) => b,
+            _ => unreachable!("parse_block_expr always returns Block"),
+        };
+        let span = self.span_from(start);
+        Expr::new(ExprKind::Async(block), span, next_id())
+    }
+
+    fn parse_await_expr(&mut self) -> Expr {
+        let start = self.pos;
+        self.expect(TK::Await);
+        let future = self.parse_unary(); // await has higher precedence than most operators
+        let span = self.span_from(start);
+        Expr::new(ExprKind::Await(Box::new(future)), span, next_id())
     }
 
     // ===== Control flow =====

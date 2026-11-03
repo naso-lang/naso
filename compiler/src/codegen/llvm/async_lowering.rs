@@ -264,6 +264,59 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
             int_type.fn_type(&[ptr_type.into(), ptr_type.into(), int_type.into()], false),
         )
     }
+
+    fn get_or_declare_naso_spawn(&mut self) -> CodegenResult<FunctionValue<'ctx>> {
+        let int_type = self.module_builder.value_builder().type_lowering().int_type(crate::codegen::abi::IntWidth::I64);
+        let ptr_type = self.module_builder.value_builder().type_lowering().ptr_type(int_type.into(), 0);
+        self.module_builder.get_or_declare_ffi_function(
+            "naso_spawn",
+            ptr_type.fn_type(&[ptr_type.into(), ptr_type.into(), int_type.into()], false),
+        )
+    }
+
+    fn get_or_declare_naso_yield(&mut self) -> CodegenResult<FunctionValue<'ctx>> {
+        let int_type = self.module_builder.value_builder().type_lowering().int_type(crate::codegen::abi::IntWidth::I64);
+        self.module_builder.get_or_declare_ffi_function(
+            "naso_yield",
+            int_type.fn_type(&[], false),
+        )
+    }
+
+    fn get_or_declare_naso_channel_new(&mut self) -> CodegenResult<FunctionValue<'ctx>> {
+        let int_type = self.module_builder.value_builder().type_lowering().int_type(crate::codegen::abi::IntWidth::I64);
+        let ptr_type = self.module_builder.value_builder().type_lowering().ptr_type(int_type.into(), 0);
+        self.module_builder.get_or_declare_ffi_function(
+            "naso_channel_new",
+            ptr_type.fn_type(&[int_type.into()], false),
+        )
+    }
+
+    fn get_or_declare_naso_sender_send(&mut self) -> CodegenResult<FunctionValue<'ctx>> {
+        let int_type = self.module_builder.value_builder().type_lowering().int_type(crate::codegen::abi::IntWidth::I64);
+        let ptr_type = self.module_builder.value_builder().type_lowering().ptr_type(int_type.into(), 0);
+        self.module_builder.get_or_declare_ffi_function(
+            "naso_sender_send",
+            int_type.fn_type(&[ptr_type.into(), ptr_type.into(), int_type.into()], false),
+        )
+    }
+
+    fn get_or_declare_naso_receiver_recv(&mut self) -> CodegenResult<FunctionValue<'ctx>> {
+        let int_type = self.module_builder.value_builder().type_lowering().int_type(crate::codegen::abi::IntWidth::I64);
+        let ptr_type = self.module_builder.value_builder().type_lowering().ptr_type(int_type.into(), 0);
+        self.module_builder.get_or_declare_ffi_function(
+            "naso_receiver_recv",
+            int_type.fn_type(&[ptr_type.into(), ptr_type.into(), int_type.into()], false),
+        )
+    }
+
+    fn get_or_declare_naso_channel_free(&mut self) -> CodegenResult<FunctionValue<'ctx>> {
+        let int_type = self.module_builder.value_builder().type_lowering().int_type(crate::codegen::abi::IntWidth::I64);
+        let ptr_type = self.module_builder.value_builder().type_lowering().ptr_type(int_type.into(), 0);
+        self.module_builder.get_or_declare_ffi_function(
+            "naso_channel_free",
+            int_type.fn_type(&[ptr_type.into()], false),
+        )
+    }
 }
 
 /// Extension trait for async lowering

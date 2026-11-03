@@ -137,6 +137,11 @@ pub enum TokenKind {
     Extern,
     #[regex("[cC][oO][nN][sS][tT]", priority = 3)]
     Const,
+    // async/await for async programming
+    #[regex("[aA][sS][yY][nN][cC]", priority = 3)]
+    Async,
+    #[regex("[aA][wW][aA][iI][tT]", priority = 3)]
+    Await,
     // `proof` introduces a proof block: obligations that the verifier must
     // discharge. Parsed and typechecked by the compiler, then consumed by
     // naso-verify. Not reachable by codegen.
@@ -375,6 +380,8 @@ impl TokenKind {
             TokenKind::Import => "'import'",
             TokenKind::Extern => "'extern'",
             TokenKind::Const => "'const'",
+            TokenKind::Async => "'async'",
+            TokenKind::Await => "'await'",
             TokenKind::Proof => "'proof'",
             TokenKind::Requires => "'requires'",
             TokenKind::As => "'as'",

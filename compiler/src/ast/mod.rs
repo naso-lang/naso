@@ -192,6 +192,7 @@ pub struct ExternFn {
     pub ret_ty: Option<Type>,
     pub link_name: Option<String>,
     pub span: Span,
+    pub is_async: bool,
 }
 
 /// Parameter of an external function
@@ -215,6 +216,7 @@ pub struct Function {
     pub span: Span,
     pub attributes: Vec<Attribute>,
     pub is_reversible: bool,
+    pub is_async: bool,
     pub quantity: Quantity,
     /// Claims the CALLER must satisfy, written `requires { assert(..); .. }`.
     ///

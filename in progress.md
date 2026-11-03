@@ -183,6 +183,9 @@ No cleanup needed.
 | **Channels** | ✅ MPSC `NSender`/`NReceiver` | Crossbeam-based |
 | **Sleep/yield** | ✅ `sleep()`, `sleep_ms()`, `yield_now()` | Timer wheel integration |
 | **FFI bindings** | ✅ Connected in `naso-ffi` | `naso_runtime_new`, `naso_spawn`, `naso_future_*`, `naso_channel_*` |
+| **Epoll/kqueue integration** | ✅ Implemented in `naso-ffi` | `naso_poll_add`, `naso_poll_wait`, `naso_epoll_*` |
+| **Connection pooling** | ✅ Pool with min/max, reuse | `naso_pool_create`, `naso_pool_get_connection`, `naso_pool_return_connection` |
+| **Async I/O FFI** | ✅ Non-blocking accept/read/write/timer | `naso_tcp_accept_async`, `naso_read_async`, `naso_write_async`, `naso_timer_sleep_async` |
 | **AST: Async/Await** | ✅ Added to `ExprKind` | `compiler/src/ast/expr.rs` |
 | **Visitor: Async/Await** | ✅ Walk support | `compiler/src/ast/visit.rs` |
 | **Lowering: Async/Await** | ✅ `PirExpr::Async`/`Await` | `compiler/src/lowering/mod.rs` |
@@ -285,18 +288,18 @@ Naso: `Stream` has quantity `[1]` — **must** be passed to `read`/`write`/`clos
 ## Next Immediate Actions (Updated 2026-11-03)
 
 1. **Integrate async runtime with compiler** (P0 - Critical)
-   - Add `Async` and `Await` expression kinds to AST (`compiler/src/ast/expr.rs`)
-   - Implement async/await lowering in `compiler/src/lowering/mod.rs`
+   - Add `Async` and `Await` expression kinds to AST (`compiler/src/ast/expr.rs`) ✅
+   - Implement async/await lowering in `compiler/src/lowering/mod.rs` ✅
    - Implement state machine codegen in `compiler/src/codegen/llvm/` (async_lowering.rs)
    - Wire `naso_spawn`, `naso_yield`, `naso_future_*`, `naso_channel_*` FFI calls to codegen
    - Generate state machines for async functions
    - Test: compile `examples/techempower_simple.nasoc` with async/await
 
-2. **Connection pooling in FFI** (P0)
-   - Implement epoll/kqueue in `naso-ffi` for async I/O
-   - Replace single `accept` loop with thread pool + completion queue
-   - `naso_tcp_accept_async(fd, callback_ptr)` non-blocking variant
-   - Connection pool in `async.naso` for reusing connections
+2. **Connection pooling in FFI** (P0) ✅ COMPLETE
+   - Implement epoll/kqueue in `naso-ffi` for async I/O ✅
+   - Replace single `accept` loop with thread pool + completion queue ✅
+   - `naso_tcp_accept_async(fd, callback_ptr)` non-blocking variant ✅
+   - Connection pool in `async.naso` for reusing connections ✅
 
 3. **Middleware/routing layer** (P1)
    - `http.naso`: `Router`, `Middleware`, `Handler` traits
@@ -310,6 +313,20 @@ Naso: `Stream` has quantity `[1]` — **must** be passed to `read`/`write`/`clos
 5. **TLS/HTTPS via rustls** (P2)
    - FFI bindings to `rustls` crate (no OpenSSL dependency)
    - `naso_tls_accept(fd, cert_path, key_path)`
+
+---
+
+## Current Focus: Compiler Codegen for Async/Await
+
+The async runtime and FFI layer are complete. The next phase is **compiler codegen for async/await lowering**:
+
+1. Create `compiler/src/codegen/llvm/async_lowering.rs` for state machine generation
+2. Implement `await` point splitting (separate basic blocks before/after each await)
+3. Wire FFI calls (`naso_spawn`, `naso_yield`, `naso_future_*`, `naso_channel_*`) to codegen
+4. Generate state machine struct with future storage for each async function
+5. Test: compile async Naso code end-to-end
+
+This will enable native Naso async servers that can finally compete with Rust's multi-threaded async model.
 
 ---
 

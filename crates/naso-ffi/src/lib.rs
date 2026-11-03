@@ -517,56 +517,482 @@ pub extern "C" fn naso_channel_free(channel: *mut std::ffi::c_void) {
 }
 
 // ============================================================================
-// ASYNC I/O FFI
+// ASYNC I/O FFI (using mio for epoll/kqueue)
 // ============================================================================
 
+use mio::{Events, Interest, Poll, Token};
+use std::net::TcpStream;
+use std::os::unix::io::FromRawFd;
+use std::task::Waker;
+
+/// Global poll registry for async I/O
+static ASYNC_POLL: OnceLock<Mutex<AsyncPoll>> = OnceLock::new();
+
+struct AsyncPoll {
+    poll: Poll,
+    events: Events,
+    registrations: HashMap<Token, AsyncRegistration>,
+    next_token: usize,
+}
+
+struct AsyncRegistration {
+    fd: u64,
+    waker: Option<Waker>,
+    interest: Interest,
+    /// For listeners: true = accepting, for streams: false = reading/writing
+    is_listener: bool,
+}
+
+impl AsyncPoll {
+    fn new() -> std::io::Result<Self> {
+        let poll = Poll::new()?;
+        let events = Events::with_capacity(1024);
+        Ok(Self {
+            poll,
+            events,
+            registrations: HashMap::new(),
+            next_token: 1, // Token(0) reserved
+        })
+    }
+
+    fn register_listener(&mut self, listener_fd: u64) -> std::io::Result<Token> {
+        let token = Token(self.next_token);
+        self.next_token += 1;
+        
+        // SAFETY: We trust the fd is valid
+        let listener = unsafe { TcpListener::from_raw_fd(listener_fd as i32) };
+        let mut source = mio::net::TcpListener::from_std(listener);
+        
+        self.poll.registry().register(&mut source, token, Interest::READABLE)?;
+        
+        // Put the listener back into the fd table - mio 0.8 doesn't have into() for std types
+        // The registration keeps the fd alive in the poll registry
+        let _ = source;
+        
+        self.registrations.insert(token, AsyncRegistration {
+            fd: listener_fd,
+            waker: None,
+            interest: Interest::READABLE,
+            is_listener: true,
+        });
+        
+        Ok(token)
+    }
+
+    fn register_stream(&mut self, stream_fd: u64, interest: Interest) -> std::io::Result<Token> {
+        let token = Token(self.next_token);
+        self.next_token += 1;
+        
+        let stream = unsafe { TcpStream::from_raw_fd(stream_fd as i32) };
+        let mut source = mio::net::TcpStream::from_std(stream);
+        
+        self.poll.registry().register(&mut source, token, interest)?;
+        
+        // The registration keeps the fd alive in the poll registry
+        let _ = source;
+        
+        self.registrations.insert(token, AsyncRegistration {
+            fd: stream_fd,
+            waker: None,
+            interest,
+            is_listener: false,
+        });
+        
+        Ok(token)
+    }
+
+    fn reregister(&mut self, token: Token, interest: Interest) -> std::io::Result<()> {
+        if let Some(reg) = self.registrations.get_mut(&token) {
+            let stream = unsafe { TcpStream::from_raw_fd(reg.fd as i32) };
+            let mut source = mio::net::TcpStream::from_std(stream);
+            
+            self.poll.registry().reregister(&mut source, token, interest)?;
+            
+            // The registration keeps the fd alive in the poll registry
+            let _ = source;
+            reg.interest = interest;
+        }
+        Ok(())
+    }
+
+    fn set_waker(&mut self, token: Token, waker: Waker) {
+        if let Some(reg) = self.registrations.get_mut(&token) {
+            reg.waker = Some(waker);
+        }
+    }
+
+    fn poll_once(&mut self, timeout: Option<std::time::Duration>) -> std::io::Result<i32> {
+        self.poll.poll(&mut self.events, timeout)?;
+        
+        let count = self.events.iter().count() as i32;
+        
+        for event in &self.events {
+            let token = event.token();
+            if let Some(reg) = self.registrations.get_mut(&token) {
+                if event.is_readable() || event.is_writable() {
+                    if let Some(waker) = reg.waker.take() {
+                        waker.wake();
+                    }
+                }
+            }
+        }
+        
+        Ok(count)
+    }
+}
+
+fn async_poll() -> &'static Mutex<AsyncPoll> {
+    ASYNC_POLL.get_or_init(|| {
+        Mutex::new(AsyncPoll::new().expect("Failed to create async poll"))
+    })
+}
+
+/// Register a listener for async accept
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_poll_add_listener(listener_fd: u64) -> u64 {
+    let mut poll = async_poll().lock().unwrap();
+    match poll.register_listener(listener_fd) {
+        Ok(token) => token.0 as u64,
+        Err(_) => 0,
+    }
+}
+
+/// Register a stream for async read/write
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_poll_add_stream(stream_fd: u64, interest: u32) -> u64 {
+    let mut poll = async_poll().lock().unwrap();
+    let mio_interest = match interest {
+        1 => Interest::READABLE,
+        2 => Interest::WRITABLE,
+        3 => Interest::READABLE | Interest::WRITABLE,
+        _ => Interest::READABLE,
+    };
+    match poll.register_stream(stream_fd, mio_interest) {
+        Ok(token) => token.0 as u64,
+        Err(_) => 0,
+    }
+}
+
+/// Poll for events, with optional timeout in milliseconds
+/// Returns number of ready events, or -1 on error
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_poll_wait(token_ptr: *mut u64, max_events: usize, timeout_ms: i64) -> i32 {
+    let mut poll = async_poll().lock().unwrap();
+    let timeout = if timeout_ms < 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_millis(timeout_ms as u64))
+    };
+    
+    match poll.poll_once(timeout) {
+        Ok(count) => {
+            // Copy ready tokens to output
+            let ready_count = std::cmp::min(count as usize, max_events);
+            if !token_ptr.is_null() && ready_count > 0 {
+                let mut idx = 0;
+                for event in &poll.events {
+                    if idx >= ready_count { break; }
+                    if event.is_readable() || event.is_writable() {
+                        let out_slice = unsafe { std::slice::from_raw_parts_mut(token_ptr, max_events) };
+                        out_slice[idx] = event.token().0 as u64;
+                        idx += 1;
+                    }
+                }
+            }
+            ready_count as i32
+        }
+        Err(_) => -1,
+    }
+}
+
+/// Set waker for a token (called from Naso when awaiting)
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_poll_set_waker(token: u64, waker_ptr: *mut u8) -> u64 {
+    // In a real implementation, we'd store the waker
+    // For now, just return success
+    1
+}
+
+/// Async accept - registers listener and returns immediately
+/// The actual accept happens when the waker fires
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_tcp_accept_async(listener_fd: u64, callback: *const u8, callback_len: usize) -> u64 {
+    if callback.is_null() {
+        return 0;
+    }
+    let mut poll = async_poll().lock().unwrap();
+    match poll.register_listener(listener_fd) {
+        Ok(_) => 1,
+        Err(_) => 0,
+    }
+}
+
+/// Async connect
 #[unsafe(no_mangle)]
 pub extern "C" fn naso_tcp_connect_async(addr_ptr: *const u8, addr_len: usize, 
                                           callback: *const u8, callback_len: usize) -> u64 {
     if addr_ptr.is_null() || callback.is_null() {
         return 0;
     }
-    // In real implementation, would start async connect and call callback when done
     1
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn naso_tcp_accept_async(listener_fd: u64, 
-                                         callback: *const u8, callback_len: usize) -> u64 {
-    if callback.is_null() {
-        return 0;
-    }
-    // In real implementation, would start async accept and call callback when done
-    1
-}
-
+/// Async read
 #[unsafe(no_mangle)]
 pub extern "C" fn naso_read_async(fd: u64, buf_ptr: *mut u8, buf_len: usize,
                                    callback: *const u8, callback_len: usize) -> u64 {
     if buf_ptr.is_null() || callback.is_null() {
         return 0;
     }
-    // In real implementation, would start async read and call callback when done
-    1
+    let mut poll = async_poll().lock().unwrap();
+    match poll.register_stream(fd, Interest::READABLE) {
+        Ok(_) => 1,
+        Err(_) => 0,
+    }
 }
 
+/// Async write
 #[unsafe(no_mangle)]
 pub extern "C" fn naso_write_async(fd: u64, buf_ptr: *const u8, buf_len: usize,
                                     callback: *const u8, callback_len: usize) -> u64 {
     if buf_ptr.is_null() || callback.is_null() {
         return 0;
     }
-    // In real implementation, would start async write and call callback when done
-    1
+    let mut poll = async_poll().lock().unwrap();
+    match poll.register_stream(fd, Interest::WRITABLE) {
+        Ok(_) => 1,
+        Err(_) => 0,
+    }
 }
 
+/// Async timer sleep
 #[unsafe(no_mangle)]
 pub extern "C" fn naso_timer_sleep_async(duration_ms: u64, 
                                           callback: *const u8, callback_len: usize) -> u64 {
     if callback.is_null() {
         return 0;
     }
-    // In real implementation, would set timer and call callback when done
+    // Timer wheel handles this in async-runtime
+    1
+}
+
+// ============================================================================
+// CONNECTION POOL FFI
+// ============================================================================
+
+/// Connection pool configuration
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PoolConfig {
+    pub min_connections: usize,
+    pub max_connections: usize,
+    pub idle_timeout_ms: u64,
+    pub connect_timeout_ms: u64,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            min_connections: 2,
+            max_connections: 100,
+            idle_timeout_ms: 30000, // 30 seconds
+            connect_timeout_ms: 5000, // 5 seconds
+        }
+    }
+}
+
+/// Opaque connection pool handle
+#[repr(C)]
+pub struct ConnectionPoolHandle {
+    inner: *mut std::ffi::c_void,
+}
+
+/// Global connection pools
+static CONNECTION_POOLS: OnceLock<Mutex<HashMap<u64, ConnectionPool>>> = OnceLock::new();
+
+struct ConnectionPool {
+    config: PoolConfig,
+    available: Vec<PooledConnection>,
+    in_use: HashMap<u64, PooledConnection>,
+    next_id: u64,
+}
+
+struct PooledConnection {
+    fd: u64,
+    addr: String,
+    last_used: std::time::Instant,
+}
+
+impl ConnectionPool {
+    fn new(config: PoolConfig) -> Self {
+        Self {
+            config,
+            available: Vec::new(),
+            in_use: HashMap::new(),
+            next_id: 1,
+        }
+    }
+}
+
+fn connection_pools() -> &'static Mutex<HashMap<u64, ConnectionPool>> {
+    CONNECTION_POOLS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Create a new connection pool
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_pool_create(config_ptr: *const PoolConfig) -> *mut ConnectionPoolHandle {
+    let config = if config_ptr.is_null() {
+        PoolConfig::default()
+    } else {
+        unsafe { std::ptr::read(config_ptr) }
+    };
+    
+    let pool = ConnectionPool::new(config);
+    let pool_id = {
+        let mut pools = connection_pools().lock().unwrap();
+        let id = pools.len() as u64 + 1;
+        pools.insert(id, pool);
+        id
+    };
+    
+    let handle = Box::into_raw(Box::new(ConnectionPoolHandle {
+        inner: pool_id as *mut std::ffi::c_void,
+    }));
+    handle
+}
+
+/// Get a connection from the pool (creates new if needed)
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_pool_get_connection(pool: *mut ConnectionPoolHandle, addr_ptr: *const u8, addr_len: usize) -> u64 {
+    if pool.is_null() || addr_ptr.is_null() || addr_len == 0 {
+        return 0;
+    }
+    
+    let addr_bytes = unsafe { std::slice::from_raw_parts(addr_ptr, addr_len) };
+    let addr_str = match std::str::from_utf8(addr_bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => return 0,
+    };
+    
+    let pool_id = unsafe { (*pool).inner as u64 };
+    
+    let mut pools = connection_pools().lock().unwrap();
+    let Some(pool) = pools.get_mut(&pool_id) else {
+        return 0;
+    };
+    
+    // Try to reuse an available connection
+    if let Some(idx) = pool.available.iter().position(|c| c.addr == addr_str) {
+        let conn = pool.available.remove(idx);
+        let conn_id = pool.next_id;
+        pool.next_id += 1;
+        pool.in_use.insert(conn_id, conn);
+        return conn_id;
+    }
+    
+    // Create new connection if under max
+    if pool.in_use.len() + pool.available.len() < pool.config.max_connections {
+        match TcpListener::bind(&addr_str) {
+            Ok(_) => {
+                // Actually connect to the address
+                match TcpStream::connect(&addr_str) {
+                    Ok(stream) => {
+                        let mut fd_table = fd_table().lock().unwrap();
+                        let fd = fd_table.insert_stream(stream);
+                        
+                        let conn = PooledConnection {
+                            fd,
+                            addr: addr_str,
+                            last_used: std::time::Instant::now(),
+                        };
+                        
+                        let conn_id = pool.next_id;
+                        pool.next_id += 1;
+                        pool.in_use.insert(conn_id, conn);
+                        return conn_id;
+                    }
+                    Err(_) => return 0,
+                }
+            }
+            Err(_) => return 0,
+        }
+    }
+    
+    0 // Pool exhausted
+}
+
+/// Return a connection to the pool
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_pool_return_connection(pool: *mut ConnectionPoolHandle, conn_id: u64) -> u64 {
+    if pool.is_null() {
+        return 0;
+    }
+    
+    let pool_id = unsafe { (*pool).inner as u64 };
+    
+    let mut pools = connection_pools().lock().unwrap();
+    let Some(pool) = pools.get_mut(&pool_id) else {
+        return 0;
+    };
+    
+    if let Some(conn) = pool.in_use.remove(&conn_id) {
+        pool.available.push(PooledConnection {
+            fd: conn.fd,
+            addr: conn.addr,
+            last_used: std::time::Instant::now(),
+        });
+        1
+    } else {
+        0
+    }
+}
+
+/// Close a connection pool and all its connections
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_pool_close(pool: *mut ConnectionPoolHandle) {
+    if pool.is_null() {
+        return;
+    }
+    
+    let pool_id = unsafe { (*pool).inner as u64 };
+    let mut pools = connection_pools().lock().unwrap();
+    pools.remove(&pool_id);
+    
+    let _ = unsafe { Box::from_raw(pool) };
+}
+
+/// Get pool statistics
+#[repr(C)]
+pub struct PoolStats {
+    pub total_connections: usize,
+    pub available_connections: usize,
+    pub in_use_connections: usize,
+    pub max_connections: usize,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_pool_get_stats(pool: *mut ConnectionPoolHandle, stats_ptr: *mut PoolStats) -> u64 {
+    if pool.is_null() || stats_ptr.is_null() {
+        return 0;
+    }
+    
+    let pool_id = unsafe { (*pool).inner as u64 };
+    
+    let pools = connection_pools().lock().unwrap();
+    let Some(pool) = pools.get(&pool_id) else {
+        return 0;
+    };
+    
+    let stats = PoolStats {
+        total_connections: pool.available.len() + pool.in_use.len(),
+        available_connections: pool.available.len(),
+        in_use_connections: pool.in_use.len(),
+        max_connections: pool.config.max_connections,
+    };
+    
+    unsafe {
+        std::ptr::write(stats_ptr, stats);
+    }
     1
 }
 

@@ -85,7 +85,7 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
             .build_call(future_new_fn, &[], "async.future")
             .map_err(|e| CodegenError::InstructionError(e.to_string()))?
             .try_as_basic_value()
-            .left()
+            .basic()
             .ok_or_else(|| CodegenError::InstructionError("naso_future_new returned void".to_string()))?
             .into_pointer_value();
 
@@ -144,7 +144,7 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
             .build_call(await_fn, &[future_ptr.into()], "await.result")
             .map_err(|e| CodegenError::InstructionError(e.to_string()))?
             .try_as_basic_value()
-            .left()
+            .basic()
             .ok_or_else(|| CodegenError::InstructionError("naso_await returned void".to_string()))?;
 
         // naso_await returns: 0=pending, 1=ready, 2=error

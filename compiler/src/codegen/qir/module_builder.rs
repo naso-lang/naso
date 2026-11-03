@@ -181,7 +181,7 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
         let builder = llvm_context.create_builder();
 
         // QIR types
-        let qubit_type = llvm_context.ptr_type(AddressSpace::from(0));
+        let qubit_type = llvm_context.i8_type().ptr_type(AddressSpace::from(0));
         let result_type = llvm_context.bool_type();
 
         let profile = QirProfile::new(QirProfileKind::Base);
@@ -217,7 +217,7 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
         let module = llvm_context.create_module("qir_module");
         let builder = llvm_context.create_builder();
 
-        let qubit_type = llvm_context.ptr_type(AddressSpace::from(0));
+        let qubit_type = llvm_context.i8_type().ptr_type(AddressSpace::from(0));
         let result_type = llvm_context.bool_type();
 
         let mut qir_builder = Self {
@@ -483,7 +483,7 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
                 if let Some((ptr, pointee_ty)) = self.variables.get(name) {
                     Ok(self
                         .builder
-                        .build_load(*pointee_ty, *ptr, name)
+                        .build_load(*ptr, name)
                         .map_err(|e| CodegenError::InstructionError(e.to_string()))?)
                 } else if self.quantum_var.contains(name) {
                     //
@@ -857,6 +857,12 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
                 let base_val = self.build_expr(base)?;
                 Ok(base_val)
             }
+            PirExpr::Async(_) => Err(CodegenError::UnsupportedFeature(
+                "async blocks are not supported in the QIR backend".to_string(),
+            )),
+            PirExpr::Await(_) => Err(CodegenError::UnsupportedFeature(
+                "await expressions are not supported in the QIR backend".to_string(),
+            )),
             PirExpr::Binary { op, left, right } => {
                 let l = self.build_expr(left)?;
                 let r = self.build_expr(right)?;
@@ -922,6 +928,7 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
                 if qir_intrinsic_returns_qubit(op) {
                     return Ok(self
                         .llvm_context
+                        .i8_type()
                         .ptr_type(AddressSpace::default())
                         .const_null()
                         .into());

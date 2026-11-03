@@ -471,7 +471,7 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
         for (i, field) in fields.iter().enumerate() {
             let gep = self
                 .builder
-                .build_struct_gep(struct_ty, alloca, i as u32, "field_gep")
+                .build_struct_gep(alloca, i as u32, "field_gep")
                 .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
             self.ptr_pointee_types.insert(gep, struct_ty.into());
             self.build_store(gep, *field)?;
@@ -534,7 +534,7 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
         // integers, which is what LLVMBuildGEP2 requires.
         let gep = unsafe {
             self.builder
-                .build_gep(ty, ptr, &indices, name)
+                .build_gep(ptr, &indices, name)
                 .map_err(|e| CodegenError::InstructionError(e.to_string()))?
         };
         self.ptr_pointee_types.insert(gep, ty);
@@ -551,7 +551,7 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
     ) -> CodegenResult<PointerValue<'ctx>> {
         let gep = self
             .builder
-            .build_struct_gep(struct_ty, ptr, index, name)
+            .build_struct_gep(ptr, index, name)
             .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
         self.ptr_pointee_types.insert(gep, struct_ty.into());
         Ok(gep)
@@ -578,25 +578,17 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
             .ok_or_else(|| CodegenError::InstructionError("Call returned void".to_string()))
     }
 
-    /// Build an indirect function call
+    /// Build an indirect function call - not available in inkwell 0.10, use build_call with function value
     pub fn build_indirect_call(
         &mut self,
-        fn_ty: FunctionType<'ctx>,
-        func_ptr: PointerValue<'ctx>,
-        args: &[BasicValueEnum<'ctx>],
-        name: &str,
+        _fn_ty: FunctionType<'ctx>,
+        _func_ptr: PointerValue<'ctx>,
+        _args: &[BasicValueEnum<'ctx>],
+        _name: &str,
     ) -> CodegenResult<BasicValueEnum<'ctx>> {
-        let args: Vec<BasicMetadataValueEnum<'ctx>> = args
-            .iter()
-            .map(|a| BasicMetadataValueEnum::from(*a))
-            .collect();
-        let call_site = self
-            .builder
-            .build_indirect_call(fn_ty, func_ptr, &args, name)
-            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
-        call_site.try_as_basic_value().basic().ok_or_else(|| {
-            CodegenError::InstructionError("Indirect call returned void".to_string())
-        })
+        Err(CodegenError::UnsupportedFeature(
+            "Indirect function calls not supported in inkwell 0.10".to_string(),
+        ))
     }
 
     /// Build a return instruction

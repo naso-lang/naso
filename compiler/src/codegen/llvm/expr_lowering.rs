@@ -34,8 +34,10 @@ use crate::ast::Quantity;
 use crate::codegen::abi::IntWidth;
 use crate::codegen::error::{CodegenError, CodegenResult};
 use crate::codegen::ffi_integration::resolve_symbol;
+use crate::codegen::llvm::module_builder::LLVMModuleBuilder;
 use crate::codegen::llvm::value_builder::LlvmValueBuilder;
 use crate::ir::pir_types::{BinaryOp, ParamKind, PirExpr, UnaryOp};
+use inkwell::AddressSpace;
 use inkwell::module::Module;
 use inkwell::types::BasicTypeEnum;
 use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue};
@@ -161,6 +163,10 @@ pub struct PirExprLowerer<'ctx, 'a> {
     /// the error path -- a `?` between push and pop would leave a stale loop on the
     /// stack and let a later `break` outside any loop jump to a dead block.
     pub loop_stack: Vec<LoopTargets<'ctx>>,
+    /// Module builder reference for async lowering
+    pub module_builder: Option<&'a mut crate::codegen::llvm::module_builder::LLVMModuleBuilder<'ctx>>,
+    /// Quantities map for async lowering
+    pub quantities: Option<&'a HashMap<String, crate::ast::Quantity>>,
 }
 
 /// Where `break` and `continue` go for one enclosing loop.
@@ -571,8 +577,14 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                                     let ptr_type = self
                                         .value_builder
                                         .type_lowering()
-                                        .context()
-                                        .ptr_type(inkwell::AddressSpace::default());
+                                        .ptr_type(
+                                            self.value_builder
+                                                .type_lowering()
+                                                .context()
+                                                .i8_type()
+                                                .into(),
+                                            AddressSpace::from(0),
+                                        );
                                     match builder.build_int_to_ptr(v.into_int_value(), ptr_type, &format!("ffi_arg_ptr_{i}")) {
                                         Ok(ptr_val) => BasicMetadataValueEnum::from(ptr_val),
                                         Err(_) => BasicMetadataValueEnum::from(v),
@@ -1140,39 +1152,43 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
             // unreachable, and a mutation restoring the old behaviour survived every
             // other test in the file.
             PirExpr::Reversible { .. } => Err(CodegenError::UnsupportedFeature(
-                            "a `Reversible` block reached codegen, and this backend does not \\\n                 perform uncomputation. The INVERSE is not optional -- it is the part \\\n                 that undoes the computation -- so emitting the body alone would leave \\\n                 the state the block existed to erase. Refused rather than half-run."
-                                .to_string(),
-                        )),
-                        PirExpr::Async { body } => {
-                            let mut async_lowerer = crate::codegen::llvm::async_lowering::AsyncLowerer::new(
-                                self.module_builder,
-                                self.quantities,
-                            );
-                            async_lowerer.build_async(
-                                body,
-                                self.value_builder,
-                                self.module,
-                                self.current_function,
-                                self.callee_params,
-                                self.in_statement_position,
-                                self.loop_stack,
-                            )
-                        }
-                        PirExpr::Await { future } => {
-                            let mut async_lowerer = crate::codegen::llvm::async_lowering::AsyncLowerer::new(
-                                self.module_builder,
-                                self.quantities,
-                            );
-                            async_lowerer.build_await(
-                                future,
-                                self.value_builder,
-                                self.module,
-                                self.current_function,
-                                self.callee_params,
-                                self.in_statement_position,
-                                self.loop_stack,
-                            )
-                        }
+                                        "a `Reversible` block reached codegen, and this backend does not \\\n                 perform uncomputation. The INVERSE is not optional -- it is the part \\\n                 that undoes the computation -- so emitting the body alone would leave \\\n                 the state the block existed to erase. Refused rather than half-run."
+                                            .to_string(),
+                                    )),
+                                    PirExpr::Async(body) => {
+                                        let module_builder = self.module_builder.as_mut().unwrap();
+                                        let quantities = self.quantities.unwrap();
+                                        let mut async_lowerer = crate::codegen::llvm::async_lowering::AsyncLowerer::new(
+                                            module_builder,
+                                            quantities,
+                                        );
+                                        async_lowerer.build_async(
+                                            body,
+                                            self.value_builder,
+                                            self.module,
+                                            self.current_function,
+                                            self.callee_params,
+                                            self.in_statement_position,
+                                            &mut self.loop_stack,
+                                        )
+                                    }
+                                    PirExpr::Await(future) => {
+                                        let module_builder = self.module_builder.as_mut().unwrap();
+                                        let quantities = self.quantities.unwrap();
+                                        let mut async_lowerer = crate::codegen::llvm::async_lowering::AsyncLowerer::new(
+                                            module_builder,
+                                            quantities,
+                                        );
+                                        async_lowerer.build_await(
+                                            future,
+                                            self.value_builder,
+                                            self.module,
+                                            self.current_function,
+                                            self.callee_params,
+                                            self.in_statement_position,
+                                            &mut self.loop_stack,
+                                        )
+                                    }
             PirExpr::Await { .. } => Err(CodegenError::UnsupportedFeature(
                 "await expression lowering not yet implemented".to_string(),
             )),
@@ -1933,7 +1949,7 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
 
         self.value_builder
             .builder()
-            .build_load(tensor.elem, gep, "elem")
+            .build_load(gep, "elem")
             .map_err(|e| CodegenError::InstructionError(e.to_string()))
     }
 
@@ -2620,7 +2636,7 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                     builder
                         .build_int_to_ptr(
                             ptr.into_int_value(),
-                            self.value_builder.type_lowering().context().ptr_type(inkwell::AddressSpace::default()),
+                            self.value_builder.type_lowering().ptr_type(self.value_builder.type_lowering().context().i8_type().into(), AddressSpace::from(0)),
                             "tensor_ptr_ptr"
                         )
                         .map_err(|e| CodegenError::InstructionError(e.to_string()))?

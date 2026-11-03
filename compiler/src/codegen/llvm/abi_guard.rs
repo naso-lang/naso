@@ -363,7 +363,7 @@ fn declare_violation_runtime<'ctx>(
     type_lowering: &LlvmTypeLowering<'ctx>,
     module: &LlvmModule<'ctx>,
 ) -> CodegenResult<()> {
-    let ptr_type = type_lowering.ptr_type(type_lowering.void_type().into(), 0);
+    let ptr_type = type_lowering.ptr_type(type_lowering.context().i8_type().into(), AddressSpace::from(0));
 
     if module.get_function("exit").is_none() {
         let exit_type = type_lowering

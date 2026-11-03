@@ -18,6 +18,7 @@ use inkwell::builder::Builder as LlvmBuilder;
 use inkwell::module::Module as LlvmModule;
 use inkwell::types::BasicTypeEnum;
 use inkwell::values::{AnyValue, BasicMetadataValueEnum, FunctionValue, PointerValue};
+use inkwell::AddressSpace;
 use std::collections::HashMap;
 
 // LLVM Module Builder for constructing LLVM IR from PIR
@@ -204,7 +205,7 @@ fn param_slot<'ctx>(
 ) -> CodegenResult<(BasicTypeEnum<'ctx>, ParamKind)> {
     use crate::ir::pir_types::ElemType;
     let ptr_ty = type_lowering
-        .ptr_type(i64_placeholder(type_lowering).into(), 0)?
+        .ptr_type(i64_placeholder(type_lowering).into(), AddressSpace::from(0))
         .into();
     Ok(match &param.kind {
         // A tensor is a POINTER to the caller's buffer. It is never an alloca and never

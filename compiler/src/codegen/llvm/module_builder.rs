@@ -573,6 +573,20 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
             .map(|(ptr, _)| ptr)
     }
 
+    /// Get or declare an FFI function by name and signature
+    pub fn get_or_declare_ffi_function(
+        &mut self,
+        name: &str,
+        fn_type: inkwell::types::FunctionType<'ctx>,
+    ) -> CodegenResult<FunctionValue<'ctx>> {
+        if let Some(func) = self.module.get_function(name) {
+            Ok(func)
+        } else {
+            let func = self.module.add_function(name, fn_type, None);
+            Ok(func)
+        }
+    }
+
     // Build the entire PIR module.
     //
     // # One LLVM symbol per Naso function

@@ -9,6 +9,7 @@ use inkwell::values::BasicValueEnum;
 
 /// Placeholder for async lowering state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum AsyncState {
     Start = 0,
     Await(u32),

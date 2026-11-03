@@ -1146,6 +1146,12 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                  the state the block existed to erase. Refused rather than half-run."
                     .to_string(),
             )),
+            PirExpr::Async { .. } => Err(CodegenError::UnsupportedFeature(
+                "async block lowering not yet implemented".to_string(),
+            )),
+            PirExpr::Await { .. } => Err(CodegenError::UnsupportedFeature(
+                "await expression lowering not yet implemented".to_string(),
+            )),
             // `base[indices...]`: a real load out of a caller-owned tensor buffer.
             //
             // This used to evaluate the base, throw the indices away, and return the

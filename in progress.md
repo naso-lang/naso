@@ -321,12 +321,13 @@ Naso: `Stream` has quantity `[1]` — **must** be passed to `read`/`write`/`clos
 The async runtime and FFI layer are complete. The next phase is **compiler codegen for async/await lowering**:
 
 1. ~~Create `compiler/src/codegen/llvm/async_lowering.rs` for state machine generation~~ ✅ Created (stub)
-2. Implement `await` point splitting (separate basic blocks before/after each await)
-3. Wire FFI calls (`naso_spawn`, `naso_yield`, `naso_future_*`, `naso_channel_*`) to codegen
-4. Generate state machine struct with future storage for each async function
-5. Test: compile async Naso code end-to-end
+2. ~~Add `PirExpr::Async` and `PirExpr::Await` match arms in expr_lowering returning `UnsupportedFeature`~~ ✅
+3. Implement `await` point splitting (separate basic blocks before/after each await)
+4. Wire FFI calls (`naso_spawn`, `naso_yield`, `naso_future_*`, `naso_channel_*`) to codegen
+5. Generate state machine struct with future storage for each async function
+6. Test: compile async Naso code end-to-end
 
-**Note**: LLVM backend currently has inkwell/LLVM 14 API mismatches in existing codegen (abi_guard, abi_llvm, access_emission). Compiler compiles cleanly without `--features llvm`. The async lowering is a stub returning `UnsupportedFeature` — ready for incremental implementation once LLVM backend is fixed.
+**Note**: LLVM backend currently has inkwell/LLVM 14 API mismatches in existing codegen (abi_guard, abi_llvm, access_emission, value_builder, type_lowering, qir/module_builder). Compiler compiles cleanly without `--features llvm`. The async lowering is a stub returning `UnsupportedFeature` — ready for incremental implementation once LLVM backend is fixed.
 
 This will enable native Naso async servers that can finally compete with Rust's multi-threaded async model.
 

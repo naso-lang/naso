@@ -394,11 +394,11 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 Ok(ptr.into())
             }
             PirExpr::Var(name) => {
-                if let Some((ptr, ty)) = self.value_builder.variable(name) {
+                if let Some((ptr, _ty)) = self.value_builder.variable(name) {
                     let load = self
                         .value_builder
                         .builder()
-                        .build_load(ty, ptr, name)
+                        .build_load(ptr, name)
                         .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
                     Ok(load)
                 } else {
@@ -1213,7 +1213,6 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                                 let gep = unsafe {
                                     builder
                                         .build_gep(
-                                            array_type,
                                             array_ptr,
                                             &[int_type.const_int(0, false), idx],
                                             &format!("array_elem_{i}"),
@@ -1246,7 +1245,6 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                             let elem_ptr = unsafe {
                                 builder
                                     .build_gep(
-                                        array_type,
                                         array_ptr,
                                         &[int_type.const_int(0, false), int_type.const_int(0, false)],
                                         "array_elem_ptr",
@@ -1306,7 +1304,11 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                     let field_idx = int_type.const_int(i as u64, false);
                     let gep = unsafe {
                         builder
-                            .build_gep(struct_type, struct_ptr, &[field_idx], &format!("struct_field_{i}"))
+                            .build_gep(
+                                struct_ptr,
+                                &[field_idx],
+                                &format!("struct_field_{i}"),
+                            )
                             .map_err(|e| CodegenError::InstructionError(e.to_string()))?
                     };
                     builder
@@ -1316,7 +1318,7 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
 
                 // Load the struct value and return it
                 let struct_val = builder
-                    .build_load(struct_type, struct_ptr, "struct_val")
+                    .build_load(struct_ptr, "struct_val")
                     .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
                 Ok(struct_val)
             }

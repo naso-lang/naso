@@ -237,7 +237,7 @@ pub fn lower_schedule_tree_into<'ctx>(
     // with no tensor parameter emits nothing here and the builder stays in `entry`, so
     // a scalar-only kernel's block structure is unchanged.
     crate::codegen::llvm::abi_guard::emit_abi_guard(
-        llvm_context,
+        value_builder.type_lowering(),
         module,
         function,
         value_builder.builder(),

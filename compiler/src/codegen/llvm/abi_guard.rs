@@ -122,6 +122,7 @@
 
 use crate::codegen::error::{CodegenError, CodegenResult};
 use crate::codegen::llvm::module_builder::EntryParam;
+use crate::codegen::llvm::type_lowering::LlvmTypeLowering;
 use crate::ir::pir_types::ParamKind;
 use inkwell::AddressSpace;
 use inkwell::attributes::{Attribute, AttributeLoc};
@@ -161,7 +162,7 @@ struct TensorSlot<'ctx> {
 /// A module with no tensor parameter emits NOTHING here: no blocks, no `exit`
 /// declaration, no message strings. A scalar-only kernel's IR is unchanged.
 pub fn emit_abi_guard<'ctx>(
-    context: &'ctx Context,
+    type_lowering: &LlvmTypeLowering<'ctx>,
     module: &LlvmModule<'ctx>,
     function: FunctionValue<'ctx>,
     builder: &LlvmBuilder<'ctx>,
@@ -171,13 +172,13 @@ pub fn emit_abi_guard<'ctx>(
     if slots.is_empty() {
         return Ok(());
     }
-    declare_violation_runtime(context, module)?;
+    declare_violation_runtime(type_lowering, module)?;
 
     for slot in &slots {
         let violation_null =
-            append_block(context, function, &format!("naso.abi.null.{}", slot.name));
+            append_block(type_lowering.context(), function, &format!("naso.abi.null.{}", slot.name));
         let after_null = append_block(
-            context,
+            type_lowering.context(),
             function,
             &format!("naso.abi.null.{}.cont", slot.name),
         );
@@ -194,7 +195,7 @@ pub fn emit_abi_guard<'ctx>(
 
         builder.position_at_end(violation_null);
         emit_violation(
-            context,
+            type_lowering,
             module,
             builder,
             &format!("naso.abi.violation.null.{}", slot.name),
@@ -215,9 +216,9 @@ pub fn emit_abi_guard<'ctx>(
         // declared extent is running a correct program, and refusing it would be
         // the guard inventing a rule. See the module doc.
         let violation_short =
-            append_block(context, function, &format!("naso.abi.short.{}", slot.name));
+            append_block(type_lowering.context(), function, &format!("naso.abi.short.{}", slot.name));
         let after_short = append_block(
-            context,
+            type_lowering.context(),
             function,
             &format!("naso.abi.short.{}.cont", slot.name),
         );
@@ -246,7 +247,7 @@ pub fn emit_abi_guard<'ctx>(
         // and this message is the one a person debugging a wrong buffer sees.
         let plural = if slot.declared == 1 { "" } else { "s" };
         emit_violation(
-            context,
+            type_lowering,
             module,
             builder,
             &format!("naso.abi.violation.short.{}", slot.name),
@@ -359,15 +360,16 @@ fn element_count(name: &str, shape: &[u64]) -> CodegenResult<u64> {
 /// because LLVM's enum attribute numbering is not stable across releases, and a
 /// hard-coded id would attach whatever attribute happens to have that number.
 fn declare_violation_runtime<'ctx>(
-    context: &'ctx Context,
+    type_lowering: &LlvmTypeLowering<'ctx>,
     module: &LlvmModule<'ctx>,
 ) -> CodegenResult<()> {
-    let ptr_type = context.ptr_type(AddressSpace::default());
+    let ptr_type = type_lowering.ptr_type(type_lowering.void_type().into(), 0);
 
     if module.get_function("exit").is_none() {
-        let exit_type = context
+        let exit_type = type_lowering
+            .context()
             .void_type()
-            .fn_type(&[context.i32_type().into()], false);
+            .fn_type(&[type_lowering.context().i32_type().into()], false);
         let exit_fn = module.add_function("exit", exit_type, None);
         let noreturn_kind = Attribute::get_named_enum_kind_id("noreturn");
         if noreturn_kind == 0 {
@@ -383,12 +385,13 @@ fn declare_violation_runtime<'ctx>(
         }
         exit_fn.add_attribute(
             AttributeLoc::Function,
-            context.create_enum_attribute(noreturn_kind, 0),
+            type_lowering.context().create_enum_attribute(noreturn_kind, 0),
         );
     }
 
     if module.get_function("fputs").is_none() {
-        let fputs_type = context
+        let fputs_type = type_lowering
+            .context()
             .i32_type()
             .fn_type(&[ptr_type.into(), ptr_type.into()], false);
         module.add_function("fputs", fputs_type, None);
@@ -407,7 +410,7 @@ fn declare_violation_runtime<'ctx>(
 ///
 /// These two calls are the whole reason this guard cannot be optimised away.
 fn emit_violation<'ctx>(
-    context: &'ctx Context,
+    type_lowering: &LlvmTypeLowering<'ctx>,
     module: &LlvmModule<'ctx>,
     builder: &LlvmBuilder<'ctx>,
     global_name: &str,
@@ -427,7 +430,6 @@ fn emit_violation<'ctx>(
         .ok_or_else(|| CodegenError::InternalError("stderr was not declared".to_string()))?;
     let stderr_ptr: PointerValue<'ctx> = builder
         .build_load(
-            pointer_type(context),
             stderr_global.as_pointer_value(),
             "stderr",
         )
@@ -444,7 +446,11 @@ fn emit_violation<'ctx>(
     let exit_fn = module
         .get_function("exit")
         .ok_or_else(|| CodegenError::InternalError("exit was not declared".to_string()))?;
-    let code_value: BasicValueEnum<'ctx> = context.i32_type().const_int(code as u64, true).into();
+    let code_value: BasicValueEnum<'ctx> = type_lowering
+        .context()
+        .i32_type()
+        .const_int(code as u64, true)
+        .into();
     builder
         .build_call(exit_fn, &[code_value.into()], "")
         .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
@@ -455,10 +461,6 @@ fn emit_violation<'ctx>(
         .build_unreachable()
         .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
     Ok(())
-}
-
-fn pointer_type<'ctx>(context: &'ctx Context) -> PointerType<'ctx> {
-    context.ptr_type(AddressSpace::default())
 }
 
 #[cfg(test)]

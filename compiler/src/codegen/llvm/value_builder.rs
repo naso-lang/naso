@@ -397,17 +397,8 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
         ptr: PointerValue<'ctx>,
         name: &str,
     ) -> CodegenResult<BasicValueEnum<'ctx>> {
-        // Opaque pointers: the load needs the pointee type explicitly. Recover
-        // it from the pointers this builder handed out.
-        let pointee = *self.ptr_pointee_types.get(&ptr).ok_or_else(|| {
-            CodegenError::InstructionError(format!(
-                "cannot load from {ptr:?}: unknown pointee type (opaque pointers \
-                 require the pointer to come from build_alloca/build_gep/build_struct_gep \
-                 on this value builder)"
-            ))
-        })?;
         self.builder
-            .build_load(pointee, ptr, name)
+            .build_load(ptr, name)
             .map_err(|e| CodegenError::InstructionError(e.to_string()))
     }
 

@@ -79,7 +79,7 @@ impl LlvmPointerType {
                 self.address_space
             ))
         })?;
-        Ok(lowering.context().ptr_type(addr_space).into())
+        Ok(lowering.ptr_type(_pointee_type, addr_space as u32).into())
     }
 }
 

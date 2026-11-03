@@ -30,7 +30,7 @@ pub struct LlvmTypeLowering<'ctx> {
 impl<'ctx> LlvmTypeLowering<'ctx> {
     /// Create a new type lowering context
     pub fn new(context: &'ctx Context) -> Self {
-        let qubit_type = context.ptr_type(AddressSpace::from(0)); // Generic address space for qubits
+        let qubit_type = context.ptr_type(inkwell::AddressSpace::default());
         let result_type = context.bool_type(); // i1
 
         Self {
@@ -150,9 +150,9 @@ impl<'ctx> LlvmTypeLowering<'ctx> {
     fn lower_pointer(&mut self, ptr: &LlvmPointerType) -> CodegenResult<BasicTypeEnum<'ctx>> {
         // Validate the pointee lowers cleanly even though opaque pointers
         // erase it in the resulting type.
-        let _pointee_type = self.lower_quantity_aware(&ptr.pointee)?;
+        let pointee_type = self.lower_quantity_aware(&ptr.pointee)?;
         let addr_space = self.address_space(ptr.address_space)?;
-        Ok(self.context.ptr_type(addr_space).into())
+        Ok(self.ptr_type(pointee_type, ptr.address_space).into())
     }
 
     /// Convert a raw address space id into an inkwell `AddressSpace`.
@@ -173,7 +173,6 @@ impl<'ctx> LlvmTypeLowering<'ctx> {
     }
 
     /// Get pointer type for the given address space.
-    ///
     /// LLVM 15+ has opaque pointers, so the `pointee` argument does not
     /// affect the pointer type; it is retained for call-site readability and
     /// must still be a valid basic type. The address space is honoured.
@@ -181,11 +180,12 @@ impl<'ctx> LlvmTypeLowering<'ctx> {
         &self,
         pointee: BasicTypeEnum<'ctx>,
         address_space: u32,
-    ) -> CodegenResult<PointerType<'ctx>> {
+    ) -> PointerType<'ctx> {
         // Keep the pointee meaningful: opaque pointers erase it in the IR, but
         // dropping it entirely would lose the caller's intent silently.
         let _ = pointee;
-        Ok(self.context.ptr_type(self.address_space(address_space)?))
+        let addr_space = self.address_space(address_space).unwrap_or(AddressSpace::default());
+        self.context.ptr_type(addr_space)
     }
 
     /// Get function type

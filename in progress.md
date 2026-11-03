@@ -328,7 +328,7 @@ The async runtime and FFI layer are complete. The next phase is **compiler codeg
 6. ✅ Parser support: async/await keywords in all contexts (extern blocks, top-level fn, expressions)
 7. ✅ Spawn/yield FFI wiring: `build_async` calls `naso_spawn`, `build_await` calls `naso_yield`
 8. ✅ Implement `await` point splitting (separate basic blocks before/after each await)
-9. ⬜ Generate state machine struct with future storage for each async function
+9. ✅ Generate state machine struct with future storage for each async function
 10. ⬜ Test: compile async Naso code end-to-end
 
 **Note**: LLVM backend currently has inkwell/LLVM 14 API mismatches in existing codegen (abi_guard, abi_llvm, access_emission, value_builder, type_lowering, qir/module_builder). Compiler compiles cleanly without `--features llvm`. The async lowering is implemented (not just stubbed) but requires working LLVM backend for full testing.

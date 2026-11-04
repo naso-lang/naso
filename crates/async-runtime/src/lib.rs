@@ -315,7 +315,7 @@ pub struct Runtime {
     config: RuntimeConfig,
     workers: Vec<Worker>,
     global_queue: Arc<Mutex<VecDeque<Arc<Task>>>>,
-    shutdown_flag: Arc<AtomicBool>,
+    pub shutdown_flag: Arc<AtomicBool>,
     timer_tick_handle: Option<StdJoinHandle<()>>,
 }
 
@@ -474,7 +474,8 @@ impl Runtime {
     
     /// Run the runtime (blocking until shutdown)
     pub fn run(&mut self) {
-        // Wait for shutdown signal
+        // The I/O event loop is managed by naso-ffi's ASYNC_POLL
+        // This just waits for shutdown signal
         while !self.shutdown_flag.load(Ordering::Relaxed) {
             thread::sleep(Duration::from_millis(100));
         }
@@ -558,6 +559,30 @@ impl<T: Send + 'static> StdFuture for NFuture<T> {
         } else {
             *this.inner.waker.lock() = Some(cx.waker().clone());
             Poll::Pending
+        }
+    }
+}
+
+/// Wrapper that converts a future with output to a future with output ()
+pub struct FutureWrap<F> {
+    inner: Pin<Box<F>>,
+}
+
+impl<F> FutureWrap<F> {
+    pub fn new(f: F) -> Self {
+        Self { inner: Box::pin(f) }
+    }
+}
+
+impl<F: StdFuture<Output = Vec<u8>> + Send + 'static> StdFuture for FutureWrap<F> {
+    type Output = ();
+    
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Safety: we're not moving inner, just polling it
+        let inner = unsafe { self.get_unchecked_mut().inner.as_mut() };
+        match inner.poll(cx) {
+            Poll::Ready(_) => Poll::Ready(()),
+            Poll::Pending => Poll::Pending,
         }
     }
 }

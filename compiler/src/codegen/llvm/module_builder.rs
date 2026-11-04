@@ -531,11 +531,23 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
         &mut self.type_lowering
     }
 
-    // Get the value builder
+    // Get the value builder (non-consuming, for async lowering which needs it while module_builder is borrowed)
     pub fn value_builder(&mut self) -> &mut LlvmValueBuilder<'ctx> {
         self.value_builder
             .as_mut()
             .expect("value_builder not initialized")
+    }
+    
+    // Get the value builder, taking it out (for lowering that needs full ownership)
+    pub fn take_value_builder(&mut self) -> LlvmValueBuilder<'ctx> {
+        self.value_builder
+            .take()
+            .expect("value_builder not initialized")
+    }
+    
+    // Put the value builder back
+    pub fn put_value_builder(&mut self, vb: LlvmValueBuilder<'ctx>) {
+        self.value_builder = Some(vb);
     }
 
     // Set the current function

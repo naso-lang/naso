@@ -19,6 +19,7 @@ pub static FFI_SYMBOLS: &[(&str, &str)] = &[
     // Async runtime FFI
     ("naso_runtime_new", "naso_runtime_new"),
     ("naso_runtime_free", "naso_runtime_free"),
+    ("naso_runtime_run", "naso_runtime_run"),
     ("naso_spawn", "naso_spawn"),
     ("naso_yield", "naso_yield"),
     ("naso_future_new", "naso_future_new"),
@@ -48,6 +49,11 @@ pub static FFI_SYMBOLS: &[(&str, &str)] = &[
     ("naso_pool_return_connection", "naso_pool_return_connection"),
     ("naso_pool_free", "naso_pool_free"),
     ("naso_pool_get_stats", "naso_pool_get_stats"),
+    // Simplified pool FFI (scalar args for Naso examples)
+    ("naso_pool_create_simple", "naso_pool_create_simple"),
+    ("naso_pool_get_connection_simple", "naso_pool_get_connection_simple"),
+    ("naso_pool_return_connection_simple", "naso_pool_return_connection_simple"),
+    ("naso_pool_close_simple", "naso_pool_close_simple"),
 ];
 
 /// Returns the Rust symbol name for a Naso extern function

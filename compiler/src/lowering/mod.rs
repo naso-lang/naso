@@ -2279,7 +2279,7 @@ impl LoweringContext {
             UnOp::Neg => PirUnaryOp::Neg,
             UnOp::Not => PirUnaryOp::Not,
             UnOp::BitNot => PirUnaryOp::Not,
-            UnOp::Deref => PirUnaryOp::Neg,
+            UnOp::Deref => PirUnaryOp::Deref,
             UnOp::InOut => PirUnaryOp::Neg,
             UnOp::Consume => PirUnaryOp::Neg,
         }

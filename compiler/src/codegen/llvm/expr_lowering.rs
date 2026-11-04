@@ -3073,14 +3073,44 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                      spelling; the typechecker should have rejected it."
                         .to_string(),
                 )),
+                UnaryOp::Deref => Err(CodegenError::UnsupportedFeature(
+                    "`*` (deref) on a floating-point operand is not supported."
+                        .to_string(),
+                )),
             };
         }
         let int_val = expr.into_int_value();
         let result = match op {
-            UnaryOp::Neg => self.value_builder.builder().build_int_neg(int_val, "neg"),
-            UnaryOp::Not => self.value_builder.builder().build_not(int_val, "not"),
-        }
-        .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
-        Ok(result.into())
+            UnaryOp::Neg => self
+                .value_builder
+                .builder()
+                .build_int_neg(int_val, "neg")
+                .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                .into(),
+            UnaryOp::Not => self
+                .value_builder
+                .builder()
+                .build_not(int_val, "not")
+                .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                .into(),
+            UnaryOp::Deref => {
+                // Deref: load from the pointer address
+                let ptr_type = self.value_builder.type_lowering().ptr_type(
+                    self.value_builder.type_lowering().context().i8_type().into(),
+                    AddressSpace::from(0),
+                );
+                let ptr = self.value_builder.builder().build_int_to_ptr(
+                    int_val,
+                    ptr_type,
+                    "deref.ptr",
+                ).map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                let loaded = self.value_builder.builder().build_load(
+                    ptr,
+                    "deref.load",
+                ).map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                loaded
+            }
+        };
+        Ok(result)
     }
 }

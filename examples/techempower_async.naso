@@ -2,7 +2,8 @@ extern "C" {
     fn naso_write(fd: u64, buf: *u8, len: usize) -> usize;
     fn naso_read(fd: u64, buf: *u8, max_len: usize) -> usize;
     fn naso_tcp_bind(addr: *u8, len: usize) -> u64;
-    fn naso_tcp_accept_async(fd: u64, out_ptr: *u64, out_len: usize) -> u64;
+    fn naso_tcp_accept(listener_fd: u64, out_ptr: *u64) -> u64;
+    fn naso_accept_get_client(out_ptr: *u64) -> u64;
     fn naso_close(fd: u64) -> u64;
     fn naso_runtime_new(workers: u64) -> *u8;
     fn naso_runtime_run(runtime: *u8) -> u64;
@@ -17,15 +18,16 @@ async fn handle_client(client_fd: u64) -> () {
     let _ = naso_close(client_fd);
 }
 
-async fn accept_loop(fd: u64) -> () {
+fn accept_loop(fd: u64, runtime: *u8) -> () {
     let mut running = 1;
     let mut out = [0, 0];
     let out_ptr = out as *u64;
     
     while running != 0 {
-        if naso_tcp_accept_async(fd, out_ptr, 16) != 0 {
-            let client_fd = *out_ptr;
-            await handle_client(client_fd);
+        if naso_tcp_accept(fd, out_ptr) != 0 {
+            let client_fd = naso_accept_get_client(out_ptr);
+            // Spawn async handler
+            let _ = handle_client(client_fd);
         }
         naso_yield();
     }
@@ -37,8 +39,8 @@ fn main() -> () {
     
     let runtime = naso_runtime_new(4);
     
-    // Spawn the accept loop instead of awaiting in sync main
-    let _ = accept_loop(fd);
+    // Run accept loop (sync) with async runtime
+    accept_loop(fd, runtime);
     
     let _ = naso_runtime_run(runtime);
 }

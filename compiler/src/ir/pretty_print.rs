@@ -252,6 +252,7 @@ fn unary_op_to_str(op: UnaryOp) -> &'static str {
     match op {
         UnaryOp::Neg => "-",
         UnaryOp::Not => "!",
+        UnaryOp::Deref => "*",
     }
 }
 

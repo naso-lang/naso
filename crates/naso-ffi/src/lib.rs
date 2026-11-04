@@ -371,26 +371,12 @@ pub extern "C" fn naso_runtime_run(rt: *mut AsyncRuntimeHandle) -> u64 {
             break;
         }
         
-        // Poll for I/O events
-        let mut events = Events::with_capacity(1024);
-        let timeout = Some(Duration::from_millis(10));
-        {
-            let mut poll_guard = async_poll().lock().unwrap();
-            match poll_guard.poll.poll(&mut events, timeout) {
-                Ok(_) => {
-                    for event in &events {
-                        let token = event.token();
-                        if let Some(reg) = poll_guard.registrations.get_mut(&token) {
-                            if event.is_readable() || event.is_writable() {
-                                if let Some(waker) = reg.waker.take() {
-                                    waker.wake();
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(_) => {}
-            }
+        // Poll for I/O events using the async poll's poll_once
+        // This handles both stream events and listener accepts
+        let mut poll_guard = async_poll().lock().unwrap();
+        match poll_guard.poll_once(Some(Duration::from_millis(10))) {
+            Ok(_) => {}
+            Err(_) => {}
         }
         
         // Also run the timer tick

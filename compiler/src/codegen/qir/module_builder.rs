@@ -1014,11 +1014,30 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
     ) -> CodegenResult<BasicValueEnum<'ctx>> {
         let int_val = expr.into_int_value();
         let result = match op {
-            crate::ir::pir_types::UnaryOp::Neg => self.builder.build_int_neg(int_val, "neg"),
-            crate::ir::pir_types::UnaryOp::Not => self.builder.build_not(int_val, "not"),
-        }
-        .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
-        Ok(result.into())
+            crate::ir::pir_types::UnaryOp::Neg => self
+                .builder
+                .build_int_neg(int_val, "neg")
+                .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                .into(),
+            crate::ir::pir_types::UnaryOp::Not => self
+                .builder
+                .build_not(int_val, "not")
+                .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                .into(),
+            crate::ir::pir_types::UnaryOp::Deref => {
+                // Deref: load from the pointer address
+                let ptr_type = self.llvm_context.i8_type().ptr_type(AddressSpace::from(0));
+                let ptr = self
+                    .builder
+                    .build_int_to_ptr(int_val, ptr_type, "deref.ptr")
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                self.builder
+                    .build_load(ptr, "deref.load")
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                    .into()
+            }
+        };
+        Ok(result)
     }
 
     // Convert module to QIR text format (.qir file)

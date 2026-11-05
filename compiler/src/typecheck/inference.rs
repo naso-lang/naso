@@ -32,16 +32,18 @@ fn infer_cast(
     let is_numeric = |k: &TypeKind| {
         matches!(
             k,
-            TypeKind::Int | TypeKind::UInt | TypeKind::Float | TypeKind::Nat | TypeKind::Quint8 | TypeKind::Pointer(_)
+            TypeKind::Int | TypeKind::UInt | TypeKind::Float | TypeKind::Nat | TypeKind::Quint8 | TypeKind::Pointer(_) | TypeKind::Function(_, _)
         )
     };
     /// Also allow String -> Pointer casts (for C string literals)
     let is_string_to_ptr = matches!((&from.kind, &target.kind), (TypeKind::String, TypeKind::Pointer(_)));
     // Also allow Array -> Pointer casts (for buffer passing to C)
     let is_array_to_ptr = matches!((&from.kind, &target.kind), (TypeKind::Array(_, _), TypeKind::Pointer(_)));
+    // Allow Function -> Pointer casts (for FFI callbacks)
+    let is_fn_to_ptr = matches!((&from.kind, &target.kind), (TypeKind::Function(_, _), TypeKind::Pointer(_)));
 
     if !is_numeric(&from.kind) || !is_numeric(&target.kind) {
-        if !is_string_to_ptr && !is_array_to_ptr {
+        if !is_string_to_ptr && !is_array_to_ptr && !is_fn_to_ptr {
             return Err(TypeError::InvalidCast {
                 from,
                 to: target.clone(),
@@ -382,6 +384,21 @@ fn infer_unary(
             // Consumes the operand, produces same type with consume mutability
             checker.env.move_var(&operand_ty.to_ident(), span)?;
             operand_ty
+        }
+        UnOp::AddrOf => {
+            // Address-of operator: for function pointers, returns a pointer to the function
+            // For arrays, returns a pointer to the element type (u8 for byte arrays)
+            // For now, return a pointer to the operand type
+            let pointee = if let TypeKind::Array(elem_ty, _) = &operand_ty.kind {
+                *elem_ty.clone()
+            } else {
+                operand_ty
+            };
+            Type::new(
+                TypeKind::Pointer(Box::new(pointee)),
+                Quantity::Many,
+                span,
+            )
         }
     };
     Ok(result_ty)

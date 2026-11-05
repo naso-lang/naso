@@ -9,21 +9,22 @@ extern "C" {
 
 fn main() -> () {
     let addr = [49, 50, 55, 46, 48, 46, 48, 46, 49, 58, 56, 48, 56, 56]; // "127.0.0.1:8088"
-    let fd = naso_tcp_bind(addr as *u8, 14);
+    let listener_fd = naso_tcp_bind(addr as * u8, 14);
     
-    let out = [0, 0];
+    let out: [u64; 2] = [0, 0];
     let out_ptr = out as * u64;
-    let buf = [0, 0, 0, 0, 0, 0, 0, 0];
+    let buf: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
     let response = [72, 84, 84, 80, 47, 49, 46, 49, 32, 50, 48, 48, 32, 79, 75, 13, 10, 67, 111, 110, 116, 101, 110, 116, 45, 76, 101, 110, 103, 116, 104, 58, 32, 49, 50, 13, 10, 13, 10, 72, 101, 108, 108, 111, 32, 87, 111, 114, 108, 100, 10]; // "HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nHello World\n"
-    let mut running = 1;
+    let response_len = response.len();
     
-    while running != 0 {
-        let accept_result = naso_tcp_accept(fd, out_ptr);
+    // Continuous loop: accept, read, write, close
+    loop {
+        let accept_result = naso_tcp_accept(listener_fd, out_ptr);
         if accept_result != 0 {
             let client_fd = naso_accept_get_client(out_ptr);
-            let read_result = naso_read(client_fd, buf as * u8, buf.len());
-            let write_result = naso_write(client_fd, response as * u8, 51);
-            let close_result = naso_close(client_fd);
+            let _ = naso_read(client_fd, buf as * u8, buf.len());
+            let _ = naso_write(client_fd, response as * u8, response_len);
+            let _ = naso_close(client_fd);
         }
     }
 }

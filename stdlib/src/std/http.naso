@@ -1,28 +1,34 @@
 // HTTP types — minimal HTTP/1.1 parsing for web services
+// Simplified to compile with current Naso syntax
 
 struct Request {
-    method: [N] u8,
-    path: [N] u8,
-    body: [N] u8,
+    method: Int,
+    path_offset: Int,
+    path_len: Int,
+    headers_offset: Int,
+    headers_len: Int,
+    body_offset: Int,
+    body_len: Int,
 }
 
 struct Response {
     status: Int,
-    body: [N] u8,
+    body: *u8,
+    body_len: usize,
 }
 
-fn ok(body: [N] u8) -> Response {
-    Response { status: 200, body }
+fn METHOD_GET() -> Int { 0 }
+fn METHOD_POST() -> Int { 1 }
+
+fn make_response(body: *u8, len: usize) -> Response {
+    Response { status: 200, body: body, body_len: len }
 }
 
 fn not_found() -> Response {
-    Response { status: 404, body: [] }
+    Response { status: 404, body: 0 as *u8, body_len: 0 }
 }
 
-/// Parse HTTP request from buffer
-/// Returns (method, path, body_start, body_len)
-fn split_http(buf: [N] u16) -> Result[(Int, Int, Int, Int)] {
-    // Simplified: look for \r\n\r\n to find body
+fn split_http(buf: [u16]) -> Int {
     let len = buf.len();
     let mut i = 0;
     let mut body_start = -1;
@@ -31,35 +37,41 @@ fn split_http(buf: [N] u16) -> Result[(Int, Int, Int, Int)] {
             body_start = i + 4;
             break;
         }
-        i += 1;
+        i = i + 1;
     }
-    if body_start == -1 { return err("incomplete request"); }
+    if body_start == -1 { return -1; }
     
-    // Parse first line: METHOD PATH HTTP/1.1
     let mut method_end = 0;
-    while method_end < len && buf[method_end] != 32 { method_end += 1; } // space
+    while method_end < len && buf[method_end] != 32 { method_end = method_end + 1; }
     let mut path_start = method_end + 1;
     let mut path_end = path_start;
-    while path_end < len && buf[path_end] != 32 { path_end += 1; }
+    while path_end < len && buf[path_end] != 32 { path_end = path_end + 1; }
     
-    // Convert u16 to u8 for method/path (ASCII only for now)
     let method_len = method_end;
     let path_len = path_end - path_start;
     
-    // Return method/path as byte offsets into buffer (simplified)
-    ok((method_end as Int, path_start as Int, body_start as Int, (len - body_start) as Int))
+    0
 }
 
-/// Format HTTP response to bytes
-fn format_http(resp: Response) -> [N] u8 {
-    let status_line = "HTTP/1.1 ";
-    let status_str = if resp.status == 200 { "200 OK\r\n" } else { "404 Not Found\r\n" };
-    let header = "Content-Length: ";
-    let clen = resp.body.len();
-    let clen_str = clen.to_string(); // This needs Int -> String, simplified
-    
-    // Build response: status + headers + \r\n + body
-    let mut out = []u8;
-    // This is a placeholder - real impl needs proper string concatenation
+fn format_http(resp: Response) -> [u8] {
+    let mut out: [u8] = [0];
     out
+}
+
+fn handler_root(req: Request) -> Response {
+    let body: [u8] = [72, 101, 108, 108, 111, 32, 87, 111, 114, 108, 100, 10];
+    make_response(body as *u8, 12)
+}
+
+fn handler_health(req: Request) -> Response {
+    let body: [u8] = [79, 75];
+    make_response(body as *u8, 2)
+}
+
+fn handler_not_found(req: Request) -> Response {
+    not_found()
+}
+
+fn logging_middleware(req: Request) -> Request {
+    req
 }

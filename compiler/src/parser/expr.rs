@@ -144,6 +144,17 @@ impl<'a> Parser<'a> {
             let span = e.span;
             return Expr::new(ExprKind::Unary(UnOp::Deref, Box::new(e)), span, next_id());
         }
+        // Address-of operator: &expr or @expr for function pointers
+        if self.eat(TK::Amp) {
+            let e = self.parse_unary();
+            let span = e.span;
+            return Expr::new(ExprKind::Unary(UnOp::AddrOf, Box::new(e)), span, next_id());
+        }
+        if self.eat(TK::At) {
+            let e = self.parse_unary();
+            let span = e.span;
+            return Expr::new(ExprKind::Unary(UnOp::AddrOf, Box::new(e)), span, next_id());
+        }
         self.parse_postfix()
     }
 

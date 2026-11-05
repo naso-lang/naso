@@ -318,6 +318,8 @@ pub enum UnOp {
     InOut,
     /// Consume move
     Consume,
+    /// Address-of operator for function pointers
+    AddrOf,
 }
 
 impl fmt::Display for UnOp {
@@ -329,6 +331,7 @@ impl fmt::Display for UnOp {
             UnOp::Deref => write!(f, "*"),
             UnOp::InOut => write!(f, "&mut"),
             UnOp::Consume => write!(f, "consume"),
+            UnOp::AddrOf => write!(f, "&"),
         }
     }
 }

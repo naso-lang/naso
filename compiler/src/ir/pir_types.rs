@@ -246,6 +246,7 @@ pub enum UnaryOp {
     Neg,
     Not,
     Deref,
+    AddrOf,
 }
 
 /// The element type of a tensor or scalar, as the LLVM ABI needs it.
@@ -1148,6 +1149,7 @@ fn unary_op_to_str(op: UnaryOp) -> &'static str {
         UnaryOp::Neg => "-",
         UnaryOp::Not => "!",
         UnaryOp::Deref => "*",
+        UnaryOp::AddrOf => "&",
     }
 }
 

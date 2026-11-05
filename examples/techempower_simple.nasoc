@@ -1,0 +1,21 @@
+def serve_http(handler)
+  addr = "127.0.0.1:8099"
+  options = ["port", port(8099), "reuseaddr", true]
+  
+  server = HTTP.server(addr, handler, options)
+  IO.puts("Server started on http://#{addr}")
+  
+  # Keep the server running
+  :timer.sleep(:infinity)
+end
+
+def handler(request) do
+  case {request.method, request.path} do
+    {"GET", "/plaintext"} -> {:ok, "Hello, world!"}
+    {"GET", "/json"} -> {:ok, %{"message" => "Hello, World!"}}
+    _ -> {:not_found}
+  end
+end
+
+# Start the server in a separate process
+serve_http(handler)

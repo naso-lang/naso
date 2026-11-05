@@ -189,6 +189,8 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Type::new(TypeKind::Bool, Quantity::Many, Span::default())
             }
+            // Function pointer type: fn(param1, param2, ...) -> ret
+            Some(TK::Fn) => self.parse_function_pointer_type(),
             Some(TK::Int4) => {
                 let span = self.peek_token().map(token_span).unwrap_or_default();
                 self.bump();
@@ -396,6 +398,39 @@ impl<'a> Parser<'a> {
             ExprKind::Literal(Literal::Int(n)) => NatExpr::from_u64(*n as u64),
             _ => NatExpr::Var(Ident::new("unknown", expr.span)),
         }
+    }
+    
+    /// Parse function pointer type: fn(param1: T1, param2: T2, ...) -> Ret
+    fn parse_function_pointer_type(&mut self) -> Type {
+        let start = self.pos;
+        self.expect(TK::Fn); // consume 'fn'
+        self.expect(TK::LParen); // consume '('
+        
+        let mut params = Vec::new();
+        if !self.at(TK::RParen) {
+            while !self.loop_should_stop() {
+                let param_ty = self.parse_type();
+                params.push(param_ty);
+                if self.at(TK::RParen) {
+                    break;
+                }
+                self.expect(TK::Comma);
+                if self.at(TK::RParen) {
+                    break;
+                }
+            }
+        }
+        self.expect(TK::RParen); // consume ')'
+        
+        // Parse return type (optional, defaults to Unit)
+        let ret_ty = if self.eat(TK::Arrow) {
+            self.parse_type()
+        } else {
+            Type::unit(Span::default())
+        };
+        
+        let span = self.span_from(start);
+        Type::new(TypeKind::Function(params, Box::new(ret_ty)), Quantity::Many, span)
     }
 }
 

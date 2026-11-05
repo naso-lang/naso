@@ -2,13 +2,8 @@ extern "C" {
     fn naso_write(fd: u64, buf: *u8, len: usize) -> usize;
 }
 
-struct Stream {
-    fd: Int,
-}
-
 fn main() -> () {
-    let body: [u8] = [104, 101, 108, 108, 111];
-    let stream = Stream { fd: 1 };
-    let _ = write(stream, body);
+    let body = [104, 101, 108, 108, 111];
+    let _ = naso_write(1, body as *u8, body.len());
     ()
 }

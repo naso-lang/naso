@@ -1036,6 +1036,11 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
                     .map_err(|e| CodegenError::InstructionError(e.to_string()))?
                     .into()
             }
+            crate::ir::pir_types::UnaryOp::AddrOf => {
+                // Address-of: return the pointer value as an integer
+                // This is a no-op for function pointers - they're already integers
+                int_val.into()
+            }
         };
         Ok(result)
     }

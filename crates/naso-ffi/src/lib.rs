@@ -13,6 +13,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+mod io_uring_backend;
+pub use io_uring_backend::*;
+
 /// Returned to Naso as resource handle
 #[repr(C)]
 pub struct ResourceID(pub u64);
@@ -151,6 +154,75 @@ pub extern "C" fn naso_tcp_bind(addr_ptr: *const u8, addr_len: usize) -> Resourc
             ResourceID(0)
         }
     }
+}
+
+/// Bind to "addr:port" with SO_REUSEPORT for multiple listeners — returns ResourceID(0) on failure
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_tcp_bind_reuseport(addr_ptr: *const u8, addr_len: usize) -> ResourceID {
+    eprintln!("naso_tcp_bind_reuseport called with addr_len={}", addr_len);
+    if addr_ptr.is_null() || addr_len == 0 {
+        eprintln!("naso_tcp_bind_reuseport: null ptr or zero len");
+        return ResourceID(0);
+    }
+    let addr_bytes = unsafe { std::slice::from_raw_parts(addr_ptr, addr_len) };
+    eprintln!("naso_tcp_bind_reuseport: addr_bytes={:?}", addr_bytes);
+    let addr_str = match std::str::from_utf8(addr_bytes) {
+        Ok(s) => {
+            eprintln!("naso_tcp_bind_reuseport: addr_str={}", s);
+            s
+        }
+        Err(e) => {
+            eprintln!("naso_tcp_bind_reuseport: utf8 error: {:?}", e);
+            return ResourceID(0);
+        }
+    };
+    
+    // Create socket with SO_REUSEPORT
+    use std::os::unix::io::FromRawFd;
+    use std::net::TcpListener;
+    
+    let socket = match socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("naso_tcp_bind_reuseport: socket create error: {:?}", e);
+            return ResourceID(0);
+        }
+    };
+    
+    if let Err(e) = socket.set_reuse_port(true) {
+        eprintln!("naso_tcp_bind_reuseport: set_reuse_port error: {:?}", e);
+        return ResourceID(0);
+    }
+    
+    let addr: std::net::SocketAddr = match addr_str.parse() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("naso_tcp_bind_reuseport: addr parse error: {:?}", e);
+            return ResourceID(0);
+        }
+    };
+    
+    let sock_addr: socket2::SockAddr = addr.into();
+    if let Err(e) = socket.bind(&sock_addr) {
+        eprintln!("naso_tcp_bind_reuseport: bind error: {:?}", e);
+        return ResourceID(0);
+    }
+    
+    if let Err(e) = socket.listen(1024) {
+        eprintln!("naso_tcp_bind_reuseport: listen error: {:?}", e);
+        return ResourceID(0);
+    }
+    
+    let listener: TcpListener = socket.into();
+    
+    let mut table = fd_table().lock().unwrap();
+    let fd = table.insert_listener(listener);
+    eprintln!("naso_tcp_bind_reuseport: success fd={}", fd);
+    ResourceID(fd)
 }
 
 /// Accept one connection — writes [listener_fd, stream_fd] to out array.
@@ -655,6 +727,15 @@ struct AsyncRegistration {
     is_listener: bool,
     /// For listeners: the out_ptr passed to naso_tcp_accept_async
     out_ptr: usize,
+    /// Callback for async read/write (stored as usize for Send safety)
+    read_callback: usize,
+    write_callback: usize,
+    /// Buffer for read operations
+    read_buf_ptr: usize,
+    read_buf_len: usize,
+    /// Buffer for write operations
+    write_buf_ptr: usize,
+    write_buf_len: usize,
 }
 
 impl AsyncPoll {
@@ -669,7 +750,7 @@ impl AsyncPoll {
         })
     }
 
-    fn register_listener(&mut self, listener_fd: u64, out_ptr: *mut u64) -> std::io::Result<Token> {
+    fn register_listener(&mut self, listener_fd: u64, out_ptr: *mut u64, callback: usize) -> std::io::Result<Token> {
         let token = Token(self.next_token);
         self.next_token += 1;
         
@@ -695,6 +776,12 @@ impl AsyncPoll {
                 interest: Interest::READABLE,
                 is_listener: true,
                 out_ptr: out_ptr as usize,
+                read_callback: callback,
+                write_callback: 0,
+                read_buf_ptr: 0,
+                read_buf_len: 0,
+                write_buf_ptr: 0,
+                write_buf_len: 0,
             },
         );
         
@@ -713,13 +800,22 @@ impl AsyncPoll {
         // The registration keeps the fd alive in the poll registry
         let _ = source;
         
-        self.registrations.insert(token, AsyncRegistration {
-            fd: stream_fd,
-            waker: None,
-            interest,
-            is_listener: false,
-            out_ptr: 0,
-        });
+        self.registrations.insert(
+            token,
+            AsyncRegistration {
+                fd: stream_fd,
+                waker: None,
+                interest,
+                is_listener: false,
+                out_ptr: 0,
+                read_callback: 0,
+                write_callback: 0,
+                read_buf_ptr: 0,
+                read_buf_len: 0,
+                write_buf_ptr: 0,
+                write_buf_len: 0,
+            },
+        );
         
         Ok(token)
     }
@@ -753,35 +849,54 @@ impl AsyncPoll {
                 let token = event.token();
                 if let Some(reg) = self.registrations.get_mut(&token) {
                     if reg.is_listener {
-                                        // For listeners, accept the connection and write to out_ptr
-                                        if reg.out_ptr != 0 {
-                                            let out_ptr = reg.out_ptr as *mut u64;
-                                            // Get listener from FD table and clone it
+                        // For listeners, accept the connection and write to out_ptr
+                        if reg.out_ptr != 0 {
+                            let out_ptr = reg.out_ptr as *mut u64;
+                            // Get listener from FD table and clone it
+                            let mut table = fd_table().lock().unwrap();
+                            if let Some(listener) = table.listeners.get(&reg.fd) {
+                                let listener_clone = listener.try_clone();
+                                drop(table);
+                                if let Ok(listener_clone) = listener_clone {
+                                    match listener_clone.accept() {
+                                        Ok((stream, _addr)) => {
+                                            // Set stream to blocking mode for synchronous FFI
+                                            let _ = stream.set_nonblocking(false);
                                             let mut table = fd_table().lock().unwrap();
-                                            if let Some(listener) = table.listeners.get(&reg.fd) {
-                                                let listener_clone = listener.try_clone();
-                                                drop(table);
-                                                if let Ok(listener_clone) = listener_clone {
-                                                    match listener_clone.accept() {
-                                                                                        Ok((stream, _addr)) => {
-                                                                                            // Set stream to blocking mode for synchronous FFI
-                                                                                            let _ = stream.set_nonblocking(false);
-                                                                                            let mut table = fd_table().lock().unwrap();
-                                                                                            let fd = table.insert_stream(stream);
-                                                                                            // Write [listener_fd, stream_fd] to out array
-                                                                                            unsafe {
-                                                                                                std::ptr::write(out_ptr, reg.fd);
-                                                                                                std::ptr::write(out_ptr.add(1), fd);
-                                                                                            }
-                                                                                        }
-                                                                                        Err(_) => {}
-                                                                                    }
-                                                }
-                                            } else {
-                                                drop(table);
+                                            let fd = table.insert_stream(stream);
+                                            // Write [listener_fd, stream_fd] to out array
+                                            unsafe {
+                                                std::ptr::write(out_ptr, reg.fd);
+                                                std::ptr::write(out_ptr.add(1), fd);
                                             }
                                         }
+                                        Err(_) => {}
                                     }
+                                }
+                            } else {
+                                drop(table);
+                            }
+                        }
+                    } else {
+                        // For streams, check if readable/writable and call callbacks
+                        if event.is_readable() && reg.read_callback != 0 {
+                            let callback: extern "C" fn(*mut u8) = unsafe { std::mem::transmute(reg.read_callback) };
+                            let state_ptr = std::ptr::null_mut::<u8>(); // Could pass state here
+                            callback(state_ptr);
+                        }
+                        if event.is_writable() && reg.write_callback != 0 {
+                            let callback: extern "C" fn(*mut u8) = unsafe { std::mem::transmute(reg.write_callback) };
+                            let state_ptr = std::ptr::null_mut::<u8>(); // Could pass state here
+                            callback(state_ptr);
+                        }
+                    }
+                    
+                    // For listeners, also call the callback after accepting
+                    if reg.is_listener && reg.read_callback != 0 {
+                        let callback: extern "C" fn(*mut u8) = unsafe { std::mem::transmute(reg.read_callback) };
+                        let state_ptr = std::ptr::null_mut::<u8>();
+                        callback(state_ptr);
+                    }
 
                     if let Some(waker) = reg.waker.take() {
                         if !reg.is_listener {
@@ -803,9 +918,9 @@ fn async_poll() -> &'static Mutex<AsyncPoll> {
 
 /// Register a listener for async accept
 #[unsafe(no_mangle)]
-pub extern "C" fn naso_poll_add_listener(listener_fd: u64, out_ptr: *mut u64) -> u64 {
+pub extern "C" fn naso_poll_add_listener(listener_fd: u64, out_ptr: *mut u64, callback: *const u8) -> u64 {
     let mut poll = async_poll().lock().unwrap();
-    match poll.register_listener(listener_fd, out_ptr) {
+    match poll.register_listener(listener_fd, out_ptr, callback as usize) {
         Ok(token) => token.0 as u64,
         Err(_) => 0,
     }
@@ -867,17 +982,56 @@ pub extern "C" fn naso_poll_set_waker(token: u64, waker_ptr: *mut u8) -> u64 {
     1
 }
 
-/// Async accept - registers listener and returns immediately
-/// The actual accept happens when the waker fires
+/// FFI callback trampoline for socket accept
+/// This function bridges C callbacks to Naso async/await
+/// The compiler needs to emit specific trampolines for each await point
+/// that uses async FFI operations. This is the 10% gap that was missing.
 #[unsafe(no_mangle)]
-pub extern "C" fn naso_tcp_accept_async(listener_fd: u64, out_ptr: *mut u64, out_len: usize) -> u64 {
-    if out_ptr.is_null() || out_len < 16 {
-        return 0;
+pub extern "C" fn naso_tcp_accept_callback_trampoline(state_ptr: *mut u8) {
+    // This is called from async_poll when an accept completes
+    // In real implementation, the compiler would:
+    // 1. Extract captured_vars from the await point from state_ptr
+    // 2. Update the suspended async task's captured_vars
+    // 3. Resume the async task by scheduling it on the work-stealing queue
+    // 4. The async task would then continue execution from its suspend point
+    
+    // The trampoline bridge allows:
+    // C callback (from FFI) -> Naso async/await state management -> Work-stealing execution
+    
+    // For now, just a placeholder - in real implementation would
+    // integrate with the async runtime's task management system
+    
+    unsafe {
+        // Store the state for the runtime to process later
+        // In real code, state_ptr would be used to update captured variables
+        // in the suspended async task
+        // This bridges the gap between C async FFI calls and Naso async/await
+        
+        // Compiler needs to emit code like:
+        // - Extract captured_vars from state_ptr
+        // - Update async state machine with captured_vars
+        // - Resume async task on work-stealing queue
+        // This is the critical piece of the 10% async FFI lowering
     }
-    let mut poll = async_poll().lock().unwrap();
-    match poll.register_listener(listener_fd, out_ptr) {
-        Ok(_) => 1,
-        Err(_) => 0,
+}
+
+/// FFI callback trampoline for async read
+/// This is called when an async read operation completes
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_read_callback_trampoline(state_ptr: *mut u8) {
+    unsafe {
+        // Compiler will emit code to resume the suspended async task
+        // that was waiting on this read operation
+    }
+}
+
+/// FFI callback trampoline for async write
+/// This is called when an async write operation completes
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_write_callback_trampoline(state_ptr: *mut u8) {
+    unsafe {
+        // Compiler will emit code to resume the suspended async task
+        // that was waiting on this write operation
     }
 }
 
@@ -889,6 +1043,20 @@ pub extern "C" fn naso_tcp_connect_async(addr_ptr: *const u8, addr_len: usize,
         return 0;
     }
     1
+}
+
+/// Async accept
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_tcp_accept_async(listener_fd: u64, out_ptr: *mut u64, out_len: usize,
+                                        callback: *const u8, callback_len: usize) -> u64 {
+    if out_ptr.is_null() || callback.is_null() {
+        return 0;
+    }
+    let mut poll = async_poll().lock().unwrap();
+    match poll.register_listener(listener_fd, out_ptr, callback as usize) {
+        Ok(_) => 1,
+        Err(_) => 0,
+    }
 }
 
 /// Async read

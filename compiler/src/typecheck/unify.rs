@@ -70,7 +70,17 @@ pub fn unify_kinds(
         (TypeKind::Int, TypeKind::UInt) => Ok(TypeKind::UInt),
         (TypeKind::UInt, TypeKind::Int) => Ok(TypeKind::UInt),
 
-        // Named types
+                // Array -> Pointer coercion (for buffer passing to C/FFI)
+                (TypeKind::Array(_, _), TypeKind::Pointer(_)) => Ok(TypeKind::Pointer(Box::new(Type::new(TypeKind::UInt, Quantity::Many, Span::default())))),
+                (TypeKind::Pointer(_), TypeKind::Array(_, _)) => Ok(TypeKind::Pointer(Box::new(Type::new(TypeKind::UInt, Quantity::Many, Span::default())))),
+
+                // String -> Pointer coercion (for C string literals)
+                (TypeKind::String, TypeKind::Pointer(_)) => Ok(TypeKind::Pointer(Box::new(Type::new(TypeKind::UInt, Quantity::Many, Span::default())))),
+                (TypeKind::Pointer(_), TypeKind::String) => Ok(TypeKind::Pointer(Box::new(Type::new(TypeKind::UInt, Quantity::Many, Span::default())))),
+
+                // Function -> Pointer coercion (for FFI callbacks)
+                (TypeKind::Function(_, _), TypeKind::Pointer(_)) => Ok(TypeKind::Pointer(Box::new(Type::new(TypeKind::UInt, Quantity::Many, Span::default())))),
+                (TypeKind::Pointer(_), TypeKind::Function(_, _)) => Ok(TypeKind::Pointer(Box::new(Type::new(TypeKind::UInt, Quantity::Many, Span::default())))),
         (TypeKind::Named(name1, args1), TypeKind::Named(name2, args2)) => {
             if name1.name != name2.name {
                 return Err(TypeError::TypeMismatch {

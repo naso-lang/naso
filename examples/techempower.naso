@@ -3,6 +3,7 @@ extern "C" {
     fn naso_read(fd: u64, buf: *u8, max_len: usize) -> usize;
     fn naso_tcp_bind(addr_ptr: *u8, len: usize) -> u64;
     fn naso_tcp_accept(fd: u64, out: *u64) -> u64;
+    fn naso_accept_get_client(out: *u64) -> u64;
     fn naso_close(fd: u64) -> u64;
 }
 
@@ -15,10 +16,11 @@ fn main() -> () {
         let mut running = 1;
         while running == 1 {
             let mut out = [0, 0];
-            let res = naso_tcp_accept(fd, out as *u64);
+            let out_ptr = out as *u64;
+            let res = naso_tcp_accept(fd, out_ptr);
             if res == 0 { continue; }
-            let stream_fd = out[1];
-            let mut buf = [0; 4096];
+            let stream_fd = naso_accept_get_client(out_ptr);
+            let mut buf = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
             let n = naso_read(stream_fd, buf as *u8, 4096);
             if n > 0 {
                 let body = [72, 101, 108, 108, 111, 44, 32, 87, 111, 114, 108, 100, 33];
@@ -33,7 +35,6 @@ fn main() -> () {
                 let _ = naso_write(stream_fd as u64, ct as *u8, ct.len());
                 let _ = naso_write(stream_fd as u64, header3 as *u8, header3.len());
                 let _ = naso_write(stream_fd as u64, header4 as *u8, header4.len());
-                let _ = naso_write(stream_fd as u64, body.len() as *u8, 10);
                 let _ = naso_write(stream_fd as u64, header5 as *u8, header5.len());
                 let _ = naso_write(stream_fd as u64, body as *u8, body.len());
             }

@@ -9,6 +9,7 @@
 /// These are the actual #[unsafe(no_mangle)] names from crates/naso-ffi/src/lib.rs
 pub static FFI_SYMBOLS: &[(&str, &str)] = &[
     ("naso_tcp_bind", "naso_tcp_bind"),
+    ("naso_tcp_bind_reuseport", "naso_tcp_bind_reuseport"),
     ("naso_tcp_accept", "naso_tcp_accept"),
     ("naso_read", "naso_read"),
     ("naso_write", "naso_write"),
@@ -43,6 +44,18 @@ pub static FFI_SYMBOLS: &[(&str, &str)] = &[
     ("naso_read_async", "naso_read_async"),
     ("naso_write_async", "naso_write_async"),
     ("naso_timer_sleep_async", "naso_timer_sleep_async"),
+    // io_uring FFI
+    ("naso_uring_init", "naso_uring_init"),
+    ("naso_uring_submit", "naso_uring_submit"),
+    ("naso_uring_wait", "naso_uring_wait"),
+    ("naso_uring_poll", "naso_uring_poll"),
+    ("naso_tcp_accept_uring", "naso_tcp_accept_uring"),
+    ("naso_read_uring", "naso_read_uring"),
+    ("naso_write_uring", "naso_write_uring"),
+    // Callback trampolines
+    ("accept_callback_trampoline", "accept_callback_trampoline"),
+    ("read_callback_trampoline", "read_callback_trampoline"),
+    ("write_callback_trampoline", "write_callback_trampoline"),
     // Connection pool FFI
     ("naso_pool_create", "naso_pool_create"),
     ("naso_pool_get_connection", "naso_pool_get_connection"),

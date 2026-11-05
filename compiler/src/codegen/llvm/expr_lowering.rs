@@ -400,6 +400,22 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 Ok(ptr.into())
             }
             PirExpr::Var(name) => {
+                // Check if this is an extern function - if so, return its address as integer
+                if let Some(module_builder) = &mut self.module_builder {
+                    if let Some(func) = module_builder.module().get_function(name) {
+                        // Return the function as a pointer value converted to integer
+                        let ptr_val = func.as_global_value().as_pointer_value();
+                        let int_type = self.value_builder.type_lowering().int_type(crate::codegen::abi::IntWidth::I64);
+                        let ptr_type = self.value_builder.type_lowering().ptr_type(
+                            self.value_builder.type_lowering().context().i8_type().into(),
+                            AddressSpace::from(0),
+                        );
+                        let ptr = self.value_builder.builder().build_ptr_to_int(ptr_val, int_type, &format!("fn_ptr_{name}"))
+                            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                        return Ok(ptr.into());
+                    }
+                }
+                // Regular variable lookup
                 if let Some((ptr, _ty)) = self.value_builder.variable(name) {
                     let load = self
                         .value_builder
@@ -569,7 +585,12 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                                 "naso_tcp_bind" => i == 0,
                                 "naso_write" | "naso_read" | "naso_tcp_accept" => i == 1,
                                 "naso_accept_get_client" => i == 0,
-                                "naso_tcp_accept_async" => i == 1,
+                                "naso_tcp_accept_async" => i == 1 || i == 3,
+                                "naso_read_async" => i == 1 || i == 3,
+                                "naso_write_async" => i == 1 || i == 3,
+                                "naso_tcp_accept_uring" => i == 1 || i == 2,
+                                "naso_read_uring" => i == 1 || i == 3,
+                                "naso_write_uring" => i == 1 || i == 3,
                                 "naso_spawn" => i == 1,
                                 "naso_future_complete" => i == 0,
                                 "naso_await" => i == 0,
@@ -1412,7 +1433,13 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                         let ptr_val = builder
                             .build_extract_value(v.into_struct_value(), 0, "tensor_ptr_cast")
                             .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
-                        return Ok(ptr_val.into());
+                        // Convert the integer pointer back to a proper LLVM pointer type (i8*)
+                        let i8_type = self.value_builder.type_lowering().int_type(crate::codegen::abi::IntWidth::I8);
+                        let ptr_type = i8_type.ptr_type(AddressSpace::default());
+                        let ptr = builder
+                            .build_int_to_ptr(ptr_val.into_int_value(), ptr_type, "array_ptr_cast")
+                            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                        return Ok(ptr.into());
                     }
                 }
 
@@ -3052,65 +3079,95 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
     }
 
     /// Float negation, and the integer arm below.
-    ///
-    /// `into_int_value` panics on a `double`, so `-v` on a float had to route here
-    /// first for the same reason binary multiplication does.
-    fn build_unary_op(
-        &mut self,
-        op: UnaryOp,
-        expr: BasicValueEnum<'ctx>,
-    ) -> CodegenResult<BasicValueEnum<'ctx>> {
-        if let BasicTypeEnum::FloatType(_) = expr.get_type() {
-            return match op {
-                UnaryOp::Neg => Ok(self
-                    .value_builder
-                    .builder()
-                    .build_float_neg(expr.into_float_value(), "fneg")
-                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?
-                    .into()),
-                UnaryOp::Not => Err(CodegenError::UnsupportedFeature(
-                    "`!` (logical not) on a floating-point operand has no LLVM \
-                     spelling; the typechecker should have rejected it."
-                        .to_string(),
-                )),
-                UnaryOp::Deref => Err(CodegenError::UnsupportedFeature(
-                    "`*` (deref) on a floating-point operand is not supported."
-                        .to_string(),
-                )),
-            };
-        }
-        let int_val = expr.into_int_value();
-        let result = match op {
-            UnaryOp::Neg => self
-                .value_builder
-                .builder()
-                .build_int_neg(int_val, "neg")
-                .map_err(|e| CodegenError::InstructionError(e.to_string()))?
-                .into(),
-            UnaryOp::Not => self
-                .value_builder
-                .builder()
-                .build_not(int_val, "not")
-                .map_err(|e| CodegenError::InstructionError(e.to_string()))?
-                .into(),
-            UnaryOp::Deref => {
-                // Deref: load from the pointer address
-                let ptr_type = self.value_builder.type_lowering().ptr_type(
-                    self.value_builder.type_lowering().context().i8_type().into(),
-                    AddressSpace::from(0),
-                );
-                let ptr = self.value_builder.builder().build_int_to_ptr(
-                    int_val,
-                    ptr_type,
-                    "deref.ptr",
-                ).map_err(|e| CodegenError::InstructionError(e.to_string()))?;
-                let loaded = self.value_builder.builder().build_load(
-                    ptr,
-                    "deref.load",
-                ).map_err(|e| CodegenError::InstructionError(e.to_string()))?;
-                loaded
-            }
-        };
-        Ok(result)
+    /// 
+            /// `into_int_value` panics on a `double`, so `-v` on a float had to route here
+            /// first for the same reason binary multiplication does.
+            fn build_unary_op(
+                &mut self,
+                op: UnaryOp,
+                expr: BasicValueEnum<'ctx>,
+            ) -> CodegenResult<BasicValueEnum<'ctx>> {
+                // Handle AddrOf on tensor structs (arrays) BEFORE trying to convert to int
+                if op == UnaryOp::AddrOf {
+                    if let BasicValueEnum::StructValue(struct_val) = expr {
+                        // Extract ptr field (first field) from tensor struct
+                        let builder = self.value_builder.builder();
+                        let ptr_val = builder
+                            .build_extract_value(struct_val, 0, "addr_of_array_ptr")
+                            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                        return Ok(ptr_val.into());
+                    }
+                }
+                
+                if let BasicTypeEnum::FloatType(_) = expr.get_type() {
+                    return match op {
+                        UnaryOp::Neg => Ok(self
+                            .value_builder
+                            .builder()
+                            .build_float_neg(expr.into_float_value(), "fneg")
+                            .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                            .into()),
+                        UnaryOp::Not => Err(CodegenError::UnsupportedFeature(
+                            "`!` (logical not) on a floating-point operand has no LLVM \
+                             spelling; the typechecker should have rejected it."
+                                .to_string(),
+                        )),
+                        UnaryOp::Deref => Err(CodegenError::UnsupportedFeature(
+                            "`*` (deref) on a floating-point operand is not supported."
+                                .to_string(),
+                        )),
+                        UnaryOp::AddrOf => Err(CodegenError::UnsupportedFeature(
+                            "`&` (address-of) on a floating-point operand is not supported."
+                                .to_string(),
+                        )),
+                    };
+                }
+                let int_val = expr.into_int_value();
+                let result = match op {
+                    UnaryOp::Neg => self
+                        .value_builder
+                        .builder()
+                        .build_int_neg(int_val, "neg")
+                        .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                        .into(),
+                    UnaryOp::Not => self
+                        .value_builder
+                        .builder()
+                        .build_not(int_val, "not")
+                        .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                        .into(),
+                    UnaryOp::Deref => {
+                        // Deref: load from the pointer address
+                        let ptr_type = self.value_builder.type_lowering().ptr_type(
+                            self.value_builder.type_lowering().context().i8_type().into(),
+                            AddressSpace::from(0),
+                        );
+                        let ptr = self.value_builder.builder().build_int_to_ptr(
+                            int_val,
+                            ptr_type,
+                            "deref.ptr",
+                        ).map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                        let loaded = self.value_builder.builder().build_load(
+                            ptr,
+                            "deref.load",
+                        ).map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                        loaded
+                    }
+                    UnaryOp::AddrOf => {
+                        // Address-of: return the pointer value as an integer
+                        // This is a no-op for function pointers - they're already integers
+                        // But for arrays (tensor structs), we need to extract the ptr field
+                        if let BasicValueEnum::StructValue(struct_val) = expr {
+                            // Extract ptr field (first field) from tensor struct
+                            let builder = self.value_builder.builder();
+                            let ptr_val = builder
+                                .build_extract_value(struct_val, 0, "addr_of_array_ptr")
+                                .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                            return Ok(ptr_val.into());
+                        }
+                        int_val.into()
+                    }
+                };
+                Ok(result)
     }
 }

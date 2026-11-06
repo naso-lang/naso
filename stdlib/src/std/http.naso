@@ -30,6 +30,7 @@ struct Route {
 
 struct Router {
     route_count: Int,
+    routes: [Route; 32],
 }
 
 fn METHOD_GET() -> Int { 0 }

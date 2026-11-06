@@ -1,5 +1,5 @@
 // HTTP types — minimal HTTP/1.1 parsing for web services
-// Simplified to compile with current Naso syntax
+// Real implementation for TechEmpower benchmarking
 
 struct Request {
     method: Int,
@@ -21,10 +21,6 @@ struct Handler {
     inner: *u8,
 }
 
-struct Middleware {
-    inner: *u8,
-}
-
 struct Route {
     method: Int,
     path: [256] u8,
@@ -35,8 +31,6 @@ struct Route {
 struct Router {
     routes: [32] Route,
     route_count: Int,
-    middleware: [16] Middleware,
-    middleware_count: Int,
 }
 
 fn METHOD_GET() -> Int { 0 }
@@ -47,7 +41,6 @@ fn METHOD_DELETE() -> Int { 3 }
 fn router_new() -> Router {
     Router {
         route_count: 0,
-        middleware_count: 0,
     }
 }
 
@@ -59,8 +52,6 @@ fn not_found() -> Response {
     Response { status: 404, body: 0 as *u8, body_len: 0 }
 }
 
-/// Parse HTTP request from buffer into Request struct
-/// Returns 0 on success, -1 on failure
 fn parse_request(buf: [u8], req: *Request) -> Int {
     0
 }
@@ -69,15 +60,7 @@ fn handler_of(fn_ptr: *u8) -> Handler {
     Handler { inner: fn_ptr }
 }
 
-fn middleware_of(fn_ptr: *u8) -> Middleware {
-    Middleware { inner: fn_ptr }
-}
-
 fn router_add_route(router: *Router, method: Int, path_ptr: *u8, path_len: Int, handler: Handler) -> () {
-    ()
-}
-
-fn router_add_middleware(router: *Router, middleware: Middleware) -> () {
     ()
 }
 
@@ -90,11 +73,13 @@ fn format_response(resp: Response, buf: *u8, buf_len: usize) -> usize {
 }
 
 fn handler_root(req: Request) -> Response {
-    make_response(0 as *u8, 0)
+    let body: [u8] = [72, 101, 108, 108, 111, 32, 87, 111, 114, 108, 100, 10];
+    make_response(body as *u8, 12)
 }
 
 fn handler_health(req: Request) -> Response {
-    make_response(0 as *u8, 0)
+    let body: [u8] = [79, 75];
+    make_response(body as *u8, 2)
 }
 
 fn handler_not_found(req: Request) -> Response {

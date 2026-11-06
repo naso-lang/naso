@@ -10,6 +10,26 @@ extern "C" {
     fn naso_yield() -> u64;
 }
 
+fn handler_plaintext(req: u64) -> u64 {
+    0
+}
+
+fn handler_json(req: u64) -> u64 {
+    0
+}
+
+fn handler_db(req: u64) -> u64 {
+    0
+}
+
+fn handler_root(req: u64) -> u64 {
+    0
+}
+
+fn handler_health(req: u64) -> u64 {
+    0
+}
+
 fn handle_client(client_fd: u64) -> () {
     let buf = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     let n = naso_read(client_fd, buf as *u8, buf.len());

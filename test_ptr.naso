@@ -1,4 +1,0 @@
-fn test_ptr_arith(ptr: *u8, idx: Int) -> u8 {
-    let p = ptr.add(idx);
-    *p
-}

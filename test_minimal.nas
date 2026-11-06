@@ -1,23 +1,5 @@
 extern "C" {
     fn naso_write(fd: u64, buf: *u8, len: usize) -> usize;
-    fn naso_read(fd: u64, buf: *u8, max_len: usize) -> usize;
-    fn naso_tcp_bind(addr: *u8, len: usize) -> u64;
-    fn naso_tcp_accept(listener_fd: u64, out_ptr: *u64) -> u64;
-    fn naso_accept_get_client(out_ptr: *u64) -> u64;
-    fn naso_close(fd: u64) -> u64;
-    fn naso_runtime_new(workers: u64) -> *u8;
-    fn naso_runtime_run(runtime: *u8) -> u64;
-    fn naso_yield() -> u64;
-}
-
-struct Request {
-    method: Int,
-    path_offset: Int,
-    path_len: Int,
-    headers_offset: Int,
-    headers_len: Int,
-    body_offset: Int,
-    body_len: Int,
 }
 
 struct Response {
@@ -60,30 +42,30 @@ fn split_http(buf: [u8]) -> Int {
 }
 
 fn format_http(resp: Response) -> [u8] {
+    let status_str = if resp.status == 200 { "200 OK\r\n" } else { "404 Not Found\r\n" };
     let mut out = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     let status_line = [72, 84, 84, 80, 47, 49, 46, 49, 32];
+    let clen = resp.body_len;
     
     let mut pos = 0;
-    let mut idx = 0;
-    while idx < 9 {
-        out[pos] = status_line[idx];
-        pos = pos + 1;
-        idx = idx + 1;
+    for b in status_line { 
+        out[pos] = b; 
+        pos = pos + 1; 
+    }
+    for b in status_str.as_bytes() { 
+        out[pos] = b; 
+        pos = pos + 1; 
+    }
+    let cl_header = [67, 111, 110, 116, 101, 110, 116, 45, 76, 101, 110, 103, 116, 104, 58, 32];
+    for b in cl_header { 
+        out[pos] = b; 
+        pos = pos + 1; 
     }
     
     out
 }
 
-fn handler_root(req: Request) -> Response {
-    let body = [72, 101, 108, 108, 111, 32, 87, 111, 114, 108, 100, 10];
-    ok(body as *u8, 12)
-}
-
-fn handler_health(req: Request) -> Response {
-    let body = [79, 75];
-    ok(body as *u8, 2)
-}
-
-fn handler_not_found(req: Request) -> Response {
-    not_found()
+fn main() -> () {
+    let r = ok(0 as *u8, 0);
+    ()
 }

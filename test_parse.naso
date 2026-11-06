@@ -1,0 +1,27 @@
+struct Router {
+    routes_method: [N] Int,
+    routes_path: [N] *u8,
+    routes_len: [N] usize,
+    handlers: [N] Int,
+}
+
+fn router_new() -> Router {
+    let rm: [N] Int = [0];
+    let rp: [N] *u8 = [0 as *u8];
+    let rl: [N] usize = [0];
+    let h: [N] Int = [0];
+    Router { routes_method: rm, routes_path: rp, routes_len: rl, handlers: h }
+}
+
+fn router_get(router: *Router, path: *u8, len: usize, handler_idx: Int) -> () {
+    router.routes_method.push(0);
+    router.routes_path.push(path);
+    router.routes_len.push(len);
+    router.handlers.push(handler_idx);
+}
+
+fn main() -> () {
+    let mut r = router_new();
+    let p: *Router = r as *Router;
+    router_get(p, 0 as *u8, 0, 0);
+}

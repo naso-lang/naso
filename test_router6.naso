@@ -1,0 +1,54 @@
+struct Handler {
+    inner: *u8,
+}
+
+struct Route {
+    method: Int,
+    path: Int,
+    path_len: Int,
+    handler: Handler,
+}
+
+struct Router {
+    routes_method: [32] Int,
+    routes_path: [32] Int,
+    routes_path_len: [32] Int,
+    routes_handler: [32] Handler,
+    route_count: Int,
+}
+
+fn handler_fn() -> Int {
+    42
+}
+
+fn router_new() -> Router {
+    let rm: [32] Int = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let rp: [32] Int = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let rpl: [32] Int = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let rh: [32] Handler = [Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }, Handler { inner: 0 as *u8 }];
+    Router {
+        route_count: 0,
+        routes_method: rm,
+        routes_path: rp,
+        routes_path_len: rpl,
+        routes_handler: rh,
+    }
+}
+
+fn router_add_route(router: *Router, method: Int, path: Int, path_len: Int, handler: Handler) -> () {
+    let idx = (*router).route_count;
+    if idx < 32 {
+        (*router).routes_method[idx] = method;
+        (*router).routes_path[idx] = path;
+        (*router).routes_path_len[idx] = path_len;
+        (*router).routes_handler[idx] = handler;
+        (*router).route_count = idx + 1;
+    }
+}
+
+fn main() -> () {
+    let mut router = router_new();
+    let h = Handler { inner: handler_fn as *u8 };
+    let rp = &router as *Router;
+    router_add_route(rp, 0, 47, 1, h);
+}

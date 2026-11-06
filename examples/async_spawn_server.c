@@ -1,0 +1,103 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdint.h>
+
+// FFI declarations
+extern uint64_t naso_tcp_bind_reuseport(const uint8_t* addr, size_t len);
+extern uint64_t naso_tcp_accept(uint64_t listener_fd, uint64_t* out_ptr);
+extern uint64_t naso_accept_get_client(const uint64_t* out_ptr);
+extern uint64_t naso_read(uint64_t fd, uint8_t* buf, size_t max_len);
+extern uint64_t naso_write(uint64_t fd, const uint8_t* buf, size_t len);
+extern uint64_t naso_close(uint64_t fd);
+extern void* naso_runtime_new(uint64_t worker_count);
+extern uint64_t naso_runtime_run(void* runtime);
+extern uint64_t naso_yield();
+extern void* naso_future_new();
+extern uint64_t naso_future_complete(void* future, const uint8_t* data, size_t len);
+extern uint64_t naso_future_get_result(void* future, uint8_t* out, size_t len);
+extern void naso_spawn(void* runtime, void (*task_fn)(void*), void* arg);
+extern void* naso_spawn_future(void* future);
+
+typedef struct {
+    uint64_t client_fd;
+} client_context_t;
+
+static const uint8_t response[] = {
+    72, 84, 84, 80, 47, 49, 46, 49, 32, 50, 48, 48, 32, 79, 75, 13, 10,
+    67, 111, 110, 116, 101, 110, 116, 45, 76, 101, 110, 103, 116, 104, 58, 32, 49, 50, 13, 10,
+    67, 111, 110, 110, 101, 99, 116, 105, 111, 110, 58, 32, 99, 108, 111, 115, 101, 13, 10,
+    13, 10,
+    72, 101, 108, 108, 111, 32, 87, 111, 114, 108, 100, 10
+};
+
+static void handle_client(void* arg) {
+    client_context_t* ctx = (client_context_t*)arg;
+    uint64_t client_fd = ctx->client_fd;
+    free(ctx);
+    
+    uint8_t buf[16];
+    uint64_t read = naso_read(client_fd, buf, sizeof(buf));
+    if (read > 0) {
+        naso_write(client_fd, response, sizeof(response));
+    }
+    naso_close(client_fd);
+}
+
+static void accept_loop(void* arg) {
+    uint64_t* fds = (uint64_t*)arg;
+    uint64_t listener_fd = fds[0];
+    uint64_t runtime_ptr = fds[1];
+    
+    uint64_t out[2];
+    uint64_t* out_ptr = out;
+    
+    while (1) {
+        if (naso_tcp_accept(listener_fd, out_ptr) != 0) {
+            uint64_t client_fd = naso_accept_get_client(out_ptr);
+            
+            client_context_t* ctx = malloc(sizeof(client_context_t));
+            ctx->client_fd = client_fd;
+            
+            // Spawn task to handle client on worker pool
+            naso_spawn((void*)runtime_ptr, handle_client, ctx);
+        }
+        naso_yield();
+    }
+}
+
+int main(int argc, char* argv[]) {
+    const char* host = argc > 1 ? argv[1] : "127.0.0.1";
+    const char* port = argc > 2 ? argv[2] : "8099";
+    
+    char addr[64];
+    snprintf(addr, sizeof(addr), "%s:%s", host, port);
+    size_t addr_len = strlen(addr);
+    
+    uint64_t fd = naso_tcp_bind_reuseport((const uint8_t*)addr, addr_len);
+    if (fd == 0) {
+        printf("Failed to bind\n");
+        return 1;
+    }
+    printf("Bound to %s (fd=%lu)\n", addr, fd);
+    
+    void* runtime = naso_runtime_new(4);
+    if (!runtime) {
+        printf("Failed to create runtime\n");
+        return 1;
+    }
+    printf("Runtime created with 4 workers\n");
+    
+    // Start accept loop as a spawned task
+    uint64_t fds[2] = {fd, (uint64_t)runtime};
+    naso_spawn(runtime, accept_loop, fds);
+    printf("Accept loop spawned\n");
+    
+    // Run runtime (event loop + worker pool)
+    printf("Starting runtime...\n");
+    naso_runtime_run(runtime);
+    
+    return 0;
+}

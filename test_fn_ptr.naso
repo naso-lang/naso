@@ -1,0 +1,26 @@
+struct Handler {
+    inner: *u8,
+}
+
+struct Route {
+    method: Int,
+    path: Int,
+    path_len: Int,
+    handler: Handler,
+}
+
+fn handler_fn() -> Int {
+    42
+}
+
+fn test_struct_field() -> Int {
+    let r = Route {
+        method: 0,
+        path: 0,
+        path_len: 0,
+        handler: Handler { inner: handler_fn as *u8 },
+    };
+    let h = r.handler;
+    let fn_ptr = h.inner as fn() -> Int;
+    fn_ptr()
+}

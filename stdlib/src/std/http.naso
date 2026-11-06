@@ -1,6 +1,3 @@
-// HTTP types — minimal HTTP/1.1 parsing for web services
-// Real implementation for TechEmpower benchmarking
-
 struct Request {
     method: Int,
     path: [u8; 256],
@@ -38,10 +35,6 @@ fn METHOD_POST() -> Int { 1 }
 fn METHOD_PUT() -> Int { 2 }
 fn METHOD_DELETE() -> Int { 3 }
 
-fn router_new() -> Router {
-    Router { route_count: 0 }
-}
-
 fn make_response(body: *u8, len: usize) -> Response {
     Response { status: 200, body: body, body_len: len }
 }
@@ -50,7 +43,7 @@ fn not_found() -> Response {
     Response { status: 404, body: 0 as *u8, body_len: 0 }
 }
 
-fn parse_request(buf: [u8], req: *Request) -> Int {
+fn parse_request(buf: *u8, len: usize, req: *Request) -> Int {
     0
 }
 
@@ -70,20 +63,6 @@ fn format_response(resp: Response, buf: *u8, buf_len: usize) -> usize {
     0
 }
 
-fn handler_root(req: Request) -> Response {
-    let body: [u8] = [72, 101, 108, 108, 111, 32, 87, 111, 114, 108, 100, 10];
-    make_response(body as *u8, 12)
-}
-
-fn handler_health(req: Request) -> Response {
-    let body: [u8] = [79, 75];
-    make_response(body as *u8, 2)
-}
-
-fn handler_not_found(req: Request) -> Response {
-    not_found()
-}
-
 fn handler_plaintext(req: Request) -> Response {
     let body: [u8] = [72, 101, 108, 108, 111, 44, 32, 87, 111, 114, 108, 100, 33];
     make_response(body as *u8, 13)
@@ -97,4 +76,86 @@ fn handler_json(req: Request) -> Response {
 fn handler_db(req: Request) -> Response {
     let body: [u8] = [123, 34, 105, 100, 34, 58, 49, 44, 34, 114, 97, 110, 100, 111, 109, 78, 117, 109, 98, 101, 114, 34, 58, 52, 50, 125];
     make_response(body as *u8, 35)
+}
+
+fn handler_root(req: Request) -> Response {
+    let body: [u8] = [72, 101, 108, 108, 111, 32, 87, 111, 114, 108, 100, 10];
+    make_response(body as *u8, 12)
+}
+
+fn handler_health(req: Request) -> Response {
+    let body: [u8] = [79, 75];
+    make_response(body as *u8, 2)
+}
+
+fn handle_client(client_fd: u64) -> () {
+    let mut buf = [0; 2048];
+    let n = naso_read(client_fd, buf as *u8, buf.len());
+    
+    if n > 0 {
+        let mut req_buf = [0; 4096];
+        let mut req = Request {
+            method: 0,
+            path: [0; 256],
+            path_len: 0,
+            headers: [0; 1024],
+            headers_len: 0,
+            body: [0; 4096],
+            body_len: 0,
+        };
+        
+        let _ = parse_request(req_buf as *u8, req_buf.len(), &mut req);
+        
+        let mut router: Router = {
+            let routes = [Route { method: 0, path: [0; 256], path_len: 0, handler: Handler { inner: 0 } }];
+            Router { route_count: 1, routes: routes }
+        };
+        
+        let plaintext_path: [u8; 10] = [47, 112, 108, 97, 105, 110, 116, 101, 120, 116];
+        router_add_route(&mut router, 0, plaintext_path as *u8, 10, handler_of(handler_plaintext as *u8));
+        
+        let json_path: [u8; 5] = [47, 106, 115, 111, 110];
+        router_add_route(&mut router, 0, json_path as *u8, 5, handler_of(handler_json as *u8));
+        
+        let db_path: [u8; 3] = [47, 100, 98];
+        router_add_route(&mut router, 0, db_path as *u8, 3, handler_of(handler_db as *u8));
+        
+        let root_path: [u8; 1] = [47];
+        router_add_route(&mut router, 0, root_path as *u8, 1, handler_of(handler_root as *u8));
+        
+        let health_path: [u8; 7] = [47, 104, 101, 97, 108, 116, 104];
+        router_add_route(&mut router, 0, health_path as *u8, 7, handler_of(handler_health as *u8));
+        
+        let resp = router_dispatch(router, req);
+        
+        let mut out_buf = [0; 512];
+        let out_len = format_response(resp, out_buf as *u8, out_buf.len());
+        naso_write(client_fd, out_buf as *u8, out_len);
+    }
+    
+    naso_close(client_fd);
+}
+
+fn accept_loop(fd: u64) -> () {
+    let mut running = 1;
+    let mut out = [0];
+    let out_ptr = out as *u64;
+    
+    while running != 0 {
+        if naso_tcp_accept(fd, out_ptr) != 0 {
+            let client_fd = naso_accept_get_client(out_ptr);
+            handle_client(client_fd);
+        }
+        naso_yield();
+    }
+}
+
+fn main() -> () {
+    let addr = [49, 50, 55, 46, 48, 46, 48, 46, 49, 58, 56, 48, 57, 57];
+    let fd = naso_tcp_bind(addr as *u8, 14);
+    
+    let runtime = naso_runtime_new(4);
+    
+    accept_loop(fd);
+    let _ = naso_runtime_run(runtime);
 }

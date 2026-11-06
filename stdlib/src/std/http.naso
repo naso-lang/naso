@@ -3,11 +3,11 @@
 
 struct Request {
     method: Int,
-    path: [256] u8,
+    path: [u8; 256],
     path_len: Int,
-    headers: [1024] u8,
+    headers: [u8; 1024],
     headers_len: Int,
-    body: [4096] u8,
+    body: [u8; 4096],
     body_len: Int,
 }
 
@@ -23,13 +23,12 @@ struct Handler {
 
 struct Route {
     method: Int,
-    path: [256] u8,
+    path: [u8; 256],
     path_len: Int,
     handler: Handler,
 }
 
 struct Router {
-    routes: [32] Route,
     route_count: Int,
 }
 
@@ -39,9 +38,7 @@ fn METHOD_PUT() -> Int { 2 }
 fn METHOD_DELETE() -> Int { 3 }
 
 fn router_new() -> Router {
-    Router {
-        route_count: 0,
-    }
+    Router { route_count: 0 }
 }
 
 fn make_response(body: *u8, len: usize) -> Response {

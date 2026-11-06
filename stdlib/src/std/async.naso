@@ -1,3 +1,6 @@
+// Naso standard library for async operations
+// Real implementations using FFI to naso-ffi async runtime
+
 struct AsyncRuntime { inner: *u8 }
 struct Task { inner: *u8 }
 struct Future { inner: *u8 }
@@ -5,77 +8,98 @@ struct Stream { inner: *u8 }
 struct Sender { inner: *u8 }
 struct Receiver { inner: *u8 }
 
+extern "C" {
+    fn naso_runtime_new(workers: u64) -> *u8;
+    fn naso_runtime_run(runtime: *u8) -> u64;
+    fn naso_runtime_shutdown(runtime: *u8) -> u64;
+    fn naso_runtime_free(runtime: *u8);
+    fn naso_spawn(rt: *u8, f: *u8) -> *u8;
+    fn naso_task_join(task: *u8) -> u64;
+    fn naso_task_cancel(task: *u8) -> u64;
+    fn naso_task_free(task: *u8);
+    fn naso_yield() -> u64;
+    fn naso_await(future: *u8) -> u64;
+    fn naso_future_new() -> *u8;
+    fn naso_future_complete(fut: *u8, value: *u8, value_len: usize) -> u64;
+    fn naso_future_get_result(fut: *u8, out: *u8, out_len: usize) -> u64;
+    fn naso_future_free(fut: *u8);
+    fn naso_channel_new(capacity: usize) -> *u8;
+    fn naso_sender_send(sender: *u8, value: *u8, value_len: usize) -> u64;
+    fn naso_receiver_recv(receiver: *u8, out: *u8, out_len: usize) -> u64;
+    fn naso_channel_free(channel: *u8);
+}
+
 fn runtime_new(worker_count: usize) -> AsyncRuntime {
-    let rt_ptr = 0 as *u8;
+    let rt_ptr = naso_runtime_new(worker_count as u64);
     AsyncRuntime { inner: rt_ptr }
 }
 
 fn runtime_run(rt: AsyncRuntime) -> u64 {
-    0
+    naso_runtime_run(rt.inner)
 }
 
 fn runtime_shutdown(rt: AsyncRuntime) -> u64 {
-    0
+    naso_runtime_shutdown(rt.inner)
 }
 
 fn runtime_free(rt: AsyncRuntime) {
-    ()
+    naso_runtime_free(rt.inner)
 }
 
 fn spawn(rt: AsyncRuntime, f: *u8) -> Task {
-    let task_ptr = 0 as *u8;
+    let task_ptr = naso_spawn(rt.inner, f);
     Task { inner: task_ptr }
 }
 
 fn task_join(task: Task) -> u64 {
-    0
+    naso_task_join(task.inner)
 }
 
 fn task_cancel(task: Task) -> u64 {
-    0
+    naso_task_cancel(task.inner)
 }
 
 fn task_free(task: Task) {
-    ()
+    naso_task_free(task.inner)
 }
 
 fn yield_now() -> u64 {
-    0
+    naso_yield()
 }
 
 fn await_future(future: Future) -> u64 {
-    0
+    naso_await(future.inner)
 }
 
 fn future_new() -> Future {
-    let fut_ptr = 0 as *u8;
+    let fut_ptr = naso_future_new();
     Future { inner: fut_ptr }
 }
 
 fn future_complete(fut: Future, value: *u8, value_len: usize) -> u64 {
-    0
+    naso_future_complete(fut.inner, value, value_len)
 }
 
 fn future_get_result(fut: Future, out: *u8, out_len: usize) -> u64 {
-    0
+    naso_future_get_result(fut.inner, out, out_len)
 }
 
 fn future_free(fut: Future) {
-    ()
+    naso_future_free(fut.inner)
 }
 
 fn channel_new(capacity: usize) -> *u8 {
-    0 as *u8
+    naso_channel_new(capacity)
 }
 
 fn channel_send(sender: Sender, value: *u8, value_len: usize) -> u64 {
-    0
+    naso_sender_send(sender.inner, value, value_len)
 }
 
 fn channel_recv(receiver: Receiver, out: *u8, out_len: usize) -> u64 {
-    0
+    naso_receiver_recv(receiver.inner, out, out_len)
 }
 
 fn channel_free(channel: *u8) {
-    ()
+    naso_channel_free(channel)
 }

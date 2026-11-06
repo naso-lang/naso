@@ -1081,6 +1081,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-runtime",
+ "crossbeam",
  "io-uring",
  "mio 0.8.11",
  "once_cell",

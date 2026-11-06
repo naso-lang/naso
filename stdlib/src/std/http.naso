@@ -3,22 +3,100 @@
 
 struct Request {
     method: Int,
+    path: [256] u8,
+    path_len: Int,
+    headers: [1024] u8,
+    headers_len: Int,
+    body: [4096] u8,
+    body_len: Int,
 }
 
 struct Response {
     status: Int,
+    body: *u8,
+    body_len: usize,
+}
+
+struct Handler {
+    inner: *u8,
+}
+
+struct Middleware {
+    inner: *u8,
+}
+
+struct Route {
+    method: Int,
+    path: [256] u8,
+    path_len: Int,
+    handler: Handler,
+}
+
+struct Router {
+    routes: [32] Route,
+    route_count: Int,
+    middleware: [16] Middleware,
+    middleware_count: Int,
 }
 
 fn METHOD_GET() -> Int { 0 }
+fn METHOD_POST() -> Int { 1 }
+fn METHOD_PUT() -> Int { 2 }
+fn METHOD_DELETE() -> Int { 3 }
 
-fn make_response() -> Response {
-    Response { status: 200 }
+fn router_new() -> Router {
+    Router {
+        route_count: 0,
+        middleware_count: 0,
+    }
+}
+
+fn make_response(body: *u8, len: usize) -> Response {
+    Response { status: 200, body: body, body_len: len }
+}
+
+fn not_found() -> Response {
+    Response { status: 404, body: 0 as *u8, body_len: 0 }
+}
+
+/// Parse HTTP request from buffer into Request struct
+/// Returns 0 on success, -1 on failure
+fn parse_request(buf: [u8], req: *Request) -> Int {
+    0
+}
+
+fn handler_of(fn_ptr: *u8) -> Handler {
+    Handler { inner: fn_ptr }
+}
+
+fn middleware_of(fn_ptr: *u8) -> Middleware {
+    Middleware { inner: fn_ptr }
+}
+
+fn router_add_route(router: *Router, method: Int, path_ptr: *u8, path_len: Int, handler: Handler) -> () {
+    ()
+}
+
+fn router_add_middleware(router: *Router, middleware: Middleware) -> () {
+    ()
+}
+
+fn router_dispatch(router: Router, req: Request) -> Response {
+    not_found()
+}
+
+fn format_response(resp: Response, buf: *u8, buf_len: usize) -> usize {
+    0
 }
 
 fn handler_root(req: Request) -> Response {
-    make_response()
+    make_response(0 as *u8, 0)
 }
 
 fn handler_health(req: Request) -> Response {
-    make_response()
+    make_response(0 as *u8, 0)
+}
+
+fn handler_not_found(req: Request) -> Response {
+    not_found()
 }

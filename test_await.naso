@@ -1,0 +1,8 @@
+async fn test_async() -> Int {
+    42
+}
+
+async fn main() -> Int {
+    let f = await test_async();
+    f
+}

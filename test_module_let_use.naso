@@ -1,0 +1,5 @@
+let MODULE_ARRAY: [u8; 10] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+fn test() -> [u8; 10] {
+    MODULE_ARRAY
+}

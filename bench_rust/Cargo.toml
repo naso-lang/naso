@@ -1,0 +1,9 @@
+[package]
+name = "bench-rust-server"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+naso-ffi = { path = "../crates/naso-ffi" }

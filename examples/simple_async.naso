@@ -1,0 +1,18 @@
+// Test async/await lowering - minimal
+extern "C" {
+    fn naso_future_new() -> *u8;
+    fn naso_future_complete(fut: *u8, value: *u8, len: u64) -> u64;
+    fn naso_spawn_future(fut: *u8) -> u64;
+    fn naso_yield() -> u64;
+    fn naso_await(fut: *u8) -> *u8;
+}
+
+fn main() -> u64 {
+    let future = async {
+        42
+    };
+    let awaited = await future;
+    naso_spawn_future(future);
+    naso_yield();
+    0
+}

@@ -107,11 +107,12 @@ pub fn infer_expr(checker: &mut TypeChecker, expr: &Expr) -> Result<Type, TypeEr
         ExprKind::Continue => infer_continue(expr.span),
         ExprKind::Async(block) => {
             // async { ... } creates a future
-            let block_ty = infer_block(checker, block, expr.span)?;
-            // The result is a Future<[0] T> where T is the block's type
-            // For now, return the block type wrapped as an async computation
-            // In a full implementation, this would be Future<block_ty>
-            Ok(block_ty.with_quantity(Quantity::Many))
+            let _block_ty = infer_block(checker, block, expr.span)?;
+            // The result is a Future pointer (i8*), as expected by FFI functions
+            // Return a pointer type to u8 (future handle is a raw pointer to u8)
+            let mut u8_type = Type::new(TypeKind::UInt, Quantity::Many, Span::default());
+            u8_type.int_width = Some(8);
+            Ok(Type::new(TypeKind::Pointer(Box::new(u8_type)), Quantity::Many, expr.span))
         }
         ExprKind::Await(future) => {
             // await future - extracts the value from the future

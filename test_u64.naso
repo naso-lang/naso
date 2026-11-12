@@ -1,0 +1,149 @@
+extern "C" {
+    fn naso_tcp_bind_reuseport(addr: *u8, len: u64) -> u64;
+    fn naso_tcp_accept_async(fd: u64, out: *u64, out_len: u64, cb: *u8, cb_len: u64) -> u64;
+    fn naso_accept_get_client(out: *u64) -> u64;
+    fn naso_accept_get_fd_table(out: *u64) -> u64;
+    fn naso_read_async(fd: u64, buf: *u8, len: u64, cb: *u8, cb_len: u64) -> u64;
+    fn naso_write_async(fd: u64, buf: *u8, len: u64, cb: *u8, cb_len: u64) -> u64;
+    fn naso_uring_submit_batch() -> u64;
+    fn naso_uring_poll() -> u64;
+    fn naso_check_read_completion(fd: u64) -> u64;
+    fn naso_check_write_completion(fd: u64) -> u64;
+    fn naso_close(fd: u64) -> u64;
+    fn naso_runtime_new(workers: u64) -> *u8;
+    fn naso_runtime_run(runtime: *u8) -> u64;
+    fn naso_yield() -> u64;
+    fn naso_spawn(rt: *u8, task_fn: *u8, task_arg: u64, extra: *u8) -> *u8;
+    fn naso_task_join(task: *u8) -> u64;
+    fn naso_timer_sleep_async(duration_ms: u64, callback: *u8, callback_len: u64) -> u64;
+    fn naso_parse_http_request(
+        buf: *u8,
+        len: u64,
+        out_method: *u8,
+        out_method_len: u64,
+        out_path: *u8,
+        out_path_len: u64,
+        out_headers: *u8,
+        out_headers_len: u64,
+    ) -> u64;
+    fn naso_build_response(
+        method_ptr: *u8,
+        method_len: u64,
+        path_ptr: *u8,
+        path_len: u64,
+        body_ptr: *u8,
+        body_len: u64,
+    ) -> u64;
+}
+
+fn accept_loop(fd: u64, runtime: *u8) -> u64 {
+    let mut running = 1;
+    let mut out = [0, 0, 0, 0];
+    let out_ptr = out as *u64;
+
+    let _ = naso_tcp_accept_async(fd, out_ptr, 32, 0 as *u8, 0);
+    let _ = naso_uring_submit_batch();
+
+    while running != 0 {
+        let _ = naso_yield();
+        
+        // Poll for completions (accept, read, write)
+        let _ = naso_uring_poll();
+
+        let client_fd = naso_accept_get_client(out_ptr);
+        if client_fd != 0 {
+            // Get the fd_table index from out[2] for read/write operations
+            let fd_table_index = naso_accept_get_fd_table(out_ptr);
+            
+            // Handle request synchronously for testing
+            let _ = handle_request(fd_table_index);
+            
+            let _ = naso_tcp_accept_async(fd, out_ptr, 32, 0 as *u8, 0);
+            let _ = naso_uring_submit_batch();
+        }
+    }
+    0
+}
+
+fn handle_request(conn_fd: u64) -> u64 {
+    let mut keep_alive = 1;
+    let mut request_count = 0;
+    let mut read_buf = [0; 1024];
+    let read_buf_ptr = read_buf as *u8;
+    let mut method_buf = [0; 32];
+    let mut path_buf = [0; 256];
+    let mut headers_buf = [0; 256];
+    
+    while keep_alive != 0 {
+        // Read request
+        let bytes_read = naso_read_async(conn_fd, read_buf_ptr, 1024, 0 as *u8, 0);
+        let _ = naso_uring_submit_batch();
+        
+        // Yield to let I/O complete
+        let _ = naso_yield();
+        let _ = naso_uring_poll();
+        
+        let actual_bytes = naso_check_read_completion(conn_fd);
+        if actual_bytes == 0 {
+            break;
+        }
+        
+        // Parse HTTP request
+        let parsed = naso_parse_http_request(
+            read_buf_ptr,
+            actual_bytes,
+            method_buf as *u8,
+            32,
+            path_buf as *u8,
+            256,
+            headers_buf as *u8,
+            256,
+        );
+        
+        if parsed == 0 {
+            // Invalid request, close connection
+            break;
+        }
+        
+        // Build response
+        let resp_ptr = naso_build_response(
+            method_buf as *u8,
+            32,
+            path_buf as *u8,
+            256,
+            0 as *u8,
+            0,
+        );
+        
+        // Write response - fixed length for now
+        let _ = naso_write_async(conn_fd, resp_ptr, 64, 0 as *u8, 0);
+        let _ = naso_uring_submit_batch();
+        
+        // Yield for write to complete
+        let _ = naso_yield();
+        let _ = naso_uring_poll();
+        
+        let wrote = naso_check_write_completion(conn_fd);
+        if wrote == 0 {
+            break;
+        }
+        
+        request_count = request_count + 1;
+        if request_count > 100 {
+            keep_alive = 0;
+        }
+    }
+    
+    let _ = naso_close(conn_fd);
+    0
+}
+
+fn main() -> () {
+    let addr = [49, 50, 55, 46, 48, 46, 48, 46, 49, 58, 56, 48, 57, 57]; // "127.0.0.1:8099"
+    let fd = naso_tcp_bind_reuseport(addr as *u8, 14);
+
+    let runtime = naso_runtime_new(4);
+
+    // Run accept loop directly in main for testing
+    let _ = accept_loop(fd, runtime);
+}

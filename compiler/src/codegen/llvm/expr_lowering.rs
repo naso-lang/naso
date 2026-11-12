@@ -595,6 +595,7 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                                 "naso_future_complete" => i == 0,
                                 "naso_await" => i == 0,
                                 "naso_future_get_result" => i == 0,
+                                "naso_spawn_future" => i == 0,
                                 "naso_channel_new" => false,
                                 "naso_future_new" => false,
                                 "naso_runtime_new" => false,

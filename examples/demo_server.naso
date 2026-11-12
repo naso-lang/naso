@@ -43,9 +43,10 @@ fn accept_loop(fd: u64) -> () {
     let mut running = 1;
     let mut out = [0, 0];
     let out_ptr = out as *u64;
+    let listener_fd = fd;  // Preserve listener fd in local var
     
     while running != 0 {
-        if naso_tcp_accept(fd, out_ptr) != 0 {
+        if naso_tcp_accept(listener_fd, out_ptr) != 0 {
             let client_fd = naso_accept_get_client(out_ptr);
             // Handle client
             handle_client(client_fd);

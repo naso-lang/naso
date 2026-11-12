@@ -79,6 +79,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "base64"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
 name = "beef"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1081,10 +1087,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-runtime",
+ "base64",
  "crossbeam",
  "io-uring",
  "mio 0.8.11",
  "once_cell",
+ "rand 0.8.8",
  "socket2 0.5.10",
  "thiserror",
  "tokio",

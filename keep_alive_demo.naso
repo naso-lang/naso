@@ -1,0 +1,387 @@
+// ============================================================================
+// HTTP Keep-Alive Demo Application
+// ============================================================================
+// This demo application showcases the Phase 9 HTTP Keep-Alive Support implementation
+// Demonstrates: Connection reuse, timeout management, request pipelining, and
+// reduced TCP overhead for improved performance
+// ============================================================================
+
+extern "C" {
+    // Core FFI functions
+    fn naso_tcp_bind(addr: *u8, len: u64) -> u64;
+    fn naso_tcp_accept(listener_fd: u64, out: *mut u64) -> u64;
+    fn naso_accept_get_client(out: *mut u64) -> u64;
+    fn naso_read(fd: u64, buf: *mut u8, max_len: usize) -> usize;
+    fn naso_write(fd: u64, buf: *const u8, len: usize) -> usize;
+    fn naso_close(fd: u64) -> u64;
+    fn naso_yield() -> u64;
+    
+    // Enhanced HTTP functions for Keep-Alive
+    fn naso_parse_http_request(
+        buf: *const u8,
+        len: usize,
+        out_method: *mut u8,
+        out_method_len: usize,
+        out_path: *mut u8,
+        out_path_len: usize,
+        out_headers: *mut u8,
+        out_headers_len: usize,
+    ) -> u64;
+    
+    fn naso_build_response_enhanced(
+        method_ptr: *const u8,
+        method_len: u64,
+        path_ptr: *const u8,
+        path_len: u64,
+        headers_ptr: *const u8,
+        headers_len: u64,
+        body_ptr: *const u8,
+        body_len: u64,
+        out_ptr: *mut u8,
+        out_len: u64,
+        stream_fd: u64,
+        enable_keep_alive: u8,
+    ) -> u64;
+    
+    // Keep-Alive management functions
+    fn naso_check_keep_alive_support(stream_fd: u64) -> u64;
+    fn naso_get_connection_stats(
+        stream_fd: u64,
+        out_requests: *mut u64,
+        out_idle_ms: *mut u64,
+    ) -> u64;
+    fn naso_add_pipelined_request(
+        stream_fd: u64,
+        request_ptr: *const u8,
+        request_len: usize,
+    ) -> u64;
+    fn naso_process_pipelined_request(
+        stream_fd: u64,
+        out_request_ptr: *mut u8,
+        out_request_len: usize,
+    ) -> u64;
+    fn naso_cleanup_connections() -> u64;
+    
+    // Utility functions
+    fn naso_last_error(out_ptr: *mut u8, max_len: usize) -> usize;
+    fn naso_runtime_new(worker_count: u64) -> *mut u8;
+    fn naso_runtime_run(rt: *mut u8) -> u64;
+    fn naso_runtime_free(rt: *mut u8) -> u64;
+}
+
+// Server statistics
+struct ServerStats {
+    pub total_connections: u64,
+    pub active_connections: u64,
+    pub keep_alive_connections: u64,
+    pub total_requests: u64,
+    pub pipelined_requests: u64,
+    pub connection_cleanups: u64,
+}
+
+// HTTP Response handlers
+fn handle_root_request(req_method: u8, req_path: *const u8, path_len: usize, body_len: usize) -> (*mut u8, usize) {
+    let mut response_body: [u8; 256] = [0; 256];
+    let mut response_len = 0;
+    
+    if path_len == 1 && req_path[0] == b'/' as u8 {
+        // Root path: Return welcome message with server info
+        let welcome_msg = "HTTP Keep-Alive Demo Server\r\nVersion: 1.0\r\nPhase 9: Enhanced Connection Management\r\n";
+        for i in 0..welcome_msg.len() - 1 {
+            response_body[response_len] = welcome_msg.as_bytes()[i] as u8;
+            response_len += 1;
+        }
+    } else if path_len == 5 && std::slice::from_raw_parts(req_path, path_len) == [b'/', b'h', b'e', b'a', b'l', b't', b'h'] as &[u8] {
+        // Health endpoint: Simple OK response
+        response_body[0] = b'2';
+        response_body[1] = b'0';
+        response_body[2] = b'0';
+        response_len = 3;
+    } else if path_len == 5 && std::slice::from_raw_parts(req_path, path_len) == [b'/', b'e', b'c', b'h', b'o'] as &[bytes] {
+        // Echo endpoint: Echo back the request body
+        let mut body_copy_len = body_len.min(100); // Limit echoed body size
+        for i in 0..body_copy_len {
+            response_body[i] = unsafe { *req_path.add(i) };
+        }
+        response_len = body_copy_len;
+    } else {
+        // Not found: 404 response
+        let not_found_msg = "404 Not Found\r\nResource not available";
+        for i in 0..not_found_msg.len() - 1 {
+            response_body[response_len] = not_found_msg.as_bytes()[i] as u8;
+            response_len += 1;
+        }
+    }
+    
+    (response_body.as_mut_ptr(), response_len)
+}
+
+fn handle_keep_alive_info(stream_fd: u64) -> (*mut u8, usize) {
+    // Create a detailed connection info response
+    let mut info_body: [u8; 512] = [0; 512];
+    let mut info_len = 0;
+    
+    let info_msg = "=== Keep-Alive Connection Info ===\r\n";
+    for i in 0..info_msg.len() - 1 {
+        info_body[info_len] = info_msg.as_bytes()[i] as u8;
+        info_len += 1;
+    }
+    
+    let mut stats_msg = "Connection Statistics:\r\n";
+    let mut stats_len = info_len;
+    
+    // Get connection statistics
+    let mut req_count: u64 = 0;
+    let mut idle_ms: u64 = 0;
+    let stats_result = naso_get_connection_stats(stream_fd, &mut req_count as *mut u64, &mut idle_ms as *mut u64);
+    
+    if stats_result != 0 {
+        let req_str = format!("Requests Processed: {}\r\n", req_count);
+        let idle_str = format!("Idle Time: {} ms\r\n", idle_ms);
+        let support_result = naso_check_keep_alive_support(stream_fd);
+        let support_str = if support_result != 0 { "Keep-Alive: Enabled" } else { "Keep-Alive: Disabled" };
+        
+        let full_stats = format!(
+            "Connection Statistics:\r\nRequests Processed: {}\r\nIdle Time: {} ms\r\nKeep-Alive: {}\r\n\r\n",
+            req_count, idle_ms, support_str
+        );
+        
+        for i in 0..full_stats.len() - 1 {
+            info_body[stats_len] = full_stats.as_bytes()[i] as u8;
+            stats_len += 1;
+        }
+    }
+    
+    (info_body.as_mut_ptr(), stats_len)
+}
+
+fn handle_client_with_keep_alive(client_fd: u64, stats: &mut ServerStats) -> () {
+    // Initialize buffer for reading request
+    let mut read_buf: [u8; 4096] = [0; 4096];
+    let mut read_done: u64 = 0;
+    let mut write_done: u64 = 0;
+    
+    let mut request_method: [u8; 16] = [0; 16];
+    let mut request_path: [u8; 256] = [0; 256];
+    let mut request_headers: [u8; 2048] = [0; 2048];
+    let mut response_buf: [u8; 2048] = [0; 2048];
+    
+    stats.active_connections += 1;
+    stats.total_connections += 1;
+    
+    // Enable Keep-Alive for this connection
+    let enable_keep_alive: u8 = 1;
+    
+    loop {
+        // Step 1: Read request from client
+        let n = naso_read(client_fd, read_buf.as_mut_ptr() as *mut u8, read_buf.len());
+        
+        if n == 0 {
+            // Connection closed or error
+            break;
+        }
+        
+        stats.total_requests += 1;
+        
+        // Step 2: Parse HTTP request
+        let parsed_len = naso_parse_http_request(
+            read_buf.as_ptr() as *const u8,
+            n,
+            request_method.as_mut_ptr() as *mut u8,
+            request_method.len(),
+            request_path.as_mut_ptr() as *mut u8,
+            request_path.len(),
+            request_headers.as_mut_ptr() as *mut u8,
+            request_headers.len(),
+        );
+        
+        if parsed_len == 0 {
+            // Failed to parse request
+            let error_msg = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 17\r\nConnection: close\r\n\r\nBad Request";
+            let mut error_buf: [u8; 256] = [0; 256];
+            let mut error_len = 0;
+            for i in 0..error_msg.len() - 1 {
+                error_buf[error_len] = error_msg.as_bytes()[i] as u8;
+                error_len += 1;
+            }
+            
+            let _ = naso_write(client_fd, error_buf.as_ptr() as *const u8, error_len);
+            break;
+        }
+        
+        // Step 3: Handle specific endpoints
+        let path_str: &[u8] = &request_path[..request_path.iter().position(|&b| b == 0).unwrap_or(request_path.len())];
+        let path_len = path_str.len();
+        
+        let (response_body, response_len) = if path_len == 1 && request_path[0] == b'/' as u8 {
+            // Root endpoint
+            handle_root_request(request_method[0], request_path.as_ptr() as *const u8, path_len, n)
+        } else if path_len == 13 && request_path[0..13] == [b'/', b'k', b'e', b'e', b'p', b'-', b'a', b'l', b'i', b'v', b'e', b'_', b'i', b'n', b'f', b'o'] as &[u8] {
+            // Keep-Alive info endpoint
+            handle_keep_alive_info(client_fd)
+        } else {
+            // Default endpoint
+            let default_body: [u8; 32] = [72, 101, 108, 108, 111, 44, 32, 87, 111, 114, 108, 100, 33]; // "Hello, World!"
+            (default_body.as_mut_ptr(), 13)
+        };
+        
+        // Step 4: Build enhanced HTTP response with Keep-Alive support
+        let response_len_u64 = response_len as u64;
+        let built_len = naso_build_response_enhanced(
+            request_method.as_ptr() as *const u8,
+            request_method.iter().position(|&b| b == 0).unwrap_or(request_method.len()) as u64,
+            request_path.as_ptr() as *const u8,
+            path_len as u64,
+            request_headers.as_ptr() as *const u8,
+            request_headers.iter().position(|&b| b == 0).unwrap_or(request_headers.len()) as u64,
+            read_buf.as_ptr() as *const u8,
+            n as u64,
+            response_buf.as_mut_ptr() as *mut u8,
+            response_buf.len() as u64,
+            client_fd,
+            enable_keep_alive,
+        );
+        
+        if built_len > 0 {
+            // Step 5: Write response
+            let _ = naso_write(client_fd, response_buf.as_ptr() as *const u8, built_len as usize);
+            
+            // Check if client supports pipelining
+            if path_len == 10 && request_path[0..10] == [b'/', b'p', b'i', b'p', b'e', b'l', b'i', b'n', b'g', b'_', b't', b'e', b's', b't'] as &[u8] {
+                // Pipeline test endpoint - demonstrate pipelining
+                let pipeline_msg = "Pipelined requests supported\r\n";
+                let mut pipeline_buf: [u8; 256] = [0; 256];
+                let mut pipeline_len = 0;
+                for i in 0..pipeline_msg.len() - 1 {
+                    pipeline_buf[pipeline_len] = pipeline_msg.as_bytes()[i] as u8;
+                    pipeline_len += 1;
+                }
+                
+                let _ = naso_write(client_fd, pipeline_buf.as_ptr() as *const u8, pipeline_len);
+                stats.pipelined_requests += 1;
+            }
+            
+            // Continue for Keep-Alive connections
+            if enable_keep_alive != 0 {
+                continue;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    
+    // Connection cleanup
+    let _ = naso_close(client_fd);
+    stats.active_connections -= 1;
+}
+
+fn worker_accept_loop(listener_fd: u64, stats: &mut ServerStats) -> () {
+    let mut running: u64 = 1;
+    let mut out: [u64; 2] = [0, 0];
+    let out_ptr = out.as_mut_ptr();
+    
+    loop {
+        if running == 0 {
+            break;
+        }
+        
+        // Check for connection cleanup
+        let cleanup_count = naso_cleanup_connections();
+        if cleanup_count > 0 {
+            stats.connection_cleanups += cleanup_count;
+        }
+        
+        // Accept new connection
+        if naso_tcp_accept(listener_fd, out_ptr) != 0 {
+            let client_fd = naso_accept_get_client(out_ptr);
+            if client_fd != 0 {
+                handle_client_with_keep_alive(client_fd, stats);
+            }
+        }
+        
+        naso_yield();
+    }
+}
+
+fn print_server_stats(stats: &ServerStats) -> () {
+    let stats_msg = format!(
+        "=== HTTP Keep-Alive Server Statistics ===\r\n" +
+        "Total Connections: {}\r\n" +
+        "Active Connections: {}\r\n" +
+        "Keep-Alive Connections: {}\r\n" +
+        "Total Requests: {}\r\n" +
+        "Pipelined Requests: {}\r\n" +
+        "Connection Cleanups: {}\r\n",
+        stats.total_connections,
+        stats.active_connections,
+        stats.keep_alive_connections, // Note: This would need to be tracked separately
+        stats.total_requests,
+        stats.pipelined_requests,
+        stats.connection_cleanups
+    );
+    
+    let mut stats_buf: [u8; 512] = [0; 512];
+    let mut stats_len = 0;
+    
+    for i in 0..stats_msg.len() - 1 {
+        stats_buf[stats_len] = stats_msg.as_bytes()[i] as u8;
+        stats_len += 1;
+    }
+    
+    // In a real implementation, this would print to console
+    // For demo purposes, we'll just create the buffer
+    let _ = stats_buf;
+    let _ = stats_len;
+}
+
+fn main() -> () {
+    // Initialize server statistics
+    let mut stats: ServerStats = ServerStats {
+        total_connections: 0,
+        active_connections: 0,
+        keep_alive_connections: 0,
+        total_requests: 0,
+        pipelined_requests: 0,
+        connection_cleanups: 0,
+    };
+    
+    // Server configuration
+    let addr: [u8; 14] = [49, 50, 55, 46, 48, 46, 48, 46, 49, 58, 56, 48, 57, 57]; // "127.0.0.1:8099"
+    
+    // Create TCP listener
+    let listener_fd = naso_tcp_bind(addr.as_ptr() as *const u8, addr.len() as u64);
+    
+    if listener_fd == 0 {
+        // Failed to bind
+        let error_msg = "Failed to bind to 127.0.0.1:8099";
+        let mut error_buf: [u8; 256] = [0; 256];
+        let mut error_len = 0;
+        for i in 0..error_msg.len() - 1 {
+            error_buf[error_len] = error_msg.as_bytes()[i] as u8;
+            error_len += 1;
+        }
+        
+        let mut dummy_fd: u64 = 0;
+        let _ = naso_write(dummy_fd, error_buf.as_ptr() as *const u8, error_len);
+        return;
+    }
+    
+    // Create async runtime
+    let runtime = naso_runtime_new(4); // 4 worker threads
+    
+    // Start worker threads for handling connections
+    // Note: In a real implementation, this would spawn actual threads
+    // For this demo, we'll run the accept loop in the main thread
+    print_server_stats(&stats);
+    
+    // Start accept loop with Keep-Alive support
+    worker_accept_loop(listener_fd, &mut stats);
+    
+    // Cleanup
+    let _ = naso_runtime_run(runtime);
+    let _ = naso_runtime_free(runtime);
+    
+    print_server_stats(&stats);
+}

@@ -1,0 +1,111 @@
+// ============================================================================
+// FULL HTTP: Full HTTP Pipeline with naso_parse_http_request + naso_build_response
+// ============================================================================
+// Demonstrates complete HTTP request/response cycle using parser + builder
+
+extern "C" {
+    fn naso_tcp_bind(addr: *u8, len: u64) -> u64;
+    fn naso_tcp_accept(fd: u64, out: *u64) -> u64;
+    fn naso_accept_get_client(out: *u64) -> u64;
+    fn naso_read(fd: u64, buf: *u8, max_len: u64) -> u64;
+    fn naso_write(fd: u64, buf: *u8, len: u64) -> u64;
+    fn naso_close(fd: u64) -> u64;
+    fn naso_yield() -> u64;
+    fn naso_runtime_new(worker_count: u64) -> *u8;
+    fn naso_runtime_run(rt: *u8) -> u64;
+    fn naso_runtime_free(rt: *u8) -> u64;
+    fn naso_parse_http_request(
+        buf: *u8,
+        len: u64,
+        out_method: *u8,
+        out_method_len: u64,
+        out_path: *u8,
+        out_path_len: u64,
+        out_headers: *u8,
+        out_headers_len: u64
+    ) -> u64;
+    fn naso_build_response(
+        method_ptr: *u8,
+        method_len: u64,
+        path_ptr: *u8,
+        path_len: u64,
+        headers_ptr: *u8,
+        headers_len: u64,
+        body_ptr: *u8,
+        body_len: u64,
+        out_ptr: *u8,
+        out_len: u64
+    ) -> u64;
+}
+
+fn handle_client(client_fd: u64) -> () {
+    let mut read_buf = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let _ = naso_read(client_fd, read_buf as *u8, 64);
+    
+    // Parse HTTP request
+    let mut method_buf = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut path_buf = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut headers_buf = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                           0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                           0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                           0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    
+    let parse_result = naso_parse_http_request(
+        read_buf as *u8, 64,
+        method_buf as *u8, 64,
+        path_buf as *u8, 64,
+        headers_buf as *u8, 128
+    );
+    
+    // Build response using parsed request
+    let mut response_buf = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    
+    let _ = naso_build_response(
+        method_buf as *u8, 64,
+        path_buf as *u8, 64,
+        headers_buf as *u8, 128,
+        read_buf as *u8, 0,  // body
+        response_buf as *u8, 256
+    );
+    
+    let _ = naso_write(client_fd, response_buf as *u8, 256);
+    let _ = naso_close(client_fd);
+}
+
+fn main() -> () {
+    let addr = [49, 50, 55, 46, 48, 46, 48, 46, 49, 58, 56, 48, 57, 57]; // "127.0.0.1:8099"
+    let fd = naso_tcp_bind(addr as *u8, 14);
+    
+    let runtime = naso_runtime_new(4);
+    
+    let mut running = 1;
+    let mut out = [0, 0];
+    let out_ptr = out as *u64;
+    let listener_fd = fd;
+    
+    while running != 0 {
+        let accept_result = naso_tcp_accept(listener_fd, out_ptr);
+        if accept_result != 0 {
+            let client_fd = naso_accept_get_client(out_ptr);
+            if client_fd != 0 {
+                handle_client(client_fd);
+            }
+            naso_yield();
+        } else {
+            naso_yield();
+        }
+    }
+    
+    let _ = naso_runtime_run(runtime);
+}

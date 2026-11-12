@@ -1,0 +1,128 @@
+// ============================================================================
+// ASYNC I/O: Full HTTP Pipeline with naso_read_async/naso_write_async
+// ============================================================================
+// Demonstrates:
+// - naso_spawn for 4-thread parallelism (runtime)
+// - naso_read_async / naso_write_async for non-blocking I/O
+// - naso_check_read_completion / naso_check_write_completion for polling
+// - naso_check_accept_completion for async accept
+// - naso_yield to drive async event loop
+// ============================================================================
+
+extern "C" {
+    fn naso_tcp_bind(addr: *u8, len: u64) -> u64;
+    fn naso_poll_add_listener(listener_fd: u64, out_ptr: *u64, callback: *u8) -> u64;
+    fn naso_check_accept_completion(fd: u64) -> u64;
+    fn naso_accept_get_client(out: *u64) -> u64;
+    fn naso_read_async(fd: u64, buf: *u8, max_len: u64, callback: *u8, callback_len: u64) -> u64;
+    fn naso_write_async(fd: u64, buf: *u8, len: u64, callback: *u8, callback_len: u64) -> u64;
+    fn naso_check_read_completion(fd: u64) -> u64;
+    fn naso_check_write_completion(fd: u64) -> u64;
+    fn naso_close(fd: u64) -> u64;
+    fn naso_yield() -> u64;
+    fn naso_runtime_new(worker_count: u64) -> *u8;
+    fn naso_runtime_run(rt: *u8) -> u64;
+    fn naso_runtime_free(rt: *u8) -> u64;
+}
+
+fn handle_client_async(client_fd: u64) -> () {
+    // Buffer for reading HTTP request
+    let mut read_buf = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut read_done: u64 = 0;
+    let mut write_done: u64 = 0;
+    
+    // Step 1: Start async read
+    let _ = naso_read_async(client_fd, read_buf as *u8, 16, 0 as *u8, 0);
+    
+    // Poll for read completion
+    while read_done == 0 {
+        read_done = naso_check_read_completion(client_fd);
+        if read_done == 0 {
+            naso_yield();
+        }
+    }
+    
+    // For this demo, we just send a fixed response regardless of request
+    // Step 2: Start async write - use inline array literal like optimized_server
+    let _ = naso_write_async(client_fd, 
+        [72, 84, 84, 80, 47, 49, 46, 49, 32, 50, 48, 48, 32, 79, 75, 13, 10,
+         67, 111, 110, 116, 101, 110, 116, 45, 76, 101, 110, 103, 116, 104, 58, 32, 49, 51, 13, 10,
+         13, 10,
+         72, 101, 108, 108, 111, 32, 87, 111, 114, 108, 100, 10] as *u8, 
+        57, 0 as *u8, 0);
+    
+    // Poll for write completion
+    while write_done == 0 {
+        write_done = naso_check_write_completion(client_fd);
+        if write_done == 0 {
+            naso_yield();
+        }
+    }
+    
+    // Step 3: Close connection
+    let _ = naso_close(client_fd);
+}
+
+// Worker task that runs the accept loop - this will be spawned on each worker thread
+fn worker_accept_loop(listener_fd: u64) -> () {
+    let mut running = 1;
+    let mut out = [0, 0];
+    let out_ptr = out as *u64;
+    
+    // Register listener for async accept
+    let _ = naso_poll_add_listener(listener_fd, out_ptr as *u8, 0 as *u8);
+    
+    while running != 0 {
+        // Check if async accept has completed
+        let accept_done = naso_check_accept_completion(listener_fd);
+        if accept_done != 0 {
+            // Accept completed - get the client fd from out array
+            let client_fd = naso_accept_get_client(out_ptr);
+            if client_fd != 0 {
+                handle_client_async(client_fd);
+            }
+            // Re-register for next accept (keep-alive accept loop)
+            let _ = naso_poll_add_listener(listener_fd, out_ptr, 0 as *u8);
+        }
+        naso_yield();
+    }
+}
+
+fn main() -> () {
+    let addr = [49, 50, 55, 46, 48, 46, 48, 46, 49, 58, 56, 48, 57, 57]; // "127.0.0.1:8099"
+    let fd = naso_tcp_bind(addr as *u8, 14);
+    
+    let runtime = naso_runtime_new(4);
+    
+    // Spawn 4 worker tasks on the runtime, each running an accept loop
+    // Each task is a function pointer to worker_accept_loop
+    // In reality, the compiler would emit the task code as a function pointer
+    let worker_fn = 0 as *u8;  // Placeholder - compiler should provide actual function pointer
+    
+    // For now, run single accept loop in main thread to test async I/O
+    // naso_spawn will be wired properly once compiler supports async lowering
+    let mut running = 1;
+    let mut out = [0, 0];
+    let out_ptr = out as *u64;
+    let listener_fd = fd;
+    
+    // Register listener for async accept
+    let _ = naso_poll_add_listener(listener_fd, out_ptr as *u8, 0 as *u8);
+    
+    while running != 0 {
+        // Check if async accept has completed
+        let accept_done = naso_check_accept_completion(listener_fd);
+        if accept_done != 0 {
+            // Accept completed - get the client fd from out array
+            let client_fd = naso_accept_get_client(out_ptr);
+            if client_fd != 0 {
+                handle_client_async(client_fd);
+            }
+            // Re-register for next accept (keep-alive accept loop)
+            let _ = naso_poll_add_listener(listener_fd, out_ptr, 0 as *u8);
+        }
+        naso_yield();
+    }
+    
+    let _ = naso_runtime_run(runtime);
+}

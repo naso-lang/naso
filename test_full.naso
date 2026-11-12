@@ -1,0 +1,42 @@
+extern "C" {
+    fn naso_tcp_bind_reuseport(addr: *u8, len: usize) -> u64;
+    fn naso_tcp_accept_async(fd: u64, out: *u64, out_len: usize, cb: *u8, cb_len: usize) -> u64;
+    fn naso_accept_get_client(out: *u64) -> u64;
+    fn naso_accept_get_fd_table(out: *u64) -> u64;
+    fn naso_read_async(fd: u64, buf: *u8, len: usize, cb: *u8, cb_len: usize) -> u64;
+    fn naso_write_async(fd: u64, buf: *u8, len: usize, cb: *u8, cb_len: usize) -> u64;
+    fn naso_uring_submit_batch() -> u64;
+    fn naso_uring_poll() -> u64;
+    fn naso_check_read_completion(fd: u64) -> u64;
+    fn naso_check_write_completion(fd: u64) -> u64;
+    fn naso_close(fd: u64) -> u64;
+    fn naso_runtime_new(workers: u64) -> *u8;
+    fn naso_runtime_run(runtime: *u8) -> u64;
+    fn naso_yield() -> u64;
+    fn naso_spawn(rt: *u8, task_fn: *u8, task_arg: u64, extra: *u8) -> *u8;
+    fn naso_task_join(task: *u8) -> u64;
+    fn naso_timer_sleep_async(duration_ms: u64, callback: *u8, callback_len: usize) -> u64;
+    fn naso_parse_http_request(
+        buf: *u8,
+        len: usize,
+        out_method: *u8,
+        out_method_len: usize,
+        out_path: *u8,
+        out_path_len: usize,
+        out_headers: *u8,
+        out_headers_len: usize,
+    ) -> u64;
+    fn naso_build_response(
+        method_ptr: *u8,
+        method_len: usize,
+        path_ptr: *u8,
+        path_len: usize,
+        body_ptr: *u8,
+        body_len: usize,
+    ) -> u64;
+}
+
+fn main() -> () {
+    let x = 0;
+    ()
+}

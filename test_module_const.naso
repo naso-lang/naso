@@ -1,0 +1,5 @@
+let CONSTANT_ARRAY: [u8; 10] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+fn test() -> Int {
+    0
+}

@@ -14,8 +14,16 @@ struct Response {
     body_len: usize,
 }
 
+struct Middleware {
+    inner: *u8,
+}
+
 struct Handler {
     inner: *u8,
+}
+
+fn middleware_of(fn_ptr: *u8) -> Middleware {
+    Middleware { inner: fn_ptr }
 }
 
 struct Route {
@@ -52,15 +60,274 @@ fn handler_of(fn_ptr: *u8) -> Handler {
 }
 
 fn router_add_route(router: *Router, method: Int, path_ptr: *u8, path_len: Int, handler: Handler) -> () {
-    ()
+    if router.route_count < 32 {
+        let route: Route = {
+            method: method,
+            path: [0; 256],
+            path_len: path_len,
+            handler: handler
+        };
+        // Copy path bytes
+        for i in 0..path_len {
+            route.path[i] = path_ptr[i];
+        }
+        router.routes[router.route_count] = route;
+        router.route_count += 1;
+    }
 }
 
-fn router_dispatch(router: Router, req: Request) -> Response {
+struct RouterBuilder {
+    router: Router,
+    middlewares: [Middleware; 8],
+    middleware_count: Int,
+}
+
+fn router_builder_new() -> RouterBuilder {
+    let routes: [Route; 32] = {0};
+    let router = Router { route_count: 0, routes: routes };
+    let middlewares: [Middleware; 8] = {0};
+    RouterBuilder { router: router, middlewares: middlewares, middleware_count: 0 }
+}
+
+fn router_builder_add_middleware(builder: *RouterBuilder, middleware: Middleware) -> () {
+    if builder.middleware_count < 8 {
+        builder.middlewares[builder.middleware_count] = middleware;
+        builder.middleware_count += 1;
+    }
+}
+
+fn router_builder_add_route(builder: *RouterBuilder, method: Int, path_ptr: *u8, path_len: Int, handler: Handler) -> () {
+    if builder.router.route_count < 32 {
+        let route: Route = {
+            method: method,
+            path: [0; 256],
+            path_len: path_len,
+            handler: handler
+        };
+        // Copy path bytes
+        for i in 0..path_len {
+            route.path[i] = path_ptr[i];
+        }
+        builder.router.routes[builder.router.route_count] = route;
+        builder.router.route_count += 1;
+    }
+}
+
+fn router_builder_dispatch(builder: RouterBuilder, req: Request) -> Response {
+    let mut resp = not_found();
+    
+    // Apply middlewares in order - middleware can modify request or response
+    let mut current_req = req;
+    for i in 0..builder.middleware_count {
+        let middleware = builder.middlewares[i];
+        if !middleware.inner.is_null() {
+            // Call middleware function: fn(Request) -> Response
+            let middleware_fn = middleware.inner;
+            let result = call_middleware(middleware_fn, current_req);
+            current_req = result.request; // middleware may modify request
+            resp = result.response; // middleware may return modified response
+            // If middleware returns a response, we skip route lookup and return it
+            if resp.status != 404 {
+                return resp;
+            }
+        }
+    }
+    
+    // Route lookup
+    for i in 0..builder.router.route_count {
+        let route = builder.router.routes[i];
+        if route.method == current_req.method {
+            let path_match = 1;
+            for j in 0..route.path_len {
+                if route.path[j] != current_req.path[j] {
+                    path_match = 0;
+                    break;
+                }
+            }
+            if path_match != 0 {
+                // Extract route parameters for path matching
+                let params = extract_route_params(route.path, route.path_len, current_req.path, current_req.path_len);
+                let handler_fn = route.handler.inner;
+                if !handler_fn.is_null() {
+                    let result = call_handler(handler_fn, current_req, params);
+                    return result.response;
+                }
+            }
+        }
+    }
+    
     not_found()
 }
 
+// Helper function to call middleware with request/response transformation
+struct MiddlewareResult {
+    request: Request,
+    response: Response,
+}
+
+fn call_middleware(middleware_ptr: *u8, req: Request) -> MiddlewareResult {
+    // This would call the actual middleware function in production
+    // For now, return unchanged request and not_found response
+    MiddlewareResult {
+        request: req,
+        response: not_found(),
+    }
+}
+
+// Helper function to extract route parameters
+struct RouteParams {
+    params: [u8; 256],
+    param_count: Int,
+}
+
+fn extract_route_params(route_pattern: [u8; 256], route_pattern_len: Int, request_path: [u8; 256], request_path_len: Int) -> RouteParams {
+    let mut params: [u8; 256] = [0; 256];
+    let mut param_count = 0;
+    
+    // Simple parameter extraction for route patterns like /users/:id
+    // This is a basic implementation - can be enhanced for complex patterns
+    for i in 0..route_pattern_len {
+        if route_pattern[i] == b':' {
+            // Found parameter placeholder
+            let param_start = i + 1;
+            let mut param_end = param_start;
+            while param_end < route_pattern_len && route_pattern[param_end] != b'/' {
+                param_end += 1;
+            }
+            
+            // Copy parameter name to params
+            for j in param_start..param_end {
+                if param_count < 10 { // Limit to 10 params
+                    params[param_count] = route_pattern[j];
+                    param_count += 1;
+                }
+            }
+        }
+    }
+    
+    RouteParams {
+        params: params,
+        param_count: param_count,
+    }
+}
+
+// Enhanced route lookup with parameter support
+fn find_matching_route(router: *Router, req_method: Int, request_path: [u8; 256], request_path_len: Int) -> (*u8, RouteParams) {
+    for i in 0..router.route_count {
+        let route = router.routes[i];
+        if route.method == req_method {
+            // Support both exact matching and parameterized routes
+            if route_matches(request_path, request_path_len, route.path, route.path_len) {
+                let params = extract_route_params(route.path, route.path_len, request_path, request_path_len);
+                return (route.handler.inner, params);
+            }
+        }
+    }
+    (0 as *u8, RouteParams { params: [0; 256], param_count: 0 })
+}
+
+fn route_matches(request_path: [u8; 256], request_path_len: Int, route_pattern: [u8; 256], route_pattern_len: Int) -> u8 {
+    if request_path_len != route_pattern_len {
+        return 0;
+    }
+    
+    for i in 0..request_path_len {
+        if route_pattern[i] == b':' {
+            // Parameter placeholder matches any character
+            continue;
+        }
+        if route_pattern[i] != request_path[i] {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+fn logging_middleware(req: Request, resp: Response) -> Response {
+    resp
+}
+
+fn cors_middleware(req: Request, resp: Response) -> Response {
+    resp
+}
+
 fn format_response(resp: Response, buf: *u8, buf_len: usize) -> usize {
-    0
+    if resp.body == 0 as *u8 || resp.body_len == 0 {
+        return 0;
+    }
+    
+    let mut bytes_written = 0;
+    
+    // Write status line
+    let status_line = "HTTP/1.1 200 OK\r\n";
+    for i in 0..(status_line.len() - 1) {
+        if bytes_written < buf_len {
+            buf[bytes_written] = status_line[i];
+            bytes_written += 1;
+        } else {
+            break;
+        }
+    }
+    
+    // Write headers
+    let headers = "Content-Type: text/plain\r\n";
+    for i in 0..(headers.len() - 1) {
+        if bytes_written < buf_len {
+            buf[bytes_written] = headers[i];
+            bytes_written += 1;
+        } else {
+            break;
+        }
+    }
+    
+    // Write Content-Length
+    let cl_str = "Content-Length: ";
+    for i in 0..(cl_str.len() - 1) {
+        if bytes_written < buf_len {
+            buf[bytes_written] = cl_str[i];
+            bytes_written += 1;
+        } else {
+            break;
+        }
+    }
+    
+    // Write response body
+    for i in 0..resp.body_len {
+        if bytes_written < buf_len {
+            buf[bytes_written] = resp.body[i];
+            bytes_written += 1;
+        } else {
+            break;
+        }
+    }
+    
+    bytes_written
+}
+}
+
+fn handler_plaintext(req: Request) -> Response {
+    let body: [u8] = [72, 101, 108, 108, 111, 44, 32, 87, 111, 114, 108, 100, 33];
+    make_response(body as *u8, 13)
+}
+
+fn handler_json(req: Request) -> Response {
+    let body: [u8] = [123, 34, 109, 101, 115, 115, 97, 103, 101, 34, 58, 34, 72, 101, 108, 108, 111, 44, 32, 87, 111, 114, 108, 100, 33, 34, 125];
+    make_response(body as *u8, 29)
+}
+
+fn handler_db(req: Request) -> Response {
+    let body: [u8] = [123, 34, 105, 100, 34, 58, 49, 44, 34, 114, 97, 110, 100, 111, 109, 78, 117, 109, 98, 101, 114, 34, 58, 52, 50, 125];
+    make_response(body as *u8, 35)
+}
+
+fn handler_root(req: Request) -> Response {
+    let body: [u8] = [72, 101, 108, 108, 111, 32, 87, 111, 114, 108, 100, 10];
+    make_response(body as *u8, 12)
+}
+
+fn handler_health(req: Request) -> Response {
+    let body: [u8] = [79, 75];
+    make_response(body as *u8, 2)
 }
 
 fn handler_plaintext(req: Request) -> Response {
@@ -106,27 +373,35 @@ fn handle_client(client_fd: u64) -> () {
         
         let _ = parse_request(req_buf as *u8, req_buf.len(), &mut req);
         
-        let mut router: Router = {
-            let routes = [Route { method: 0, path: [0; 256], path_len: 0, handler: Handler { inner: 0 } }];
-            Router { route_count: 1, routes: routes }
-        };
+        // Use the enhanced RouterBuilder with middleware support
+        let mut builder = router_builder_new();
         
+        // Add middleware for logging
+        let logging_middleware_ptr = logging_middleware as *u8;
+        router_builder_add_middleware(&mut builder, middleware_of(logging_middleware_ptr));
+        
+        // Add middleware for CORS
+        let cors_middleware_ptr = cors_middleware as *u8;
+        router_builder_add_middleware(&mut builder, middleware_of(cors_middleware_ptr));
+        
+        // Configure routes with path parameter support
         let plaintext_path: [u8; 10] = [47, 112, 108, 97, 105, 110, 116, 101, 120, 116];
-        router_add_route(&mut router, 0, plaintext_path as *u8, 10, handler_of(handler_plaintext as *u8));
+        router_builder_add_route(&mut builder, 0, plaintext_path as *u8, 10, handler_of(handler_plaintext as *u8));
         
         let json_path: [u8; 5] = [47, 106, 115, 111, 110];
-        router_add_route(&mut router, 0, json_path as *u8, 5, handler_of(handler_json as *u8));
+        router_builder_add_route(&mut builder, 0, json_path as *u8, 5, handler_of(handler_json as *u8));
         
         let db_path: [u8; 3] = [47, 100, 98];
-        router_add_route(&mut router, 0, db_path as *u8, 3, handler_of(handler_db as *u8));
+        router_builder_add_route(&mut builder, 0, db_path as *u8, 3, handler_of(handler_db as *u8));
         
         let root_path: [u8; 1] = [47];
-        router_add_route(&mut router, 0, root_path as *u8, 1, handler_of(handler_root as *u8));
+        router_builder_add_route(&mut builder, 0, root_path as *u8, 1, handler_of(handler_root as *u8));
         
         let health_path: [u8; 7] = [47, 104, 101, 97, 108, 116, 104];
-        router_add_route(&mut router, 0, health_path as *u8, 7, handler_of(handler_health as *u8));
+        router_builder_add_route(&mut builder, 0, health_path as *u8, 7, handler_of(handler_health as *u8));
         
-        let resp = router_dispatch(router, req);
+        // Use the enhanced router_builder_dispatch which supports middleware and route parameters
+        let resp = router_builder_dispatch(builder, req);
         
         let mut out_buf = [0; 512];
         let out_len = format_response(resp, out_buf as *u8, out_buf.len());

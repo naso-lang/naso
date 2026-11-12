@@ -1,0 +1,25 @@
+extern "C" {
+    fn naso_parse_http_request(
+        buf: *u8,
+        len: usize,
+        out_method: *u8,
+        out_method_len: usize,
+        out_path: *u8,
+        out_path_len: usize,
+        out_headers: *u8,
+        out_headers_len: usize,
+    ) -> u64;
+    fn naso_build_response(
+        method_ptr: *u8,
+        method_len: usize,
+        path_ptr: *u8,
+        path_len: usize,
+        body_ptr: *u8,
+        body_len: usize,
+    ) -> u64;
+}
+
+fn main() -> () {
+    let x = 0;
+    ()
+}

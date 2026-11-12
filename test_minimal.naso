@@ -1,0 +1,24 @@
+struct Request {
+    method: Int,
+    path: [u8; 256],
+    path_len: Int,
+    headers: [u8; 1024],
+    headers_len: Int,
+    body: [u8; 4096],
+    body_len: Int,
+}
+
+struct Response {
+    status: Int,
+    body: *u8,
+    body_len: usize,
+}
+
+fn test() -> Response {
+    let body: [u8] = [72, 101, 108, 108, 111];
+    Response { status: 200, body: body as *u8, body_len: 5 }
+}
+
+fn main() -> () {
+    test();
+}

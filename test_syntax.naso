@@ -1,0 +1,12 @@
+struct Foo {
+    arr: [u8; 10],
+}
+
+fn test() -> Int {
+    let f = Foo { arr: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] };
+    0
+}
+
+fn main() -> () {
+    test();
+}

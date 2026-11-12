@@ -16,6 +16,12 @@ use std::time::Duration;
 mod io_uring_backend;
 pub use io_uring_backend::*;
 
+mod http_parser;
+pub use http_parser::*;
+
+mod multi_threaded_accept;
+pub use multi_threaded_accept::*;
+
 /// Returned to Naso as resource handle
 #[repr(C)]
 pub struct ResourceID(pub u64);
@@ -229,40 +235,49 @@ pub extern "C" fn naso_tcp_bind_reuseport(addr_ptr: *const u8, addr_len: usize) 
 /// Returns 1 on success, 0 on failure.
 #[unsafe(no_mangle)]
 pub extern "C" fn naso_tcp_accept(listener_fd: u64, out: *mut u64) -> u64 {
-    eprintln!("naso_tcp_accept called with listener_fd={}, out={:?}", listener_fd, out);
+    static CALL_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let count = CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    eprintln!("naso_tcp_accept CALL #{}: listener_fd={}, out={:?}", count, listener_fd, out);
     if out.is_null() {
+        eprintln!("naso_tcp_accept: null out, returning 0");
         return 0;
     }
     let mut table = fd_table().lock().unwrap();
+    eprintln!("naso_tcp_accept CALL #{}: table.listeners.keys() = {:?}", count, table.listeners.keys().collect::<Vec<_>>());
+    eprintln!("naso_tcp_accept CALL #{}: table.streams.keys() = {:?}", count, table.streams.keys().collect::<Vec<_>>());
     let Some(listener) = table.listeners.get(&listener_fd) else {
-        eprintln!("Listener {} not found in table", listener_fd);
+        eprintln!("naso_tcp_accept CALL #{}: Listener {} not found in table", count, listener_fd);
+        eprintln!("naso_tcp_accept CALL #{}: Available listeners: {:?}", count, table.listeners.keys().collect::<Vec<_>>());
         return 0;
     };
     let listener_clone = listener.try_clone();
     drop(table);
+    eprintln!("naso_tcp_accept CALL #{}: got listener clone, calling accept()", count);
     match listener_clone {
         Ok(listener_clone) => {
+            eprintln!("naso_tcp_accept CALL #{}: calling accept() on listener_fd={}", count, listener_fd);
             match listener_clone.accept() {
                 Ok((stream, _addr)) => {
+                    eprintln!("naso_tcp_accept CALL #{}: accept() succeeded", count);
                     // Set stream to blocking mode for synchronous FFI
                     let _ = stream.set_nonblocking(false);
                     let mut table = fd_table().lock().unwrap();
                     let stream_fd = table.insert_stream(stream);
-                    eprintln!("Accepted connection: listener_fd={}, stream_fd={}", listener_fd, stream_fd);
+                    eprintln!("naso_tcp_accept CALL #{}: inserted stream_fd={}", count, stream_fd);
                     let out_slice = unsafe { std::slice::from_raw_parts_mut(out, 2) };
                     out_slice[0] = listener_fd;
                     out_slice[1] = stream_fd;
-                    eprintln!("naso_tcp_accept: wrote out[0]={}, out[1]={}", out_slice[0], out_slice[1]);
+                    eprintln!("naso_tcp_accept CALL #{}: wrote out[0]={}, out[1]={}", count, out_slice[0], out_slice[1]);
                     1
                 }
                 Err(e) => {
-                    eprintln!("naso_tcp_accept: accept error: {:?}", e);
+                    eprintln!("naso_tcp_accept CALL #{}: accept error: {:?}", count, e);
                     0
                 }
             }
         }
         Err(e) => {
-            eprintln!("naso_tcp_accept: clone error: {:?}", e);
+            eprintln!("naso_tcp_accept CALL #{}: clone error: {:?}", count, e);
             0
         }
     }
@@ -272,7 +287,7 @@ pub extern "C" fn naso_tcp_accept(listener_fd: u64, out: *mut u64) -> u64 {
 /// Returns bytes read (0 = EOF or error).
 #[unsafe(no_mangle)]
 pub extern "C" fn naso_read(fd: u64, buf: *mut u8, max_len: usize) -> usize {
-    eprintln!(">>> naso_read called with fd={}, max_len={}", fd, max_len);
+    eprintln!(">>> naso_read ENTRY: fd={}, max_len={}", fd, max_len);
     if buf.is_null() || max_len == 0 {
         eprintln!(">>> naso_read: null buf or zero max_len, returning 0");
         return 0;
@@ -280,9 +295,11 @@ pub extern "C" fn naso_read(fd: u64, buf: *mut u8, max_len: usize) -> usize {
     let mut table = fd_table().lock().unwrap();
     let Some(stream) = table.get_stream(fd) else {
         eprintln!(">>> naso_read: Stream {} not found in table, returning 0", fd);
+        eprintln!(">>> naso_read: Available streams: {:?}", table.streams.keys().collect::<Vec<_>>());
         return 0;
     };
     let buf_slice = unsafe { std::slice::from_raw_parts_mut(buf, max_len) };
+    eprintln!(">>> naso_read: calling stream.read()");
     match std::io::Read::read(stream, buf_slice) {
         Ok(n) => {
             memory_tracker().record_alloc(n);
@@ -364,15 +381,17 @@ pub extern "C" fn naso_last_error(out_ptr: *mut u8, max_len: usize) -> usize {
 /// Returns 1 on success, 0 on failure
 #[unsafe(no_mangle)]
 pub extern "C" fn naso_close(fd: u64) -> u64 {
-    eprintln!(">>> naso_close called with fd={}", fd);
+    eprintln!(">>> naso_close ENTRY: fd={}", fd);
     let mut table = fd_table().lock().unwrap();
+    eprintln!(">>> naso_close: table.streams.keys() = {:?}", table.streams.keys().collect::<Vec<_>>());
+    eprintln!(">>> naso_close: table.listeners.keys() = {:?}", table.listeners.keys().collect::<Vec<_>>());
     if let Some(stream) = table.streams.remove(&fd) {
         // Don't shutdown - just let the stream be dropped naturally
         // shutdown can close the connection before buffered data is sent
-        eprintln!(">>> naso_close: closed fd={} (stream dropped)", fd);
+        eprintln!(">>> naso_close: removed stream fd={}, remaining streams: {}", fd, table.streams.len());
         1
     } else {
-        eprintln!(">>> naso_close: fd={} not found", fd);
+        eprintln!(">>> naso_close: fd={} not found in streams, existing streams: {:?}", fd, table.streams.keys().collect::<Vec<_>>());
         0
     }
 }
@@ -388,6 +407,512 @@ pub extern "C" fn naso_accept_get_client(out: *const u64) -> u64 {
     let out_slice = unsafe { std::slice::from_raw_parts(out, 2) };
     eprintln!(">>> naso_accept_get_client: out[0]={}, out[1]={}", out_slice[0], out_slice[1]);
     out_slice[1]
+}
+
+// ============================================================================
+// WEBSOCKET FFI (Phase 3 Enhancement)
+// ============================================================================
+
+/// WebSocket connection upgrade from HTTP request
+/// Returns 1 on success (upgraded to WebSocket), 0 on failure
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_websocket_upgrade(
+    stream_fd: u64,
+    request_ptr: *const u8,
+    request_len: usize,
+    response_ptr: *mut u8,
+    response_max_len: usize,
+) -> u64 {
+    eprintln!(">>> naso_websocket_upgrade called for stream_fd={}", stream_fd);
+    
+    if request_ptr.is_null() || response_ptr.is_null() || response_max_len == 0 {
+        eprintln!(">>> naso_websocket_upgrade: null pointer or zero response buffer");
+        return 0;
+    }
+
+    // Convert request to string for parsing
+    let request_bytes = unsafe { std::slice::from_raw_parts(request_ptr, request_len) };
+    let request_str = match std::str::from_utf8(request_bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(">>> naso_websocket_upgrade: UTF8 parse error: {:?}", e);
+            return 0;
+        }
+    };
+
+    // Check for WebSocket upgrade request
+    let has_upgrade = request_str.contains("Upgrade: websocket") && 
+                     request_str.contains("Connection: Upgrade") &&
+                     request_str.contains("Sec-WebSocket-Key:");
+    
+    if !has_upgrade {
+        eprintln!(">>> naso_websocket_upgrade: not a WebSocket upgrade request");
+        return 0;
+    }
+
+    // Generate WebSocket handshake response
+    let response = generate_websocket_response(request_str);
+    
+    // Copy response to output buffer
+    let response_bytes = response.as_bytes();
+    if response_bytes.len() >= response_max_len {
+        eprintln!(">>> naso_websocket_upgrade: response too large for buffer");
+        return 0;
+    }
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(response_bytes.as_ptr(), response_ptr, response_bytes.len());
+        response_ptr.add(response_bytes.len()).write(0); // Null-terminate
+    }
+
+    eprintln!(">>> naso_websocket_upgrade: successful upgrade for stream_fd={}", stream_fd);
+    1
+}
+
+/// Generate WebSocket handshake response
+fn generate_websocket_response(request: &str) -> String {
+    // Extract the Sec-WebSocket-Key
+    let mut key = "";
+    for line in request.lines() {
+        if line.to_lowercase().starts_with("sec-websocket-key:") {
+            key = line.split(':').nth(1).unwrap_or("").trim();
+            break;
+        }
+    }
+
+    if key.is_empty() {
+        return "HTTP/1.1 400 Bad Request\r\n\r\nInvalid WebSocket key".to_string();
+    }
+
+    // Compute the accept key (base64 of key + magic string)
+    use base64::Engine;
+    let magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    let accept_key = format!("{}", base64::engine::general_purpose::STANDARD.encode(format!("{}{}", key, magic)));
+
+    // Build response
+    format!(
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Accept: {}\r\n"
+        "\r\n",
+        accept_key
+    )
+}
+
+/// Send WebSocket frame (binary or text)
+/// Returns bytes written on success, 0 on failure
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_websocket_send(
+    stream_fd: u64,
+    frame_type: u8,  // 1 = text, 2 = binary
+    mask: u8,        // 0 = server-to-client, 1 = client-to-server
+    data_ptr: *const u8,
+    data_len: usize,
+) -> u64 {
+    eprintln!(">>> naso_websocket_send called for stream_fd={}, type={}, mask={}", stream_fd, frame_type, mask);
+    
+    if data_ptr.is_null() || data_len == 0 {
+        eprintln!(">>> naso_websocket_send: null data or zero length");
+        return 0;
+    }
+
+    let stream = get_stream_mut(stream_fd);
+    if stream.is_none() {
+        eprintln!(">>> naso_websocket_send: stream {} not found", stream_fd);
+        return 0;
+    }
+
+    // Encode and send WebSocket frame
+    let frame = encode_websocket_frame(frame_type, mask, data_ptr, data_len);
+    let frame_bytes = frame.as_bytes();
+    
+    // Write frame to stream
+    match stream.unwrap().write_all(frame_bytes) {
+        Ok(()) => {
+            eprintln!(">>> naso_websocket_send: wrote {} bytes to stream {}", frame_bytes.len(), stream_fd);
+            frame_bytes.len() as u64
+        }
+        Err(e) => {
+            eprintln!(">>> naso_websocket_send: write error: {:?}", e);
+            0
+        }
+    }
+}
+
+/// Receive WebSocket frame
+/// Returns 1 if frame received and ready, 0 on error or no data
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_websocket_recv(
+    stream_fd: u64,
+    frame_type_out: *mut u8,
+    mask_out: *mut u8,
+    data_ptr: *mut u8,
+    data_max_len: usize,
+    payload_len_out: *mut usize,
+) -> u64 {
+    eprintln!(">>> naso_websocket_recv called for stream_fd={}", stream_fd);
+    
+    if frame_type_out.is_null() || mask_out.is_null() || data_ptr.is_null() || data_max_len == 0 {
+        eprintln!(">>> naso_websocket_recv: null output pointers or zero buffer");
+        return 0;
+    }
+
+    let stream = get_stream_mut(stream_fd);
+    if stream.is_none() {
+        eprintln!(">>> naso_websocket_recv: stream {} not found", stream_fd);
+        return 0;
+    }
+
+    // Read and parse WebSocket frame
+    let mut buffer = [0u8; 4096];
+    match stream.unwrap().read(&mut buffer) {
+        Ok(bytes_read) => {
+            if bytes_read == 0 {
+                eprintln!(">>> naso_websocket_recv: stream closed");
+                return 0;
+            }
+
+            match decode_websocket_frame(&buffer[..bytes_read], frame_type_out, mask_out, data_ptr, data_max_len) {
+                Ok(payload_len) => {
+                    if let Some(len_out) = payload_len_out {
+                        *len_out = payload_len;
+                    }
+                    eprintln!(">>> naso_websocket_recv: successfully parsed frame, payload length {}", payload_len);
+                    1
+                }
+                Err(e) => {
+                    eprintln!(">>> naso_websocket_recv: frame decode error: {:?}", e);
+                    0
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!(">>> naso_websocket_recv: read error: {:?}", e);
+            0
+        }
+    }
+}
+
+/// Send WebSocket ping frame
+/// Returns bytes written on success, 0 on failure
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_websocket_ping(
+    stream_fd: u64,
+    data_ptr: *const u8,
+    data_len: usize,
+) -> u64 {
+    eprintln!(">>> naso_websocket_ping called for stream_fd={}", stream_fd);
+    
+    if data_ptr.is_null() || data_len == 0 {
+        // Ping with empty payload is valid
+        // Just send a simple ping frame
+        let frame = encode_websocket_frame(0, 0, std::ptr::null(), 0);
+        let frame_bytes = frame.as_bytes();
+        
+        let stream = get_stream_mut(stream_fd);
+        if stream.is_none() {
+            return 0;
+        }
+        
+        match stream.unwrap().write_all(frame_bytes) {
+            Ok(()) => frame_bytes.len() as u64,
+            Err(e) => {
+                eprintln!(">>> naso_websocket_ping: write error: {:?}", e);
+                0
+            }
+        }
+    } else {
+        // Ping with data payload
+        let stream = get_stream_mut(stream_fd);
+        if stream.is_none() {
+            return 0;
+        }
+
+        let frame = encode_websocket_frame(0, 0, data_ptr, data_len);
+        let frame_bytes = frame.as_bytes();
+        
+        match stream.unwrap().write_all(frame_bytes) {
+            Ok(()) => frame_bytes.len() as u64,
+            Err(e) => {
+                eprintln!(">>> naso_websocket_ping: write error: {:?}", e);
+                0
+            }
+        }
+    }
+}
+
+/// Send WebSocket pong frame
+/// Returns bytes written on success, 0 on failure
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_websocket_pong(
+    stream_fd: u64,
+    data_ptr: *const u8,
+    data_len: usize,
+) -> u64 {
+    eprintln!(">>> naso_websocket_pong called for stream_fd={}", stream_fd);
+    
+    let stream = get_stream_mut(stream_fd);
+    if stream.is_none() {
+        return 0;
+    }
+
+    let frame = encode_websocket_frame(0, 0, data_ptr, data_len);
+    let frame_bytes = frame.as_bytes();
+    
+    match stream.unwrap().write_all(frame_bytes) {
+        Ok(()) => frame_bytes.len() as u64,
+        Err(e) => {
+            eprintln!(">>> naso_websocket_pong: write error: {:?}", e);
+            0
+        }
+    }
+}
+
+/// Close WebSocket connection with status code
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_websocket_close(
+    stream_fd: u64,
+    status_code: u16,
+    reason_ptr: *const u8,
+    reason_len: usize,
+) -> u64 {
+    eprintln!(">>> naso_websocket_close called for stream_fd={}, status={}", stream_fd, status_code);
+    
+    let stream = get_stream_mut(stream_fd);
+    if stream.is_none() {
+        return 0;
+    }
+
+    // Encode close frame
+    let reason = if reason_ptr.is_null() {
+        "".to_string()
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(reason_ptr, reason_len) };
+        String::from_utf8_lossy(bytes).to_string()
+    };
+
+    let frame = encode_close_frame(status_code, reason);
+    let frame_bytes = frame.as_bytes();
+    
+    match stream.unwrap().write_all(frame_bytes) {
+        Ok(()) => {
+            // Close the stream after sending close frame
+            let _ = stream.unwrap().shutdown(std::net::Shutdown::Both);
+            frame_bytes.len() as u64
+        }
+        Err(e) => {
+            eprintln!(">>> naso_websocket_close: write error: {:?}", e);
+            0
+        }
+    }
+}
+
+/// Validate WebSocket frame (RFC 6455)
+/// Returns 1 if frame is valid, 0 if invalid
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_websocket_validate_frame(
+    frame_ptr: *const u8,
+    frame_len: usize,
+) -> u64 {
+    eprintln!(">>> naso_websocket_validate_frame called, length={}", frame_len);
+    
+    if frame_ptr.is_null() || frame_len < 2 {
+        return 0;
+    }
+
+    let frame_bytes = unsafe { std::slice::from_raw_parts(frame_ptr, frame_len) };
+    
+    match validate_websocket_frame(frame_bytes) {
+        true => 1,
+        false => {
+            eprintln!(">>> naso_websocket_validate_frame: invalid frame");
+            0
+        }
+    }
+}
+
+// Helper function to get mutable stream reference
+fn get_stream_mut<'a>(fd: u64) -> Option<&'a mut std::net::TcpStream> {
+    let mut table = fd_table().lock().unwrap();
+    table.get_stream(fd)
+}
+
+// WebSocket frame encoding functions
+fn encode_websocket_frame(frame_type: u8, mask: u8, data_ptr: *const u8, data_len: usize) -> String {
+    let payload = if data_ptr.is_null() { vec![] } else {
+        unsafe { std::slice::from_raw_parts(data_ptr, data_len).to_vec() }
+    };
+    
+    let fin = 1; // Final fragment
+    let opcode = match frame_type {
+        1 => 0x1, // Text frame
+        2 => 0x2, // Binary frame
+        0 => 0x9, // Ping frame
+        0 => 0xA, // Pong frame
+        _ => 0x2, // Default to binary
+    };
+    
+    // Build frame header
+    let mut frame = Vec::new();
+    
+    // First byte: FIN + RSV + opcode
+    let first_byte = (fin << 7) | opcode;
+    frame.push(first_byte);
+    
+    // Length encoding
+    let mut len_bytes = encode_length(payload.len());
+    frame.append(&mut len_bytes);
+    
+    // Mask (for client-to-server frames)
+    if mask == 1 {
+        let mask_bytes: [u8; 4] = rand::random();
+        frame.extend_from_slice(&mask_bytes);
+        
+        // Apply mask to payload
+        for (i, byte) in payload.iter().enumerate() {
+            frame.push(byte ^ mask_bytes[i % 4]);
+        }
+    } else {
+        frame.extend_from_slice(&payload);
+    }
+    
+    // Convert to string
+    String::from_utf8(frame).unwrap_or_default()
+}
+
+fn encode_length(len: usize) -> Vec<u8> {
+    if len <= 125 {
+        vec![len as u8]
+    } else if len <= 65535 {
+        vec![126, (len >> 8) as u8, len as u8]
+    } else {
+        vec![127, (len >> 56) as u8, (len >> 48) as u8, (len >> 40) as u8, (len >> 32) as u8, (len >> 24) as u8, (len >> 16) as u8, (len >> 8) as u8, len as u8]
+    }
+}
+
+fn encode_close_frame(status_code: u16, reason: String) -> String {
+    let mut frame = Vec::new();
+    
+    // Close frame opcode
+    frame.push(0x8); // Close frame
+    
+    // Status code + reason
+    frame.push(0x3); // Control frame payload length <= 125
+    frame.push((status_code >> 8) as u8);
+    frame.push(status_code as u8);
+    frame.extend_from_slice(reason.as_bytes());
+    
+    String::from_utf8(frame).unwrap_or_default()
+}
+
+fn decode_websocket_frame(frame_bytes: &[u8], frame_type_out: *mut u8, mask_out: *mut u8, data_ptr: *mut u8, data_max_len: usize) -> Result<usize, String> {
+    if frame_bytes.len() < 2 {
+        return Err("Frame too short".to_string());
+    }
+
+    let first_byte = frame_bytes[0];
+    let fin = (first_byte >> 7) & 0x1;
+    let opcode = first_byte & 0xF;
+
+    // Determine payload length
+    let mut payload_start = 2;
+    let payload_len = match frame_bytes[1] {
+        len if len <= 125 => {
+            len as usize
+        }
+        len @ 126 => {
+            if frame_bytes.len() < 4 {
+                return Err("Incomplete frame length".to_string());
+            }
+            ((frame_bytes[2] as usize) << 8) | (frame_bytes[3] as usize)
+        }
+        len @ 127 => {
+            if frame_bytes.len() < 10 {
+                return Err("Incomplete extended frame length".to_string());
+            }
+            let mut len_val = 0usize;
+            for i in 2..10 {
+                len_val = (len_val << 8) | (frame_bytes[i] as usize);
+            }
+            len_val
+        }
+        _ => return Err("Invalid frame length byte".to_string()),
+    };
+
+    // Determine if frame is masked
+    let is_masked = (frame_bytes[1] & 0x80) != 0;
+    payload_start += if is_masked { 4 } else { 0 };
+
+    if frame_bytes.len() < payload_start + payload_len {
+        return Err("Frame too short for payload".to_string());
+    }
+
+    // Extract payload
+    let payload_start = payload_start;
+    let payload_end = payload_start + payload_len;
+
+    // Copy payload to output buffer
+    if data_max_len > 0 && payload_len <= data_max_len {
+        unsafe {
+            std::ptr::copy_nonoverlapping(frame_bytes.as_ptr().add(payload_start), data_ptr, payload_len);
+            data_ptr.add(payload_len).write(0);
+        }
+    }
+
+    // Set output parameters
+    unsafe {
+        *frame_type_out = match opcode {
+            0x1 => 1, // Text
+            0x2 => 2, // Binary
+            0x9 => 0, // Ping
+            0xA => 0, // Pong
+            _ => 0,   // Close or other
+        };
+        *mask_out = if is_masked { 1 } else { 0 };
+    }
+
+    Ok(payload_len)
+}
+
+fn validate_websocket_frame(frame_bytes: &[u8]) -> bool {
+    if frame_bytes.len() < 2 {
+        return false;
+    }
+
+    let first_byte = frame_bytes[0];
+    let opcode = first_byte & 0xF;
+    let fin = (first_byte >> 7) & 0x1;
+
+    // Valid opcodes: 1 (text), 2 (binary), 8 (close), 9 (ping), 10 (pong)
+    if !(opcode == 0x1 || opcode == 0x2 || opcode == 0x8 || opcode == 0x9 || opcode == 0xA) {
+        return false;
+    }
+
+    // Frame length validation
+    let payload_len = match frame_bytes[1] {
+        len if len <= 125 => len as usize,
+        len @ 126 => {
+            if frame_bytes.len() < 4 { return false; }
+            ((frame_bytes[2] as usize) << 8) | (frame_bytes[3] as usize)
+        }
+        len @ 127 => {
+            if frame_bytes.len() < 10 { return false; }
+            let mut len_val = 0usize;
+            for i in 2..10 {
+                len_val = (len_val << 8) | (frame_bytes[i] as usize);
+            }
+            len_val
+        }
+        _ => return false,
+    };
+
+    // Check if frame length is reasonable
+    if payload_len > 1024 * 1024 {
+        return false; // 1MB max payload
+    }
+
+    true
 }
 
 // ============================================================================
@@ -574,8 +1099,10 @@ pub extern "C" fn naso_spawn_future(future_ptr: *mut FutureHandle) -> u64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn naso_yield() -> u64 {
-    // Call yield_now and block on it (simplified - in real impl would use executor)
-    let _future = async_runtime::yield_now();
+    // Drive the async poll loop to process any pending I/O events
+    // This allows the accept loop to yield control and handle multiple connections
+    let mut poll_guard = async_poll().lock().unwrap();
+    let _ = poll_guard.poll_once(Some(Duration::from_millis(1)));
     1
 }
 
@@ -736,6 +1263,11 @@ struct AsyncRegistration {
     /// Buffer for write operations
     write_buf_ptr: usize,
     write_buf_len: usize,
+    /// Completion flags for polling model
+    read_completed: bool,
+    write_completed: bool,
+    /// Accept completion flag for polling model
+    accept_completed: bool,
 }
 
 impl AsyncPoll {
@@ -782,6 +1314,9 @@ impl AsyncPoll {
                 read_buf_len: 0,
                 write_buf_ptr: 0,
                 write_buf_len: 0,
+                read_completed: false,
+                write_completed: false,
+                accept_completed: false,
             },
         );
         
@@ -814,6 +1349,9 @@ impl AsyncPoll {
                 read_buf_len: 0,
                 write_buf_ptr: 0,
                 write_buf_len: 0,
+                read_completed: false,
+                write_completed: false,
+                accept_completed: false,
             },
         );
         
@@ -869,6 +1407,9 @@ impl AsyncPoll {
                                                 std::ptr::write(out_ptr, reg.fd);
                                                 std::ptr::write(out_ptr.add(1), fd);
                                             }
+                                            eprintln!("poll_once: accepted new connection, listener_fd={}, stream_fd={}", reg.fd, fd);
+                                            // Set accept completion flag for polling model
+                                            reg.accept_completed = true;
                                         }
                                         Err(_) => {}
                                     }
@@ -884,10 +1425,18 @@ impl AsyncPoll {
                             let state_ptr = std::ptr::null_mut::<u8>(); // Could pass state here
                             callback(state_ptr);
                         }
+                        // Also set read_completed flag for polling model
+                        if event.is_readable() {
+                            reg.read_completed = true;
+                        }
                         if event.is_writable() && reg.write_callback != 0 {
                             let callback: extern "C" fn(*mut u8) = unsafe { std::mem::transmute(reg.write_callback) };
                             let state_ptr = std::ptr::null_mut::<u8>(); // Could pass state here
                             callback(state_ptr);
+                        }
+                        // Also set write_completed flag for polling model
+                        if event.is_writable() {
+                            reg.write_completed = true;
                         }
                     }
                     
@@ -1049,9 +1598,11 @@ pub extern "C" fn naso_tcp_connect_async(addr_ptr: *const u8, addr_len: usize,
 #[unsafe(no_mangle)]
 pub extern "C" fn naso_tcp_accept_async(listener_fd: u64, out_ptr: *mut u64, out_len: usize,
                                         callback: *const u8, callback_len: usize) -> u64 {
-    if out_ptr.is_null() || callback.is_null() {
+    eprintln!("naso_tcp_accept_async: listener_fd={}, out_ptr={:?}, callback={:?}", listener_fd, out_ptr, callback);
+    if out_ptr.is_null() {
         return 0;
     }
+    // Allow null callback for polling-based completion model
     let mut poll = async_poll().lock().unwrap();
     match poll.register_listener(listener_fd, out_ptr, callback as usize) {
         Ok(_) => 1,
@@ -1063,9 +1614,10 @@ pub extern "C" fn naso_tcp_accept_async(listener_fd: u64, out_ptr: *mut u64, out
 #[unsafe(no_mangle)]
 pub extern "C" fn naso_read_async(fd: u64, buf_ptr: *mut u8, buf_len: usize,
                                    callback: *const u8, callback_len: usize) -> u64 {
-    if buf_ptr.is_null() || callback.is_null() {
+    if buf_ptr.is_null() {
         return 0;
     }
+    // Allow null callback for polling-based completion model
     let mut poll = async_poll().lock().unwrap();
     match poll.register_stream(fd, Interest::READABLE) {
         Ok(_) => 1,
@@ -1077,14 +1629,66 @@ pub extern "C" fn naso_read_async(fd: u64, buf_ptr: *mut u8, buf_len: usize,
 #[unsafe(no_mangle)]
 pub extern "C" fn naso_write_async(fd: u64, buf_ptr: *const u8, buf_len: usize,
                                     callback: *const u8, callback_len: usize) -> u64 {
-    if buf_ptr.is_null() || callback.is_null() {
+    if buf_ptr.is_null() {
         return 0;
     }
+    // Allow null callback for polling-based completion model
     let mut poll = async_poll().lock().unwrap();
     match poll.register_stream(fd, Interest::WRITABLE) {
         Ok(_) => 1,
         Err(_) => 0,
     }
+}
+
+/// Check if async read has completed
+/// Returns 1 if completed, 0 if still pending
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_check_read_completion(fd: u64) -> u64 {
+    let mut poll = async_poll().lock().unwrap();
+    // Find registration for this fd
+    for (_token, reg) in poll.registrations.iter_mut() {
+        if reg.fd == fd && !reg.is_listener {
+            if reg.read_completed {
+                reg.read_completed = false; // Reset for next read
+                return 1;
+            }
+        }
+    }
+    0
+}
+
+/// Check if async write has completed
+/// Returns 1 if completed, 0 if still pending
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_check_write_completion(fd: u64) -> u64 {
+    let mut poll = async_poll().lock().unwrap();
+    // Find registration for this fd
+    for (_token, reg) in poll.registrations.iter_mut() {
+        if reg.fd == fd && !reg.is_listener {
+            if reg.write_completed {
+                reg.write_completed = false; // Reset for next write
+                return 1;
+            }
+        }
+    }
+    0
+}
+
+/// Check if async accept has completed
+/// Returns 1 if completed, 0 if still pending
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_check_accept_completion(fd: u64) -> u64 {
+    let mut poll = async_poll().lock().unwrap();
+    // Find registration for this fd
+    for (_token, reg) in poll.registrations.iter_mut() {
+        if reg.fd == fd && reg.is_listener {
+            if reg.accept_completed {
+                reg.accept_completed = false; // Reset for next accept
+                return 1;
+            }
+        }
+    }
+    0
 }
 
 /// Async timer sleep

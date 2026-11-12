@@ -1,0 +1,402 @@
+; ModuleID = 'naso_module'
+source_filename = "naso_module"
+
+@RESPONSE = constant [50 x i64] [i64 72, i64 84, i64 84, i64 80, i64 47, i64 49, i64 46, i64 49, i64 32, i64 50, i64 48, i64 48, i64 32, i64 79, i64 75, i64 13, i64 10, i64 67, i64 111, i64 110, i64 116, i64 101, i64 110, i64 116, i64 45, i64 76, i64 101, i64 110, i64 103, i64 116, i64 104, i64 58, i64 32, i64 49, i64 51, i64 13, i64 10, i64 13, i64 10, i64 72, i64 101, i64 108, i64 108, i64 111, i64 32, i64 87, i64 111, i64 114, i64 108, i64 100]
+
+declare i64 @naso_tcp_bind_reuseport(i8*, i64)
+
+declare i64 @naso_tcp_accept_async(i64, i8*, i64, i8*, i64)
+
+declare i64 @naso_accept_get_client(i8*)
+
+declare i64 @naso_read_async(i64, i8*, i64, i8*, i64)
+
+declare i64 @naso_write_async(i64, i8*, i64, i8*, i64)
+
+declare i64 @naso_uring_submit_batch()
+
+declare i64 @naso_uring_poll()
+
+declare i64 @naso_close(i64)
+
+declare i64 @naso_runtime_new(i64)
+
+declare i64 @naso_runtime_run(i8*)
+
+declare i64 @naso_yield()
+
+declare i64 @naso_spawn(i8*, i8*, i64, i8*)
+
+declare i64 @naso_task_join(i8*)
+
+define i64 @naso_handle_request(i64 %conn_fd) {
+entry:
+  %conn_fd1 = alloca i64, align 8
+  store i64 %conn_fd, i64* %conn_fd1, align 4
+  %async.future = alloca { i8, i64, i8* }, align 8
+  %future.state.ptr = getelementptr inbounds { i8, i64, i8* }, { i8, i64, i8* }* %async.future, i32 0, i32 0
+  store i8 0, i8* %future.state.ptr, align 1
+  %future.waker.ptr = getelementptr inbounds { i8, i64, i8* }, { i8, i64, i8* }* %async.future, i32 0, i32 2
+  store i8* null, i8** %future.waker.ptr, align 8
+  %async.state_machine = alloca { i8, i8* }, align 8
+  %state_ptr = getelementptr inbounds { i8, i8* }, { i8, i8* }* %async.state_machine, i32 0, i32 0
+  store i8 0, i8* %state_ptr, align 1
+  %future_field_ptr = getelementptr inbounds { i8, i8* }, { i8, i8* }* %async.state_machine, i32 0, i32 1
+  %future_field_val = bitcast { i8, i64, i8* }* %async.future to i8*
+  store i8* %future_field_val, i8** %future_field_ptr, align 8
+  br label %async.body
+
+async.body:                                       ; preds = %entry
+  %keep_alive = alloca i64, align 8
+  store i64 1, i64* %keep_alive, align 4
+  %request_count = alloca i64, align 8
+  store i64 0, i64* %request_count, align 4
+  %array_literal = alloca [2 x i8], align 1
+  %array_elem_0 = getelementptr [2 x i8], [2 x i8]* %array_literal, i64 0, i64 0
+  store i8 0, i8* %array_elem_0, align 1
+  %array_elem_1 = getelementptr [2 x i8], [2 x i8]* %array_literal, i64 0, i64 1
+  store i8 0, i8* %array_elem_1, align 1
+  %array_elem_ptr = getelementptr [2 x i8], [2 x i8]* %array_literal, i64 0, i64 0
+  %array_ptr_i64 = ptrtoint i8* %array_elem_ptr to i64
+  %tensor_with_ptr = insertvalue { i64, i64 } undef, i64 %array_ptr_i64, 0
+  %tensor_complete = insertvalue { i64, i64 } %tensor_with_ptr, i64 2, 1
+  %read_buf = alloca { i64, i64 }, align 8
+  store { i64, i64 } %tensor_complete, { i64, i64 }* %read_buf, align 4
+  %read_buf2 = load { i64, i64 }, { i64, i64 }* %read_buf, align 4
+  %tensor_ptr_cast = extractvalue { i64, i64 } %read_buf2, 0
+  %array_ptr_cast = inttoptr i64 %tensor_ptr_cast to i8*
+  %read_buf_ptr = alloca i8*, align 8
+  store i8* %array_ptr_cast, i8** %read_buf_ptr, align 8
+  %resp_ptr = alloca i8*, align 8
+  store i8* bitcast ([50 x i64]* @RESPONSE to i8*), i8** %resp_ptr, align 8
+  %resp_len = alloca i64, align 8
+  store i64 50, i64* %resp_len, align 4
+  %keep_alive3 = load i64, i64* %keep_alive, align 4
+  %ne = icmp ne i64 %keep_alive3, 0
+  %while_entry_test = icmp ne i1 %ne, false
+  br i1 %while_entry_test, label %while_cond, label %while_exit
+
+while_cond:                                       ; preds = %while_step, %async.body
+  %keep_alive4 = load i64, i64* %keep_alive, align 4
+  %ne5 = icmp ne i64 %keep_alive4, 0
+  %while_cond_val = icmp ne i1 %ne5, false
+  br i1 %while_cond_val, label %while_body, label %while_exit
+
+while_body:                                       ; preds = %while_cond
+  %conn_fd6 = load i64, i64* %conn_fd1, align 4
+  %read_buf_ptr7 = load i8*, i8** %read_buf_ptr, align 8
+  %naso.call.naso_read_async = call i64 @naso_read_async(i64 %conn_fd6, i8* %read_buf_ptr7, i64 256, i8* null, i64 0)
+  %await.future_ptr = inttoptr i64 %naso.call.naso_read_async to i8*
+  %await.poll = call i64 @naso_await(i8* %await.future_ptr)
+  %await.yield = call i64 @naso_yield()
+  br label %await.resume
+
+while_exit:                                       ; preds = %while_cond, %async.body
+  %conn_fd55 = load i64, i64* %conn_fd1, align 4
+  %naso.call.naso_close = call i64 @naso_close(i64 %conn_fd55)
+  br label %async.done
+
+while_step:                                       ; preds = %if_merge
+  br label %while_cond
+
+await.resume:                                     ; preds = %while_body
+  %await.result.buf = alloca i8, i64 8, align 1
+  %await.get_result.future_ptr = inttoptr i64 %naso.call.naso_read_async to i8*
+  %await.get_result = call i64 @naso_future_get_result(i8* %await.get_result.future_ptr, i8* %await.result.buf, i64 8)
+  %await.loaded = load i8, i8* %await.result.buf, align 1
+  %naso.call.naso_uring_submit_batch = call i64 @naso_uring_submit_batch()
+  %await.future_ptr9 = inttoptr i64 %naso.call.naso_uring_submit_batch to i8*
+  %await.poll10 = call i64 @naso_await(i8* %await.future_ptr9)
+  %await.yield11 = call i64 @naso_yield()
+  br label %await.resume8
+
+await.resume8:                                    ; preds = %await.resume
+  %await.result.buf12 = alloca i8, i64 8, align 1
+  %await.get_result.future_ptr13 = inttoptr i64 %naso.call.naso_uring_submit_batch to i8*
+  %await.get_result14 = call i64 @naso_future_get_result(i8* %await.get_result.future_ptr13, i8* %await.result.buf12, i64 8)
+  %await.loaded15 = load i8, i8* %await.result.buf12, align 1
+  %naso.call.naso_yield = call i64 @naso_yield()
+  %await.future_ptr17 = inttoptr i64 %naso.call.naso_yield to i8*
+  %await.poll18 = call i64 @naso_await(i8* %await.future_ptr17)
+  %await.yield19 = call i64 @naso_yield()
+  br label %await.resume16
+
+await.resume16:                                   ; preds = %await.resume8
+  %await.result.buf20 = alloca i8, i64 8, align 1
+  %await.get_result.future_ptr21 = inttoptr i64 %naso.call.naso_yield to i8*
+  %await.get_result22 = call i64 @naso_future_get_result(i8* %await.get_result.future_ptr21, i8* %await.result.buf20, i64 8)
+  %await.loaded23 = load i8, i8* %await.result.buf20, align 1
+  %request_count24 = load i64, i64* %request_count, align 4
+  %add = add i64 %request_count24, 1
+  store i64 %add, i64* %request_count, align 4
+  %conn_fd25 = load i64, i64* %conn_fd1, align 4
+  %resp_ptr26 = load i8*, i8** %resp_ptr, align 8
+  %resp_len27 = load i64, i64* %resp_len, align 4
+  %naso.call.naso_write_async = call i64 @naso_write_async(i64 %conn_fd25, i8* %resp_ptr26, i64 %resp_len27, i8* null, i64 0)
+  %await.future_ptr29 = inttoptr i64 %naso.call.naso_write_async to i8*
+  %await.poll30 = call i64 @naso_await(i8* %await.future_ptr29)
+  %await.yield31 = call i64 @naso_yield()
+  br label %await.resume28
+
+await.resume28:                                   ; preds = %await.resume16
+  %await.result.buf32 = alloca i8, i64 8, align 1
+  %await.get_result.future_ptr33 = inttoptr i64 %naso.call.naso_write_async to i8*
+  %await.get_result34 = call i64 @naso_future_get_result(i8* %await.get_result.future_ptr33, i8* %await.result.buf32, i64 8)
+  %await.loaded35 = load i8, i8* %await.result.buf32, align 1
+  %naso.call.naso_uring_submit_batch36 = call i64 @naso_uring_submit_batch()
+  %await.future_ptr38 = inttoptr i64 %naso.call.naso_uring_submit_batch36 to i8*
+  %await.poll39 = call i64 @naso_await(i8* %await.future_ptr38)
+  %await.yield40 = call i64 @naso_yield()
+  br label %await.resume37
+
+await.resume37:                                   ; preds = %await.resume28
+  %await.result.buf41 = alloca i8, i64 8, align 1
+  %await.get_result.future_ptr42 = inttoptr i64 %naso.call.naso_uring_submit_batch36 to i8*
+  %await.get_result43 = call i64 @naso_future_get_result(i8* %await.get_result.future_ptr42, i8* %await.result.buf41, i64 8)
+  %await.loaded44 = load i8, i8* %await.result.buf41, align 1
+  %naso.call.naso_yield45 = call i64 @naso_yield()
+  %await.future_ptr47 = inttoptr i64 %naso.call.naso_yield45 to i8*
+  %await.poll48 = call i64 @naso_await(i8* %await.future_ptr47)
+  %await.yield49 = call i64 @naso_yield()
+  br label %await.resume46
+
+await.resume46:                                   ; preds = %await.resume37
+  %await.result.buf50 = alloca i8, i64 8, align 1
+  %await.get_result.future_ptr51 = inttoptr i64 %naso.call.naso_yield45 to i8*
+  %await.get_result52 = call i64 @naso_future_get_result(i8* %await.get_result.future_ptr51, i8* %await.result.buf50, i64 8)
+  %await.loaded53 = load i8, i8* %await.result.buf50, align 1
+  %request_count54 = load i64, i64* %request_count, align 4
+  %ge = icmp sge i64 %request_count54, 100
+  %if_cond = icmp ne i1 %ge, false
+  br i1 %if_cond, label %then, label %else
+
+then:                                             ; preds = %await.resume46
+  store i64 0, i64* %keep_alive, align 4
+  br label %if_merge
+
+else:                                             ; preds = %await.resume46
+  br label %if_merge
+
+if_merge:                                         ; preds = %else, %then
+  %if_phi = phi i64 [ 0, %then ], [ 0, %else ]
+  br label %while_step
+
+async.done:                                       ; preds = %while_exit
+  store i8 3, i8* %state_ptr, align 1
+  %future.result.ptr = getelementptr inbounds { i8, i64, i8* }, { i8, i64, i8* }* %async.future, i32 0, i32 1
+  store i64 0, i64* %future.result.ptr, align 4
+  %future.state.ptr56 = getelementptr inbounds { i8, i64, i8* }, { i8, i64, i8* }* %async.future, i32 0, i32 0
+  store i8 1, i8* %future.state.ptr56, align 1
+  %async.future.ret = ptrtoint { i8, i64, i8* }* %async.future to i64
+  ret i64 %async.future.ret
+}
+
+define i64 @naso_accept_loop(i64 %fd, i64 %runtime) {
+entry:
+  %runtime2 = alloca i64, align 8
+  %fd1 = alloca i64, align 8
+  store i64 %fd, i64* %fd1, align 4
+  store i64 %runtime, i64* %runtime2, align 4
+  %async.future = alloca { i8, i64, i8* }, align 8
+  %future.state.ptr = getelementptr inbounds { i8, i64, i8* }, { i8, i64, i8* }* %async.future, i32 0, i32 0
+  store i8 0, i8* %future.state.ptr, align 1
+  %future.waker.ptr = getelementptr inbounds { i8, i64, i8* }, { i8, i64, i8* }* %async.future, i32 0, i32 2
+  store i8* null, i8** %future.waker.ptr, align 8
+  %async.state_machine = alloca { i8, i8* }, align 8
+  %state_ptr = getelementptr inbounds { i8, i8* }, { i8, i8* }* %async.state_machine, i32 0, i32 0
+  store i8 0, i8* %state_ptr, align 1
+  %future_field_ptr = getelementptr inbounds { i8, i8* }, { i8, i8* }* %async.state_machine, i32 0, i32 1
+  %future_field_val = bitcast { i8, i64, i8* }* %async.future to i8*
+  store i8* %future_field_val, i8** %future_field_ptr, align 8
+  br label %async.body
+
+async.body:                                       ; preds = %entry
+  %running = alloca i64, align 8
+  store i64 1, i64* %running, align 4
+  %array_literal = alloca [4 x i8], align 1
+  %array_elem_0 = getelementptr [4 x i8], [4 x i8]* %array_literal, i64 0, i64 0
+  store i8 0, i8* %array_elem_0, align 1
+  %array_elem_1 = getelementptr [4 x i8], [4 x i8]* %array_literal, i64 0, i64 1
+  store i8 0, i8* %array_elem_1, align 1
+  %array_elem_2 = getelementptr [4 x i8], [4 x i8]* %array_literal, i64 0, i64 2
+  store i8 0, i8* %array_elem_2, align 1
+  %array_elem_3 = getelementptr [4 x i8], [4 x i8]* %array_literal, i64 0, i64 3
+  store i8 0, i8* %array_elem_3, align 1
+  %array_elem_ptr = getelementptr [4 x i8], [4 x i8]* %array_literal, i64 0, i64 0
+  %array_ptr_i64 = ptrtoint i8* %array_elem_ptr to i64
+  %tensor_with_ptr = insertvalue { i64, i64 } undef, i64 %array_ptr_i64, 0
+  %tensor_complete = insertvalue { i64, i64 } %tensor_with_ptr, i64 4, 1
+  %out = alloca { i64, i64 }, align 8
+  store { i64, i64 } %tensor_complete, { i64, i64 }* %out, align 4
+  %out3 = load { i64, i64 }, { i64, i64 }* %out, align 4
+  %tensor_ptr_cast = extractvalue { i64, i64 } %out3, 0
+  %array_ptr_cast = inttoptr i64 %tensor_ptr_cast to i8*
+  %out_ptr = alloca i8*, align 8
+  store i8* %array_ptr_cast, i8** %out_ptr, align 8
+  %fd4 = load i64, i64* %fd1, align 4
+  %out_ptr5 = load i8*, i8** %out_ptr, align 8
+  %naso.call.naso_tcp_accept_async = call i64 @naso_tcp_accept_async(i64 %fd4, i8* %out_ptr5, i64 16, i8* null, i64 0)
+  %naso.call.naso_uring_submit_batch = call i64 @naso_uring_submit_batch()
+  %running6 = load i64, i64* %running, align 4
+  %ne = icmp ne i64 %running6, 0
+  %while_entry_test = icmp ne i1 %ne, false
+  br i1 %while_entry_test, label %while_cond, label %while_exit
+
+while_cond:                                       ; preds = %while_step, %async.body
+  %running7 = load i64, i64* %running, align 4
+  %ne8 = icmp ne i64 %running7, 0
+  %while_cond_val = icmp ne i1 %ne8, false
+  br i1 %while_cond_val, label %while_body, label %while_exit
+
+while_body:                                       ; preds = %while_cond
+  %naso.call.naso_yield = call i64 @naso_yield()
+  %await.future_ptr = inttoptr i64 %naso.call.naso_yield to i8*
+  %await.poll = call i64 @naso_await(i8* %await.future_ptr)
+  %await.yield = call i64 @naso_yield()
+  br label %await.resume
+
+while_exit:                                       ; preds = %while_cond, %async.body
+  br label %async.done
+
+while_step:                                       ; preds = %if_merge
+  br label %while_cond
+
+await.resume:                                     ; preds = %while_body
+  %await.result.buf = alloca i8, i64 8, align 1
+  %await.get_result.future_ptr = inttoptr i64 %naso.call.naso_yield to i8*
+  %await.get_result = call i64 @naso_future_get_result(i8* %await.get_result.future_ptr, i8* %await.result.buf, i64 8)
+  %await.loaded = load i8, i8* %await.result.buf, align 1
+  %out_ptr9 = load i8*, i8** %out_ptr, align 8
+  %naso.call.naso_accept_get_client = call i64 @naso_accept_get_client(i8* %out_ptr9)
+  %client_fd = alloca i64, align 8
+  store i64 %naso.call.naso_accept_get_client, i64* %client_fd, align 4
+  %client_fd10 = load i64, i64* %client_fd, align 4
+  %ne11 = icmp ne i64 %client_fd10, 0
+  %if_cond = icmp ne i1 %ne11, false
+  br i1 %if_cond, label %then, label %else
+
+then:                                             ; preds = %await.resume
+  %runtime12 = load i64, i64* %runtime2, align 4
+  %client_fd13 = load i64, i64* %client_fd, align 4
+  %runtime14 = load i64, i64* %runtime2, align 4
+  %ffi_arg_ptr_0 = inttoptr i64 %runtime12 to i8*
+  %ffi_arg_ptr_3 = inttoptr i64 %runtime14 to i8*
+  %naso.call.naso_spawn = call i64 @naso_spawn(i8* %ffi_arg_ptr_0, i8* bitcast (i64 (i64)* @naso_handle_request to i8*), i64 %client_fd13, i8* %ffi_arg_ptr_3)
+  %await.future_ptr16 = inttoptr i64 %naso.call.naso_spawn to i8*
+  %await.poll17 = call i64 @naso_await(i8* %await.future_ptr16)
+  %await.yield18 = call i64 @naso_yield()
+  br label %await.resume15
+
+else:                                             ; preds = %await.resume
+  br label %if_merge
+
+if_merge:                                         ; preds = %else, %await.resume15
+  %if_phi = phi i64 [ %naso.call.naso_uring_submit_batch26, %await.resume15 ], [ 0, %else ]
+  br label %while_step
+
+await.resume15:                                   ; preds = %then
+  %await.result.buf19 = alloca i8, i64 8, align 1
+  %await.get_result.future_ptr20 = inttoptr i64 %naso.call.naso_spawn to i8*
+  %await.get_result21 = call i64 @naso_future_get_result(i8* %await.get_result.future_ptr20, i8* %await.result.buf19, i64 8)
+  %await.loaded22 = load i8, i8* %await.result.buf19, align 1
+  %fd23 = load i64, i64* %fd1, align 4
+  %out_ptr24 = load i8*, i8** %out_ptr, align 8
+  %naso.call.naso_tcp_accept_async25 = call i64 @naso_tcp_accept_async(i64 %fd23, i8* %out_ptr24, i64 16, i8* null, i64 0)
+  %naso.call.naso_uring_submit_batch26 = call i64 @naso_uring_submit_batch()
+  br label %if_merge
+
+async.done:                                       ; preds = %while_exit
+  store i8 3, i8* %state_ptr, align 1
+  %future.result.ptr = getelementptr inbounds { i8, i64, i8* }, { i8, i64, i8* }* %async.future, i32 0, i32 1
+  store i64 0, i64* %future.result.ptr, align 4
+  %future.state.ptr27 = getelementptr inbounds { i8, i64, i8* }, { i8, i64, i8* }* %async.future, i32 0, i32 0
+  store i8 1, i8* %future.state.ptr27, align 1
+  %async.future.ret = ptrtoint { i8, i64, i8* }* %async.future to i64
+  ret i64 %async.future.ret
+}
+
+define void @naso_main() {
+entry:
+  %array_literal = alloca [14 x i8], align 1
+  %array_elem_0 = getelementptr [14 x i8], [14 x i8]* %array_literal, i64 0, i64 0
+  store i8 49, i8* %array_elem_0, align 1
+  %array_elem_1 = getelementptr [14 x i8], [14 x i8]* %array_literal, i64 0, i64 1
+  store i8 50, i8* %array_elem_1, align 1
+  %array_elem_2 = getelementptr [14 x i8], [14 x i8]* %array_literal, i64 0, i64 2
+  store i8 55, i8* %array_elem_2, align 1
+  %array_elem_3 = getelementptr [14 x i8], [14 x i8]* %array_literal, i64 0, i64 3
+  store i8 46, i8* %array_elem_3, align 1
+  %array_elem_4 = getelementptr [14 x i8], [14 x i8]* %array_literal, i64 0, i64 4
+  store i8 48, i8* %array_elem_4, align 1
+  %array_elem_5 = getelementptr [14 x i8], [14 x i8]* %array_literal, i64 0, i64 5
+  store i8 46, i8* %array_elem_5, align 1
+  %array_elem_6 = getelementptr [14 x i8], [14 x i8]* %array_literal, i64 0, i64 6
+  store i8 48, i8* %array_elem_6, align 1
+  %array_elem_7 = getelementptr [14 x i8], [14 x i8]* %array_literal, i64 0, i64 7
+  store i8 46, i8* %array_elem_7, align 1
+  %array_elem_8 = getelementptr [14 x i8], [14 x i8]* %array_literal, i64 0, i64 8
+  store i8 49, i8* %array_elem_8, align 1
+  %array_elem_9 = getelementptr [14 x i8], [14 x i8]* %array_literal, i64 0, i64 9
+  store i8 58, i8* %array_elem_9, align 1
+  %array_elem_10 = getelementptr [14 x i8], [14 x i8]* %array_literal, i64 0, i64 10
+  store i8 56, i8* %array_elem_10, align 1
+  %array_elem_11 = getelementptr [14 x i8], [14 x i8]* %array_literal, i64 0, i64 11
+  store i8 48, i8* %array_elem_11, align 1
+  %array_elem_12 = getelementptr [14 x i8], [14 x i8]* %array_literal, i64 0, i64 12
+  store i8 57, i8* %array_elem_12, align 1
+  %array_elem_13 = getelementptr [14 x i8], [14 x i8]* %array_literal, i64 0, i64 13
+  store i8 57, i8* %array_elem_13, align 1
+  %array_elem_ptr = getelementptr [14 x i8], [14 x i8]* %array_literal, i64 0, i64 0
+  %array_ptr_i64 = ptrtoint i8* %array_elem_ptr to i64
+  %tensor_with_ptr = insertvalue { i64, i64 } undef, i64 %array_ptr_i64, 0
+  %tensor_complete = insertvalue { i64, i64 } %tensor_with_ptr, i64 14, 1
+  %addr = alloca { i64, i64 }, align 8
+  store { i64, i64 } %tensor_complete, { i64, i64 }* %addr, align 4
+  %addr1 = load { i64, i64 }, { i64, i64 }* %addr, align 4
+  %tensor_ptr_cast = extractvalue { i64, i64 } %addr1, 0
+  %array_ptr_cast = inttoptr i64 %tensor_ptr_cast to i8*
+  %naso.call.naso_tcp_bind_reuseport = call i64 @naso_tcp_bind_reuseport(i8* %array_ptr_cast, i64 14)
+  %fd = alloca i64, align 8
+  store i64 %naso.call.naso_tcp_bind_reuseport, i64* %fd, align 4
+  %naso.call.naso_runtime_new = call i64 @naso_runtime_new(i64 4)
+  %runtime = alloca i64, align 8
+  store i64 %naso.call.naso_runtime_new, i64* %runtime, align 4
+  %runtime2 = load i64, i64* %runtime, align 4
+  %fd3 = load i64, i64* %fd, align 4
+  %runtime4 = load i64, i64* %runtime, align 4
+  %ffi_arg_ptr_0 = inttoptr i64 %runtime2 to i8*
+  %ffi_arg_ptr_3 = inttoptr i64 %runtime4 to i8*
+  %naso.call.naso_spawn = call i64 @naso_spawn(i8* %ffi_arg_ptr_0, i8* bitcast (i64 (i64, i64)* @naso_accept_loop to i8*), i64 %fd3, i8* %ffi_arg_ptr_3)
+  %runtime5 = load i64, i64* %runtime, align 4
+  %fd6 = load i64, i64* %fd, align 4
+  %runtime7 = load i64, i64* %runtime, align 4
+  %ffi_arg_ptr_08 = inttoptr i64 %runtime5 to i8*
+  %ffi_arg_ptr_39 = inttoptr i64 %runtime7 to i8*
+  %naso.call.naso_spawn10 = call i64 @naso_spawn(i8* %ffi_arg_ptr_08, i8* bitcast (i64 (i64, i64)* @naso_accept_loop to i8*), i64 %fd6, i8* %ffi_arg_ptr_39)
+  %runtime11 = load i64, i64* %runtime, align 4
+  %fd12 = load i64, i64* %fd, align 4
+  %runtime13 = load i64, i64* %runtime, align 4
+  %ffi_arg_ptr_014 = inttoptr i64 %runtime11 to i8*
+  %ffi_arg_ptr_315 = inttoptr i64 %runtime13 to i8*
+  %naso.call.naso_spawn16 = call i64 @naso_spawn(i8* %ffi_arg_ptr_014, i8* bitcast (i64 (i64, i64)* @naso_accept_loop to i8*), i64 %fd12, i8* %ffi_arg_ptr_315)
+  %runtime17 = load i64, i64* %runtime, align 4
+  %fd18 = load i64, i64* %fd, align 4
+  %runtime19 = load i64, i64* %runtime, align 4
+  %ffi_arg_ptr_020 = inttoptr i64 %runtime17 to i8*
+  %ffi_arg_ptr_321 = inttoptr i64 %runtime19 to i8*
+  %naso.call.naso_spawn22 = call i64 @naso_spawn(i8* %ffi_arg_ptr_020, i8* bitcast (i64 (i64, i64)* @naso_accept_loop to i8*), i64 %fd18, i8* %ffi_arg_ptr_321)
+  %runtime23 = load i64, i64* %runtime, align 4
+  %ffi_arg_ptr_024 = inttoptr i64 %runtime23 to i8*
+  %naso.call.naso_runtime_run = call i64 @naso_runtime_run(i8* %ffi_arg_ptr_024)
+  ret void
+}
+
+declare i64 @naso_await(i8*)
+
+declare i64 @naso_future_get_result(i8*, i8*, i64)
+
+define void @naso_entry() {
+entry:
+  call void @naso_main()
+  ret void
+}

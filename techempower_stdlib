@@ -1,0 +1,13 @@
+; ModuleID = 'naso_module'
+source_filename = "naso_module"
+
+define void @naso_main() {
+entry:
+  ret void
+}
+
+define void @naso_entry() {
+entry:
+  call void @naso_main()
+  ret void
+}

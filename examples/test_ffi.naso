@@ -1,0 +1,63 @@
+// ============================================================================
+// TEST: Minimal FFI Read/Write Validation (Simplified)
+// ============================================================================
+
+extern "C" {
+    fn naso_write(fd: u64, buf: *u8, len: usize) -> usize;
+    fn naso_read(fd: u64, buf: *u8, max_len: usize) -> usize;
+    fn naso_tcp_bind(addr: *u8, len: usize) -> u64;
+    fn naso_tcp_accept(fd: u64, out: *u64) -> u64;
+    fn naso_accept_get_client(out: *u64) -> u64;
+    fn naso_close(fd: u64) -> u64;
+    fn naso_runtime_new(workers: u64) -> *u8;
+    fn naso_runtime_run(runtime: *u8) -> u64;
+    fn naso_yield() -> u64;
+}
+
+fn test_read_write_flow(client_fd: u64) -> () {
+    let mut buf = [0; 512];
+    let bytes_read = naso_read(client_fd, buf as *mut u8, 512);
+    
+    if bytes_read > 0 {
+        let r1 = [72, 84, 84, 80, 47, 49, 46, 49, 32, 50, 48, 48, 32, 79, 75, 13, 10];
+        let r2 = [67, 111, 110, 116, 101, 110, 116, 45, 76, 101, 110, 103, 116, 104, 58, 32, 49, 49, 13, 10];
+        let r3 = [13, 10];
+        let r4 = [72, 101, 108, 108, 111, 32, 87, 111, 114, 108, 100];
+        naso_write(client_fd, r1 as *u8, 17);
+        naso_write(client_fd, r2 as *u8, 20);
+        naso_write(client_fd, r3 as *u8, 2);
+        naso_write(client_fd, r4 as *u8, 11);
+    } else {
+        let r1 = [72, 84, 84, 80, 47, 49, 46, 49, 32, 50, 48, 48, 32, 79, 75, 13, 10];
+        let r2 = [67, 111, 110, 116, 101, 110, 116, 45, 76, 101, 110, 103, 116, 104, 58, 32, 48, 13, 10];
+        let r3 = [13, 10];
+        naso_write(client_fd, r1 as *u8, 17);
+        naso_write(client_fd, r2 as *u8, 20);
+        naso_write(client_fd, r3 as *u8, 2);
+    }
+    
+    naso_close(client_fd);
+}
+
+fn accept_loop(fd: u64) -> () {
+    let mut running = 1;
+    let mut out = [0, 0];
+    let out_ptr = out as *u64;
+    
+    while running != 0 {
+        if naso_tcp_accept(fd, out_ptr) != 0 {
+            let client_fd = naso_accept_get_client(out_ptr);
+            test_read_write_flow(client_fd);
+        }
+        naso_yield();
+    }
+}
+
+fn main() -> () {
+    let addr = [48, 46, 48, 46, 48, 46, 48, 58, 56, 48, 57, 48];
+    let fd = naso_tcp_bind(addr as *u8, 12);
+    
+    let runtime = naso_runtime_new(4);
+    accept_loop(fd);
+    naso_runtime_run(runtime);
+}

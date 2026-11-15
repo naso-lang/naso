@@ -21,6 +21,29 @@ use inkwell::values::{AnyValue, BasicMetadataValueEnum, FunctionValue, PointerVa
 use inkwell::AddressSpace;
 use std::collections::HashMap;
 
+/// Map `ElemType` to the LLVM type used for tensor element storage.
+fn elem_to_llvm_type<'ctx>(
+    type_lowering: &LlvmTypeLowering<'ctx>,
+    elem: crate::ir::pir_types::ElemType,
+) -> BasicTypeEnum<'ctx> {
+    use crate::codegen::abi::{FloatWidth, IntWidth};
+    use crate::ir::pir_types::ElemType;
+    match elem {
+        ElemType::F64 => type_lowering.float_type(FloatWidth::F64).into(),
+        ElemType::I4 => type_lowering.int_type(IntWidth::I8).into(), // stored as i8
+        ElemType::I8 => type_lowering.int_type(IntWidth::I8).into(),
+        ElemType::I16 => type_lowering.int_type(IntWidth::I16).into(),
+        ElemType::I32 => type_lowering.int_type(IntWidth::I32).into(),
+        ElemType::I64 => type_lowering.int_type(IntWidth::I64).into(),
+        ElemType::Bool => type_lowering.int_type(IntWidth::I1).into(),
+    }
+}
+
+/// Map `ElemType` to `ParamKind::Scalar` element type.
+fn elem_to_elem_type(elem: crate::ir::pir_types::ElemType) -> crate::ir::pir_types::ElemType {
+    elem
+}
+
 // LLVM Module Builder for constructing LLVM IR from PIR
 pub struct LLVMModuleBuilder<'ctx> {
     context: &'ctx CodegenContext,
@@ -112,16 +135,38 @@ pub struct EntryParam<'ctx> {
 /// a declared count treats `i64 -1` as `u64::MAX`, the largest possible buffer, so a
 /// caller passing a negative length would sail past the check. Signed comparison
 /// catches that for free, because `-1 < 4`.
+///
+/// If `return_type` is `FnReturn::Tensor`, prepends an sret (structure return) parameter
+/// as the first argument: a pointer to caller-allocated memory for the return value.
 pub fn build_entry_signature<'ctx>(
     type_lowering: &mut LlvmTypeLowering<'ctx>,
     pir_module: &PirModule,
+    return_type: Option<&crate::ir::pir_types::FnReturn>,
 ) -> CodegenResult<Vec<EntryParam<'ctx>>> {
     let mut out: Vec<EntryParam<'ctx>> = Vec::new();
+    let mut next_arg: u32 = 0;
+
+    // Add sret parameter for tensor/struct returns (caller-allocated return pointer)
+    if let Some(crate::ir::pir_types::FnReturn::Tensor { elem, shape: _ }) = return_type {
+        let ptr_type = type_lowering.ptr_type(
+            elem_to_llvm_type(type_lowering, *elem),
+            inkwell::AddressSpace::default(),
+        );
+        out.push(EntryParam {
+            name: "sret".to_string(),
+            ty: ptr_type.into(),
+            arg_index: 0,
+            len_arg_index: None,
+            kind: ParamKind::Scalar(elem_to_elem_type(*elem)),
+        });
+        next_arg = 1;
+    }
+
     // Every argument index handed out so far. A tensor consumes two, so the next
     // index cannot be `out.len()` -- which is exactly the bug a naive `enumerate`
     // over `out` would introduce: binding the second tensor's pointer to the first
     // tensor's element count, and reading a length where a buffer is expected.
-    let mut next_arg: u32 = 0;
+    let mut next_arg: u32 = if return_type.is_some() && matches!(return_type, Some(crate::ir::pir_types::FnReturn::Tensor { .. })) { 1 } else { 0 };
     for param in &pir_module.function_params {
         let (ty, kind) = param_slot(type_lowering, param)?;
         let takes_length = matches!(kind, ParamKind::Tensor { .. });
@@ -319,6 +364,9 @@ fn name_arguments<'ctx>(function: FunctionValue<'ctx>, abi: &[EntryParam<'ctx>])
 /// the failure this compiler is built to avoid. The message names the type, because
 /// "unsupported return type" without the type sends the reader looking through the
 /// whole type system for it.
+///
+/// For `FnReturn::Tensor`, returns `None` (void) because the sret convention uses a
+/// hidden first argument (caller-allocated pointer) instead of a direct return.
 pub fn function_return_type<'ctx>(
     type_lowering: &mut LlvmTypeLowering<'ctx>,
     func: &crate::ir::pir_types::PirFunction,
@@ -343,6 +391,8 @@ pub fn function_return_type<'ctx>(
         FnReturn::Scalar(ElemType::I32) => type_lowering.int_type(IntWidth::I32).into(),
         FnReturn::Scalar(ElemType::I64) => type_lowering.int_type(IntWidth::I64).into(),
         FnReturn::Scalar(ElemType::Bool) => type_lowering.int_type(IntWidth::I1).into(),
+        // Tensor/struct return: uses sret convention (caller-allocated, hidden first arg)
+        FnReturn::Tensor { elem: _, shape: _ } => return Ok(None),
         FnReturn::Unsupported(ty) => {
             return Err(CodegenError::UnsupportedFeature(format!(
                 "function `{}` returns `{ty}`, which has no slot in this ABI. Nothing \
@@ -707,7 +757,7 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
             Vec::with_capacity(functions.len());
         for (i, func) in functions.iter().enumerate() {
             let view = function_view(func, pir_module);
-            let abi = build_entry_signature(&mut self.type_lowering, &view)?;
+            let abi = build_entry_signature(&mut self.type_lowering, &view, Some(&func.return_type))?;
             let param_types = entry_arg_types(&self.type_lowering, &abi)?;
             let ret_type = function_return_type(&mut self.type_lowering, func)?;
             let fn_type = self.type_lowering.fn_type(ret_type, &param_types, false);
@@ -718,6 +768,12 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
             // count, and which is a trip count. Named by the recorded index rather than
             // by position, because a tensor's count is the argument AFTER its pointer.
             name_arguments(function, &abi);
+            // Add sret attribute to the first parameter if this is a tensor return
+            if let crate::ir::pir_types::FnReturn::Tensor { elem, shape: _ } = &func.return_type {
+                let sret_attr = self.context.llvm_context().create_string_attribute("sret", "");
+                // Add sret attribute to the function's first parameter (index 0)
+                function.add_attribute(inkwell::attributes::AttributeLoc::Param(0), sret_attr);
+            }
             declared.push((function, abi));
         }
 

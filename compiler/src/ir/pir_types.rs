@@ -402,6 +402,12 @@ pub enum FnReturn {
     Void,
     /// A scalar, returned by value.
     Scalar(ElemType),
+    /// A tensor/struct return: pointer to caller-allocated buffer + optional shape.
+    /// Uses LLVM sret convention: caller allocates, passes hidden first argument.
+    Tensor {
+        elem: ElemType,
+        shape: Option<Vec<u64>>,
+    },
     /// A declared return type with no slot in this ABI.
     ///
     /// Recorded rather than dropped, so a backend refuses it NAMING the type instead

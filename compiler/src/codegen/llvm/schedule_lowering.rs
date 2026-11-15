@@ -61,7 +61,7 @@ pub fn lower_schedule_tree<'ctx>(
     let type_lowering = LlvmTypeLowering::new(llvm_context);
     let mut value_builder = LlvmValueBuilder::new(builder, type_lowering);
 
-    let abi = build_entry_signature(&mut LlvmTypeLowering::new(llvm_context), pir_module)?;
+    let abi = build_entry_signature(&mut LlvmTypeLowering::new(llvm_context), pir_module, None)?;
     lower_schedule_tree_into(
         ctx,
         function,

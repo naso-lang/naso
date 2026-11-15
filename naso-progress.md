@@ -204,6 +204,70 @@ bench_runner/src/main.rs              Standard main() calling extern "C" fn naso
 5. Run wrk benchmarks to measure throughput progression
 6. Target: 30,000 req/s
 
+---
+
+## 🎯 Phase 13B: Core Optimization (Target: 30,000 req/s)
+
+**Status:** 🔄 **IN PROGRESS**
+**Description:** Complete the remaining integration work to achieve 30,000 req/s throughput
+
+### Phase 13B Target Areas
+
+#### 1. Fix SO_REUSEPORT Binding Issue
+- **Problem**: `naso_tcp_bind_multithreaded` creates listeners on different ports (8099, 8100, 8101, 8102) instead of same port
+- **Root Cause**: Each listener binds to a different port instead of using SO_REUSEPORT to share the same port
+- **Fix**: Modify `multi_threaded_accept.rs` to bind all listeners to the same port with SO_REUSEPORT
+
+#### 2. Integrate Multi-threaded Accept with Naso Async Runtime
+- **Problem**: `naso_get_next_connection()` exists but not connected to Naso's async/await system
+- **Solution**: Create async wrapper that polls for connections and yields to Naso runtime
+- **Implementation**: Add async task that calls `naso_get_next_connection()` and integrates with runtime scheduler
+
+#### 3. Implement io_uring Async I/O with Naso Async/Await
+- **Problem**: io_uring backend exists but not integrated with Naso async/await
+- **Solution**: Create async I/O operations using io_uring completions
+- **Implementation**: Add async read/write/accept using `naso_uring_*` FFI functions
+
+#### 4. Create Optimized Benchmark Server
+- **Problem**: Current benchmarks use legacy single-threaded FFI
+- **Solution**: Build new benchmark using multi-threaded accept + async I/O
+- **Implementation**: New Naso example combining all Phase 13 optimizations
+
+### Phase 13B Implementation Plan
+
+| Task | Component | Status |
+|------|-----------|--------|
+| Fix SO_REUSEPORT port binding | `crates/naso-ffi/src/multi_threaded_accept.rs` | ✅ **COMPLETE** |
+| Async connection integration | `crates/async-runtime/src/lib.rs` + FFI | ⏳ Pending |
+| io_uring async I/O integration | `crates/naso-ffi/src/io_uring_backend.rs` + async | ⏳ Pending |
+| Optimized benchmark server | `examples/bench_phase13b.naso` | ⏳ Pending |
+| Build and test pipeline | `bench_runner/build.rs` | ⏳ Pending |
+| wrk benchmark execution | Performance validation | ⏳ Pending |
+
+### Phase 13B Task 1: SO_REUSEPORT Fix - COMPLETE ✅
+
+**Fixed:** `naso_tcp_bind_multithreaded` now parses the address ONCE outside the loop and reuses the same `SockAddr` for all listeners, ensuring all listeners bind to the same port with SO_REUSEPORT.
+
+**Verification:** Server logs confirm all 4 listeners bind to port 8099:
+```
+naso_tcp_bind_multithreaded[0]: Created listener fd=1 with SO_REUSEPORT on 127.0.0.1:8099
+naso_tcp_bind_multithreaded[1]: Created listener fd=1 with SO_REUSEPORT on 127.0.0.1:8099
+naso_tcp_bind_multithreaded[2]: Created listener fd=1 with SO_REUSEPORT on 127.0.0.1:8099
+naso_tcp_bind_multithreaded[3]: Created listener fd=2 with SO_REUSEPORT on 127.0.0.1:8099
+```
+
+**Remaining Issue:** Listener fd tracking - the FFI only returns the first listener fd, but multi-threaded accept needs all fds. This will be addressed in the async integration task.
+
+### Expected Performance Trajectory (Updated)
+
+| Phase | Target Throughput | Status |
+|-------|-------------------|--------|
+| Phase 10 (raw FFI) | ~1,300 req/s | ✅ Achieved |
+| Phase 11 (middleware + async) | 5,000-10,000 req/s | ✅ Architecture ready |
+| Phase 12 (native benchmark) | Baseline: 0.06 req/s | ✅ COMPLETE |
+| **Phase 13 (infrastructure)** | Architecture complete | ✅ COMPLETE |
+| **Phase 13B (core optimization)** | **30,000 req/s** | 🔄 **IN PROGRESS** |
+
 ## Current Implementation Summary
 
 ### Legacy FFI (Phase 9 & 12):

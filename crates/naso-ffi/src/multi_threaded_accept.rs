@@ -23,6 +23,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
+use socket2::{Socket, Domain, Type, Protocol, SockAddr};
 use crate::ResourceID;
 
 // Global manager for multi-threaded accept loop
@@ -293,7 +294,7 @@ impl WorkerThreadManager {
 /// Multi-threaded bind function that creates multiple SO_REUSEPORT listeners
 #[unsafe(no_mangle)]
 pub extern "C" fn naso_tcp_bind_multithreaded(addr_ptr: *const u8, addr_len: usize, num_listeners: usize) -> u64 {
-    eprintln!("naso_tcp_bind_multithreaded called: addr_len={}, num_listeners={}", addr_len, num_listeners);
+    eprintln!(">>> MULTI_THREADED naso_tcp_bind_multithreaded called: addr_len={}, num_listeners={}", addr_len, num_listeners);
     
     if addr_ptr.is_null() || addr_len == 0 || num_listeners == 0 {
         eprintln!("naso_tcp_bind_multithreaded: Invalid parameters");
@@ -309,48 +310,55 @@ pub extern "C" fn naso_tcp_bind_multithreaded(addr_ptr: *const u8, addr_len: usi
         }
     };
     
-    let mut listener_fds = Vec::new();
-    
-    // Create multiple listeners with SO_REUSEPORT
-    for i in 0..num_listeners {
-        // Each listener gets a slightly different port to enable load balancing
-        let port = if num_listeners == 1 {
-            addr_str.to_string()
-        } else {
-            // Parse address and increment port for each listener
-            let parts: Vec<&str> = addr_str.split(':').collect();
-            if parts.len() == 2 {
-                let base_port: u16 = parts[1].parse().unwrap_or(8080u16);
-                format!("{}:{}", parts[0], base_port + i as u16)
-            } else {
-                addr_str.to_string()
+    // Create multiple listeners with SO_REUSEPORT on the SAME port
+        let mut listener_fds = Vec::new();
+
+        // Parse address ONCE outside the loop to ensure all listeners use the same port
+        let addr: std::net::SocketAddr = match addr_str.parse() {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("naso_tcp_bind_multithreaded: addr parse error: {:?}", e);
+                return 0;
             }
         };
-        
-        match TcpListener::bind(&port) {
-            Ok(mut listener) => {
-                // Enable SO_REUSEPORT for this listener using socket2
-                use socket2::{Socket, Domain, Type, Protocol, SockAddr};
-                let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP));
-                if let Ok(socket) = socket {
-                    let _ = socket.set_reuse_port(true);
-                    let addr: std::net::SocketAddr = port.parse().unwrap();
-                    let sock_addr: SockAddr = addr.into();
-                    if socket.bind(&sock_addr).is_ok() && socket.listen(1024).is_ok() {
-                        listener = socket.into();
-                    }
+        let sock_addr: SockAddr = addr.into();
+        eprintln!("naso_tcp_bind_multithreaded: Binding {} listeners to {} with SO_REUSEPORT", num_listeners, addr_str);
+
+        for i in 0..num_listeners {
+            // Use socket2 directly to create SO_REUSEPORT sockets
+            let socket = match Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("naso_tcp_bind_multithreaded[{i}]: socket create error: {:?}", e);
+                    continue;
                 }
-                
-                let fd = global_sharded_fd_table().insert_listener(listener);
-                listener_fds.push(fd);
-                eprintln!("naso_tcp_bind_multithreaded: Created listener {} with SO_REUSEPORT on port {}", fd, port);
+            };
+
+            if let Err(e) = socket.set_reuse_port(true) {
+                eprintln!("naso_tcp_bind_multithreaded[{i}]: set_reuse_port error: {:?}", e);
+                continue;
             }
-            Err(e) => {
-                eprintln!("naso_tcp_bind_multithreaded: Failed to bind to port {}: {:?}", port, e);
-                // Continue with remaining listeners even if some fail
+
+            // Also set SO_REUSEADDR for additional compatibility
+            if let Err(e) = socket.set_reuse_address(true) {
+                eprintln!("naso_tcp_bind_multithreaded[{i}]: set_reuse_address error: {:?}", e);
             }
+
+            if let Err(e) = socket.bind(&sock_addr) {
+                eprintln!("naso_tcp_bind_multithreaded[{i}]: bind error: {:?}", e);
+                continue;
+            }
+
+            if let Err(e) = socket.listen(1024) {
+                eprintln!("naso_tcp_bind_multithreaded[{i}]: listen error: {:?}", e);
+                continue;
+            }
+
+            let listener: TcpListener = socket.into();
+            let fd = global_sharded_fd_table().insert_listener(listener);
+            listener_fds.push(fd);
+            eprintln!("naso_tcp_bind_multithreaded[{i}]: Created listener fd={} with SO_REUSEPORT on {}", fd, addr_str);
         }
-    }
     
     if listener_fds.is_empty() {
         eprintln!("naso_tcp_bind_multithreaded: No listeners created successfully");
@@ -417,6 +425,27 @@ pub extern "C" fn naso_get_accept_stats() -> u64 {
     
     // Pack stats into return value (simplified for demo)
     ((total_listeners as u64) << 32) | (total_streams as u64)
+}
+
+/// Get next accepted connection from multi-threaded accept loop
+/// Returns stream_fd if available, 0 if none
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_get_next_connection() -> u64 {
+    let table = global_sharded_fd_table();
+    
+    // Search all shards for available streams
+    for shard in &table.shards {
+        let mut shard_guard = shard.lock().unwrap();
+        if let Some((&fd, _)) = shard_guard.streams.iter().next() {
+            // Found a stream, remove it and return
+            if shard_guard.streams.remove(&fd).is_some() {
+                eprintln!("naso_get_next_connection: returning stream_fd={}", fd);
+                return fd;
+            }
+        }
+    }
+    
+    0 // No connections available
 }
 
 // ============================================================================

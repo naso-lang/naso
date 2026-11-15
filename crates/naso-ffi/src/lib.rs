@@ -7,7 +7,7 @@
 //! All functions return 0/ResourceID(0) on error (Naso checks via QTT)
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -491,11 +491,7 @@ fn generate_websocket_response(request: &str) -> String {
 
     // Build response
     format!(
-        "HTTP/1.1 101 Switching Protocols\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        "Sec-WebSocket-Accept: {}\r\n"
-        "\r\n",
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
         accept_key
     )
 }
@@ -517,18 +513,18 @@ pub extern "C" fn naso_websocket_send(
         return 0;
     }
 
-    let stream = get_stream_mut(stream_fd);
-    if stream.is_none() {
+    let mut table = fd_table().lock().unwrap();
+    let Some(mut stream) = table.get_stream(stream_fd) else {
         eprintln!(">>> naso_websocket_send: stream {} not found", stream_fd);
         return 0;
-    }
+    };
 
     // Encode and send WebSocket frame
     let frame = encode_websocket_frame(frame_type, mask, data_ptr, data_len);
     let frame_bytes = frame.as_bytes();
     
     // Write frame to stream
-    match stream.unwrap().write_all(frame_bytes) {
+    match stream.write_all(frame_bytes) {
         Ok(()) => {
             eprintln!(">>> naso_websocket_send: wrote {} bytes to stream {}", frame_bytes.len(), stream_fd);
             frame_bytes.len() as u64
@@ -558,15 +554,15 @@ pub extern "C" fn naso_websocket_recv(
         return 0;
     }
 
-    let stream = get_stream_mut(stream_fd);
-    if stream.is_none() {
+    let mut table = fd_table().lock().unwrap();
+    let Some(mut stream) = table.get_stream(stream_fd) else {
         eprintln!(">>> naso_websocket_recv: stream {} not found", stream_fd);
         return 0;
-    }
+    };
 
     // Read and parse WebSocket frame
     let mut buffer = [0u8; 4096];
-    match stream.unwrap().read(&mut buffer) {
+    match stream.read(&mut buffer) {
         Ok(bytes_read) => {
             if bytes_read == 0 {
                 eprintln!(">>> naso_websocket_recv: stream closed");
@@ -575,8 +571,8 @@ pub extern "C" fn naso_websocket_recv(
 
             match decode_websocket_frame(&buffer[..bytes_read], frame_type_out, mask_out, data_ptr, data_max_len) {
                 Ok(payload_len) => {
-                    if let Some(len_out) = payload_len_out {
-                        *len_out = payload_len;
+                    if !payload_len_out.is_null() {
+                        unsafe { *payload_len_out = payload_len; }
                     }
                     eprintln!(">>> naso_websocket_recv: successfully parsed frame, payload length {}", payload_len);
                     1
@@ -610,12 +606,12 @@ pub extern "C" fn naso_websocket_ping(
         let frame = encode_websocket_frame(0, 0, std::ptr::null(), 0);
         let frame_bytes = frame.as_bytes();
         
-        let stream = get_stream_mut(stream_fd);
-        if stream.is_none() {
+        let mut table = fd_table().lock().unwrap();
+        let Some(mut stream) = table.get_stream(stream_fd) else {
             return 0;
-        }
+        };
         
-        match stream.unwrap().write_all(frame_bytes) {
+        match stream.write_all(frame_bytes) {
             Ok(()) => frame_bytes.len() as u64,
             Err(e) => {
                 eprintln!(">>> naso_websocket_ping: write error: {:?}", e);
@@ -624,15 +620,15 @@ pub extern "C" fn naso_websocket_ping(
         }
     } else {
         // Ping with data payload
-        let stream = get_stream_mut(stream_fd);
-        if stream.is_none() {
+        let mut table = fd_table().lock().unwrap();
+        let Some(mut stream) = table.get_stream(stream_fd) else {
             return 0;
-        }
+        };
 
         let frame = encode_websocket_frame(0, 0, data_ptr, data_len);
         let frame_bytes = frame.as_bytes();
         
-        match stream.unwrap().write_all(frame_bytes) {
+        match stream.write_all(frame_bytes) {
             Ok(()) => frame_bytes.len() as u64,
             Err(e) => {
                 eprintln!(">>> naso_websocket_ping: write error: {:?}", e);
@@ -652,15 +648,15 @@ pub extern "C" fn naso_websocket_pong(
 ) -> u64 {
     eprintln!(">>> naso_websocket_pong called for stream_fd={}", stream_fd);
     
-    let stream = get_stream_mut(stream_fd);
-    if stream.is_none() {
+    let mut table = fd_table().lock().unwrap();
+    let Some(mut stream) = table.get_stream(stream_fd) else {
         return 0;
-    }
+    };
 
     let frame = encode_websocket_frame(0, 0, data_ptr, data_len);
     let frame_bytes = frame.as_bytes();
     
-    match stream.unwrap().write_all(frame_bytes) {
+    match stream.write_all(frame_bytes) {
         Ok(()) => frame_bytes.len() as u64,
         Err(e) => {
             eprintln!(">>> naso_websocket_pong: write error: {:?}", e);
@@ -679,10 +675,10 @@ pub extern "C" fn naso_websocket_close(
 ) -> u64 {
     eprintln!(">>> naso_websocket_close called for stream_fd={}, status={}", stream_fd, status_code);
     
-    let stream = get_stream_mut(stream_fd);
-    if stream.is_none() {
+    let mut table = fd_table().lock().unwrap();
+    let Some(mut stream) = table.get_stream(stream_fd) else {
         return 0;
-    }
+    };
 
     // Encode close frame
     let reason = if reason_ptr.is_null() {
@@ -695,10 +691,10 @@ pub extern "C" fn naso_websocket_close(
     let frame = encode_close_frame(status_code, reason);
     let frame_bytes = frame.as_bytes();
     
-    match stream.unwrap().write_all(frame_bytes) {
+    match stream.write_all(frame_bytes) {
         Ok(()) => {
             // Close the stream after sending close frame
-            let _ = stream.unwrap().shutdown(std::net::Shutdown::Both);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
             frame_bytes.len() as u64
         }
         Err(e) => {
@@ -730,12 +726,6 @@ pub extern "C" fn naso_websocket_validate_frame(
             0
         }
     }
-}
-
-// Helper function to get mutable stream reference
-fn get_stream_mut<'a>(fd: u64) -> Option<&'a mut std::net::TcpStream> {
-    let mut table = fd_table().lock().unwrap();
-    table.get_stream(fd)
 }
 
 // WebSocket frame encoding functions

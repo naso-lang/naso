@@ -23,6 +23,14 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
+use crate::ResourceID;
+
+// Global manager for multi-threaded accept loop
+static GLOBAL_MANAGER: OnceLock<Mutex<Option<WorkerThreadManager>>> = OnceLock::new();
+
+fn global_manager() -> &'static Mutex<Option<WorkerThreadManager>> {
+    GLOBAL_MANAGER.get_or_init(|| Mutex::new(None))
+}
 
 // ============================================================================
 // SHARDED FILE DESCRIPTOR TABLE
@@ -65,7 +73,7 @@ impl ShardedFdTable {
     
     /// Insert a listener and return its fd
     fn insert_listener(&self, listener: TcpListener) -> u64 {
-        let shard_index = self.get_shard_index(self.next_fd.load(Ordering::Relaxed));
+        let shard_index = self.get_shard_index(self.next_fd.load(Ordering::Relaxed) as u64);
         let mut shard = self.shards[shard_index].lock().unwrap();
         let fd = shard.insert_listener(listener);
         self.next_fd.fetch_add(1, Ordering::Relaxed);
@@ -74,7 +82,7 @@ impl ShardedFdTable {
     
     /// Insert a stream and return its fd
     fn insert_stream(&self, stream: std::net::TcpStream) -> u64 {
-        let shard_index = self.get_shard_index(self.next_fd.load(Ordering::Relaxed));
+        let shard_index = self.get_shard_index(self.next_fd.load(Ordering::Relaxed) as u64);
         let mut shard = self.shards[shard_index].lock().unwrap();
         let fd = shard.insert_stream(stream);
         self.next_fd.fetch_add(1, Ordering::Relaxed);
@@ -321,10 +329,16 @@ pub extern "C" fn naso_tcp_bind_multithreaded(addr_ptr: *const u8, addr_len: usi
         
         match TcpListener::bind(&port) {
             Ok(mut listener) => {
-                // Enable SO_REUSEPORT for this listener
-                if let Err(e) = listener.set_reuse_port(true) {
-                    eprintln!("naso_tcp_bind_multithreaded: set_reuse_port error for port {}: {:?}", port, e);
-                    return 0;
+                // Enable SO_REUSEPORT for this listener using socket2
+                use socket2::{Socket, Domain, Type, Protocol, SockAddr};
+                let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP));
+                if let Ok(socket) = socket {
+                    let _ = socket.set_reuse_port(true);
+                    let addr: std::net::SocketAddr = port.parse().unwrap();
+                    let sock_addr: SockAddr = addr.into();
+                    if socket.bind(&sock_addr).is_ok() && socket.listen(1024).is_ok() {
+                        listener = socket.into();
+                    }
                 }
                 
                 let fd = global_sharded_fd_table().insert_listener(listener);
@@ -366,9 +380,9 @@ pub extern "C" fn naso_start_multithreaded_accept(listener_fds_ptr: *const u64, 
     manager.create_workers(num_workers as usize, &listener_fds_vec);
     
     // Store manager in a global static for cleanup
-    static mut GLOBAL_MANAGER: Option<WorkerThreadManager> = None;
-    unsafe {
-        GLOBAL_MANAGER = Some(manager);
+    {
+        let mut global = global_manager().lock().unwrap();
+        *global = Some(manager);
     }
     
     eprintln!("Started multi-threaded accept loop with {} workers and {} listeners", num_workers, listener_count);
@@ -380,12 +394,10 @@ pub extern "C" fn naso_start_multithreaded_accept(listener_fds_ptr: *const u64, 
 pub extern "C" fn naso_stop_multithreaded_accept() {
     eprintln!("naso_stop_multithreaded_accept called");
     
-    static mut GLOBAL_MANAGER: Option<WorkerThreadManager> = None;
-    unsafe {
-        if let Some(mut manager) = GLOBAL_MANAGER.take() {
-            manager.stop_all();
-            eprintln!("Multi-threaded accept loop stopped");
-        }
+    let mut global = global_manager().lock().unwrap();
+    if let Some(mut manager) = global.take() {
+        manager.stop_all();
+        eprintln!("Multi-threaded accept loop stopped");
     }
 }
 

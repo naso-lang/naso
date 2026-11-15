@@ -128,7 +128,11 @@ impl ConnectionManager {
     fn get_pipelined_request(&mut self, fd: u64) -> Option<Vec<u8>> {
         if let Some(state) = self.connections.get_mut(&fd) {
             state.decrement_requests();
-            state.pipelined_requests.pop_front()
+            if !state.pipelined_requests.is_empty() {
+                Some(state.pipelined_requests.remove(0))
+            } else {
+                None
+            }
         } else {
             None
         }
@@ -185,73 +189,6 @@ fn parse_connection_header(request_data: &[u8]) -> (bool, u64, u64) {
     }
     
     (has_keep_alive, timeout_ms, max_requests)
-}
-
-// Connection state for Keep-Alive support
-#[derive(Debug, Clone)]
-struct ConnectionState {
-    pub idle_since: Instant,
-    pub request_count: u64,
-    pub last_activity: Instant,
-    pub keep_alive_timeout: Duration,
-    pub max_requests: u64,
-    pub current_requests: u64,
-    pub pipelined_requests: Vec<Vec<u8>>, // Buffer for pipelined requests
-    pub is_active: bool,
-}
-
-impl ConnectionState {
-    fn new(keep_alive_timeout_ms: u64, max_requests: u64) -> Self {
-        let now = Instant::now();
-        Self {
-            idle_since: now,
-            request_count: 0,
-            last_activity: now,
-            keep_alive_timeout: Duration::from_millis(keep_alive_timeout_ms),
-            max_requests,
-            current_requests: 0,
-            pipelined_requests: Vec::new(),
-            is_active: true,
-        }
-    }
-    
-    fn update_activity(&mut self) {
-        self.last_activity = Instant::now();
-        if !self.is_active {
-            self.is_active = true;
-        }
-    }
-    
-    fn is_timed_out(&self) -> bool {
-        self.last_activity.elapsed() > self.keep_alive_timeout
-    }
-    
-    fn can_accept_request(&mut self) -> bool {
-        if !self.is_active {
-            return false;
-        }
-        if self.current_requests >= self.max_requests {
-            return false;
-        }
-        true
-    }
-    
-    fn increment_requests(&mut self) -> bool {
-        if self.request_count >= self.max_requests {
-            return false;
-        }
-        self.request_count += 1;
-        self.current_requests += 1;
-        self.update_activity();
-        true
-    }
-    
-    fn decrement_requests(&mut self) {
-        if self.current_requests > 0 {
-            self.current_requests -= 1;
-        }
-        self.update_activity();
-    }
 }
 
 /// Parse HTTP request into method, path, and headers
@@ -504,8 +441,8 @@ pub extern "C" fn naso_build_response_enhanced(
     let mut timeout_ms = 30000; // default 30 seconds
     let mut max_requests = 100; // default 100 requests
     
-    if headers_ptr.is_not_null() && headers_len > 0 {
-        let headers_data = unsafe { std::slice::from_raw_parts(headers_ptr, headers_len) };
+    if !headers_ptr.is_null() && headers_len > 0 {
+        let headers_data = unsafe { std::slice::from_raw_parts(headers_ptr, headers_len as usize) };
         let (parsed_keep_alive, parsed_timeout, parsed_max) = parse_connection_header(headers_data);
         has_keep_alive = has_keep_alive || parsed_keep_alive;
         timeout_ms = parsed_timeout;

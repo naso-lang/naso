@@ -1,0 +1,307 @@
+// ============================================================================
+// TechEmpower Benchmark with Middleware & Routing Layer (Phase 10)
+// ============================================================================
+// Demonstrates: Router, Middleware chain, Handler system, Extractors
+// Target: 5,000-10,000 req/s (5-10x improvement over raw FFI)
+// ============================================================================
+
+extern "C" {
+    // Core FFI functions
+    fn naso_tcp_bind(addr: *u8, len: u64) -> u64;
+    fn naso_tcp_accept(listener_fd: u64, out: *mut u64) -> u64;
+    fn naso_accept_get_client(out: *mut u64) -> u64;
+    fn naso_read(fd: u64, buf: *mut u8, max_len: usize) -> usize;
+    fn naso_write(fd: u64, buf: *const u8, len: usize) -> usize;
+    fn naso_close(fd: u64) -> u64;
+    fn naso_yield() -> u64;
+    fn naso_runtime_new(worker_count: u64) -> *mut u8;
+    fn naso_runtime_run(rt: *mut u8) -> u64;
+    fn naso_runtime_free(rt: *mut u8) -> u64;
+    
+    // HTTP parsing
+    fn naso_parse_http_request(
+        buf: *const u8,
+        len: usize,
+        out_method: *mut u8,
+        out_method_len: usize,
+        out_path: *mut u8,
+        out_path_len: usize,
+        out_headers: *mut u8,
+        out_headers_len: usize,
+    ) -> u64;
+    
+    // Enhanced response building
+    fn naso_build_response_enhanced(
+        method_ptr: *const u8,
+        method_len: u64,
+        path_ptr: *const u8,
+        path_len: u64,
+        headers_ptr: *const u8,
+        headers_len: u64,
+        body_ptr: *const u8,
+        body_len: u64,
+        out_ptr: *mut u8,
+        out_len: u64,
+        stream_fd: u64,
+        enable_keep_alive: u8,
+    ) -> u64;
+}
+
+// ============================================================================
+// Import stdlib http module
+// ============================================================================
+use std.http;
+
+// ============================================================================
+// Application State (shared across handlers)
+// ============================================================================
+
+struct AppState {
+    pub request_count: u64,
+    pub start_time: u64,
+}
+
+// ============================================================================
+// Handlers (using QTT-linear ownership)
+// ============================================================================
+
+fn handle_plaintext(req: std.http.OwnedRequest) -> std.http.OwnedResponse {
+    let body: [u8; 13] = [72, 101, 108, 108, 111, 44, 32, 87, 111, 114, 108, 100, 33]; // "Hello, World!"
+    std.http.OwnedResponse { inner: std.http.response_ok(body as *u8, 13) }
+}
+
+fn handle_json(req: std.http.OwnedRequest) -> std.http.OwnedResponse {
+    let body: [u8; 29] = [123, 34, 109, 101, 115, 115, 97, 103, 101, 34, 58, 34, 72, 101, 108, 108, 111, 44, 32, 87, 111, 114, 108, 100, 33, 34, 125]; // {"message":"Hello, World!"}
+    std.http.OwnedResponse { inner: std.http.response_ok(body as *u8, 29) }
+}
+
+fn handle_health(req: std.http.OwnedRequest) -> std.http.OwnedResponse {
+    let body: [u8; 2] = [79, 75]; // "OK"
+    std.http.OwnedResponse { inner: std.http.response_ok(body as *u8, 2) }
+}
+
+fn handle_root(req: std.http.OwnedRequest) -> std.http.OwnedResponse {
+    let body: [u8; 12] = [72, 101, 108, 108, 111, 32, 87, 111, 114, 108, 100, 10]; // "Hello World\n"
+    std.http.OwnedResponse { inner: std.http.response_ok(body as *u8, 12) }
+}
+
+fn handle_echo(req: std.http.OwnedRequest) -> std.http.OwnedResponse {
+    // Echo the request body back
+    let body_len = req.inner.body_len.min(1024);
+    std.http.OwnedResponse { inner: std.http.response_ok(req.inner.body as *u8, body_len) }
+}
+
+fn handle_user_by_id(req: std.http.OwnedRequest) -> std.http.OwnedResponse {
+    // Extract path parameter (in real impl, would use Path extractor)
+    let user_id: [u8; 10] = [49, 50, 51]; // "123" placeholder
+    std.http.OwnedResponse { inner: std.http.response_ok(user_id as *u8, 3) }
+}
+
+// ============================================================================
+// Middleware Implementations
+// ============================================================================
+
+// Request ID middleware - adds X-Request-ID header
+fn request_id_middleware(req: std.http.Request) -> std.http.MiddlewareNext {
+    std.http.MiddlewareNext {
+        request: req,
+        response: std.http.response_not_found(0 as *u8, 0),
+        continue_chain: 1,
+    }
+}
+
+// Logging middleware
+fn logging_middleware(req: std.http.Request) -> std.http.MiddlewareNext {
+    std.http.MiddlewareNext {
+        request: req,
+        response: std.http.response_not_found(0 as *u8, 0),
+        continue_chain: 1,
+    }
+}
+
+// Security headers middleware
+fn security_headers_middleware(req: std.http.Request) -> std.http.MiddlewareNext {
+    std.http.MiddlewareNext {
+        request: req,
+        response: std.http.response_not_found(0 as *u8, 0),
+        continue_chain: 1,
+    }
+}
+
+// ============================================================================
+// Main Server Logic
+// ============================================================================
+
+fn handle_client(client_fd: u64, router: std.http.Router) -> () {
+    let mut read_buf: [u8; 4096] = [0; 4096];
+    let mut request_method: [u8; 16] = [0; 16];
+    let mut request_path: [u8; 256] = [0; 256];
+    let mut request_headers: [u8; 1024] = [0; 1024];
+    let mut response_buf: [u8; 2048] = [0; 2048];
+    
+    // Enable Keep-Alive
+    let enable_keep_alive: u8 = 1;
+    
+    loop {
+        // Read request
+        let n = naso_read(client_fd, read_buf.as_mut_ptr() as *mut u8, read_buf.len());
+        
+        if n == 0 {
+            break; // Connection closed
+        }
+        
+        // Parse HTTP request
+        let parsed_len = naso_parse_http_request(
+            read_buf.as_ptr() as *const u8,
+            n,
+            request_method.as_mut_ptr() as *mut u8,
+            request_method.len(),
+            request_path.as_mut_ptr() as *mut u8,
+            request_path.len(),
+            request_headers.as_mut_ptr() as *mut u8,
+            request_headers.len(),
+        );
+        
+        if parsed_len == 0 {
+            // Failed to parse - send 400
+            let error_msg = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 11\r\nConnection: close\r\n\r\nBad Request";
+            let mut error_buf: [u8; 256] = [0; 256];
+            let mut error_len = 0;
+            for i in 0..error_msg.len() - 1 {
+                error_buf[error_len] = error_msg.as_bytes()[i];
+                error_len += 1;
+            }
+            let _ = naso_write(client_fd, error_buf.as_ptr() as *const u8, error_len);
+            break;
+        }
+        
+        // Build Request struct for router
+        let method_byte = request_method[0];
+        let req = std.http.Request {
+            method: method_byte as Int,
+            path: request_path,
+            path_len: parsed_len as Int, // Using parsed_len as path_len proxy
+            headers: request_headers,
+            headers_len: request_headers.iter().position(|&b| b == 0).unwrap_or(1024) as Int,
+            body: [0; 4096],
+            body_len: (n - parsed_len as usize) as Int,
+        };
+        
+        // Copy body if present
+        if n > parsed_len as usize {
+            let body_start = parsed_len as usize;
+            let body_len = n - body_start;
+            for i in 0..body_len.min(4096) {
+                req.body[i] = read_buf[body_start + i];
+            }
+            req.body_len = body_len as Int;
+        }
+        
+        // Dispatch through router (with middleware chain)
+        let resp = std.http.router_dispatch(router, req);
+        
+        // Format and send response
+        let mut out_buf: [u8; 2048] = [0; 2048];
+        let out_len = std.http.format_response(resp, out_buf.as_mut_ptr(), out_buf.len());
+        
+        if out_len > 0 {
+            let _ = naso_write(client_fd, out_buf.as_ptr() as *const u8, out_len);
+        }
+        
+        // Check if we should continue (Keep-Alive)
+        if enable_keep_alive == 0 {
+            break;
+        }
+        
+        // Check if connection supports Keep-Alive
+        let keep_alive_supported = naso_check_keep_alive_support(client_fd);
+        if keep_alive_supported == 0 {
+            break;
+        }
+    }
+    
+    let _ = naso_close(client_fd);
+}
+
+fn worker_accept_loop(listener_fd: u64, router: std.http.Router) -> () {
+    let mut running: u64 = 1;
+    let mut out: [u64; 2] = [0, 0];
+    let out_ptr = out.as_mut_ptr();
+    
+    loop {
+        if running == 0 {
+            break;
+        }
+        
+        // Cleanup timed out connections
+        let _ = naso_cleanup_connections();
+        
+        // Accept new connection
+        if naso_tcp_accept(listener_fd, out_ptr) != 0 {
+            let client_fd = naso_accept_get_client(out_ptr);
+            if client_fd != 0 {
+                handle_client(client_fd, router);
+            }
+        }
+        
+        naso_yield();
+    }
+}
+
+// ============================================================================
+// Main Entry Point
+// ============================================================================
+
+fn main() -> () {
+    // Create router with middleware chain
+    let mut router = std.http.router_new();
+    
+    // Add middleware chain (order matters - first added = first executed)
+    std.http.router_add_middleware(&mut router, std.http.middleware_logger());
+    std.http.router_add_middleware(&mut router, std.http.middleware_cors());
+    std.http.router_add_middleware(&mut router, std.http.middleware_compression());
+    std.http.router_add_middleware(&mut router, std.http.middleware_timeout());
+    std.http.router_add_middleware(&mut router, std.http.middleware_rate_limit());
+    
+    // Add routes
+    let root_path: [u8; 1] = [47]; // "/"
+    std.http.router_get(&mut router, root_path as *u8, 1, std.http.handler_new(handle_root));
+    
+    let health_path: [u8; 7] = [47, 104, 101, 97, 108, 116, 104]; // "/health"
+    std.http.router_get(&mut router, health_path as *u8, 7, std.http.handler_new(handle_health));
+    
+    let plaintext_path: [u8; 10] = [47, 112, 108, 97, 105, 110, 116, 101, 120, 116]; // "/plaintext"
+    std.http.router_get(&mut router, plaintext_path as *u8, 10, std.http.handler_new(handle_plaintext));
+    
+    let json_path: [u8; 5] = [47, 106, 115, 111, 110]; // "/json"
+    std.http.router_get(&mut router, json_path as *u8, 5, std.http.handler_new(handle_json));
+    
+    let echo_path: [u8; 5] = [47, 101, 99, 104, 111]; // "/echo"
+    std.http.router_post(&mut router, echo_path as *u8, 5, std.http.handler_new(handle_echo));
+    
+    // Parameterized route: /users/:id
+    let users_path: [u8; 7] = [47, 117, 115, 101, 114, 115, 58]; // "/users:"
+    let id_param: [u8; 2] = [105, 100]; // "id"
+    std.http.router_get_param(&mut router, users_path as *u8, 7, std.http.handler_new(handle_user_by_id), id_param as *u8, 2);
+    
+    // Server configuration
+    let addr: [u8; 14] = [49, 50, 55, 46, 48, 46, 48, 46, 49, 58, 56, 48, 57, 57]; // "127.0.0.1:8099"
+    
+    // Create TCP listener
+    let listener_fd = naso_tcp_bind(addr.as_ptr() as *const u8, addr.len() as u64);
+    
+    if listener_fd == 0 {
+        // Failed to bind
+        return;
+    }
+    
+    // Create async runtime
+    let runtime = naso_runtime_new(4); // 4 worker threads
+    
+    // Start accept loop
+    worker_accept_loop(listener_fd, router);
+    
+    // Cleanup
+    let _ = naso_runtime_run(runtime);
+    let _ = naso_runtime_free(runtime);
+}

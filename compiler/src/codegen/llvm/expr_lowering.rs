@@ -1353,7 +1353,7 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
 
                                             Ok(BasicValueEnum::StructValue(struct_val))
                                         }
-            PirExpr::Struct { fields } => {
+            PirExpr::Struct { name: _, fields } => {
                 // Struct literals: allocate memory, store fields, return struct value
                 // For Stream { fd: Int }, this creates a struct with one i64 field
                 let context = self.value_builder.type_lowering().context();
@@ -1362,17 +1362,19 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                     .type_lowering()
                     .int_type(crate::codegen::abi::IntWidth::I64);
 
-                // Allocate struct on stack - create field types array
-                let field_types: Vec<inkwell::types::BasicTypeEnum<'_>> = (0..fields.len())
-                    .map(|_| int_type.into())
-                    .collect();
-                let struct_type = context.struct_type(&field_types, false);
-
-                // First, evaluate all field expressions (need mutable borrow of self)
+                // First, evaluate all field expressions to get their values and types
                 let mut field_vals = Vec::with_capacity(fields.len());
                 for field in fields.iter() {
                     field_vals.push(self.build_expr(field, quantities)?);
                 }
+
+                // Determine field types from the actual field values
+                let field_types: Vec<BasicTypeEnum<'_>> = field_vals
+                    .iter()
+                    .map(|v| v.get_type())
+                    .collect();
+
+                let struct_type = context.struct_type(&field_types, false);
 
                 // Now get builder and store fields (immutable borrow of self.value_builder)
                 let builder = self.value_builder.builder();
@@ -1382,16 +1384,15 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
 
                 // Store each field
                 for (i, field_val) in field_vals.into_iter().enumerate() {
-                    let field_idx = int_type.const_int(i as u64, false);
-                    let gep = unsafe {
-                        builder
-                            .build_gep(
-                                struct_ptr,
-                                &[field_idx],
-                                &format!("struct_field_{i}"),
-                            )
-                            .map_err(|e| CodegenError::InstructionError(e.to_string()))?
-                    };
+                    // Use build_struct_gep for proper struct field access
+                    // This returns a pointer to the field with the correct pointee type
+                    let gep = builder
+                        .build_struct_gep(
+                            struct_ptr,
+                            i as u32,
+                            &format!("struct_field_{i}"),
+                        )
+                        .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
                     builder
                         .build_store(gep, field_val)
                         .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
@@ -1419,6 +1420,7 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 width,
                 signed,
                 float_target,
+                pointer_target,
             } => {
                 let v = self.build_expr(expr, quantities)?;
 
@@ -1442,6 +1444,30 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                             .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
                         return Ok(ptr.into());
                     }
+                }
+                // Handle Integer -> Pointer cast (e.g., `0 as *u8`)
+                if let Some(pointee_elem) = pointer_target {
+                    // Integer to pointer cast: use inttoptr
+                    let int_val = v.into_int_value();
+                    let pointee_ty = self
+                        .value_builder
+                        .type_lowering()
+                        .int_type(match pointee_elem {
+                            crate::ir::pir_types::ElemType::I8 => crate::codegen::abi::IntWidth::I8,
+                            crate::ir::pir_types::ElemType::I16 => crate::codegen::abi::IntWidth::I16,
+                            crate::ir::pir_types::ElemType::I32 => crate::codegen::abi::IntWidth::I32,
+                            crate::ir::pir_types::ElemType::I64 => crate::codegen::abi::IntWidth::I64,
+                            crate::ir::pir_types::ElemType::F64 => crate::codegen::abi::IntWidth::I64, // fallback
+                            crate::ir::pir_types::ElemType::Bool => crate::codegen::abi::IntWidth::I1,
+                            crate::ir::pir_types::ElemType::I4 => crate::codegen::abi::IntWidth::I8, // stored as i8
+                        });
+                    let ptr_type = pointee_ty.ptr_type(AddressSpace::default());
+                    let ptr = self.value_builder.builder().build_int_to_ptr(
+                        int_val,
+                        ptr_type,
+                        "int_to_ptr_cast",
+                    ).map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                    return Ok(ptr.into());
                 }
 
                 // A FLOAT TARGET: `sitofp`/`uitofp`.

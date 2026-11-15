@@ -146,7 +146,7 @@ pub fn build_entry_signature<'ctx>(
     let mut out: Vec<EntryParam<'ctx>> = Vec::new();
     let mut next_arg: u32 = 0;
 
-    // Add sret parameter for tensor/struct returns (caller-allocated return pointer)
+    // Add sret parameter for tensor/struct/array returns (caller-allocated return pointer)
     if let Some(crate::ir::pir_types::FnReturn::Tensor { elem, shape: _ }) = return_type {
         let ptr_type = type_lowering.ptr_type(
             elem_to_llvm_type(type_lowering, *elem),
@@ -174,13 +174,27 @@ pub fn build_entry_signature<'ctx>(
             kind: ParamKind::Scalar(crate::ir::pir_types::ElemType::I8),
         });
         next_arg = 1;
+    } else if let Some(crate::ir::pir_types::FnReturn::Array { elem, size: _ }) = return_type {
+        // Array return: use typed pointer to caller-allocated array memory
+        let ptr_type = type_lowering.ptr_type(
+            elem_to_llvm_type(type_lowering, *elem),
+            inkwell::AddressSpace::default(),
+        );
+        out.push(EntryParam {
+            name: "sret".to_string(),
+            ty: ptr_type.into(),
+            arg_index: 0,
+            len_arg_index: None,
+            kind: ParamKind::Scalar(elem_to_elem_type(*elem)),
+        });
+        next_arg = 1;
     }
 
     // Every argument index handed out so far. A tensor consumes two, so the next
     // index cannot be `out.len()` -- which is exactly the bug a naive `enumerate`
     // over `out` would introduce: binding the second tensor's pointer to the first
     // tensor's element count, and reading a length where a buffer is expected.
-    let mut next_arg: u32 = if return_type.is_some() && (matches!(return_type, Some(crate::ir::pir_types::FnReturn::Tensor { .. })) || matches!(return_type, Some(crate::ir::pir_types::FnReturn::Struct))) { 1 } else { 0 };
+    let mut next_arg: u32 = if return_type.is_some() && (matches!(return_type, Some(crate::ir::pir_types::FnReturn::Tensor { .. })) || matches!(return_type, Some(crate::ir::pir_types::FnReturn::Struct)) || matches!(return_type, Some(crate::ir::pir_types::FnReturn::Array { .. }))) { 1 } else { 0 };
     for param in &pir_module.function_params {
         let (ty, kind) = param_slot(type_lowering, param)?;
         let takes_length = matches!(kind, ParamKind::Tensor { .. });
@@ -406,9 +420,10 @@ pub fn function_return_type<'ctx>(
         FnReturn::Scalar(ElemType::I32) => type_lowering.int_type(IntWidth::I32).into(),
         FnReturn::Scalar(ElemType::I64) => type_lowering.int_type(IntWidth::I64).into(),
         FnReturn::Scalar(ElemType::Bool) => type_lowering.int_type(IntWidth::I1).into(),
-        // Tensor/struct return: uses sret convention (caller-allocated, hidden first arg)
+        // Tensor/struct/array return: uses sret convention (caller-allocated, hidden first arg)
         FnReturn::Tensor { elem: _, shape: _ } => return Ok(None),
         FnReturn::Struct => return Ok(None),
+        FnReturn::Array { elem: _, size: _ } => return Ok(None),
         FnReturn::Unsupported(ty) => {
             return Err(CodegenError::UnsupportedFeature(format!(
                 "function `{}` returns `{ty}`, which has no slot in this ABI. Nothing \

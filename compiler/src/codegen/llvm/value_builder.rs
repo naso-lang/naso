@@ -206,6 +206,13 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
         self.variables.remove(name);
     }
 
+    /// Bind a function argument that is already a pointer (e.g., struct parameter passed by pointer).
+    /// The pointer is recorded directly without creating an alloca, so the body reads it by name
+    /// and gets the original pointer value.
+    pub fn bind_pointer_argument(&mut self, name: &str, arg: PointerValue<'ctx>, pointee_ty: BasicTypeEnum<'ctx>) {
+        self.variables.insert(name.to_string(), (arg, pointee_ty));
+    }
+
     /// Bind a function argument to `name`, so the body can read it by name.
     ///
     /// The argument is stored into an alloca rather than left as a bare SSA value

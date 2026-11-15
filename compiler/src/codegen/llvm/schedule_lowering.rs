@@ -237,19 +237,8 @@ pub fn lower_schedule_tree_into<'ctx>(
             }
             ParamKind::Struct => {
                 // Struct parameter: bind as a pointer (opaque pointer to caller-allocated struct)
-                value_builder.bind_tensor(
-                    &entry.name,
-                    TensorBinding {
-                        base: arg.into_pointer_value(),
-                        elem: value_builder
-                            .type_lowering()
-                            .int_type(crate::codegen::abi::IntWidth::I8)
-                            .into(),
-                        shape: None,
-                        len: None,
-                        sub_byte: false,
-                    },
-                );
+                // Use bind_argument to create an alloca and store the pointer, so the body can read it by name
+                value_builder.bind_argument(&entry.name, arg)?;
             }
             ParamKind::Scalar(_) => {
                 value_builder.bind_argument(&entry.name, arg)?;

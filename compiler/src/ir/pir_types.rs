@@ -8,7 +8,7 @@
 use super::access_relation::AccessRelations;
 use super::affine_domain::AffineDomain;
 use super::schedule_tree::{ScheduleTree, StmtId};
-use crate::ast::{Mutability, Quantity};
+use crate::ast::{Ident, Mutability, Quantity};
 use crate::ir::schedule_tree::ScheduleNode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -43,8 +43,8 @@ pub enum PirExpr {
     },
     /// Struct field access
     Field { base: Box<PirExpr>, field: String },
-    /// Struct literal - tuple of fields
-    Struct { fields: Vec<PirExpr> },
+    /// Struct literal with type name
+    Struct { name: Ident, fields: Vec<PirExpr> },
     /// Array literal
     Array { items: Vec<PirExpr> },
     /// Let binding (for SSA form)
@@ -92,40 +92,45 @@ pub enum PirExpr {
     /// the conversion must say so instead of dropping it, because a dropped cast
     /// stores the wrong type into the slot.
     Cast {
-        expr: Box<PirExpr>,
-        /// Declared bit width of the cast target, when the target is an integer.
-        ///
-        /// Only the width is carried, not the whole `ast::Type`, because `PirExpr`
-        /// derives `Eq` and `Type` does not. The width is what a backend needs to
-        /// build the right LLVM integer type or WGSL constructor, and it is what was
-        /// being lost: `q[..] as i8` lowered with the `i8` simply absent.
-        width: Option<u8>,
-        /// Whether the TARGET is a signed integer.
-        ///
-        /// Carried explicitly because LLVM integer types are SIGNLESS -- `i32` is the
-        /// same type whether it holds a signed or an unsigned value, and the difference
-        /// is entirely in whether you emit `sext` or `zext`. Nothing downstream can
-        /// recover it, so guessing here is a wrong answer rather than a default: `zext`
-        /// of a negative value wraps, and `sext` of a large unsigned value goes negative.
-        signed: bool,
-        /// The cast target is a FLOAT, not an integer.
-        ///
-        /// `width` alone cannot express `x as f32`: a float target has no bit width in
-        /// the integer sense, and `width` is `None` for it, which previously read as
-        /// "an i32" -- so `input[i] as f32` on an `i8` buffer emitted a SIGN-EXTENDING
-        /// INTEGER conversion and then multiplied an `i32` by a `double`. That is a
-        /// silent wrong answer: the program compiles, verifies, and computes nonsense.
-        ///
-        /// So the target's SORT is recorded explicitly rather than inferred from a
-        /// `None` width. `None` keeps the original integer behaviour byte for byte;
-        /// `Some(_)` means `sitofp`/`uitofp`, with the sign flag still carried because
-        /// LLVM integer types are signless and nothing downstream can recover it.
-        ///
-        /// No float WIDTH is carried, because this backend has one: `f32` and `f64` are
-        /// already the same type in the IR (`ElemType` documents why), so recording a
-        /// width would record a distinction that does not exist.
-        float_target: Option<ElemType>,
-    },
+            expr: Box<PirExpr>,
+            /// Declared bit width of the cast target, when the target is an integer.
+            ///
+            /// Only the width is carried, not the whole `ast::Type`, because `PirExpr`
+            /// derives `Eq` and `Type` does not. The width is what a backend needs to
+            /// build the right LLVM integer type or WGSL constructor, and it is what was
+            /// being lost: `q[..] as i8` lowered with the `i8` simply absent.
+            width: Option<u8>,
+            /// Whether the TARGET is a signed integer.
+            ///
+            /// Carried explicitly because LLVM integer types are SIGNLESS -- `i32` is the
+            /// same type whether it holds a signed or an unsigned value, and the difference
+            /// is entirely in whether you emit `sext` or `zext`. Nothing downstream can
+            /// recover it, so guessing here is a wrong answer rather than a default: `zext`
+            /// of a negative value wraps, and `sext` of a large unsigned value goes negative.
+            signed: bool,
+            /// The cast target is a FLOAT, not an integer.
+            ///
+            /// `width` alone cannot express `x as f32`: a float target has no bit width in
+            /// the integer sense, and `width` is `None` for it, which previously read as
+            /// "an i32" -- so `input[i] as f32` on an `i8` buffer emitted a SIGN-EXTENDING
+            /// INTEGER conversion and then multiplied an `i32` by a `double`. That is a
+            /// silent wrong answer: the program compiles, verifies, and computes nonsense.
+            ///
+            /// So the target's SORT is recorded explicitly rather than inferred from a
+            /// `None` width. `None` keeps the original integer behaviour byte for byte;
+            /// `Some(_)` means `sitofp`/`uitofp`, with the sign flag still carried because
+            /// LLVM integer types are signless and nothing downstream can recover it.
+            ///
+            /// No float WIDTH is carried, because this backend has one: `f32` and `f64` are
+            /// already the same type in the IR (`ElemType` documents why), so recording a
+            /// width would record a distinction that does not exist.
+            float_target: Option<ElemType>,
+            /// The cast target is a POINTER, carrying the pointee element type.
+            ///
+            /// Used for casts like `0 as *u8` where an integer is converted to a pointer.
+            /// The pointee type tells the backend what LLVM pointer type to create.
+            pointer_target: Option<ElemType>,
+        },
     /// A sequence of statements evaluated for effect, yielding no value.
     ///
     /// This exists because a loop body is usually statements and no tail
@@ -413,6 +418,12 @@ pub enum FnReturn {
     /// A struct return containing arrays: uses LLVM sret convention.
     /// Caller allocates, passes hidden first argument.
     Struct,
+    /// A fixed-size array return: uses LLVM sret convention.
+    /// Caller allocates, passes hidden first argument.
+    Array {
+        elem: ElemType,
+        size: u64,
+    },
     /// A declared return type with no slot in this ABI.
     ///
     /// Recorded rather than dropped, so a backend refuses it NAMING the type instead
@@ -781,7 +792,7 @@ impl PirModule {
                     || qubits.iter().any(|q| self.expr_contains_var(q, var))
             }
             PirExpr::Array { items } => items.iter().any(|a| self.expr_contains_var(a, var)),
-            PirExpr::Struct { fields } => fields.iter().any(|f| self.expr_contains_var(f, var)),
+            PirExpr::Struct { name: _, fields } => fields.iter().any(|f| self.expr_contains_var(f, var)),
             PirExpr::Async(inner) => self.expr_contains_var(inner, var),
             PirExpr::Await(inner) => self.expr_contains_var(inner, var),
             PirExpr::IntLit(_) | PirExpr::FloatLit(_) | PirExpr::BoolLit(_) => false,
@@ -1017,6 +1028,7 @@ fn pir_expr_to_string(expr: &PirExpr, _indent: usize) -> String {
             width,
             signed,
             float_target,
+            pointer_target: _,
         } => match float_target {
             // A float target is printed as a float. Printing it as `i{width}` would be
             // a lie about the conversion the dump claims to be showing.
@@ -1061,7 +1073,7 @@ fn pir_expr_to_string(expr: &PirExpr, _indent: usize) -> String {
             let inner: Vec<String> = items.iter().map(|a| pir_expr_to_string(a, 0)).collect();
             format!("[{}]", inner.join(", "))
         }
-        PirExpr::Struct { fields } => {
+        PirExpr::Struct { name: _, fields } => {
             let inner: Vec<String> = fields.iter().map(|f| pir_expr_to_string(f, 0)).collect();
             format!("{{{}}}", inner.join(", "))
         }

@@ -9,6 +9,7 @@ members = [
     "crates/nasoc-wasm",
     "crates/naso-ffi",
     "crates/async-runtime",
+    "bench_runner",
 ]
 
 [workspace.package]

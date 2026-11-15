@@ -909,6 +909,18 @@ impl LoweringContext {
                     // Tensor return type - would need shape info from type
                     return FnReturn::Tensor { elem: ElemType::F64, shape: None };
                 }
+                // Check if it's a fixed-size array type
+                if let crate::ast::ty::TypeKind::Array(elem_ty, size) = &ty.kind {
+                    if let Some(elem) = elem_kind(elem_ty) {
+                        if let Some(size_expr) = size {
+                            if let Some(size_val) = size_expr.to_u64() {
+                                return FnReturn::Array { elem, size: size_val };
+                            }
+                        }
+                        return FnReturn::Unsupported(format!("{ty}"));
+                    }
+                    return FnReturn::Unsupported(format!("{ty}"));
+                }
                 // Check if it's a user-defined type (struct, enum, alias) - use Struct variant for sret
                 if matches!(ty.kind, crate::ast::ty::TypeKind::Named(_, _)) {
                     return FnReturn::Struct;
@@ -1516,6 +1528,11 @@ impl LoweringContext {
                         crate::ast::ty::TypeKind::Float => elem_kind(ty),
                         _ => None,
                     },
+                    // A POINTER target carries the pointee element type for inttoptr.
+                    pointer_target: match ty.kind {
+                        crate::ast::ty::TypeKind::Pointer(ref pointee) => elem_kind(pointee),
+                        _ => None,
+                    },
                 })
             }
 
@@ -1607,7 +1624,7 @@ impl LoweringContext {
                     .iter()
                     .map(|f| self.lower_expr(&f.value))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(PirExpr::Struct { fields: items })
+                Ok(PirExpr::Struct { name: name.clone(), fields: items })
             }
             ExprKind::Let(let_binding) => {
                 let v = self.lower_expr(&let_binding.value)?;

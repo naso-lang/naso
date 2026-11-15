@@ -2472,13 +2472,31 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                     values.push(v);
                 }
                 ParamKind::Unsupported(ty) => {
-                    return Err(CodegenError::UnsupportedFeature(format!(
-                        "call to `{name}` passes a parameter of type `{ty}`, which has no \
-                         slot in this ABI. Nothing is substituted for it."
-                    )));
-                }
-            }
-        }
+                                    return Err(CodegenError::UnsupportedFeature(format!(
+                                        "call to `{name}` passes a parameter of type `{ty}`, which has no \
+                                         slot in this ABI. Nothing is substituted for it.",
+                                    )));
+                                }
+                                ParamKind::Struct => {
+                                    // Struct parameter: pass by pointer (caller-allocated)
+                                    let PirExpr::Var(name) = arg else {
+                                        return Err(CodegenError::UnsupportedFeature(format!(
+                                            "call to `{name}` passes a struct parameter, which is a \
+                                             caller-owned pointer, so its argument must be a NAME. \
+                                             `{arg:?}` is not.",
+                                        )));
+                                    };
+                                    let Some(binding) = self.value_builder.tensor(name) else {
+                                        return Err(CodegenError::InstructionError(format!(
+                                            "call to `{name}` passes `{name}` as a struct, but \
+                                             this function's scope has none by that name.",
+                                        )));
+                                    };
+                                    // Struct is passed as a single pointer (no length)
+                                    values.push(binding.base.into());
+                                }
+                            }
+                        }
 
         let symbol = crate::codegen::llvm::function_emission::symbol_for(name);
         let func = self.module.get_function(&symbol).ok_or_else(|| {

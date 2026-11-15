@@ -13,6 +13,8 @@ pub mod simd;
 pub mod uncomputation;
 
 use crate::ast::{Mutability, Program, Quantity};
+use crate::codegen::abi::{FloatWidth, IntWidth};
+use crate::ir::pir_types::ElemType;
 use crate::ir::validate::validate_pir;
 use crate::ir::{
     AccessRelations, AffineDomain, AffineMap, PirModule, PirStatement, QuantityMap, ScheduleNode,
@@ -140,6 +142,7 @@ fn describe_param_kind(kind: &crate::ir::pir_types::ParamKind) -> String {
         },
         ParamKind::Scalar(elem) => format!("{elem:?}"),
         ParamKind::QRegister => "QRegister".to_string(),
+        ParamKind::Struct => "Struct".to_string(),
         ParamKind::Unsupported(ty) => ty.clone(),
     }
 }
@@ -494,6 +497,27 @@ impl LoweringContext {
                 // String is represented as (ptr, len) pair in the ABI
                 // We pass it as a struct of two i64 values
                 ParamKind::Scalar(crate::ir::pir_types::ElemType::I64)
+            }
+            crate::ast::ty::TypeKind::Array(elem, size) => {
+                // Array parameters are passed by pointer (caller-allocated buffer)
+                let Some(elem_ty) = elem_kind(&*elem) else {
+                    return ParamKind::Unsupported(format!("array with unsupported element type"));
+                };
+                let shape = match size.as_ref() {
+                    Some(nat) => nat.to_u64().map(|n| vec![n]),
+                    None => None,
+                };
+                ParamKind::Tensor {
+                    elem: elem_ty,
+                    shape,
+                }
+            }
+            // User-defined structs (MiddlewareChain, Router, Response, Request, etc.)
+            // are passed as opaque pointers (caller-allocated, sret convention for params)
+            crate::ast::ty::TypeKind::Named(n, _)
+                if !matches!(n.name.as_str(), "QRegister" | "Qubits" | "Stream" | "Listener" | "Many" | "One") =>
+            {
+                ParamKind::Struct
             }
             // A quantity is not a type. `Many` and `One` parse as `Named` because
             // they are ordinary identifiers in type position, so `fn f(q: Many)`
@@ -879,7 +903,18 @@ impl LoweringContext {
         }
         match elem_kind(ty) {
             Some(elem) => FnReturn::Scalar(elem),
-            None => FnReturn::Unsupported(format!("{ty}")),
+            None => {
+                // Check if it's a tensor type
+                if matches!(ty.kind, crate::ast::ty::TypeKind::Tensor(_)) {
+                    // Tensor return type - would need shape info from type
+                    return FnReturn::Tensor { elem: ElemType::F64, shape: None };
+                }
+                // Check if it's a user-defined type (struct, enum, alias) - use Struct variant for sret
+                if matches!(ty.kind, crate::ast::ty::TypeKind::Named(_, _)) {
+                    return FnReturn::Struct;
+                }
+                FnReturn::Unsupported(format!("{ty}"))
+            }
         }
     }
 

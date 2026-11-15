@@ -160,13 +160,27 @@ pub fn build_entry_signature<'ctx>(
             kind: ParamKind::Scalar(elem_to_elem_type(*elem)),
         });
         next_arg = 1;
+    } else if let Some(crate::ir::pir_types::FnReturn::Struct) = return_type {
+        // Struct return: use i8* pointer (opaque pointer to caller-allocated struct memory)
+        let ptr_type = type_lowering.ptr_type(
+            inkwell::types::BasicTypeEnum::IntType(type_lowering.int_type(crate::codegen::abi::IntWidth::I8)),
+            inkwell::AddressSpace::default(),
+        );
+        out.push(EntryParam {
+            name: "sret".to_string(),
+            ty: ptr_type.into(),
+            arg_index: 0,
+            len_arg_index: None,
+            kind: ParamKind::Scalar(crate::ir::pir_types::ElemType::I8),
+        });
+        next_arg = 1;
     }
 
     // Every argument index handed out so far. A tensor consumes two, so the next
     // index cannot be `out.len()` -- which is exactly the bug a naive `enumerate`
     // over `out` would introduce: binding the second tensor's pointer to the first
     // tensor's element count, and reading a length where a buffer is expected.
-    let mut next_arg: u32 = if return_type.is_some() && matches!(return_type, Some(crate::ir::pir_types::FnReturn::Tensor { .. })) { 1 } else { 0 };
+    let mut next_arg: u32 = if return_type.is_some() && (matches!(return_type, Some(crate::ir::pir_types::FnReturn::Tensor { .. })) || matches!(return_type, Some(crate::ir::pir_types::FnReturn::Struct))) { 1 } else { 0 };
     for param in &pir_module.function_params {
         let (ty, kind) = param_slot(type_lowering, param)?;
         let takes_length = matches!(kind, ParamKind::Tensor { .. });
@@ -328,6 +342,7 @@ fn param_slot<'ctx>(
         // A quantum register is a caller-owned pointer, but nothing in this backend
         // indexes one, so the binding exists while every read of it stays a diagnostic.
         ParamKind::QRegister => (ptr_ty, ParamKind::QRegister),
+        ParamKind::Struct => (ptr_ty, ParamKind::Struct),
         ParamKind::Unsupported(ty) => {
             return Err(CodegenError::UnsupportedFeature(format!(
                 "parameter `{}` has type `{ty}`, which has no slot in the LLVM function \
@@ -393,6 +408,7 @@ pub fn function_return_type<'ctx>(
         FnReturn::Scalar(ElemType::Bool) => type_lowering.int_type(IntWidth::I1).into(),
         // Tensor/struct return: uses sret convention (caller-allocated, hidden first arg)
         FnReturn::Tensor { elem: _, shape: _ } => return Ok(None),
+        FnReturn::Struct => return Ok(None),
         FnReturn::Unsupported(ty) => {
             return Err(CodegenError::UnsupportedFeature(format!(
                 "function `{}` returns `{ty}`, which has no slot in this ABI. Nothing \
@@ -768,8 +784,12 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
             // count, and which is a trip count. Named by the recorded index rather than
             // by position, because a tensor's count is the argument AFTER its pointer.
             name_arguments(function, &abi);
-            // Add sret attribute to the first parameter if this is a tensor return
+            // Add sret attribute to the first parameter if this is a tensor or struct return
             if let crate::ir::pir_types::FnReturn::Tensor { elem, shape: _ } = &func.return_type {
+                let sret_attr = self.context.llvm_context().create_string_attribute("sret", "");
+                // Add sret attribute to the function's first parameter (index 0)
+                function.add_attribute(inkwell::attributes::AttributeLoc::Param(0), sret_attr);
+            } else if let crate::ir::pir_types::FnReturn::Struct = &func.return_type {
                 let sret_attr = self.context.llvm_context().create_string_attribute("sret", "");
                 // Add sret attribute to the function's first parameter (index 0)
                 function.add_attribute(inkwell::attributes::AttributeLoc::Param(0), sret_attr);

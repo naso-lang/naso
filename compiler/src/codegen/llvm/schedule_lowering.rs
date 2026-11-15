@@ -235,6 +235,22 @@ pub fn lower_schedule_tree_into<'ctx>(
                     entry.name
                 )));
             }
+            ParamKind::Struct => {
+                // Struct parameter: bind as a pointer (opaque pointer to caller-allocated struct)
+                value_builder.bind_tensor(
+                    &entry.name,
+                    TensorBinding {
+                        base: arg.into_pointer_value(),
+                        elem: value_builder
+                            .type_lowering()
+                            .int_type(crate::codegen::abi::IntWidth::I8)
+                            .into(),
+                        shape: None,
+                        len: None,
+                        sub_byte: false,
+                    },
+                );
+            }
             ParamKind::Scalar(_) => {
                 value_builder.bind_argument(&entry.name, arg)?;
             }
@@ -317,6 +333,15 @@ pub fn lower_schedule_tree_into<'ctx>(
     // Use module from lowering context (already extracted)
     let module = lowering.module;
     
+    // Check if this function uses sret (structure return) convention
+    // sret is indicated by the first ABI entry being named "sret"
+    let uses_sret = abi.first().map(|e| e.name == "sret").unwrap_or(false);
+    let sret_ptr = if uses_sret {
+        Some(function.get_first_param().unwrap().into_pointer_value())
+    } else {
+        None
+    };
+    
     let return_type = function.get_type().get_return_type();
     let returned = match (return_type, return_value) {
         (None, _) => None,
@@ -362,7 +387,19 @@ pub fn lower_schedule_tree_into<'ctx>(
         // path cannot get here: `emit_one_function` refuses first.
         (Some(ty), None) => Some(lowering.value_builder.build_zero(ty)),
     };
-    lowering.value_builder.build_return(returned)?;
+    
+    // Handle return based on calling convention
+    if uses_sret {
+        // sret convention: store value to caller-allocated pointer, then ret void
+        if let (Some(sret_ptr), Some(val)) = (sret_ptr, returned) {
+            lowering.value_builder.builder().build_store(sret_ptr, val)
+                .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+        }
+        lowering.value_builder.build_return(None)?;
+    } else {
+        // Normal return convention
+        lowering.value_builder.build_return(returned)?;
+    }
 
     // Verify function. inkwell 0.10's `verify` returns a `bool` rather than a
     // `Result`, printing diagnostics to stderr when `print` is true; on failure

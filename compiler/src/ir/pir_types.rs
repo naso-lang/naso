@@ -355,6 +355,8 @@ pub enum ParamKind {
     /// A quantum register: a caller-owned pointer, like a tensor but with no
     /// element type the LLVM backend indexes.
     QRegister,
+    /// A struct parameter containing arrays: passed by pointer (caller-allocated).
+    Struct,
     /// A parameter whose type no ABI rule covers.
     ///
     /// Recorded rather than dropped, so a backend refuses it naming the type
@@ -402,12 +404,15 @@ pub enum FnReturn {
     Void,
     /// A scalar, returned by value.
     Scalar(ElemType),
-    /// A tensor/struct return: pointer to caller-allocated buffer + optional shape.
+    /// A tensor return: pointer to caller-allocated buffer + optional shape.
     /// Uses LLVM sret convention: caller allocates, passes hidden first argument.
     Tensor {
         elem: ElemType,
         shape: Option<Vec<u64>>,
     },
+    /// A struct return containing arrays: uses LLVM sret convention.
+    /// Caller allocates, passes hidden first argument.
+    Struct,
     /// A declared return type with no slot in this ABI.
     ///
     /// Recorded rather than dropped, so a backend refuses it NAMING the type instead

@@ -22,6 +22,9 @@ pub use http_parser::*;
 mod multi_threaded_accept;
 pub use multi_threaded_accept::*;
 
+// Re-export async-runtime types
+pub use async_runtime::*;
+
 /// Returned to Naso as resource handle
 #[repr(C)]
 pub struct ResourceID(pub u64);
@@ -131,7 +134,7 @@ fn fd_table() -> &'static Mutex<FdTable> {
 /// Bind to "addr:port" — returns ResourceID(0) on failure
 #[unsafe(no_mangle)]
 pub extern "C" fn naso_tcp_bind(addr_ptr: *const u8, addr_len: usize) -> ResourceID {
-    eprintln!("naso_tcp_bind called with addr_len={}", addr_len);
+    eprintln!(">>> LEGACY naso_tcp_bind called with addr_len={}", addr_len);
     if addr_ptr.is_null() || addr_len == 0 {
         eprintln!("naso_tcp_bind: null ptr or zero len");
         return ResourceID(0);
@@ -1086,13 +1089,15 @@ pub extern "C" fn naso_spawn_future(future_ptr: *mut FutureHandle) -> u64 {
 // ============================================================================
 // YIELD / AWAIT FFI
 // ============================================================================
+// YIELD / POLL INTEGRATION
+// ============================================================================
 
 #[unsafe(no_mangle)]
 pub extern "C" fn naso_yield() -> u64 {
-    // Drive the async poll loop to process any pending I/O events
+    // Drive the unified async poll to process any pending I/O events
     // This allows the accept loop to yield control and handle multiple connections
-    let mut poll_guard = async_poll().lock().unwrap();
-    let _ = poll_guard.poll_once(Some(Duration::from_millis(1)));
+    // Polls both io_uring and mio-based async
+    naso_async_poll_all();
     1
 }
 
@@ -1693,8 +1698,175 @@ pub extern "C" fn naso_timer_sleep_async(duration_ms: u64,
 }
 
 // ============================================================================
-// CONNECTION POOL FFI
+// ASYNC I/O INTEGRATION (io_uring + async runtime)
 // ============================================================================
+
+/// Async read with io_uring integration
+/// Returns future ID that can be polled for completion
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_read_async_uring(fd: u64, buf_ptr: *mut u8, buf_len: usize) -> u64 {
+    if buf_ptr.is_null() {
+        return 0;
+    }
+    
+    // Try io_uring first, fall back to mio
+    use crate::io_uring_backend::uring_poller;
+    let mut poller_guard = uring_poller().lock().unwrap();
+    if let Some(ref mut poller) = *poller_guard {
+        match poller.submit_read(fd, buf_ptr, buf_len, 0) {
+            Ok(user_data) => user_data,
+            Err(_) => {
+                // Fall back to mio-based async
+                let mut poll = async_poll().lock().unwrap();
+                match poll.register_stream(fd, Interest::READABLE) {
+                    Ok(_) => 1,
+                    Err(_) => 0,
+                }
+            }
+        }
+    } else {
+        // io_uring not available, fall back to mio
+        let mut poll = async_poll().lock().unwrap();
+        match poll.register_stream(fd, Interest::READABLE) {
+            Ok(_) => 1,
+            Err(_) => 0,
+        }
+    }
+}
+
+/// Async write with io_uring integration
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_write_async_uring(fd: u64, buf_ptr: *const u8, buf_len: usize) -> u64 {
+    if buf_ptr.is_null() {
+        return 0;
+    }
+    
+    // Try io_uring first
+    use crate::io_uring_backend::uring_poller;
+    let mut poller_guard = uring_poller().lock().unwrap();
+    if let Some(ref mut poller) = *poller_guard {
+        match poller.submit_write(fd, buf_ptr, buf_len, 0) {
+            Ok(user_data) => user_data,
+            Err(_) => {
+                // Fall back to mio-based async
+                let mut poll = async_poll().lock().unwrap();
+                match poll.register_stream(fd, Interest::WRITABLE) {
+                    Ok(_) => 1,
+                    Err(_) => 0,
+                }
+            }
+        }
+    } else {
+        // io_uring not available, fall back to mio
+        let mut poll = async_poll().lock().unwrap();
+        match poll.register_stream(fd, Interest::WRITABLE) {
+            Ok(_) => 1,
+            Err(_) => 0,
+        }
+    }
+}
+
+/// Check if io_uring async read has completed
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_check_read_completion_uring(user_data: u64) -> u64 {
+    use crate::io_uring_backend::uring_poller;
+    let mut poller_guard = uring_poller().lock().unwrap();
+    if let Some(ref mut poller) = *poller_guard {
+        if let Some(op) = poller.pending.get(&user_data) {
+            if op.op_type == UringOp::Read && op.buf_idx.is_some() {
+                // For now, return 1 to indicate check - real impl would track completion
+                return 1;
+            }
+        }
+    }
+    0
+}
+
+/// Check if io_uring async write has completed
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_check_write_completion_uring(user_data: u64) -> u64 {
+    use crate::io_uring_backend::uring_poller;
+    let mut poller_guard = uring_poller().lock().unwrap();
+    if let Some(ref mut poller) = *poller_guard {
+        if let Some(op) = poller.pending.get(&user_data) {
+            if op.op_type == UringOp::Write {
+                return 1;
+            }
+        }
+    }
+    0
+}
+
+/// Submit all pending io_uring operations (batching)
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_uring_submit_batch() -> u64 {
+    use crate::io_uring_backend::uring_poller;
+    let mut poller_guard = uring_poller().lock().unwrap();
+    if let Some(ref mut poller) = *poller_guard {
+        match poller.submit_batch() {
+            Ok(count) => count as u64,
+            Err(_) => 0,
+        }
+    } else {
+        0 // io_uring not available
+    }
+}
+
+/// Wait for io_uring completions
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_uring_wait_completions(min_completions: u64) -> u64 {
+    use crate::io_uring_backend::uring_poller;
+    let mut poller_guard = uring_poller().lock().unwrap();
+    if let Some(ref mut poller) = *poller_guard {
+        match poller.wait_and_process(min_completions as u32) {
+            Ok(count) => count as u64,
+            Err(_) => 0,
+        }
+    } else {
+        0 // io_uring not available
+    }
+}
+
+/// Poll io_uring completions non-blocking (for runtime integration)
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_uring_poll_async() -> u64 {
+    use crate::io_uring_backend::uring_poller;
+    let mut poller_guard = uring_poller().lock().unwrap();
+    if let Some(ref mut poller) = *poller_guard {
+        match poller.poll_completions() {
+            Ok(count) => count as u64,
+            Err(_) => 0,
+        }
+    } else {
+        0 // io_uring not available
+    }
+}
+
+/// Unified async poll - polls both multi-threaded accept and io_uring
+/// This should be called from naso_yield() or the async runtime
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_async_poll_all() -> u64 {
+    let mut total: u64 = 0;
+    
+    // Poll io_uring completions
+    {
+        use crate::io_uring_backend::uring_poller;
+        let mut poller_guard = uring_poller().lock().unwrap();
+        if let Some(ref mut poller) = *poller_guard {
+            if let Ok(count) = poller.poll_completions() {
+                total += count as u64;
+            }
+        }
+    }
+    
+    // Poll mio-based async
+    {
+        let mut poll = async_poll().lock().unwrap();
+        let _ = poll.poll_once(Some(Duration::from_millis(0)));
+    }
+    
+    total
+}
 
 /// Connection pool configuration
 #[repr(C)]

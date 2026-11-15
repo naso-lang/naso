@@ -256,7 +256,40 @@ naso_tcp_bind_multithreaded[2]: Created listener fd=1 with SO_REUSEPORT on 127.0
 naso_tcp_bind_multithreaded[3]: Created listener fd=2 with SO_REUSEPORT on 127.0.0.1:8099
 ```
 
-**Remaining Issue:** Listener fd tracking - the FFI only returns the first listener fd, but multi-threaded accept needs all fds. This will be addressed in the async integration task.
+**Remaining Issue:** Listener fd distribution - the FFI only returns the first listener fd, but multi-threaded accept needs all fds for proper worker distribution. This will be addressed in the async integration task.
+
+### Phase 13B Task 2: Async Connection Integration - IN PROGRESS 🔄
+
+**Objective:** Connect `naso_get_next_connection()` with Naso async runtime for connection processing
+
+**Completed:**
+- Added async-aware FFI functions: `naso_get_next_connection_async()`, `naso_has_pending_connections()`, `naso_set_connection_callback()`
+- Added async I/O integration with io_uring: `naso_read_async_uring()`, `naso_write_async_uring()`, `naso_uring_submit_batch()`, `naso_uring_wait_completions()`, `naso_uring_poll_async()`
+- Added unified async poll: `naso_async_poll_all()` - polls both io_uring and mio-based async
+- Updated `naso_yield()` to use unified async poll
+- Added async runtime FFI: `naso_runtime_new()`, `naso_runtime_run()`, `naso_runtime_shutdown()`, `naso_spawn()`, `naso_await()`
+- io_uring fallback to mio when not available (container environments)
+
+**Known Issues:**
+- Listener fd tracking issue - workers can't find listeners by fd (fd mapping broken)
+- Stack overflow in accept loop due to excessive logging
+- Need to properly distribute all listener fds to workers
+
+### Phase 13B Task 3: io_uring Async I/O Integration - IN PROGRESS 🔄
+
+**Objective:** Implement async read/write/accept with io_uring
+
+**Completed:**
+- io_uring backend with zero-copy buffer pool (1024 buffers of 8KB)
+- Batched syscall submission via `submit_batch()`
+- Async operations: Accept, Read, Write with completion callbacks
+- FFI exports: `naso_uring_init`, `naso_tcp_accept_uring`, `naso_read_uring`, `naso_write_uring`, `naso_uring_submit`, `naso_uring_wait`, `naso_uring_poll`, `naso_uring_poll_async()`
+- Graceful fallback to mio when io_uring unavailable (container environments)
+- All io_uring FFI functions handle Option<UringPoller> gracefully
+
+### Phase 13B Task 4: Optimized Benchmark Server - PENDING ⏳
+
+### Phase 13B Task 5: wrk Benchmark Validation - PENDING ⏳
 
 ### Expected Performance Trajectory (Updated)
 

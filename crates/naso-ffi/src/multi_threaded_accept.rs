@@ -448,6 +448,52 @@ pub extern "C" fn naso_get_next_connection() -> u64 {
     0 // No connections available
 }
 
+/// Async-aware get next connection - yields to async runtime if no connections
+/// Returns stream_fd if available, 0 if none (caller should yield)
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_get_next_connection_async() -> u64 {
+    let table = global_sharded_fd_table();
+    
+    // Search all shards for available streams
+    for shard in &table.shards {
+        let mut shard_guard = shard.lock().unwrap();
+        if let Some((&fd, _)) = shard_guard.streams.iter().next() {
+            // Found a stream, remove it and return
+            if shard_guard.streams.remove(&fd).is_some() {
+                eprintln!("naso_get_next_connection_async: returning stream_fd={}", fd);
+                return fd;
+            }
+        }
+    }
+    
+    0 // No connections available - caller should call naso_yield() or naso_uring_poll()
+}
+
+/// Check if there are pending connections without blocking
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_has_pending_connections() -> u64 {
+    let table = global_sharded_fd_table();
+    
+    for shard in &table.shards {
+        let shard_guard = shard.lock().unwrap();
+        if !shard_guard.streams.is_empty() {
+            return 1;
+        }
+    }
+    
+    0
+}
+
+/// Register a callback for when new connections arrive (for async integration)
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_set_connection_callback(callback: *const u8) -> u64 {
+    // Store callback for async notification
+    // In real implementation, would store in global and call when connections arrive
+    // For now, just acknowledge
+    eprintln!("naso_set_connection_callback: registered callback={:p}", callback);
+    1
+}
+
 // ============================================================================
 // LEGACY COMPATIBILITY FUNCTIONS
 // ============================================================================

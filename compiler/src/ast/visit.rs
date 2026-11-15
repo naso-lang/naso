@@ -324,6 +324,12 @@ pub mod walk {
                 }
                 Ok(VisitOutcome::Continue)
             }
+            ExprKind::ArrayRepeat(value, count) => {
+                if visitor.visit_expr(value)? == VisitOutcome::Stop {
+                    return Ok(VisitOutcome::Stop);
+                }
+                visitor.visit_expr(count)
+            }
             ExprKind::Block(b) => walk_block(visitor, b),
             ExprKind::If(cond, then, else_) => {
                 if visitor.visit_expr(cond)? == VisitOutcome::Stop {
@@ -409,6 +415,9 @@ pub mod walk {
                     return Ok(VisitOutcome::Stop);
                 }
                 visitor.visit_expr(body)
+            }
+            ExprKind::Loop(body) => {
+                walk_block(visitor, body)
             }
             ExprKind::Return(e) | ExprKind::Break(e) => {
                 if let Some(inner) = e {

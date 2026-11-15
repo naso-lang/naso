@@ -74,6 +74,7 @@ pub fn infer_expr(checker: &mut TypeChecker, expr: &Expr) -> Result<Type, TypeEr
         }
         ExprKind::Tuple(elems) => infer_tuple(checker, elems, expr.span),
         ExprKind::Array(elems) => infer_array(checker, elems, expr.span),
+        ExprKind::ArrayRepeat(value, count) => infer_array_repeat(checker, value, count, expr.span),
         ExprKind::Block(block) => infer_block(checker, block, expr.span),
         ExprKind::If(cond, then_branch, else_branch) => infer_if(
             checker,
@@ -92,6 +93,7 @@ pub fn infer_expr(checker: &mut TypeChecker, expr: &Expr) -> Result<Type, TypeEr
         ExprKind::Forall(forall_loop) => infer_forall(checker, forall_loop, expr.span),
         ExprKind::Quantified(quant) => infer_quantified(checker, quant, expr.span),
         ExprKind::While(cond, body) => infer_while(checker, cond, body, expr.span),
+        ExprKind::Loop(body) => infer_loop(checker, body, expr.span),
         ExprKind::Return(opt_expr) => infer_return(checker, opt_expr.as_deref(), expr.span),
         ExprKind::Assign(lhs, rhs) => infer_assign(checker, lhs, rhs, expr.span),
         ExprKind::Projection(base) => infer_projection(checker, base, expr.span),
@@ -600,8 +602,14 @@ fn infer_field(
 ) -> Result<Type, TypeError> {
     let base_ty = infer_expr(checker, base)?;
 
+    // Handle pointer-to-struct: dereference the pointer first
+    let deref_ty = match &base_ty.kind {
+        TypeKind::Pointer(inner) => *inner.clone(),
+        _ => base_ty.clone(),
+    };
+
     // Look up field in struct type
-    match &base_ty.kind {
+    match &deref_ty.kind {
         TypeKind::Named(name, _) => {
             if let Some(type_def) = checker.env.lookup_type(name) {
                 if let TypeDefKind::Struct(fields) = &type_def.kind {
@@ -637,6 +645,7 @@ fn infer_index(
     match &base_ty.kind {
         TypeKind::Array(elem, _) => Ok(*elem.clone()),
         TypeKind::Tensor(dims) if !dims.is_empty() => Ok(dims[0].clone()),
+        TypeKind::Pointer(elem) => Ok(*elem.clone()), // Pointer arithmetic: ptr[i] -> *elem
         _ => Err(TypeError::NotIndexable { ty: base_ty, span }),
     }
 }
@@ -774,6 +783,28 @@ fn infer_array(checker: &mut TypeChecker, elems: &[Expr], span: Span) -> Result<
 
     Ok(Type::new(
         TypeKind::Array(Box::new(first_ty), size),
+        Quantity::Many,
+        span,
+    ))
+}
+
+/// Infer array repeat type: [value; count]
+fn infer_array_repeat(
+    checker: &mut TypeChecker,
+    value: &Expr,
+    count: &Expr,
+    span: Span,
+) -> Result<Type, TypeError> {
+    let value_ty = infer_expr(checker, value)?;
+    let count_ty = infer_expr(checker, count)?;
+    
+    // Count should be an integer type
+    let int_ty = Type::new(TypeKind::Int, Quantity::Many, span);
+    unify::unify_types(checker, &count_ty, &int_ty)?;
+    
+    // Return array type with the value's element type
+    Ok(Type::new(
+        TypeKind::Array(Box::new(value_ty), None),
         Quantity::Many,
         span,
     ))
@@ -1245,6 +1276,16 @@ fn infer_while(
 
     infer_expr(checker, body)?;
     Ok(Type::unit(span))
+}
+
+/// Infer infinite loop type
+fn infer_loop(
+    checker: &mut TypeChecker,
+    body: &crate::ast::Block,
+    span: Span,
+) -> Result<Type, TypeError> {
+    infer_block(checker, body, span)?;
+    Ok(Type::never(span)) // loop never returns normally
 }
 
 /// Infer return expression type

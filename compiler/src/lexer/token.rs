@@ -137,6 +137,8 @@ pub enum TokenKind {
     Extern,
     #[regex("[cC][oO][nN][sS][tT]", priority = 3)]
     Const,
+    #[regex("[lL][oO][oO][pP]", priority = 3)]
+    Loop,
     // async/await for async programming
     #[regex("[aA][sS][yY][nN][cC]", priority = 3)]
     Async,
@@ -298,6 +300,16 @@ pub enum TokenKind {
     FatArrow,
     #[token("..")]
     DotDot,
+    #[token("+=")]
+    PlusEq,
+    #[token("-=")]
+    MinusEq,
+    #[token("*=")]
+    StarEq,
+    #[token("/=")]
+    SlashEq,
+    #[token("%=")]
+    PercentEq,
     #[token("+")]
     Plus,
     #[token("-")]
@@ -380,6 +392,7 @@ impl TokenKind {
             TokenKind::Import => "'import'",
             TokenKind::Extern => "'extern'",
             TokenKind::Const => "'const'",
+            TokenKind::Loop => "'loop'",
             TokenKind::Async => "'async'",
             TokenKind::Await => "'await'",
             TokenKind::Proof => "'proof'",
@@ -428,6 +441,11 @@ impl TokenKind {
             TokenKind::Star => "'*'",
             TokenKind::Slash => "'/'",
             TokenKind::Percent => "'%'",
+            TokenKind::PlusEq => "'+='",
+            TokenKind::MinusEq => "'-='",
+            TokenKind::StarEq => "'*='",
+            TokenKind::SlashEq => "'/='",
+            TokenKind::PercentEq => "'%='",
             TokenKind::Eq => "'=='",
             TokenKind::Ne => "'!='",
             TokenKind::Lt => "'<'",

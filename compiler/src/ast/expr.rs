@@ -66,6 +66,8 @@ pub enum ExprKind {
     Tuple(Vec<Expr>),
     /// Array/list construction
     Array(Vec<Expr>),
+    /// Array repeat: [value; count]
+    ArrayRepeat(Box<Expr>, Box<Expr>),
     /// Block expression
     Block(Box<crate::ast::Block>),
     /// If expression
@@ -100,6 +102,8 @@ pub enum ExprKind {
     Quantified(Box<ForallLoop>),
     /// While loop
     While(Box<Expr>, Box<Expr>),
+    /// Infinite loop: `loop { ... }`
+    Loop(Box<crate::ast::Block>),
     /// Return expression
     Return(Option<Box<Expr>>),
     /// Break expression

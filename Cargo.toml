@@ -3,7 +3,7 @@ resolver = "2"
 
 members = [
     "compiler",
-    "stdlib",
+    "crates/stdlib",
     "crates/naso-lsp",
     "crates/naso-gates",
     "crates/nasoc-wasm",

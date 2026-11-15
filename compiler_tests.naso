@@ -1,0 +1,157 @@
+// ============================================================================
+// Naso Compiler Test Suite - Phase 10 Requirements
+// ============================================================================
+// These MUST compile for Phase 10 stdlib to work
+// Run: naso check compiler_tests.naso
+// ============================================================================
+
+// --- Test 1: Struct Arrays > 16 Elements ---
+struct Response {
+    status: u16,
+    body: [u8; 256],
+    body_len: usize,
+}
+
+struct Request {
+    method: u8,
+    path: [u8; 256],
+    path_len: usize,
+    headers: [u8; 512],
+    headers_len: usize,
+}
+
+// --- Test 2: Array Repeat Initialization ---
+fn test_array_repeat() -> () {
+    let buffer: [u8; 256] = [0; 256];
+    let routes: [Response; 64] = [Response { status: 0, body: [0; 256], body_len: 0 }; 64];
+}
+
+// --- Test 3: Loop / Break ---
+fn test_loop_break() -> () {
+    let mut i = 0;
+    loop {
+        if i >= 10 { break; }
+        i = i + 1;
+    }
+}
+
+// --- Test 4: Pointer-to-Struct Field Access ---
+struct Middleware { handler: *u8 }
+struct MiddlewareChain { middlewares: [Middleware; 16], count: usize }
+
+fn test_pointer_fields(chain: *MiddlewareChain, m: Middleware) -> () {
+    if chain.count < 16 {
+        chain.middlewares[chain.count] = m;
+        chain.count = chain.count + 1;
+    }
+}
+
+// --- Test 5: Struct Initializers in Returns ---
+fn build_body() -> [u8; 256] {
+    let mut body: [u8; 256] = [0; 256];
+    body[0] = 72; body[1] = 101; body[2] = 108; body[3] = 108; body[4] = 111;
+    body[5] = 44; body[6] = 32; body[7] = 87; body[8] = 111; body[9] = 114;
+    body[10] = 108; body[11] = 100; body[12] = 33;
+    body
+}
+
+fn make_response() -> Response {
+    let body = build_body();
+    Response { status: 200, body: body, body_len: 13 }
+}
+
+fn make_request() -> Request {
+    let path: [u8; 256] = [0; 256];
+    let headers: [u8; 512] = [0; 512];
+    Request { method: 71, path: path, path_len: 1, headers: headers, headers_len: 0 }
+}
+
+// --- Test 6: Mut Parameters ---
+struct Counter { value: usize }
+
+fn increment_mut(mut c: Counter) -> Counter {
+    c.value = c.value + 1;
+    c
+}
+
+fn increment_ptr(c: *Counter) -> () {
+    c.value = c.value + 1;
+}
+
+fn test_mut() -> () {
+    let mut c1 = Counter { value: 0 };
+    c1 = increment_mut(c1);
+    let mut c2 = Counter { value: 0 };
+    increment_ptr(&c2);
+}
+
+// --- Test 7: Large Array Literals ---
+fn test_large_literals() -> () {
+    let status_line = [72, 84, 84, 80, 47, 49, 46, 49, 32, 50, 48, 48, 32, 79, 75, 13, 10];
+    let json_body = [123, 34, 109, 101, 115, 115, 97, 103, 101, 34, 58, 34, 72, 101, 108, 108, 111, 34, 125];
+    let _ = status_line;
+    let _ = json_body;
+}
+
+// --- Test 8: Router with 64 Routes ---
+struct Route {
+    method: u8,
+    path: [u8; 128],
+    path_len: usize,
+    handler: *u8,
+}
+
+struct Router {
+    routes: [Route; 64],
+    route_count: usize,
+}
+
+fn default_route() -> Route {
+    Route { method: 0, path: [0; 128], path_len: 0, handler: 0 as *u8 }
+}
+
+fn router_new() -> Router {
+    Router { routes: [default_route(); 64], route_count: 0 }
+}
+
+fn router_add(mut router: Router, route: Route) -> Router {
+    if router.route_count < 64 {
+        router.routes[router.route_count] = route;
+        router.route_count = router.route_count + 1;
+    }
+    router
+}
+
+// --- Test 9: Server Loop Pattern ---
+extern "C" {
+    fn naso_tcp_bind(addr: *u8, len: u64) -> u64;
+    fn naso_tcp_accept(fd: u64, out: *u64) -> u64;
+    fn naso_accept_get_client(out: *u64) -> u64;
+    fn naso_close(fd: u64) -> u64;
+}
+
+fn test_server_loop() -> () {
+    let addr = [49, 50, 55, 46, 48, 46, 48, 46, 49, 58, 56, 48, 57, 57];
+    let listener = naso_tcp_bind(addr as *u8, 14);
+    loop {
+        let mut out = [0, 0];
+        if naso_tcp_accept(listener, out as *u64) != 0 {
+            let client = naso_accept_get_client(out as *u64);
+            if client != 0 {
+                naso_close(client);
+            }
+        }
+    }
+}
+
+// --- Main ---
+fn main() -> () {
+    test_array_repeat();
+    test_loop_break();
+    test_large_literals();
+    test_mut();
+    let _ = make_response();
+    let _ = make_request();
+    let _ = router_new();
+    test_server_loop();
+}

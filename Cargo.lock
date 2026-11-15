@@ -1091,6 +1091,7 @@ dependencies = [
  "crossbeam",
  "io-uring",
  "mio 0.8.11",
+ "naso_std",
  "once_cell",
  "rand 0.8.8",
  "socket2 0.5.10",

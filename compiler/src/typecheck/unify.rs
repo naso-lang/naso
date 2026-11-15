@@ -30,6 +30,40 @@ pub fn unify_types(checker: &mut TypeChecker, ty1: &Type, ty2: &Type) -> Result<
         return unify_meta_var(checker, *mv, ty1);
     }
 
+    // Special handling for Nat types with known values
+    if matches!(&ty1.kind, TypeKind::Nat) && matches!(&ty2.kind, TypeKind::Nat) {
+        let val1 = ty1.nat_const();
+        let val2 = ty2.nat_const();
+        if let (Some(v1), Some(v2)) = (val1, val2) {
+            if v1 != v2 {
+                return Err(TypeError::TypeMismatch {
+                    expected: Type::nat_lit(v1, ty1.span),
+                    found: Type::nat_lit(v2, ty2.span),
+                    span: ty1.span.merge(ty2.span),
+                });
+            }
+        }
+        // If we reach here, either values match or at least one is unknown
+        // Use the known value if available
+        let nat_value = val1.or(val2);
+        let unified_qty = unify_quantity(ty1.quantity, ty2.quantity, ty1.span.merge(ty2.span))?;
+        let kind = TypeKind::Nat;
+        let span = ty1.span.merge(ty2.span);
+        let mut result = Type::new(kind, unified_qty, span);
+        if let Some(n) = nat_value {
+            result.nat_value = Some(n);
+        }
+        return Ok(result);
+    }
+
+    // Handle metavariables first
+    if let TypeKind::Meta(mv) = &ty1.kind {
+        return unify_meta_var(checker, *mv, ty2);
+    }
+    if let TypeKind::Meta(mv) = &ty2.kind {
+        return unify_meta_var(checker, *mv, ty1);
+    }
+
     // Unify quantities with error reporting for Zero mismatch
     let unified_qty = unify_quantity(ty1.quantity, ty2.quantity, ty1.span.merge(ty2.span))?;
 
@@ -56,6 +90,7 @@ pub fn unify_kinds(
         (TypeKind::Int, TypeKind::Int) => Ok(TypeKind::Int),
         (TypeKind::UInt, TypeKind::UInt) => Ok(TypeKind::UInt),
         (TypeKind::Float, TypeKind::Float) => Ok(TypeKind::Float),
+        // Nat types - must have matching constant values if both are known
         (TypeKind::Nat, TypeKind::Nat) => Ok(TypeKind::Nat),
         (TypeKind::Quint8, TypeKind::Quint8) => Ok(TypeKind::Quint8),
         (TypeKind::Qubit, TypeKind::Qubit) => Ok(TypeKind::Qubit),
@@ -186,8 +221,22 @@ pub fn unify_kinds(
         // Array types
         (TypeKind::Array(elem1, size1), TypeKind::Array(elem2, size2)) => {
             let unified_elem = unify_types(checker, elem1, elem2)?;
-            // For sizes, try to unify them
-            let unified_size = unify_nat_expr(size1, size2)?;
+            // Unify sizes if both are present
+            let unified_size = match (size1, size2) {
+                (Some(s1), Some(s2)) => {
+                    if s1 == s2 {
+                        Some(s1.clone())
+                    } else {
+                        return Err(TypeError::TypeMismatch {
+                            expected: Type::new(TypeKind::Array(elem1.clone(), size1.clone()), Quantity::Many, Span::default()),
+                            found: Type::new(TypeKind::Array(elem2.clone(), size2.clone()), Quantity::Many, Span::default()),
+                            span: Span::default(),
+                        });
+                    }
+                }
+                (Some(s), None) | (None, Some(s)) => Some(s.clone()),
+                (None, None) => None,
+            };
             Ok(TypeKind::Array(Box::new(unified_elem), unified_size))
         }
 
@@ -211,6 +260,7 @@ pub fn unify_kinds(
         (TypeKind::Quint8, TypeKind::UInt) => Ok(TypeKind::UInt),
         (TypeKind::Int, TypeKind::Quint8) => Ok(TypeKind::Int),
         (TypeKind::Quint8, TypeKind::Int) => Ok(TypeKind::Int),
+
         // Metavariables handled above
 
         // Mismatch
@@ -219,28 +269,6 @@ pub fn unify_kinds(
             found: Type::new(k2.clone(), Quantity::Many, Span::default()),
             span: Span::default(),
         }),
-    }
-}
-
-/// Unify two NatExpr options
-fn unify_nat_expr(
-    size1: &Option<crate::ast::ty::NatExpr>,
-    size2: &Option<crate::ast::ty::NatExpr>,
-) -> Result<Option<crate::ast::ty::NatExpr>, TypeError> {
-    match (size1, size2) {
-        (None, None) => Ok(None),
-        (Some(n1), None) | (None, Some(n1)) => Ok(Some(n1.clone())),
-        (Some(n1), Some(n2)) => {
-            if n1 == n2 {
-                Ok(Some(n1.clone()))
-            } else {
-                Err(TypeError::TypeMismatch {
-                    expected: Type::new(TypeKind::Nat, Quantity::Many, Span::default()),
-                    found: Type::new(TypeKind::Nat, Quantity::Many, Span::default()),
-                    span: Span::default(),
-                })
-            }
-        }
     }
 }
 

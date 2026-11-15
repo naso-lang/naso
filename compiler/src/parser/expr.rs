@@ -22,6 +22,7 @@ pub(crate) fn is_control_flow_stmt(kind: &ExprKind) -> bool {
             | ExprKind::Match(..)
             | ExprKind::For(..)
             | ExprKind::While(..)
+            | ExprKind::Loop(..)
             | ExprKind::Forall(..)
             | ExprKind::Async(..)
             | ExprKind::Await(..)
@@ -64,7 +65,7 @@ fn binop_prec(op: BinOp) -> u8 {
 impl<'a> Parser<'a> {
     // ===== Expressions =====
 
-    /// Parse a full expression, handling right-associative assignment.
+    /// Parse a full expression, handling right-associative assignment and compound assignment.
     pub fn parse_expr(&mut self) -> Expr {
         let mut lhs = self.parse_expr_precedence(0);
         if self.at(TK::Assign) {
@@ -76,8 +77,43 @@ impl<'a> Parser<'a> {
                 span,
                 next_id(),
             );
+        } else if let Some((op, _)) = self.peek_compound_assign() {
+            let (op, op_token) = self.peek_compound_assign().unwrap();
+            self.bump(); // consume the compound assignment token
+            let rhs = self.parse_expr();
+            let span = lhs.span.merge(rhs.span);
+            // Desugar: x += y  =>  x = x + y
+            let binop = match op_token {
+                TK::PlusEq => BinOp::Add,
+                TK::MinusEq => BinOp::Sub,
+                TK::StarEq => BinOp::Mul,
+                TK::SlashEq => BinOp::Div,
+                TK::PercentEq => BinOp::Rem,
+                _ => unreachable!(),
+            };
+            let binary = Expr::new(
+                ExprKind::Binary(binop, Box::new(lhs.clone()), Box::new(rhs)),
+                span,
+                next_id(),
+            );
+            lhs = Expr::new(
+                ExprKind::Assign(Box::new(lhs), Box::new(binary)),
+                span,
+                next_id(),
+            );
         }
         lhs
+    }
+
+    fn peek_compound_assign(&self) -> Option<(BinOp, TK)> {
+        match self.peek() {
+            Some(TK::PlusEq) => Some((BinOp::Add, TK::PlusEq)),
+            Some(TK::MinusEq) => Some((BinOp::Sub, TK::MinusEq)),
+            Some(TK::StarEq) => Some((BinOp::Mul, TK::StarEq)),
+            Some(TK::SlashEq) => Some((BinOp::Div, TK::SlashEq)),
+            Some(TK::PercentEq) => Some((BinOp::Rem, TK::PercentEq)),
+            _ => None,
+        }
     }
 
     /// Parse an expression using precedence climbing (left-associative).
@@ -375,6 +411,7 @@ impl<'a> Parser<'a> {
             Some(TK::For) => self.parse_for(),
             Some(TK::Forall) => self.parse_quantified(),
             Some(TK::While) => self.parse_while(),
+            Some(TK::Loop) => self.parse_loop(),
             Some(TK::Break) => self.parse_break(),
             Some(TK::Continue) => self.parse_continue(),
             Some(TK::Return) => self.parse_return(),
@@ -843,23 +880,48 @@ impl<'a> Parser<'a> {
     fn parse_array(&mut self) -> Expr {
         let start = self.pos;
         self.expect(TK::LBracket);
-        let mut items = Vec::new();
-        while !self.loop_should_stop() {
-            if self.at(TK::RBracket) {
-                break;
-            }
-            items.push(self.parse_expr());
-            if self.at(TK::RBracket) {
-                break;
-            }
-            self.expect(TK::Comma);
-            if self.at(TK::RBracket) {
-                break;
+        
+        // Check for repeat syntax: [value; count]
+        // First, try to parse an expression
+        if !self.at(TK::RBracket) {
+            let first = self.parse_expr();
+            if self.at(TK::Semicolon) {
+                // Repeat syntax: [value; count]
+                self.bump(); // consume ';'
+                let count = self.parse_expr();
+                self.expect(TK::RBracket);
+                let span = self.span_from(start);
+                return Expr::new(
+                    ExprKind::ArrayRepeat(Box::new(first), Box::new(count)),
+                    span,
+                    next_id(),
+                );
+            } else {
+                // Regular array: [elem1, elem2, ...]
+                let mut items = vec![first];
+                while !self.loop_should_stop() {
+                    if self.at(TK::RBracket) {
+                        break;
+                    }
+                    self.expect(TK::Comma);
+                    if self.at(TK::RBracket) {
+                        break;
+                    }
+                    items.push(self.parse_expr());
+                    if self.at(TK::RBracket) {
+                        break;
+                    }
+                }
+                self.expect(TK::RBracket);
+                let span = self.span_from(start);
+                return Expr::new(ExprKind::Array(items), span, next_id());
             }
         }
+        
+        // Empty array
         self.expect(TK::RBracket);
         let span = self.span_from(start);
-        Expr::new(ExprKind::Array(items), span, next_id())
+        Expr::new(ExprKind::Array(Vec::new()), span, next_id())
     }
 
     fn parse_block_expr(&mut self) -> Expr {
@@ -1137,6 +1199,23 @@ impl<'a> Parser<'a> {
         let span = self.span_from(start);
         Expr::new(
             ExprKind::While(Box::new(cond), Box::new(body)),
+            span,
+            next_id(),
+        )
+    }
+
+    fn parse_loop(&mut self) -> Expr {
+        let start = self.pos;
+        self.expect(TK::Loop);
+        let body = self.parse_block_expr();
+        // Extract the inner Block from the Block expression
+        let block = match body.kind {
+            ExprKind::Block(b) => b,
+            _ => unreachable!("parse_block_expr always returns Block"),
+        };
+        let span = self.span_from(start);
+        Expr::new(
+            ExprKind::Loop(block),
             span,
             next_id(),
         )

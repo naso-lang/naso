@@ -107,11 +107,17 @@ run_verification() {
     cd "$REPO_DIR"
     
     # Test quantum runtime
-    if cargo test -p naso-quantum-runtime -p naso-gates -p async-runtime --lib 2>&1 | grep -q "test result: ok"; then
+    log "DEBUG: Running cargo test..."
+    local test_output
+    test_output=$(cargo test -p naso-quantum-runtime -p naso-gates -p async-runtime --lib 2>&1)
+    log "DEBUG: Test output length: ${#test_output}"
+    if echo "$test_output" | grep -q "test result: ok"; then
         log "✅ Core tests pass"
         return 0
     else
         log "❌ Some tests failed"
+        log "DEBUG: Test output was:"
+        echo "$test_output" | tail -20
         return 1
     fi
 }

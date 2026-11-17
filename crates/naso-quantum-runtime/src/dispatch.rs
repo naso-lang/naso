@@ -293,38 +293,56 @@ impl KernelDispatcher {
         self.job_manager.submit_job(job, None).await
     }
 
-    /// Run VQE (Variational Quantum Eigensolver)
-    pub async fn run_vqe(
+    /// Dispatch VQE (Variational Quantum Eigensolver)
+    pub async fn dispatch_vqe(
         &self,
         _hamiltonian: Vec<Observable>,
         _ansatz: QuantumCircuit,
-        initial_params: Vec<f64>,
+        _initial_params: Vec<f64>,
         _max_iterations: usize,
-    ) -> Result<VQEResult> {
-        // VQE implementation would go here
-        // This is a placeholder for the optimization loop
-        Ok(VQEResult {
-            optimal_params: initial_params,
-            ground_state_energy: 0.0,
-            iterations: 0,
-            converged: false,
-            history: vec![],
+    ) -> Result<DispatchResult> {
+        // VQE implementation - placeholder for now
+        let job = QuantumJob::new(_ansatz, ExecutionConfig::new(1024))
+            .with_backend(self.config.default_backend.clone());
+        
+        let handle = self.job_manager.submit_job(job, None).await?;
+        
+        Ok(DispatchResult {
+            job_handle: handle,
+            result: None,
+            status: JobStatus::Queued,
+            mitigated_result: None,
+            metadata: HashMap::new(),
         })
     }
 
-    /// Run QAOA (Quantum Approximate Optimization Algorithm)
-    pub async fn run_qaoa(
+    /// Dispatch QAOA (Quantum Approximate Optimization Algorithm)
+    pub async fn dispatch_qaoa(
         &self,
         _cost_hamiltonian: Vec<Observable>,
         _mixer_hamiltonian: Vec<Observable>,
-        initial_params: Vec<f64>,
-        _p: usize, // Number of QAOA layers
-    ) -> Result<QAOAResult> {
-        // QAOA implementation would go here
-        Ok(QAOAResult {
-            optimal_params: initial_params,
-            best_value: 0.0,
-            iterations: 0,
+        _initial_params: Vec<f64>,
+        _p: usize,
+    ) -> Result<DispatchResult> {
+        // QAOA implementation - placeholder for now
+        // Create a simple circuit for demonstration
+        let mut builder = QuantumCircuit::builder(4); // 4 qubits for demonstration
+        for i in 0..4 {
+            builder.h(i);
+        }
+        let circuit = builder.build();
+        
+        let job = QuantumJob::new(circuit, ExecutionConfig::new(1024))
+            .with_backend(self.config.default_backend.clone());
+        
+        let handle = self.job_manager.submit_job(job, None).await?;
+        
+        Ok(DispatchResult {
+            job_handle: handle,
+            result: None,
+            status: JobStatus::Queued,
+            mitigated_result: None,
+            metadata: HashMap::new(),
         })
     }
 

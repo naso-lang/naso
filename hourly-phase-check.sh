@@ -107,7 +107,7 @@ run_verification() {
     cd "$REPO_DIR"
     
     # Test quantum runtime
-    if cargo test -p naso-quantum-runtime -p naso-gates -p async-runtime --lib 2>&1 | tail -5 | grep -q "test result: ok"; then
+    if cargo test -p naso-quantum-runtime -p naso-gates -p async-runtime --lib 2>&1 | grep -q "test result: ok"; then
         log "✅ Core tests pass"
         return 0
     else

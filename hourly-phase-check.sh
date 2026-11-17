@@ -73,10 +73,11 @@ get_phase_status() {
     local phase_num="$2"
     # Look for status markers after the phase header
     awk -v phase="$phase_num" '
-        $0 ~ "Phase " phase "[^0-9]" { in_phase=1 }
+        $0 ~ "Phase " phase "[^0-9]" { in_phase=1; next }
         in_phase && /^###/ && !/^### Phase/ { in_phase=0 }
         in_phase && /Status:/ { print $2; exit }
-    ' "$file"
+        in_phase && /✅|🔄|⏳|IN PROGRESS|COMPLETED|PENDING/ { print; exit }
+    ' "$file" | head -1
 }
 
 # Check if there are uncommitted changes

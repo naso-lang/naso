@@ -73,7 +73,19 @@ get_phase_status() {
     local phase_num="$2"
     # Look for status markers after the phase header
     awk -v phase="$phase_num" '
-        $0 ~ "Phase " phase "[^0-9]" { in_phase=1; next }
+        $0 ~ "Phase " phase "[^0-9]" { 
+            # Check the header line itself for status indicators
+            if ($0 ~ /\(IN PROGRESS\)/ || $0 ~ /🔄/ || $0 ~ /IN PROGRESS/) { 
+                print "IN PROGRESS"; exit 
+            }
+            if ($0 ~ /\(COMPLETED\)/ || $0 ~ /✅/ || $0 ~ /COMPLETED/) { 
+                print "COMPLETED"; exit 
+            }
+            if ($0 ~ /\(PENDING\)/ || $0 ~ /⏳/ || $0 ~ /PENDING/) { 
+                print "PENDING"; exit 
+            }
+            in_phase=1; next 
+        }
         in_phase && /^###/ && !/^### Phase/ { in_phase=0 }
         in_phase && /Status:/ { print $2; exit }
         in_phase && /✅|🔄|⏳|IN PROGRESS|COMPLETED|PENDING/ { print; exit }

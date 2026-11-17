@@ -222,6 +222,10 @@ pub struct TypeEnv {
     pub functions: IndexMap<Ident, FunctionSig>,
     /// Constant definitions
     pub constants: IndexMap<Ident, ConstInfo>,
+    /// Trait definitions
+    pub traits: IndexMap<Ident, Trait>,
+    /// Trait implementations
+    pub trait_impls: IndexMap<Ident, Vec<TraitImpl>>, // keyed by trait name
     /// Active inout borrows (for alias checking)
     pub inout_borrows: Vec<InOutBorrow>,
     /// Variables that have been moved (consumed)
@@ -598,6 +602,40 @@ impl TypeEnv {
         self.functions.get(name)
     }
 
+    /// Insert a trait definition
+    pub fn insert_trait(&mut self, trait_def: Trait) {
+        self.traits.insert(trait_def.name.clone(), trait_def);
+    }
+
+    /// Lookup a trait definition
+    pub fn lookup_trait(&self, name: &Ident) -> Option<&Trait> {
+        self.traits.get(name)
+    }
+
+    /// Insert a trait implementation
+    pub fn insert_trait_impl(&mut self, impl_def: TraitImpl) {
+        let key = impl_def.trait_path.last().cloned().unwrap_or_else(|| Ident::new("", Span::default()));
+        self.trait_impls.entry(key).or_default().push(impl_def);
+    }
+
+    /// Lookup trait implementations for a given trait name
+    pub fn lookup_trait_impls(&self, trait_name: &Ident) -> Option<&Vec<TraitImpl>> {
+        self.trait_impls.get(trait_name)
+    }
+
+    /// Find trait implementation for a specific type
+    /// Returns the matching impl if the type matches the `for_ty` of the impl
+    pub fn find_trait_impl(&self, trait_name: &Ident, for_ty: &Type) -> Option<&TraitImpl> {
+        if let Some(impls) = self.trait_impls.get(trait_name) {
+            for impl_def in impls {
+                if types_match(&impl_def.for_ty, for_ty) {
+                    return Some(impl_def);
+                }
+            }
+        }
+        None
+    }
+
     /// Insert a constant
     pub fn insert_const(&mut self, c: ConstDef) {
         let info = ConstInfo {
@@ -617,6 +655,120 @@ impl TypeEnv {
     /// Check if a variable is erasable (quantity 0)
     pub fn is_erasable(&self, name: &Ident) -> bool {
         self.erasable_vars.contains(name)
+    }
+
+    /// Iterate over all trait implementations
+    pub fn all_trait_impls(&self) -> impl Iterator<Item = &TraitImpl> {
+        self.trait_impls.values().flat_map(|v| v.iter())
+    }
+
+    /// Check if a type satisfies a trait bound
+    pub fn check_trait_bound(&self, ty: &Type, bound: &TraitBound) -> Result<bool, TypeError> {
+        // Get the trait name from the bound path
+        let trait_name = bound.path.last().cloned().ok_or_else(|| TypeError::InferenceError {
+            message: "Empty trait path in trait bound".to_string(),
+            span: bound.span,
+        })?;
+
+        // Find trait implementations for this trait
+        let impls = self.trait_impls.get(&trait_name);
+        if let Some(impls) = impls {
+            // Check if there's an impl that matches the type
+            for impl_def in impls {
+                if types_match(&impl_def.for_ty, ty) {
+                    // Found matching impl - check trait args if any
+                    if !bound.args.is_empty() {
+                        // For now, just check that the number of args matches
+                        if bound.args.len() != impl_def.trait_args.len() {
+                            continue;
+                        }
+                    }
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Normalize an associated type projection: <SelfTy as Trait>::AssocType<Args>
+    /// Returns the concrete type from the trait impl, with generics substituted
+    pub fn normalize_assoc_type_projection(
+        &self,
+        self_ty: &Type,
+        trait_path: &[Ident],
+        trait_args: &[TypeArg],
+        assoc_name: &Ident,
+        assoc_args: &[TypeArg],
+        span: Span,
+    ) -> Result<Type, TypeError> {
+        // Get the trait name (last segment of trait_path)
+        let trait_name = trait_path.last().cloned().ok_or_else(|| TypeError::InferenceError {
+            message: "Empty trait path in associated type projection".to_string(),
+            span,
+        })?;
+
+        // Find the trait impl for the self type
+        let impl_def = self.find_trait_impl(&trait_name, self_ty).ok_or_else(|| TypeError::InferenceError {
+            message: format!("No trait impl found for {} as {}", self_ty, trait_name),
+            span,
+        })?;
+
+        // Find the associated type definition in the impl
+        let assoc_ty_def = impl_def.items.iter().find_map(|item| {
+            if let ImplItem::AssociatedTypeDef(def) = item {
+                if def.name.name == assoc_name.name {
+                    Some(def)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }).ok_or_else(|| TypeError::InferenceError {
+            message: format!("Associated type {} not found in impl for {}", assoc_name, trait_name),
+            span,
+        })?;
+
+        // Start with the associated type's concrete type
+        let mut result_ty = assoc_ty_def.ty.clone();
+
+        // Substitute trait generics (from impl_def.generics) with trait_args
+        // And substitute assoc type generics (from assoc_ty_def.generics) with assoc_args
+        // For now, do a simple substitution
+        result_ty = self.substitute_assoc_type_generics(
+            result_ty,
+            &impl_def.generics,
+            trait_args,
+            &assoc_ty_def.generics,
+            assoc_args,
+        );
+
+        Ok(result_ty)
+    }
+
+    /// Substitute generic parameters in an associated type
+    fn substitute_assoc_type_generics(
+        &self,
+        mut ty: Type,
+        trait_generics: &[GenericParam],
+        trait_args: &[TypeArg],
+        assoc_generics: &[GenericParam],
+        assoc_args: &[TypeArg],
+    ) -> Type {
+        // Substitute trait generics
+        for (param, arg) in trait_generics.iter().zip(trait_args.iter()) {
+            ty = Self::substitute_type_arg_in_type(ty, &param.name, arg);
+        }
+        // Substitute assoc type generics
+        for (param, arg) in assoc_generics.iter().zip(assoc_args.iter()) {
+            ty = Self::substitute_type_arg_in_type(ty, &param.name, arg);
+        }
+        ty
+    }
+
+    /// Substitute a type parameter with a TypeArg in a type
+    fn substitute_type_arg_in_type(ty: Type, param_name: &Ident, arg: &TypeArg) -> Type {
+        substitute_type_arg_in_type_inner(ty, param_name, arg)
     }
 
     /// Get all linear variables that haven't been used
@@ -706,6 +858,33 @@ impl TypeEnv {
     }
 }
 
+/// Helper function to check if two types match for trait impl matching
+fn types_match(impl_ty: &Type, for_ty: &Type) -> bool {
+    // Simple structural match - could be enhanced for generics
+    match (&impl_ty.kind, &for_ty.kind) {
+        (TypeKind::Named(name1, args1), TypeKind::Named(name2, args2)) => {
+            name1.name == name2.name && args1.len() == args2.len() &&
+            args1.iter().zip(args2.iter()).all(|(a1, a2)| type_args_match(a1, a2))
+        }
+        (TypeKind::Pointer(inner1), TypeKind::Pointer(inner2)) => {
+            types_match(inner1, inner2)
+        }
+        (TypeKind::Array(elem1, size1), TypeKind::Array(elem2, size2)) => {
+            types_match(elem1, elem2) && size1 == size2
+        }
+        _ => impl_ty.kind == for_ty.kind,
+    }
+}
+
+fn type_args_match(arg1: &TypeArg, arg2: &TypeArg) -> bool {
+    match (arg1, arg2) {
+        (TypeArg::Type(t1), TypeArg::Type(t2)) => types_match(t1, t2),
+        (TypeArg::Nat(n1), TypeArg::Nat(n2)) => n1 == n2,
+        (TypeArg::Quantity(q1), TypeArg::Quantity(q2)) => q1 == q2,
+        _ => false,
+    }
+}
+
 /// Check if two places overlap (for alias detection)
 fn places_overlap(p1: &Place, p2: &Place) -> bool {
     match (p1, p2) {
@@ -716,5 +895,144 @@ fn places_overlap(p1: &Place, p2: &Place) -> bool {
         (Place::Index(base1, _), Place::Index(base2, _)) => places_overlap(base1, base2),
         (Place::Deref(base1), Place::Deref(base2)) => places_overlap(base1, base2),
         _ => false,
+    }
+}
+
+/// Substitute a type parameter with a TypeArg in a type (recursive)
+fn substitute_type_arg_in_type_inner(ty: Type, param_name: &Ident, arg: &TypeArg) -> Type {
+    // Check if this type IS the type parameter we're substituting
+    if let TypeKind::Named(name, args) = &ty.kind {
+        if name.name == param_name.name && args.is_empty() {
+            // This is the type parameter - replace it with the argument
+            match arg {
+                TypeArg::Type(replacement_ty) => {
+                    return Type::new(
+                        replacement_ty.kind.clone(),
+                        replacement_ty.quantity,
+                        replacement_ty.span,
+                    );
+                }
+                TypeArg::Nat(_) => {
+                    // Can't substitute a type with a Nat - return as-is
+                }
+                TypeArg::Quantity(_) => {
+                    // Can't substitute a type with a Quantity - return as-is
+                }
+            }
+        }
+    }
+    
+    match ty.kind {
+        TypeKind::Named(name, args) => {
+            let new_args: Vec<TypeArg> = args
+                .into_iter()
+                .map(|a| substitute_type_arg_in_type_arg(a, param_name, arg))
+                .collect();
+            Type::new(TypeKind::Named(name, new_args), ty.quantity, ty.span)
+        }
+        TypeKind::Array(elem, size) => {
+            let new_elem = Box::new(substitute_type_arg_in_type_inner(*elem, param_name, arg));
+            Type::new(TypeKind::Array(new_elem, size), ty.quantity, ty.span)
+        }
+        TypeKind::Tuple(elems) => {
+            let new_elems: Vec<Type> = elems
+                .into_iter()
+                .map(|e| substitute_type_arg_in_type_inner(e, param_name, arg))
+                .collect();
+            Type::new(TypeKind::Tuple(new_elems), ty.quantity, ty.span)
+        }
+        TypeKind::Function(params, ret) => {
+            let new_params: Vec<Type> = params
+                .into_iter()
+                .map(|p| substitute_type_arg_in_type_inner(p, param_name, arg))
+                .collect();
+            let new_ret = Box::new(substitute_type_arg_in_type_inner(*ret, param_name, arg));
+            Type::new(TypeKind::Function(new_params, new_ret), ty.quantity, ty.span)
+        }
+        TypeKind::Projection(inner) => {
+            let new_inner = Box::new(substitute_type_arg_in_type_inner(*inner, param_name, arg));
+            Type::new(TypeKind::Projection(new_inner), ty.quantity, ty.span)
+        }
+        TypeKind::Pointer(inner) => {
+            let new_inner = Box::new(substitute_type_arg_in_type_inner(*inner, param_name, arg));
+            Type::new(TypeKind::Pointer(new_inner), ty.quantity, ty.span)
+        }
+        TypeKind::Reversible(inner) => {
+            let new_inner = Box::new(substitute_type_arg_in_type_inner(*inner, param_name, arg));
+            Type::new(TypeKind::Reversible(new_inner), ty.quantity, ty.span)
+        }
+        TypeKind::Pi(name, domain, codomain) => {
+            let new_domain = Box::new(substitute_type_arg_in_type_inner(*domain, param_name, arg));
+            let new_codomain = Box::new(substitute_type_arg_in_type_inner(*codomain, param_name, arg));
+            Type::new(TypeKind::Pi(name, new_domain, new_codomain), ty.quantity, ty.span)
+        }
+        TypeKind::Sigma(name, fst, snd) => {
+            let new_fst = Box::new(substitute_type_arg_in_type_inner(*fst, param_name, arg));
+            let new_snd = Box::new(substitute_type_arg_in_type_inner(*snd, param_name, arg));
+            Type::new(TypeKind::Sigma(name, new_fst, new_snd), ty.quantity, ty.span)
+        }
+        TypeKind::Lambda(param, body) => {
+            let new_body = Box::new(substitute_type_arg_in_type_inner(*body, param_name, arg));
+            Type::new(TypeKind::Lambda(param, new_body), ty.quantity, ty.span)
+        }
+        TypeKind::App(fun, arg_ty) => {
+            let new_fun = Box::new(substitute_type_arg_in_type_inner(*fun, param_name, arg));
+            let new_arg = Box::new(substitute_type_arg_in_type_inner(*arg_ty, param_name, arg));
+            Type::new(TypeKind::App(new_fun, new_arg), ty.quantity, ty.span)
+        }
+        TypeKind::Tensor(dims) => {
+            let new_dims: Vec<Type> = dims
+                .into_iter()
+                .map(|d| substitute_type_arg_in_type_inner(d, param_name, arg))
+                .collect();
+            Type::new(TypeKind::Tensor(new_dims), ty.quantity, ty.span)
+        }
+        TypeKind::QRegister(dims) => {
+            let new_dims: Vec<Type> = dims
+                .into_iter()
+                .map(|d| substitute_type_arg_in_type_inner(d, param_name, arg))
+                .collect();
+            Type::new(TypeKind::QRegister(new_dims), ty.quantity, ty.span)
+        }
+        TypeKind::AssociatedTypeProjection {
+            self_ty,
+            trait_path,
+            trait_args,
+            assoc_name,
+            assoc_args,
+        } => {
+            let new_self_ty = Box::new(substitute_type_arg_in_type_inner(*self_ty, param_name, arg));
+            let new_trait_args: Vec<TypeArg> = trait_args
+                .into_iter()
+                .map(|a| substitute_type_arg_in_type_arg(a, param_name, arg))
+                .collect();
+            let new_assoc_args: Vec<TypeArg> = assoc_args
+                .into_iter()
+                .map(|a| substitute_type_arg_in_type_arg(a, param_name, arg))
+                .collect();
+            Type::new(
+                TypeKind::AssociatedTypeProjection {
+                    self_ty: new_self_ty,
+                    trait_path,
+                    trait_args: new_trait_args,
+                    assoc_name,
+                    assoc_args: new_assoc_args,
+                },
+                ty.quantity,
+                ty.span,
+            )
+        }
+        // For simple types (Unit, Bool, Int, UInt, Float, String, Char, Nat, Quint8, Qubit, Universe, Var, Meta, Error)
+        // and types that don't contain type parameters, return as-is
+        _ => ty,
+    }
+}
+
+/// Substitute a type parameter with a TypeArg in a TypeArg
+fn substitute_type_arg_in_type_arg(arg: TypeArg, param_name: &Ident, replacement: &TypeArg) -> TypeArg {
+    match arg {
+        TypeArg::Type(ty) => TypeArg::Type(substitute_type_arg_in_type_inner(ty, param_name, replacement)),
+        TypeArg::Nat(nat) => TypeArg::Nat(nat), // Nat expressions don't contain type parameters in this simple model
+        TypeArg::Quantity(qty) => TypeArg::Quantity(qty),
     }
 }

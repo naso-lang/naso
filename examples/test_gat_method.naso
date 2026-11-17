@@ -1,0 +1,6 @@
+// Test - GAT (Generic Associated Type) - with method
+trait Iterator {
+    type Item[T];
+    
+    fn next(&self) -> Option[u64];
+}

@@ -295,15 +295,14 @@ pub extern "C" fn naso_read(fd: u64, buf: *mut u8, max_len: usize) -> usize {
         eprintln!(">>> naso_read: null buf or zero max_len, returning 0");
         return 0;
     }
-    let mut table = fd_table().lock().unwrap();
-    let Some(stream) = table.get_stream(fd) else {
+    let mut table = global_sharded_fd_table();
+    let Some(mut stream) = table.get_stream(fd) else {
         eprintln!(">>> naso_read: Stream {} not found in table, returning 0", fd);
-        eprintln!(">>> naso_read: Available streams: {:?}", table.streams.keys().collect::<Vec<_>>());
         return 0;
     };
     let buf_slice = unsafe { std::slice::from_raw_parts_mut(buf, max_len) };
     eprintln!(">>> naso_read: calling stream.read()");
-    match std::io::Read::read(stream, buf_slice) {
+    match std::io::Read::read(&mut stream, buf_slice) {
         Ok(n) => {
             memory_tracker().record_alloc(n);
             eprintln!(">>> naso_read: read {} bytes from fd={}", n, fd);
@@ -325,14 +324,14 @@ pub extern "C" fn naso_write(fd: u64, buf: *const u8, len: usize) -> usize {
         eprintln!(">>> naso_write: null buf or zero len, returning 0");
         return 0;
     }
-    let mut table = fd_table().lock().unwrap();
-    let Some(stream) = table.get_stream(fd) else {
+    let mut table = global_sharded_fd_table();
+    let Some(mut stream) = table.get_stream(fd) else {
         eprintln!(">>> naso_write: Stream {} not found in table, returning 0", fd);
         return 0;
     };
     let buf_slice = unsafe { std::slice::from_raw_parts(buf, len) };
     eprintln!(">>> naso_write: writing {} bytes: {:?}", len, buf_slice);
-    match std::io::Write::write_all(stream, buf_slice) {
+    match std::io::Write::write_all(&mut stream, buf_slice) {
         Ok(_) => {
             eprintln!(">>> naso_write: write_all succeeded, flushing...");
             match stream.flush() {
@@ -385,16 +384,23 @@ pub extern "C" fn naso_last_error(out_ptr: *mut u8, max_len: usize) -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn naso_close(fd: u64) -> u64 {
     eprintln!(">>> naso_close ENTRY: fd={}", fd);
-    let mut table = fd_table().lock().unwrap();
-    eprintln!(">>> naso_close: table.streams.keys() = {:?}", table.streams.keys().collect::<Vec<_>>());
-    eprintln!(">>> naso_close: table.listeners.keys() = {:?}", table.listeners.keys().collect::<Vec<_>>());
-    if let Some(stream) = table.streams.remove(&fd) {
-        // Don't shutdown - just let the stream be dropped naturally
-        // shutdown can close the connection before buffered data is sent
-        eprintln!(">>> naso_close: removed stream fd={}, remaining streams: {}", fd, table.streams.len());
+    let mut table = global_sharded_fd_table();
+    // eprintln!(">>> naso_close: table.streams.keys() = {:?}", table.shards.iter().flat_map(|s| s.lock().unwrap().streams.keys().collect::<Vec<_>>()).collect::<Vec<_>>());
+    // eprintln!(">>> naso_close: table.listeners.keys() = {:?}", table.shards.iter().flat_map(|s| s.lock().unwrap().listeners.keys().collect::<Vec<_>>()).collect::<Vec<_>>());
+    let mut found = false;
+    for shard in &table.shards {
+        let mut shard_guard = shard.lock().unwrap();
+        if shard_guard.streams.remove(&fd).is_some() {
+            found = true;
+            eprintln!(">>> naso_close: removed stream fd={}", fd);
+            break;
+        }
+    }
+    if found {
+        eprintln!(">>> naso_close: removed stream fd={}", fd);
         1
     } else {
-        eprintln!(">>> naso_close: fd={} not found in streams, existing streams: {:?}", fd, table.streams.keys().collect::<Vec<_>>());
+        eprintln!(">>> naso_close: fd={} not found in streams", fd);
         0
     }
 }
@@ -1098,6 +1104,13 @@ pub extern "C" fn naso_yield() -> u64 {
     // This allows the accept loop to yield control and handle multiple connections
     // Polls both io_uring and mio-based async
     naso_async_poll_all();
+    1
+}
+
+/// Simple sleep function to avoid stack overflow from naso_yield
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_sleep_ms(ms: u64) -> u64 {
+    std::thread::sleep(std::time::Duration::from_millis(ms));
     1
 }
 

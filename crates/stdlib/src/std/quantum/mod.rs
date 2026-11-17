@@ -1,7 +1,14 @@
-pub mod grover;
-pub mod primitives;
-pub mod qft;
+// Quantum Standard Library for Naso
+// Provides quantum primitives and algorithms.
 
-pub use grover::*;
+// Declare modules
+mod primitives;
+mod grover;
+mod qft;
+
+// Re-export core quantum primitives
 pub use primitives::*;
+
+// Re-export quantum algorithms
+pub use grover::*;
 pub use qft::*;

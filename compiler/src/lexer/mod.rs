@@ -92,6 +92,8 @@ impl Lexer {
 mod tests {
     use super::*;
 
+    use crate::token::{TokenKind, TypedInt};
+
     #[test]
     fn lexes_quantity_markers() {
         let kinds = Lexer::tokenize("[0] [1] [*] [N]");
@@ -99,10 +101,10 @@ mod tests {
             kinds,
             vec![
                 TokenKind::LBracket,
-                TokenKind::Int(0),
+                TokenKind::Int(TypedInt { value: 0, ty: None }),
                 TokenKind::RBracket,
                 TokenKind::LBracket,
-                TokenKind::Int(1),
+                TokenKind::Int(TypedInt { value: 1, ty: None }),
                 TokenKind::RBracket,
                 TokenKind::QtyStar,
                 TokenKind::LBracket,
@@ -145,7 +147,7 @@ mod tests {
         assert_eq!(
             kinds,
             vec![
-                TokenKind::Int(42),
+                TokenKind::Int(TypedInt { value: 42, ty: None }),
                 TokenKind::Float(3.14),
                 TokenKind::Bool(true),
                 TokenKind::Str("hi".to_string()),

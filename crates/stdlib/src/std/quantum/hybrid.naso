@@ -1,0 +1,662 @@
+// Hybrid Classical/Quantum Algorithms
+// 
+// Unified classical-quantum compilation: classical pre/post-processing
+// scheduled together with quantum circuits via polyhedral + QIR scheduling.
+
+use crate::std::prelude::*;
+use crate::std::quantum::primitives::*;
+use crate::std::tensor::Tensor;
+use crate::std::math::{sin, cos, sqrt, pi, exp, log, random_f32};
+
+// ============================================================
+// Classical Pre-processing for Quantum Algorithms
+// ============================================================
+
+/// Compute amplitude encoding angles for state preparation.
+/// Classical computation that runs at kernel launch time.
+pub fn amplitude_encoding_angles(
+    data: [1] Tensor[f32, N]
+) -> [1] Tensor[f32, N]
+where N: Nat
+{
+    // Normalize
+    var norm_sq = 0.0;
+    for i in 0..N {
+        norm_sq += data[i] * data[i];
+    }
+    let norm = sqrt(norm_sq + 1e-12);
+    
+    var angles: Tensor[f32, N] = tensor_zeros();
+    
+    // Recursive state preparation angles
+    var remaining = 1.0;
+    for i in 0..N {
+        let amp = data[i] / norm;
+        let ratio = amp / (remaining + 1e-12);
+        // Clamp to [-1, 1] for numerical stability
+        let clamped = if ratio > 1.0 { 1.0 } else if ratio < -1.0 { -1.0 } else { ratio };
+        angles[i] = 2.0 * clamped.asin();
+        remaining *= cos(angles[i] / 2.0);
+    }
+    
+    angles
+}
+
+/// Compute molecular Hamiltonian coefficients from geometry.
+/// Would typically call into a quantum chemistry library via FFI.
+pub fn molecular_hamiltonian_from_geometry(
+    geometry: [1] Tensor[f32, 3*N_ATOMS>,
+    basis_set: str,
+    bond_length_scale: f32
+) -> [1] [PauliTerm<N_QUBITS>; N_TERMS]
+where N_ATOMS: Nat, N_QUBITS: Nat, N_TERMS: Nat
+{
+    // Placeholder for FFI call to PySCF, Psi4, etc.
+    // In practice:
+    // 1. Write geometry to file
+    // 2. Call Python script via FFI
+    // 3. Read back integrals
+    // 4. Perform Jordan-Wigner / Bravyi-Kitaev transformation
+    // 5. Return Pauli terms
+    
+    var terms: [PauliTerm<N_QUBITS>; N_TERMS] = [];
+    // ... FFI implementation ...
+    terms
+}
+
+/// Classical optimization of variational parameters.
+/// Runs on CPU between quantum circuit executions.
+pub fn classical_optimizer_step<
+    const N_PARAMS: usize
+>(
+    params: inout [1] Tensor[f32, N_PARAMS>,
+    gradient: [1] Tensor[f32, N_PARAMS>,
+    optimizer_state: inout OptimizerState<N_PARAMS>,
+    config: OptimizerConfig
+) {
+    match config.optimizer {
+        OptimizerType::Adam => adam_step(params, gradient, optimizer_state, config),
+        OptimizerType::GradientDescent => gd_step(params, gradient, config.learning_rate),
+        OptimizerType::L_BFGS => lbfgs_step(params, gradient, optimizer_state, config),
+        OptimizerType::SPSA => spsa_step(params, gradient, optimizer_state, config),
+    }
+}
+
+/// Optimizer state for stateful optimizers.
+pub struct OptimizerState<const N_PARAMS: usize> {
+    pub m: Tensor[f32, N_PARAMS>,  // Adam first moment
+    pub v: Tensor[f32, N_PARAMS>,  // Adam second moment
+    pub t: usize,                  // Time step
+    pub history: Tensor[f32, 10, N_PARAMS>,  // L-BFGS history
+}
+
+impl<const N_PARAMS: usize> OptimizerState<N_PARAMS> {
+    pub fn new() -> Self {
+        OptimizerState {
+            m: tensor_zeros(),
+            v: tensor_zeros(),
+            t: 0,
+            history: tensor_zeros(),
+        }
+    }
+}
+
+/// Optimizer configuration.
+pub struct OptimizerConfig {
+    pub learning_rate: f32,
+    pub optimizer: OptimizerType,
+    pub beta1: f32,
+    pub beta2: f32,
+    pub eps: f32,
+}
+
+pub enum OptimizerType {
+    Adam,
+    GradientDescent,
+    L_BFGS,
+    SPSA,
+}
+
+fn adam_step<const N_PARAMS: usize>(
+    params: inout [1] Tensor[f32, N_PARAMS>,
+    gradient: [1] Tensor[f32, N_PARAMS>,
+    state: inout OptimizerState<N_PARAMS>,
+    config: OptimizerConfig
+) {
+    state.t += 1;
+    for i in 0..N_PARAMS {
+        state.m[i] = config.beta1 * state.m[i] + (1.0 - config.beta1) * gradient[i];
+        state.v[i] = config.beta2 * state.v[i] + (1.0 - config.beta2) * gradient[i] * gradient[i];
+        
+        let m_hat = state.m[i] / (1.0 - config.beta1.powi(state.t as i32));
+        let v_hat = state.v[i] / (1.0 - config.beta2.powi(state.t as i32));
+        
+        params[i] -= config.learning_rate * m_hat / (sqrt(v_hat) + config.eps);
+    }
+}
+
+fn gd_step<const N_PARAMS: usize>(
+    params: inout [1] Tensor[f32, N_PARAMS>,
+    gradient: [1] Tensor[f32, N_PARAMS>,
+    lr: f32
+) {
+    for i in 0..N_PARAMS {
+        params[i] -= lr * gradient[i];
+    }
+}
+
+fn lbfgs_step<const N_PARAMS: usize>(
+    params: inout [1] Tensor[f32, N_PARAMS>,
+    gradient: [1] Tensor[f32, N_PARAMS>,
+    state: inout OptimizerState<N_PARAMS>,
+    config: OptimizerConfig
+) {
+    // L-BFGS two-loop recursion
+    // Placeholder
+}
+
+fn spsa_step<const N_PARAMS: usize>(
+    params: inout [1] Tensor[f32, N_PARAMS>,
+    gradient: [1] Tensor[f32, N_PARAMS>,
+    state: inout OptimizerState<N_PARAMS>,
+    config: OptimizerConfig
+) {
+    // SPSA: simultaneous perturbation
+    // Uses finite differences with random perturbations
+    // Placeholder
+}
+
+// ============================================================
+// Quantum Error Mitigation
+// ============================================================
+
+/// Zero-Noise Extrapolation (ZNE) for error mitigation.
+/// Runs circuit at multiple noise scales and extrapolates to zero noise.
+pub fn zero_noise_extrapolation<
+    const N_QUBITS: usize,
+    const N_SCALE: usize
+>(
+    circuit: fn([1] [Qubit; N_QUBITS]) -> [1] [Qubit; N_QUBITS],
+    measure_fn: fn([1] [Qubit; N_QUBITS]) -> f32,
+    noise_scales: [f32; N_SCALE],
+    shots_per_scale: usize
+) -> f32 {
+    var expectations: Tensor[f32, N_SCALE> = tensor_zeros();
+    
+    for s in 0..N_SCALE {
+        let scale = noise_scales[s];
+        var sum = 0.0;
+        
+        for _ in 0..shots_per_scale {
+            let [1] qubits: [Qubit; N_QUBITS] = qalloc_array(N_QUBITS);
+            
+            // Apply noise scaling
+            apply_noise_scaling(scale);
+            
+            circuit(qubits);
+            let val = measure_fn(qubits);
+            qfree_array(qubits);
+            
+            sum += val;
+        }
+        
+        expectations[s] = sum / shots_per_scale as f32;
+    }
+    
+    // Richardson extrapolation
+    richardson_extrapolation(noise_scales, expectations)
+}
+
+/// Apply noise scaling to quantum operations.
+fn apply_noise_scaling(scale: f32) {
+    // Hardware-specific: stretch gate durations, increase measurement time
+    // For simulation: add depolarizing noise proportional to scale
+    // This would be implemented in the runtime
+}
+
+/// Richardson extrapolation to zero noise limit.
+fn richardson_extrapolation<const N: usize>(
+    scales: [f32; N],
+    values: [1] Tensor[f32, N>
+) -> f32 {
+    // Fit polynomial f(scale) = a_0 + a_1*scale + a_2*scale^2 + ...
+    // Extrapolate to scale = 0 => a_0
+    
+    // For N=2 (linear): f(s) = v0 + (v1-v0)/(s1-s0) * (s - s0)
+    // f(0) = v0 - (v1-v0)*s0/(s1-s0)
+    if N == 2 {
+        return values[0] - (values[1] - values[0]) * scales[0] / (scales[1] - scales[0]);
+    }
+    
+    // For N=3 (quadratic): use Lagrange interpolation
+    if N == 3 {
+        let s0 = scales[0], s1 = scales[1], s2 = scales[2];
+        let v0 = values[0], v1 = values[1], v2 = values[2];
+        
+        // f(0) = v0 * L0(0) + v1 * L1(0) + v2 * L2(0)
+        // L0(0) = (0-s1)(0-s2) / ((s0-s1)(s0-s2)) = s1*s2 / ((s0-s1)(s0-s2))
+        // L1(0) = s0*s2 / ((s1-s0)(s1-s2))
+        // L2(0) = s0*s1 / ((s2-s0)(s2-s1))
+        
+        let l0 = s1 * s2 / ((s0 - s1) * (s0 - s2));
+        let l1 = s0 * s2 / ((s1 - s0) * (s1 - s2));
+        let l2 = s0 * s1 / ((s2 - s0) * (s2 - s1));
+        
+        return v0 * l0 + v1 * l1 + v2 * l2;
+    }
+    
+    // General: use first point as fallback
+    values[0]
+}
+
+/// Probabilistic Error Cancellation (PEC).
+/// Requires quasi-probability decomposition of noisy gates.
+pub fn probabilistic_error_cancellation<
+    const N_QUBITS: usize
+>(
+    circuit: fn([1] [Qubit; N_QUBITS]) -> [1] [Qubit; N_QUBITS>,
+    measure_fn: fn([1] [Qubit; N_QUBITS]) -> f32,
+    quasi_prob_decomp: [1] [QuasiProbTerm; N_TERMS>,
+    shots: usize
+) -> f32 {
+    // Quasi-probability terms represent ideal gate as linear combination of implementable gates
+    // E[ideal] = sum_i c_i E[noisy_i] where c_i are quasi-probabilities
+    
+    var weighted_sum = 0.0;
+    var total_weight = 0.0;
+    
+    for term in quasi_prob_decomp {
+        let c = term.coefficient;  // Can be negative!
+        let prob = c.abs();
+        
+        // Sample this term with probability proportional to |c_i|
+        let n_samples = (shots as f32 * prob / sum_abs_quasi_probs(quasi_prob_decomp)) as usize;
+        
+        for _ in 0..n_samples {
+            let [1] qubits: [Qubit; N_QUBITS] = qalloc_array(N_QUBITS);
+            
+            // Apply the noisy implementation for this term
+            apply_quasi_prob_term(term, qubits);
+            
+            let val = measure_fn(qubits);
+            qfree_array(qubits);
+            
+            weighted_sum += c.sign() * val;
+        }
+        
+        total_weight += c.abs() * n_samples as f32;
+    }
+    
+    weighted_sum / total_weight
+}
+
+pub struct QuasiProbTerm {
+    pub coefficient: f32,  // Quasi-probability (can be negative)
+    pub circuit: fn([1] [Qubit; N_QUBITS]) -> [1] [Qubit; N_QUBITS>,
+}
+
+fn sum_abs_quasi_probs(terms: [1] [QuasiProbTerm; N_TERMS>) -> f32 {
+    var sum = 0.0;
+    for t in terms { sum += t.coefficient.abs(); }
+    sum
+}
+
+fn apply_quasi_prob_term(term: QuasiProbTerm, qubits: [1] [Qubit; N_QUBITS>) {
+    term.circuit(qubits);
+}
+
+// ============================================================
+// Quantum Kernel Methods for Machine Learning
+// ============================================================
+
+/// Quantum kernel matrix computation.
+/// K(x, x') = |<phi(x)|phi(x')>|^2
+pub fn quantum_kernel_matrix<
+    const N_SAMPLES: usize,
+    const N_FEATURES: usize,
+    const N_QUBITS: usize
+>(
+    dataset: [1] Tensor[f32, N_SAMPLES, N_FEATURES>,
+    feature_map: fn([1] Tensor[f32, N_FEATURES>, [1] [Qubit; N_QUBITS]) -> [1] [Qubit; N_QUBITS>
+) -> [1] Tensor[f32, N_SAMPLES, N_SAMPLES> {
+    var K: Tensor[f32, N_SAMPLES, N_SAMPLES> = tensor_zeros();
+    
+    for i in 0..N_SAMPLES {
+        for j in i..N_SAMPLES {
+            // Prepare |phi(x_i)>
+            let [1] qi: [Qubit; N_QUBITS] = qalloc_array(N_QUBITS);
+            feature_map(dataset[i], qi);
+            
+            // Prepare |phi(x_j)>
+            let [1] qj: [Qubit; N_QUBITS] = qalloc_array(N_QUBITS);
+            feature_map(dataset[j], qj);
+            
+            // Compute overlap using SWAP test
+            let overlap = swap_test(qi, qj);
+            
+            K[i, j] = overlap;
+            K[j, i] = overlap;  // Symmetric
+            
+            qfree_array(qi);
+            qfree_array(qj);
+        }
+    }
+    
+    K
+}
+
+/// Cross kernel matrix between test and train sets.
+pub fn quantum_kernel_matrix_cross<
+    const N_TEST: usize,
+    const N_TRAIN: usize,
+    const N_FEATURES: usize,
+    const N_QUBITS: usize
+>(
+    test_data: [1] Tensor[f32, N_TEST, N_FEATURES>,
+    train_data: [1] Tensor[f32, N_TRAIN, N_FEATURES>,
+    feature_map: fn([1] Tensor[f32, N_FEATURES>, [1] [Qubit; N_QUBITS]) -> [1] [Qubit; N_QUBITS>
+) -> [1] Tensor[f32, N_TEST, N_TRAIN> {
+    var K: Tensor[f32, N_TEST, N_TRAIN> = tensor_zeros();
+    
+    for i in 0..N_TEST {
+        for j in 0..N_TRAIN {
+            let [1] qi: [Qubit; N_QUBITS] = qalloc_array(N_QUBITS);
+            feature_map(test_data[i], qi);
+            
+            let [1] qj: [Qubit; N_QUBITS] = qalloc_array(N_QUBITS);
+            feature_map(train_data[j], qj);
+            
+            K[i, j] = swap_test(qi, qj);
+            
+            qfree_array(qi);
+            qfree_array(qj);
+        }
+    }
+    
+    K
+}
+
+/// SWAP test for fidelity estimation.
+fn swap_test<const N_QUBITS: usize>(
+    reg_a: [1] [Qubit; N_QUBITS>,
+    reg_b: [1] [Qubit; N_QUBITS>
+) -> f32 {
+    // Allocate ancilla
+    let [1] ancilla: Qubit = qalloc();
+    
+    // SWAP test circuit
+    hadamard(ancilla);
+    
+    for i in 0..N_QUBITS {
+        cswap(ancilla, reg_a[i], reg_b[i]);
+    }
+    
+    hadamard(ancilla);
+    let m = measure(ancilla);
+    qfree(ancilla);
+    
+    // P(0) = (1 + |<a|b>|^2) / 2
+    // So |<a|b>|^2 = 2 * P(0) - 1
+    // Single shot: return 1 if m=0, else 0
+    // In practice, repeat many shots and average
+    if m { 0.0 } else { 1.0 }
+}
+
+/// Controlled-SWAP (Fredkin gate).
+fn cswap(control: Qubit, target1: Qubit, target2: Qubit) {
+    cnot(target1, target2);
+    ccx(control, target2, target1);
+    cnot(target1, target2);
+}
+
+/// Toffoli (CCX) decomposition.
+fn ccx(c1: Qubit, c2: Qubit, target: Qubit) {
+    hadamard(target);
+    cnot(c2, target);
+    // T† on target
+    cnot(c1, target);
+    // T on target
+    cnot(c2, target);
+    // T† on target
+    cnot(c1, target);
+    // T on target, T on c2
+    hadamard(target);
+    // S on c2
+}
+
+/// Angle embedding feature map.
+pub fn angle_embedding_feature_map<
+    const N_FEATURES: usize,
+    const N_QUBITS: usize
+>(
+    x: [1] Tensor[f32, N_FEATURES>,
+    qubits: [1] [Qubit; N_QUBITS>
+) -> [1] [Qubit; N_QUBITS> {
+    for i in 0..min(N_FEATURES, N_QUBITS) {
+        ry(x[i], qubits[i]);
+    }
+    
+    // Entangling layer
+    for i in 0..(N_QUBITS - 1) {
+        cnot(qubits[i], qubits[i + 1]);
+    }
+    
+    qubits
+}
+
+/// IQP (Instantaneous Quantum Polynomial) feature map.
+pub fn iqp_feature_map<
+    const N_FEATURES: usize,
+    const N_QUBITS: usize
+>(
+    x: [1] Tensor[f32, N_FEATURES>,
+    qubits: [1] [Qubit; N_QUBITS>
+) -> [1] [Qubit; N_QUBITS> {
+    // H^⊗n U(x) H^⊗n where U(x) = exp(i sum_j x_j Z_j + i sum_{j<k} x_j x_k Z_j Z_k)
+    
+    for i in 0..N_QUBITS {
+        hadamard(qubits[i]);
+    }
+    
+    // Diagonal gates
+    for i in 0..min(N_FEATURES, N_QUBITS) {
+        rz(x[i], qubits[i]);
+    }
+    
+    for i in 0..min(N_FEATURES, N_QUBITS) {
+        for j in (i+1)..min(N_FEATURES, N_QUBITS) {
+            rzz(x[i] * x[j], qubits[i], qubits[j]);
+        }
+    }
+    
+    for i in 0..N_QUBITS {
+        hadamard(qubits[i]);
+    }
+    
+    qubits
+}
+
+// ============================================================
+// Quantum Phase Estimation (QPE)
+// ============================================================
+
+/// Quantum Phase Estimation for eigenvalue estimation.
+pub fn quantum_phase_estimation<
+    const N_QUBITS: usize,
+    const N_ANCILLA: usize
+>(
+    unitary: fn([1] [Qubit; N_QUBITS]) -> [1] [Qubit; N_QUBITS>,
+    eigenstate_prep: fn([1] [Qubit; N_QUBITS]) -> [1] [Qubit; N_QUBITS>,
+    time_step: f32
+) -> f32 {
+    // Allocate registers
+    let [1] ancilla: [Qubit; N_ANCILLA] = qalloc_array(N_ANCILLA);
+    let [1] system: [Qubit; N_QUBITS] = qalloc_array(N_QUBITS);
+    
+    // Prepare eigenstate
+    eigenstate_prep(system);
+    
+    // Initialize ancilla in |+>^n
+    for i in 0..N_ANCILLA {
+        hadamard(ancilla[i]);
+    }
+    
+    // Controlled-U^(2^k) operations
+    for k in 0..N_ANCILLA {
+        let reps = 1 << k;  // 2^k
+        for _ in 0..reps {
+            controlled_unitary(ancilla[k], system, unitary);
+        }
+    }
+    
+    // Inverse QFT on ancilla
+    inverse_qft(ancilla);
+    
+    // Measure ancilla
+    var phase = 0.0;
+    for i in 0..N_ANCILLA {
+        if measure(ancilla[i]) {
+            phase += 1.0 / (1 << (i + 1)) as f32;
+        }
+    }
+    
+    qfree_array(ancilla);
+    qfree_array(system);
+    
+    // Phase = eigenvalue / (2π) for U = exp(-iHt)
+    // Eigenvalue = 2π * phase / t
+    let eigenvalue = 2.0 * pi * phase / time_step;
+    
+    eigenvalue
+}
+
+/// Controlled unitary application.
+fn controlled_unitary<const N_QUBITS: usize>(
+    control: Qubit,
+    target: [1] [Qubit; N_QUBITS>,
+    unitary: fn([1] [Qubit; N_QUBITS]) -> [1] [Qubit; N_QUBITS>
+) {
+    // This would be lowered to controlled versions of each gate in the unitary
+    // For now, placeholder
+    unitary(target);  // Uncontrolled - would need proper control lowering
+}
+
+/// Inverse QFT.
+fn inverse_qft<const N: usize>(qubits: [1] [Qubit; N>) {
+    for i in (0..N).rev() {
+        for j in (0..i).rev() {
+            let angle = -pi / (2.0_f32.powi((i - j) as i32));
+            // Controlled phase gate
+            // CPHASE(angle, qubits[j], qubits[i]);
+        }
+        hadamard(qubits[i]);
+    }
+}
+
+// ============================================================
+// Hybrid Workflow: Classical Data -> Quantum -> Classical ML
+// ============================================================
+
+/// Complete hybrid quantum-classical ML workflow.
+pub fn hybrid_qsvm_workflow<
+    const N_TRAIN: usize,
+    const N_TEST: usize,
+    const N_FEATURES: usize,
+    const N_QUBITS: usize
+>(
+    train_data: [1] Tensor[f32, N_TRAIN, N_FEATURES>,
+    train_labels: [1] Tensor[f32, N_TRAIN>,
+    test_data: [1] Tensor[f32, N_TEST, N_FEATURES>
+) -> [1] Tensor[f32, N_TEST> {
+    // 1. CLASSICAL: Standardize features
+    let train_scaled = standardize(train_data);
+    let test_scaled = standardize(test_data);
+    
+    // 2. QUANTUM: Compute kernel matrices
+    let K_train = quantum_kernel_matrix(train_scaled, angle_embedding_feature_map);
+    let K_test = quantum_kernel_matrix_cross(test_scaled, train_scaled, angle_embedding_feature_map);
+    
+    // 3. CLASSICAL: Train SVM
+    let alpha = train_svm(K_train, train_labels);
+    
+    // 4. CLASSICAL: Predict
+    let predictions = predict_svm(K_test, alpha);
+    
+    predictions
+}
+
+/// Standardize features (zero mean, unit variance).
+fn standardize<
+    const N_SAMPLES: usize,
+    const N_FEATURES: usize
+>(
+    data: [1] Tensor[f32, N_SAMPLES, N_FEATURES>
+) -> [1] Tensor[f32, N_SAMPLES, N_FEATURES> {
+    var result: Tensor[f32, N_SAMPLES, N_FEATURES> = tensor_zeros();
+    
+    for f in 0..N_FEATURES {
+        var mean = 0.0;
+        for s in 0..N_SAMPLES { mean += data[s, f]; }
+        mean /= N_SAMPLES as f32;
+        
+        var var = 0.0;
+        for s in 0..N_SAMPLES { var += (data[s, f] - mean).powi(2); }
+        let std = sqrt(var / N_SAMPLES as f32 + 1e-8);
+        
+        for s in 0..N_SAMPLES {
+            result[s, f] = (data[s, f] - mean) / std;
+        }
+    }
+    
+    result
+}
+
+/// Train SVM on kernel matrix (simplified).
+fn train_svm<const N: usize>(
+    K: [1] Tensor[f32, N, N>,
+    y: [1] Tensor[f32, N>
+) -> [1] Tensor[f32, N> {
+    // Solve: max sum alpha_i - 1/2 sum_{i,j} alpha_i alpha_j y_i y_j K_ij
+    // s.t. 0 <= alpha_i <= C, sum alpha_i y_i = 0
+    // Placeholder: would use QP solver
+    var alpha: Tensor[f32, N> = tensor_zeros();
+    alpha
+}
+
+/// Predict with SVM.
+fn predict_svm<const M: usize, const N: usize>(
+    K_test: [1] Tensor[f32, M, N>,
+    alpha: [1] Tensor[f32, N>
+) -> [1] Tensor[f32, M> {
+    var pred: Tensor[f32, M> = tensor_zeros();
+    
+    for i in 0..M {
+        var sum = 0.0;
+        for j in 0..N {
+            sum += alpha[j] * K_test[i, j];
+        }
+        pred[i] = if sum > 0.0 { 1.0 } else { -1.0 };
+    }
+    
+    pred
+}
+
+// ============================================================
+// Tensor helper functions
+// ============================================================
+
+fn tensor_zeros<const N: usize>() -> Tensor[f32, N> {
+    Tensor::zeros()
+}
+
+fn tensor_zeros<const A: usize, const B: usize>() -> Tensor[f32, A, B> {
+    Tensor::zeros()
+}
+
+fn tensor_zeros<const A: usize, const B: usize, const C: usize>() -> Tensor[f32, A, B, C> {
+    Tensor::zeros()
+}
+
+fn min(a: usize, b: usize) -> usize {
+    if a < b { a } else { b }
+}

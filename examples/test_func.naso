@@ -1,0 +1,24 @@
+// Test simple function with local arrays
+extern "C" {
+    fn naso_yield() -> u64;
+}
+
+fn build_response(buf: *u8) -> u64 {
+    let mut offset = 0;
+    let mut i = 0;
+    let status_line = [72, 84, 84, 80, 47, 49, 46, 49, 32, 50, 48, 48, 32, 79, 75, 13, 10];
+    
+    *buf.add(offset + i) = status_line[i];
+    i = i + 1;
+    offset = offset + 1;
+    
+    offset
+}
+
+fn main() {
+    let mut running = 1;
+    while running != 0 {
+        naso_yield();
+        running = 0;
+    }
+}

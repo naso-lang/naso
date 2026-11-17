@@ -1,0 +1,20 @@
+// Test - check receiver type
+trait T {
+    fn m(&self) -> u64;
+}
+
+struct S {}
+
+impl T for S {
+    fn m(&self) -> u64 { 42u64 }
+}
+
+fn f(x: S) -> u64 {
+    let y = x;  // What type is y?
+    y.m()
+}
+
+fn main() -> () {
+    let s = S{};
+    let _ = f(s);
+}

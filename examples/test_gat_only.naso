@@ -1,0 +1,4 @@
+// Test - trait with GAT only
+trait Test {
+    type Item[T];
+}

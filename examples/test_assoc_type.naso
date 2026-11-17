@@ -1,0 +1,6 @@
+// Test - trait with associated type and method
+trait Test {
+    type Item;
+    
+    fn next(&self) -> u64;
+}

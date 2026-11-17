@@ -1,0 +1,12 @@
+// Minimal test for while loop syntax
+extern "C" {
+    fn naso_yield() -> u64;
+}
+
+fn main() {
+    let mut running = 1;
+    while running != 0 {
+        naso_yield();
+        running = 0;
+    }
+}

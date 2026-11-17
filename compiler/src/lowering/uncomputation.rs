@@ -167,7 +167,15 @@ impl GateApplication {
             Gate::Cz => ("CZ".to_string(), swap_operands(&self.qubits)),
             Gate::Ccx => ("CCX".to_string(), self.qubits.clone()),
             Gate::Swap => ("SWAP".to_string(), self.qubits.clone()),
-            Gate::Rx(_) | Gate::Ry(_) | Gate::Rz(_) => unreachable!("rotations refused above"),
+            Gate::Iswap => ("ISWAP".to_string(), self.qubits.clone()),
+            Gate::IswapDag => ("ISWAPDAG".to_string(), self.qubits.clone()),
+            Gate::Cswap => ("CSWAP".to_string(), self.qubits.clone()),
+            // Single-qubit rotations are handled above (lines 137-152) where we negate the angle.
+            // They cannot reach here, but the match must be exhaustive.
+            Gate::Rx(_) | Gate::Ry(_) | Gate::Rz(_) => unreachable!("single-qubit rotations handled above"),
+            // Controlled rotations and Ising couplings are not yet supported for uncomputation.
+            Gate::Crx(_) | Gate::Cry(_) | Gate::Crz(_) => unreachable!("rotations refused above"),
+            Gate::Rxx(_) | Gate::Ryy(_) | Gate::Rzz(_) | Gate::Cphase(_) => unreachable!("rotations refused above"),
         };
 
         Ok(GateApplication {

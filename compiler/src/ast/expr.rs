@@ -51,7 +51,7 @@ pub enum ExprKind {
     /// Unary operation
     Unary(UnOp, Box<Expr>),
     /// Function call
-    Call(Box<Expr>, Vec<Expr>),
+    Call(Box<Expr>, Vec<Expr>, Vec<Expr>),
     /// Method call
     MethodCall(Box<Expr>, Ident, Vec<Expr>),
     /// Field access
@@ -410,7 +410,7 @@ impl fmt::Display for ExprKind {
             ExprKind::Var(v) => write!(f, "{}", v),
             ExprKind::Binary(op, l, r) => write!(f, "({:?} {} {:?})", l, op, r),
             ExprKind::Unary(op, e) => write!(f, "({}{:?})", op, e),
-            ExprKind::Call(fun, _args) => write!(f, "{:?}(...)", fun),
+            ExprKind::Call(fun, _args, _const_args) => write!(f, "{:?}(...)", fun),
             ExprKind::Block(_) => write!(f, "{{ ... }}"),
             ExprKind::If(c, t, e) => {
                 write!(f, "if {:?} then {:?} else {:?}", c, t, e)

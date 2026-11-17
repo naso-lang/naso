@@ -1,0 +1,19 @@
+// Test associated type projection with trait bounds - no turbofish
+trait Container {
+    type Item;
+}
+
+struct MyContainer {}
+
+impl Container for MyContainer {
+    type Item = u64;
+}
+
+fn process[C: Container]() -> u64 {
+    let _: <C as Container>::Item = 42u64;
+    42u64
+}
+
+fn main() -> () {
+    // Don't call process to avoid turbofish
+}

@@ -1,0 +1,24 @@
+// Test - Trait bounds checking with concrete types
+trait Container {
+    type Item;
+    fn get() -> Self::Item;
+}
+
+struct MyContainer {}
+
+impl Container for MyContainer {
+    type Item = u64;
+    fn get() -> Self::Item {
+        123u64
+    }
+}
+
+// Function with trait bound - should work
+fn process[C: Container](c: C) -> u64 {
+    42u64
+}
+
+fn main() -> () {
+    let container = MyContainer {};
+    let result = process(container);
+}

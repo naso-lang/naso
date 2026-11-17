@@ -1,0 +1,17 @@
+// Test - Overlapping trait implementations (should FAIL - same type)
+trait MyTrait {
+    fn method(&self) -> u64;
+}
+
+struct TypeA {}
+
+// Two impls for the same type - should fail coherence check
+impl MyTrait for TypeA {
+    fn method(&self) -> u64 { 1 }
+}
+
+impl MyTrait for TypeA {
+    fn method(&self) -> u64 { 2 }
+}
+
+fn main() -> () {}

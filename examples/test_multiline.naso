@@ -1,0 +1,22 @@
+// Test multi-line array literal with typed elements
+extern "C" {
+    fn naso_write(fd: u64, buf: *u8, len: u64) -> u64;
+}
+
+fn test_multiline() -> [u8; 10] {
+    if true {
+        [
+            1u8, 2u8, 3u8, 4u8, 5u8,
+            6u8, 7u8, 8u8, 9u8, 10u8
+        ]
+    } else {
+        [
+            10u8, 9u8, 8u8, 7u8, 6u8,
+            5u8, 4u8, 3u8, 2u8, 1u8
+        ]
+    }
+}
+
+fn main() -> () {
+    let _ = test_multiline();
+}

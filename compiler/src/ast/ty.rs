@@ -219,6 +219,14 @@ pub enum TypeKind {
     Var(TypeVar),
     /// Metavariable (unsolved during inference)
     Meta(MetaVar),
+    /// Associated type projection: <Type as Trait>::AssocType<Args>
+    AssociatedTypeProjection {
+        self_ty: Box<Type>,
+        trait_path: Vec<Ident>,
+        trait_args: Vec<TypeArg>,
+        assoc_name: Ident,
+        assoc_args: Vec<TypeArg>,
+    },
     /// Error type (for recovery)
     Error,
 }
@@ -264,7 +272,9 @@ pub enum NatExpr {
     Succ(Box<NatExpr>),
     Var(Ident),
     Add(Box<NatExpr>, Box<NatExpr>),
+    Sub(Box<NatExpr>, Box<NatExpr>),
     Mul(Box<NatExpr>, Box<NatExpr>),
+    Div(Box<NatExpr>, Box<NatExpr>),
     /// Type-level if
     If(Box<Type>, Box<NatExpr>, Box<NatExpr>),
 }
@@ -292,7 +302,9 @@ impl fmt::Display for NatExpr {
             NatExpr::Succ(inner) => write!(f, "{} + 1", inner),
             NatExpr::Var(v) => write!(f, "{}", v),
             NatExpr::Add(a, b) => write!(f, "{} + {}", a, b),
+            NatExpr::Sub(a, b) => write!(f, "{} - {}", a, b),
             NatExpr::Mul(a, b) => write!(f, "{} * {}", a, b),
+            NatExpr::Div(a, b) => write!(f, "{} / {}", a, b),
             NatExpr::If(cond, t, e) => write!(f, "if {} then {} else {}", cond, t, e),
         }
     }
@@ -399,6 +411,23 @@ impl fmt::Display for TypeKind {
             TypeKind::Var(v) => write!(f, "{}", v),
             TypeKind::Meta(m) => write!(f, "{}", m),
             TypeKind::Pointer(inner) => write!(f, "*{}", inner),
+            TypeKind::AssociatedTypeProjection { self_ty, trait_path, trait_args, assoc_name, assoc_args } => {
+                write!(f, "<{} as ", self_ty)?;
+                for (i, ident) in trait_path.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, "::")?;
+                    }
+                    write!(f, "{}", ident)?;
+                }
+                if !trait_args.is_empty() {
+                    write!(f, "<{}>", trait_args.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "))?;
+                }
+                write!(f, ">::{}", assoc_name)?;
+                if !assoc_args.is_empty() {
+                    write!(f, "<{}>", assoc_args.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "))?;
+                }
+                Ok(())
+            }
             TypeKind::Error => write!(f, "<error>"),
         }
     }

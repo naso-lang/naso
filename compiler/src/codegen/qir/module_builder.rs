@@ -100,6 +100,21 @@ fn qir_intrinsic_for(op: &str) -> Option<&'static str> {
         "iswap" => "qir.iswap",
         "ccx" | "toffoli" => "qir.ccx",
 
+        // Controlled rotations
+        "crx" => "qir.crx",
+        "cry" => "qir.cry",
+        "crz" => "qir.crz",
+
+        // Ising couplings
+        "rxx" => "qir.rxx",
+        "ryy" => "qir.ryy",
+        "rzz" => "qir.rzz",
+        "cphase" => "qir.cphase",
+
+        // Three-qubit Fredkin
+        "cswap" => "qir.cswap",
+        "fredkin" => "qir.cswap",
+
         // The dynamic family: a call whose arity is chosen at runtime. QIR takes these
         // through `qir.controlled`, with `qir.adjoint` for a reversed circuit.
         "controlled" => "qir.controlled",
@@ -462,7 +477,7 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
                     .as_pointer_value();
                 Ok(ptr.into())
             }
-            PirExpr::Struct { fields } => {
+            PirExpr::Struct { name: _, fields } => {
                 // Struct literal: build each field, return as struct
                 // For now, build as a tuple-like struct
                 let field_vals: CodegenResult<Vec<BasicValueEnum<'ctx>>> = fields
@@ -1197,6 +1212,18 @@ mod tests {
             "toffoli",
             "controlled",
             "adjoint",
+            // Controlled rotations
+            "crx",
+            "cry",
+            "crz",
+            // Ising couplings
+            "rxx",
+            "ryy",
+            "rzz",
+            "cphase",
+            // Three-qubit
+            "cswap",
+            "fredkin",
         ];
 
         for op in ops {

@@ -1,0 +1,13 @@
+// Test - function returning u64 without traits
+fn test_u64() -> u64 {
+    42u64
+}
+
+fn test_returns_u64() -> u64 {
+    let x = test_u64();
+    x
+}
+
+fn main() -> () {
+    let _ = test_returns_u64();
+}

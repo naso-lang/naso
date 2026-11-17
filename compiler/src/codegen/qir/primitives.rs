@@ -297,6 +297,58 @@ pub const QIR_INTRINSICS: &[QirIntrinsic] = &[
         param_types: &[QirIntrinsicParamType::Qubit, QirIntrinsicParamType::Qubit],
         is_var_args: false,
     },
+    QirIntrinsic {
+        name: "qir.crx",
+        ret_type: QirIntrinsicRetType::Void,
+        param_types: &[QirIntrinsicParamType::Double, QirIntrinsicParamType::Qubit, QirIntrinsicParamType::Qubit],
+        is_var_args: false,
+    },
+    QirIntrinsic {
+        name: "qir.cry",
+        ret_type: QirIntrinsicRetType::Void,
+        param_types: &[QirIntrinsicParamType::Double, QirIntrinsicParamType::Qubit, QirIntrinsicParamType::Qubit],
+        is_var_args: false,
+    },
+    QirIntrinsic {
+        name: "qir.crz",
+        ret_type: QirIntrinsicRetType::Void,
+        param_types: &[QirIntrinsicParamType::Double, QirIntrinsicParamType::Qubit, QirIntrinsicParamType::Qubit],
+        is_var_args: false,
+    },
+    QirIntrinsic {
+        name: "qir.rxx",
+        ret_type: QirIntrinsicRetType::Void,
+        param_types: &[QirIntrinsicParamType::Double, QirIntrinsicParamType::Qubit, QirIntrinsicParamType::Qubit],
+        is_var_args: false,
+    },
+    QirIntrinsic {
+        name: "qir.ryy",
+        ret_type: QirIntrinsicRetType::Void,
+        param_types: &[QirIntrinsicParamType::Double, QirIntrinsicParamType::Qubit, QirIntrinsicParamType::Qubit],
+        is_var_args: false,
+    },
+    QirIntrinsic {
+        name: "qir.rzz",
+        ret_type: QirIntrinsicRetType::Void,
+        param_types: &[QirIntrinsicParamType::Double, QirIntrinsicParamType::Qubit, QirIntrinsicParamType::Qubit],
+        is_var_args: false,
+    },
+    QirIntrinsic {
+        name: "qir.cphase",
+        ret_type: QirIntrinsicRetType::Void,
+        param_types: &[QirIntrinsicParamType::Double, QirIntrinsicParamType::Qubit, QirIntrinsicParamType::Qubit],
+        is_var_args: false,
+    },
+    QirIntrinsic {
+        name: "qir.cswap",
+        ret_type: QirIntrinsicRetType::Void,
+        param_types: &[
+            QirIntrinsicParamType::Qubit,
+            QirIntrinsicParamType::Qubit,
+            QirIntrinsicParamType::Qubit,
+        ],
+        is_var_args: false,
+    },
     // Measurement
     QirIntrinsic {
         name: "qir.mz",
@@ -424,6 +476,9 @@ mod tests {
         assert!(get_intrinsic("qir.cx").is_some());
         assert!(get_intrinsic("qir.mz").is_some());
         assert!(get_intrinsic("qir.qubit_alloc").is_some());
+        assert!(get_intrinsic("qir.crx").is_some());
+        assert!(get_intrinsic("qir.rzz").is_some());
+        assert!(get_intrinsic("qir.cswap").is_some());
         assert!(get_intrinsic("nonexistent").is_none());
     }
 
@@ -442,6 +497,23 @@ mod tests {
         let mz = get_intrinsic("qir.mz").unwrap();
         assert_eq!(mz.param_types.len(), 1);
         assert!(matches!(mz.ret_type, QirIntrinsicRetType::Result));
+
+        // New intrinsics
+        let crx = get_intrinsic("qir.crx").unwrap();
+        assert_eq!(crx.param_types.len(), 3);
+        assert!(matches!(crx.param_types[0], QirIntrinsicParamType::Double));
+        assert!(matches!(crx.param_types[1], QirIntrinsicParamType::Qubit));
+        assert!(matches!(crx.param_types[2], QirIntrinsicParamType::Qubit));
+
+        let rzz = get_intrinsic("qir.rzz").unwrap();
+        assert_eq!(rzz.param_types.len(), 3);
+        assert!(matches!(rzz.param_types[0], QirIntrinsicParamType::Double));
+
+        let cswap = get_intrinsic("qir.cswap").unwrap();
+        assert_eq!(cswap.param_types.len(), 3);
+        assert!(matches!(cswap.param_types[0], QirIntrinsicParamType::Qubit));
+        assert!(matches!(cswap.param_types[1], QirIntrinsicParamType::Qubit));
+        assert!(matches!(cswap.param_types[2], QirIntrinsicParamType::Qubit));
     }
 
     #[test]
@@ -463,6 +535,14 @@ mod tests {
             "qir.qubit_release",
             "qir.result_record",
             "qir.result_update",
+            "qir.crx",
+            "qir.cry",
+            "qir.crz",
+            "qir.rxx",
+            "qir.ryy",
+            "qir.rzz",
+            "qir.cphase",
+            "qir.cswap",
         ];
 
         for name in required {

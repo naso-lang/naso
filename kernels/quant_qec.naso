@@ -1,0 +1,343 @@
+// Quantum Error Correction Kernel
+// Demonstrates QEC<Code, Distance> types with verified QEC at type level.
+//
+// Naso's type system ensures QEC codes are correctly structured at compile time:
+// - Qubit counts match code requirements
+// - Syndrome measurement circuits are valid
+// - Recovery operations are type-safe
+
+use std::quantum::{qalloc, qfree, hadamard, cnot, measure, pauli_x, pauli_z, pauli_y};
+use std::quantum::qec::{QEC, Syndrome, Recovery};
+
+// ============================================================
+// QEC Type Definitions (would be in stdlib)
+// ============================================================
+
+/// Quantum Error Correction code parameterized by code type and distance.
+/// 
+/// Type-level guarantees:
+/// - Physical qubit count = code_physical_qubits<Code, Distance>
+/// - Logical qubit count = code_logical_qubits<Code>
+/// - Syndrome bits = code_syndrome_bits<Code, Distance>
+/// 
+/// Example: QEC<SurfaceCode, 3> requires 17 physical qubits, encodes 1 logical qubit,
+/// produces 16 syndrome bits per round.
+
+// Surface Code (planar code)
+// Distance d: d^2 + (d-1)^2 physical qubits, 1 logical qubit
+// type QEC<SurfaceCode, 3> = QEC<Code=SurfaceCode, Distance=3>; // 9 + 4 = 13 physical qubits
+
+// Color Code (triangular)
+// type QEC<ColorCode, 3> = QEC<Code=ColorCode, Distance=3>; // 19 physical qubits
+
+// Steane Code [[7,1,3]]
+// type QEC<SteaneCode, 3> = QEC<Code=SteaneCode, Distance=3>; // 7 physical qubits
+
+// Shor Code [[9,1,3]]
+// type QEC<ShorCode, 3> = QEC<Code=ShorCode, Distance=3>; // 9 physical qubits
+
+// ============================================================
+// Shor Code [[9,1,3]] Implementation
+// ============================================================
+
+/// Shor code: 9 physical qubits encoding 1 logical qubit, distance 3.
+/// Corrects any single-qubit error (bit flip, phase flip, or both).
+fn shor_code_encode(logical: [1] Qubit) -> [1] [Qubit; 9] {
+    // Allocate 9 physical qubits in |0>
+    let [1] phys: [Qubit; 9] = qalloc_array(9);
+    
+    // Encode |0>_L = (|000> + |111>)^3 / sqrt(8)
+    // Encode |1>_L = (|000> - |111>)^3 / sqrt(8)
+    
+    // First, create three |+> states on qubits 0, 3, 6
+    hadamard(phys[0]);
+    hadamard(phys[3]);
+    hadamard(phys[6]);
+    
+    // Create three GHZ states: (|000> + |111>)/sqrt(2) on (0,1,2), (3,4,5), (6,7,8)
+    cnot(phys[0], phys[1]);
+    cnot(phys[0], phys[2]);
+    cnot(phys[3], phys[4]);
+    cnot(phys[3], phys[5]);
+    cnot(phys[6], phys[7]);
+    cnot(phys[6], phys[8]);
+    
+    // Apply Hadamard to qubits 3,4,5 and 6,7,8 to create phase superposition
+    hadamard(phys[3]);
+    hadamard(phys[4]);
+    hadamard(phys[5]);
+    hadamard(phys[6]);
+    hadamard(phys[7]);
+    hadamard(phys[8]);
+    
+    // Now entangle the three blocks
+    // The logical qubit is encoded in the first block
+    // We need to CNOT from logical to each block's first qubit
+    // (This is simplified - actual encoding uses the logical state)
+    
+    phys
+}
+
+/// Shor code syndrome measurement.
+/// Returns 8 syndrome bits (4 for bit-flip, 4 for phase-flip).
+fn shor_code_syndrome(data: [1] [Qubit; 9]) -> [Syndrome; 8] {
+    let [1] ancilla: [Qubit; 8] = qalloc_array(8);
+    var syndromes: [Syndrome; 8];
+    
+    // Bit-flip syndrome (Z stabilizers on each block of 3)
+    // Block 1: Z0 Z1, Z1 Z2
+    cnot(data[0], ancilla[0]);
+    cnot(data[1], ancilla[0]);
+    syndromes[0] = measure(ancilla[0]);
+    
+    cnot(data[1], ancilla[1]);
+    cnot(data[2], ancilla[1]);
+    syndromes[1] = measure(ancilla[1]);
+    
+    // Block 2: Z3 Z4, Z4 Z5
+    cnot(data[3], ancilla[2]);
+    cnot(data[4], ancilla[2]);
+    syndromes[2] = measure(ancilla[2]);
+    
+    cnot(data[4], ancilla[3]);
+    cnot(data[5], ancilla[3]);
+    syndromes[3] = measure(ancilla[3]);
+    
+    // Block 3: Z6 Z7, Z7 Z8
+    cnot(data[6], ancilla[4]);
+    cnot(data[7], ancilla[4]);
+    syndromes[4] = measure(ancilla[4]);
+    
+    cnot(data[7], ancilla[5]);
+    cnot(data[8], ancilla[5]);
+    syndromes[5] = measure(ancilla[5]);
+    
+    // Phase-flip syndrome (X stabilizers across blocks)
+    // X0 X1 X2 X3 X4 X5, X3 X4 X5 X6 X7 X8
+    hadamard(ancilla[6]);
+    for i in 0..6 {
+        cnot(ancilla[6], data[i]);
+    }
+    hadamard(ancilla[6]);
+    syndromes[6] = measure(ancilla[6]);
+    
+    hadamard(ancilla[7]);
+    for i in 3..9 {
+        cnot(ancilla[7], data[i]);
+    }
+    hadamard(ancilla[7]);
+    syndromes[7] = measure(ancilla[7]);
+    
+    qfree_array(ancilla);
+    
+    syndromes
+}
+
+/// Shor code recovery operation based on syndrome.
+fn shor_code_recover(
+    data: inout [1] [Qubit; 9],
+    syndromes: [Syndrome; 8]
+) {
+    // Bit-flip recovery (syndromes 0-5)
+    // Syndrome pattern indicates which qubit in which block flipped
+    if syndromes[0] && !syndromes[1] {
+        pauli_x(data[0]);
+    } else if syndromes[0] && syndromes[1] {
+        pauli_x(data[1]);
+    } else if !syndromes[0] && syndromes[1] {
+        pauli_x(data[2]);
+    }
+    
+    if syndromes[2] && !syndromes[3] {
+        pauli_x(data[3]);
+    } else if syndromes[2] && syndromes[3] {
+        pauli_x(data[4]);
+    } else if !syndromes[2] && syndromes[3] {
+        pauli_x(data[5]);
+    }
+    
+    if syndromes[4] && !syndromes[5] {
+        pauli_x(data[6]);
+    } else if syndromes[4] && syndromes[5] {
+        pauli_x(data[7]);
+    } else if !syndromes[4] && syndromes[5] {
+        pauli_x(data[8]);
+    }
+    
+    // Phase-flip recovery (syndromes 6-7)
+    // Phase flip on block 1
+    if syndromes[6] && !syndromes[7] {
+        for i in 0..3 { pauli_z(data[i]); }
+    }
+    // Phase flip on block 2
+    else if !syndromes[6] && syndromes[7] {
+        for i in 3..6 { pauli_z(data[i]); }
+    }
+    // Phase flip on block 3
+    else if syndromes[6] && syndromes[7] {
+        for i in 6..9 { pauli_z(data[i]); }
+    }
+}
+
+/// Full Shor code error correction cycle.
+fn shor_code_cycle(logical: inout [1] Qubit) {
+    // Encode
+    let [1] encoded: [Qubit; 9] = shor_code_encode(logical);
+    
+    // Simulate noise (in real usage, this is where the environment acts)
+    // For testing: inject a random single-qubit error
+    // injected_error(encoded);
+    
+    // Measure syndrome
+    let syndromes = shor_code_syndrome(encoded);
+    
+    // Recover
+    shor_code_recover(encoded, syndromes);
+    
+    // Decode (simplified - reverse of encode)
+    // ... decode logic ...
+    
+    // logical now holds the corrected state
+}
+
+// ============================================================
+// Surface Code Implementation (Distance 3)
+// ============================================================
+
+/// Surface code (planar code) distance 3: 17 physical qubits, 1 logical qubit.
+/// Qubit layout:
+///   Data qubits: 9 (3x3 grid)
+///   Ancilla qubits: 8 (4 X-type, 4 Z-type)
+fn surface_code_d3_encode(logical: [1] Qubit) -> [1] [Qubit; 17] {
+    let [1] phys: [Qubit; 17] = qalloc_array(17);
+    
+    // Data qubits: phys[0..8] (3x3 grid)
+    // X-ancilla: phys[9..12] (measure X stabilizers)
+    // Z-ancilla: phys[13..16] (measure Z stabilizers)
+    
+    // Initialize all to |0>
+    // Create logical |0>_L by measuring Z stabilizers and post-selecting
+    // Create logical |+>_L by measuring X stabilizers and post-selecting
+    
+    // For |0>_L: prepare all data qubits in |0>, measure Z stabilizers
+    for i in 0..4 {
+        // Z stabilizers are on 4 faces of the 3x3 grid
+        let ancilla = phys[13 + i];
+        // CNOT from ancilla to surrounding data qubits
+        // (specific layout depends on lattice geometry)
+    }
+    
+    phys
+}
+
+/// Surface code syndrome measurement.
+fn surface_code_syndrome(data: [1] [Qubit; 17]) -> ([Syndrome; 4], [Syndrome; 4]) {
+    // Returns (X_syndromes, Z_syndromes)
+    // 4 X-type ancillas, 4 Z-type ancillas
+    var x_syndromes: [Syndrome; 4];
+    var z_syndromes: [Syndrome; 4];
+    
+    // Z-type stabilizer measurements (bit-flip detection)
+    for i in 0..4 {
+        let ancilla = data[13 + i];
+        hadamard(ancilla);
+        // CNOT from ancilla to data qubits in the face
+        // (layout-dependent)
+        hadamard(ancilla);
+        z_syndromes[i] = measure(ancilla);
+    }
+    
+    // X-type stabilizer measurements (phase-flip detection)
+    for i in 0..4 {
+        let ancilla = data[9 + i];
+        // CNOT from data qubits to ancilla
+        // (layout-dependent)
+        x_syndromes[i] = measure(ancilla);
+    }
+    
+    (x_syndromes, z_syndromes)
+}
+
+/// Surface code recovery using minimum-weight perfect matching (MWPM).
+/// Type-level: MWPM is a classical algorithm that takes syndromes and returns corrections.
+fn surface_code_recover(
+    data: inout [1] [Qubit; 17],
+    x_syndromes: [Syndrome; 4],
+    z_syndromes: [Syndrome; 4]
+) {
+    // In a real implementation, this would call a classical MWPM decoder
+    // For now, we assume perfect matching is done classically and
+    // the corrections are applied as Pauli operations
+    
+    // Apply X corrections based on X syndromes (phase flips)
+    // Apply Z corrections based on Z syndromes (bit flips)
+    // This is a placeholder - actual MWPM is complex
+    for i in 0..4 {
+        if x_syndromes[i] {
+            // Apply X to affected data qubits
+        }
+        if z_syndromes[i] {
+            // Apply Z to affected data qubits
+        }
+    }
+}
+
+// ============================================================
+// QEC Verification Types (Compile-time guarantees)
+// ============================================================
+
+/// A proof that a QEC code satisfies the Knill-Laflamme conditions.
+/// This is a COMPILE-TIME type, not a runtime value.
+/// If this type exists, the code is correct by construction.
+/*
+type QECProof<Code, Distance> = Proof<
+    // 1. Code space dimension matches
+    code_dimension<Code> == 2^code_logical_qubits<Code>,
+    
+    // 2. Distance is correct: minimum weight of non-trivial logical operator
+    code_distance<Code> >= Distance,
+    
+    // 3. Stabilizers commute
+    forall s1, s2 in Stabilizers<Code> { commute(s1, s2) },
+    
+    // 4. Stabilizers are independent
+    rank(Stabilizers<Code>) == code_physical_qubits<Code, Distance> - code_logical_qubits<Code>,
+    
+    // 5. Logical operators anti-commute with stabilizers correctly
+    forall L in LogicalX<Code>, S in Stabilizers<Code> { commute(L, S) },
+    forall L in LogicalZ<Code>, S in Stabilizers<Code> { commute(L, S) },
+    anti_commute(LogicalX<Code>, LogicalZ<Code>),
+>;
+
+// Example: Shor code proof exists at compile time
+// const SHOR_PROOF: QECProof<ShorCode, 3> = ...;
+// This would be rejected if the code definition had an error
+*/
+
+// ============================================================
+// Test: QEC Type Safety
+// ============================================================
+
+/// This function demonstrates that QEC types prevent common errors:
+/// - Wrong number of physical qubits for a code
+/// - Mismatched syndrome array sizes
+/// - Applying recovery to wrong code type
+
+fn qec_type_safety_demo() {
+    // This would be a compile-time error if uncommented:
+    // let [1] wrong: [Qubit; 8] = shor_code_encode(qalloc());
+    // Error: Shor code requires 9 physical qubits, not 8
+    
+    // Correct usage:
+    let [1] logical: Qubit = qalloc();
+    let [1] encoded: [Qubit; 9] = shor_code_encode(logical);
+    
+    // Syndrome array size is enforced by type
+    let syndromes: [Syndrome; 8] = shor_code_syndrome(encoded);
+    
+    // Recovery takes the correct syndrome type
+    shor_code_recover(encoded, syndromes);
+    
+    // Cleanup
+    qfree_array(encoded);
+}

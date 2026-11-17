@@ -56,6 +56,25 @@ pub fn unify_types(checker: &mut TypeChecker, ty1: &Type, ty2: &Type) -> Result<
         return Ok(result);
     }
 
+    // Special handling for Int/UInt types with explicit bit widths
+    // u64 and u32 are different types - check int_width
+    if (matches!(&ty1.kind, TypeKind::Int | TypeKind::UInt) && matches!(&ty2.kind, TypeKind::Int | TypeKind::UInt)) {
+        let width1 = ty1.int_width;
+        let width2 = ty2.int_width;
+        if let (Some(w1), Some(w2)) = (width1, width2) {
+            if w1 != w2 {
+                return Err(TypeError::TypeMismatch {
+                    expected: ty1.clone(),
+                    found: ty2.clone(),
+                    span: ty1.span.merge(ty2.span),
+                });
+            }
+        }
+        // If we reach here, either widths match or at least one is unknown
+        // Use the known width if available
+        let int_width = width1.or(width2);
+    }
+
     // Handle metavariables first
     if let TypeKind::Meta(mv) = &ty1.kind {
         return unify_meta_var(checker, *mv, ty2);
@@ -70,11 +89,16 @@ pub fn unify_types(checker: &mut TypeChecker, ty1: &Type, ty2: &Type) -> Result<
     // Unify type kinds
     let unified_kind = unify_kinds(checker, &ty1.kind, &ty2.kind)?;
 
-    Ok(Type::new(
+    // Preserve int_width if both types have the same width or one has it
+    let int_width = ty1.int_width.or(ty2.int_width);
+
+    let mut result = Type::new(
         unified_kind,
         unified_qty,
         ty1.span.merge(ty2.span),
-    ))
+    );
+    result.int_width = int_width;
+    Ok(result)
 }
 
 /// Unify two type kinds

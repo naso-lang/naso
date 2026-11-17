@@ -1,0 +1,28 @@
+// Test - const generics with arithmetic evaluation
+fn identity[N: nat](x: u64) -> u64 {
+    x
+}
+
+fn get_array_size[N: nat]() -> u64 {
+    N as u64
+}
+
+fn main() -> () {
+    // Test arithmetic in const generics
+    let a = identity[10 + 5](42u64);      // N = 15
+    let b = identity[2 * 3](100u64);       // N = 6
+    let c = identity[4 + 2 * 3](5u64);     // N = 10 (4 + 6)
+    
+    // Test getting the array size
+    let size1 = get_array_size[100]();
+    let size2 = get_array_size[20 + 30]();
+    
+    // Nested arithmetic
+    let d = identity[(10 + 5) * 2](7u64);  // N = 30
+}
+
+fn test_complex_arithmetic() {
+    // More complex expressions
+    let x = identity[1 + 2 + 3 + 4](1u64);  // N = 10
+    let y = identity[2 * 3 * 4](2u64);       // N = 24
+}

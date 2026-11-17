@@ -216,12 +216,25 @@ impl<'a> Parser<'a> {
         );
         if !is_control_flow {
             while !self.loop_should_stop() {
-                if self.at(TK::LParen) {
+                // Check for const generic arguments: fn[10](args)
+                if self.at(TK::LBracket) {
+                    self.bump();
+                    let const_args = self.parse_const_generic_args();
+                    self.expect(TK::RBracket);
+                    // After const args, expect a function call
+                    if self.at(TK::LParen) {
+                        self.bump();
+                        let args = self.parse_args_until(TK::RParen);
+                        self.expect(TK::RParen);
+                        let span = expr.span;
+                        expr = Expr::new(ExprKind::Call(Box::new(expr), args, const_args), span, next_id());
+                    }
+                } else if self.at(TK::LParen) {
                     self.bump();
                     let args = self.parse_args_until(TK::RParen);
                     self.expect(TK::RParen);
                     let span = expr.span;
-                    expr = Expr::new(ExprKind::Call(Box::new(expr), args), span, next_id());
+                    expr = Expr::new(ExprKind::Call(Box::new(expr), args, Vec::new()), span, next_id());
                 } else if self.at(TK::Dot) {
                     self.bump();
                     let name = self.parse_ident();
@@ -264,6 +277,7 @@ impl<'a> Parser<'a> {
                                     next_id(),
                                 )),
                                 args,
+                                Vec::new(),
                             ),
                             span,
                             next_id(),
@@ -402,6 +416,25 @@ impl<'a> Parser<'a> {
         args
     }
 
+    /// Parse const generic arguments: comma-separated expressions (evaluated as Nat)
+    fn parse_const_generic_args(&mut self) -> Vec<Expr> {
+        let mut args = Vec::new();
+        while !self.loop_should_stop() {
+            if self.at(TK::RBracket) {
+                break;
+            }
+            args.push(self.parse_expr());
+            if self.at(TK::RBracket) {
+                break;
+            }
+            self.expect(TK::Comma);
+            if self.at(TK::RBracket) {
+                break;
+            }
+        }
+        args
+    }
+
     // ===== Primary =====
 
     fn parse_primary(&mut self) -> Expr {
@@ -443,7 +476,7 @@ impl<'a> Parser<'a> {
         let tok = self.bump().expect("literal token");
         let span = token_span(&tok);
         let lit = match &tok.kind {
-            TK::Int(n) => Literal::Int(*n),
+            TK::Int(typed) => Literal::Int(typed.value, typed.ty),
             TK::Float(f) => Literal::Float(*f),
             TK::Bool(b) => Literal::Bool(*b),
             TK::Str(s) => Literal::String(s.clone()),
@@ -524,7 +557,7 @@ impl<'a> Parser<'a> {
                 BinOp::Shr,
                 Box::new(index_u32.clone()),
                 Box::new(Expr::new(
-                    ExprKind::Literal(Literal::UInt(2)),
+                    ExprKind::Literal(Literal::UInt(2, None)),
                     span,
                     next_id(),
                 )),
@@ -546,7 +579,7 @@ impl<'a> Parser<'a> {
                 BinOp::BitAnd,
                 Box::new(index_u32.clone()),
                 Box::new(Expr::new(
-                    ExprKind::Literal(Literal::UInt(3)),
+                    ExprKind::Literal(Literal::UInt(3, None)),
                     span,
                     next_id(),
                 )),
@@ -559,7 +592,7 @@ impl<'a> Parser<'a> {
                 BinOp::Mul,
                 Box::new(lane),
                 Box::new(Expr::new(
-                    ExprKind::Literal(Literal::UInt(8)),
+                    ExprKind::Literal(Literal::UInt(8, None)),
                     span,
                     next_id(),
                 )),
@@ -574,7 +607,7 @@ impl<'a> Parser<'a> {
             span,
             next_id(),
         );
-        let mask = Expr::new(ExprKind::Literal(Literal::UInt(255)), span, next_id());
+        let mask = Expr::new(ExprKind::Literal(Literal::UInt(255, None)), span, next_id());
         let byte_val = Expr::new(
             ExprKind::Binary(BinOp::BitAnd, Box::new(shifted), Box::new(mask)),
             span,
@@ -675,6 +708,7 @@ impl<'a> Parser<'a> {
                         next_id(),
                     )),
                     vec![diff.clone()],
+                    Vec::new(), // const_args
                 ),
                 span,
                 next_id(),
@@ -1375,7 +1409,7 @@ impl<'a> Parser<'a> {
                 self.error_span(),
             );
             return Expr::new(
-                ExprKind::Literal(crate::ast::Literal::Int(0)),
+                ExprKind::Literal(crate::ast::Literal::Int(0, None)),
                 span,
                 next_id(),
             );
@@ -1420,7 +1454,7 @@ impl<'a> Parser<'a> {
         let tok = self.bump().expect("pattern literal token");
         let span = token_span(&tok);
         let lit = match &tok.kind {
-            TK::Int(n) => Literal::Int(*n),
+            TK::Int(typed) => Literal::Int(typed.value, typed.ty),
             TK::Float(f) => Literal::Float(*f),
             TK::Bool(b) => Literal::Bool(*b),
             TK::Str(s) => Literal::String(s.clone()),

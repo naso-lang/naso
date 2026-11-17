@@ -1,0 +1,13 @@
+// Test - function with struct parameter returning u64
+struct File {
+    fd: u64,
+}
+
+fn test_read(file: File) -> u64 {
+    42u64
+}
+
+fn main() -> () {
+    let f = File { fd: 1 };
+    let _ = test_read(f);
+}

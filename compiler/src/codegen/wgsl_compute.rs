@@ -796,7 +796,7 @@ fn emit_for(out: &mut String, loop_: &ForLoop, depth: usize, _extent: &u32) -> C
 
 fn const_int(e: &Expr, line: u32) -> CodegenResult<i64> {
     match &e.kind {
-        ExprKind::Literal(Literal::Int(v)) => Ok(*v),
+        ExprKind::Literal(Literal::Int(v, _)) => Ok(*v),
         other => Err(CodegenError::UnsupportedFeature(format!(
             "`forall` bound at line {line} is {}, which needs a constant integer \
              to write a WGSL `for` header",
@@ -836,7 +836,7 @@ fn emit_expr_inline(
             emit_expr_inline(out, idx, depth, extent)?;
             out.push(']');
         }
-        ExprKind::Call(callee, args) => {
+        ExprKind::Call(callee, args, const_args) => {
             out.push_str(&sanitize(&crate::codegen::wgsl_straight::callee_name(
                 callee,
             )));

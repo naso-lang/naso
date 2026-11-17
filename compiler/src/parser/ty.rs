@@ -85,10 +85,10 @@ impl<'a> Parser<'a> {
             // so `Tensor[f32, 1024]` and `Tensor[f32, 4]` were indistinguishable
             // in the AST, and a backend could not know the element count. The
             // value is carried as `NatExpr::Lit`.
-            if let Some(TK::Int(n)) = self.peek() {
+            if let Some(TK::Int(typed)) = self.peek() {
                 // Borrow the token for its span, then advance.
                 let span = self.peek_token().map(token_span).unwrap_or_default();
-                let n = *n;
+                let n = typed.value;
                 self.bump();
                 dims.push(Type::nat_lit(n as u64, span));
             } else {
@@ -107,9 +107,9 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a single type argument: a natural-number literal or a type.
-    fn parse_type_arg(&mut self) -> TypeArg {
-        if let Some(TK::Int(n)) = self.peek() {
-            let n = *n;
+    pub fn parse_type_arg(&mut self) -> TypeArg {
+        if let Some(TK::Int(typed)) = self.peek() {
+            let n = typed.value;
             self.bump();
             return TypeArg::Nat(NatExpr::from_u64(n as u64));
         }
@@ -119,6 +119,24 @@ impl<'a> Parser<'a> {
     /// Parse the base of a type (no leading quantity, no trailing generic
     /// arguments).
     fn parse_base_type(&mut self) -> Type {
+        // Handle reference types: &T or &mut T
+        if self.at(TK::Amp) {
+            let start = self.pos;
+            self.bump(); // consume '&'
+            let mutability = if self.eat(TK::Mut) {
+                Mutability::Mut
+            } else {
+                Mutability::Immutable
+            };
+            let inner = self.parse_base_type();
+            let span = self.span_from(start);
+            return Type::new(
+                TypeKind::Pointer(Box::new(inner)),
+                Quantity::Many,
+                span,
+            );
+        }
+
         match self.peek() {
             // `()` unit or tuple types or grouped types
             Some(TK::LParen) => {
@@ -188,6 +206,40 @@ impl<'a> Parser<'a> {
             Some(TK::BoolKw) => {
                 self.bump();
                 Type::new(TypeKind::Bool, Quantity::Many, Span::default())
+            }
+            Some(TK::SelfKw) => {
+                self.bump();
+                // Check if this is Self::AssocType (associated type access)
+                if self.at(TK::ColonColon) {
+                    // Parse the rest of the path: Self::Item::...
+                    let mut path = vec![Ident::new("Self", Span::default())];
+                    while self.eat(TK::ColonColon) {
+                        path.push(self.parse_ident());
+                    }
+                    // Parse optional generic args: Self::Item[Args]
+                    let assoc_args = if self.at(TK::LBracket) {
+                        self.parse_type_args()
+                    } else {
+                        Vec::new()
+                    };
+                    // Create AssociatedTypeProjection for Self::AssocType<Args>
+                    // self_ty is Self (the implementing type)
+                    let self_ty = Type::new(TypeKind::Named(Ident::new("Self", Span::default()), Vec::new()), Quantity::Many, Span::default());
+                    Type::new(
+                        TypeKind::AssociatedTypeProjection {
+                            self_ty: Box::new(self_ty),
+                            trait_path: vec![Ident::new("Iterator", Span::default())], // TODO: Get actual trait from context
+                            trait_args: Vec::new(),
+                            assoc_name: path.last().cloned().unwrap(),
+                            assoc_args,
+                        },
+                        Quantity::Many,
+                        Span::default()
+                    )
+                } else {
+                    // Self type - represented as a special marker that will be resolved during type checking
+                    Type::new(TypeKind::Named(Ident::new("Self", Span::default()), Vec::new()), Quantity::Many, Span::default())
+                }
             }
             // Function pointer type: fn(param1, param2, ...) -> ret
             Some(TK::Fn) => self.parse_function_pointer_type(),
@@ -336,9 +388,63 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Type::new(TypeKind::String, Quantity::Many, Span::default())
             }
+            // Associated type projection: <Type as Trait>::AssocType<Args>
+            Some(TK::Lt) => self.parse_assoc_type_projection(),
             None => self.unexpected("a type"),
             Some(_) => self.unexpected("a type"),
         }
+    }
+
+    /// Parse associated type projection: <Type as Trait>::AssocType<Args>
+    fn parse_assoc_type_projection(&mut self) -> Type {
+        let start = self.pos;
+        self.expect(TK::Lt); // consume '<'
+        
+        // Parse the self type: Type
+        let self_ty = self.parse_type();
+        
+        // Expect 'as'
+        self.expect(TK::As);
+        
+        // Parse trait path: Trait or std::trait::Trait
+        let trait_path = self.parse_path();
+        
+        // Parse optional trait args: Trait<Args>
+        let trait_args = if self.at(TK::LBracket) {
+            self.parse_type_args()
+        } else {
+            Vec::new()
+        };
+        
+        // Expect '>'
+        self.expect(TK::Gt);
+        
+        // Expect '::'
+        self.expect(TK::ColonColon);
+        
+        // Parse associated type name
+        let assoc_name = self.parse_ident();
+        
+        // Parse optional assoc type args: AssocType<Args>
+        let assoc_args = if self.at(TK::LBracket) {
+            self.parse_type_args()
+        } else {
+            Vec::new()
+        };
+        
+        let span = self.span_from(start);
+        
+        Type::new(
+            TypeKind::AssociatedTypeProjection {
+                self_ty: Box::new(self_ty),
+                trait_path,
+                trait_args,
+                assoc_name,
+                assoc_args,
+            },
+            Quantity::Many,
+            span,
+        )
     }
 
     /// Parse a bare named type (TypeIdent or the reserved `QRegister`/`Tensor` keyword,
@@ -395,7 +501,7 @@ impl<'a> Parser<'a> {
     fn expr_to_nat_expr(&mut self, expr: Expr) -> NatExpr {
         match &expr.kind {
             ExprKind::Var(ident) => NatExpr::Var(ident.clone()),
-            ExprKind::Literal(Literal::Int(n)) => NatExpr::from_u64(*n as u64),
+            ExprKind::Literal(Literal::Int(n, _)) => NatExpr::from_u64(*n as u64),
             _ => NatExpr::Var(Ident::new("unknown", expr.span)),
         }
     }

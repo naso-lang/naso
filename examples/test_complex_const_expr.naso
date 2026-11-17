@@ -1,0 +1,37 @@
+// Test - Complex const generic expressions
+fn identity[N: nat](x: u64) -> u64 {
+    x
+}
+
+fn get_size[N: nat]() -> u64 {
+    N as u64
+}
+
+fn main() -> () {
+    // Addition
+    let a = identity[10 + 5](42u64);       // N = 15
+    let b = identity[2 + 3 * 4](100u64);    // N = 14 (2 + 12)
+    
+    // Subtraction
+    let c = identity[20 - 5](5u64);         // N = 15
+    
+    // Division
+    let d = identity[20 / 4](7u64);         // N = 5
+    
+    // Complex expressions
+    let e = identity[(10 + 5) * 2](1u64);   // N = 30
+    let f = identity[100 / 2 - 10](2u64);   // N = 40
+    
+    // Get size at compile time
+    let size1 = get_size[100]();
+    let size2 = get_size[50 + 25]();
+    let size3 = get_size[100 - 10]();
+    let size4 = get_size[8 * 4]();
+}
+
+fn test_nested() {
+    // Nested arithmetic
+    let x = identity[1 + 2 + 3 + 4](1u64);  // N = 10
+    let y = identity[2 * 3 * 4](2u64);       // N = 24
+    let z = identity[(10 - 2) * (3 + 1)](3u64); // N = 32
+}

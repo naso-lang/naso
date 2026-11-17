@@ -210,6 +210,11 @@ fn lower_type_kind_to_aggregate(
         TypeKind::Error => Err(CodegenError::TypeLoweringError(
             "Cannot lower error type".to_string(),
         )),
+        TypeKind::AssociatedTypeProjection { .. } => {
+            // Associated type projections should be normalized during type checking
+            // If we reach here, treat as opaque struct
+            Ok(LlvmAggregateType::Struct(vec![]))
+        }
         TypeKind::String => Ok(LlvmAggregateType::Struct(vec![
             QuantityAwareType::Unrestricted(LlvmPointerType {
                 pointee: Box::new(QuantityAwareType::Linear(LlvmAggregateType::Int(

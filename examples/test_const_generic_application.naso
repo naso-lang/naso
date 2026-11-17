@@ -1,0 +1,36 @@
+fn identity[N: nat](x: u64) -> u64 {
+    x
+}
+
+fn main() {
+    let a = identity[10](42u64);
+    let b = identity[100](100u64);
+    let c = identity[10](identity[20](5u64));
+}
+
+fn square[N: nat](x: u64) -> u64 {
+    x * x
+}
+
+fn nested_test() {
+    let d = square[2](square[3](4u64));
+}
+
+// Test with if/else branches
+fn test_if[N: nat](x: u64) -> [u64; N] {
+    if x > 0 {
+        [1u64, 2u64, 3u64]
+    } else {
+        [0u64, 0u64, 0u64]
+    }
+}
+
+fn test_array_literal() {
+    let arr = test_if[3](2u64);
+}
+
+fn generic_array_with_const() {
+    let x = identity[5](10u64);
+    let y = square[3](2u64);
+    let z = identity[1](identity[2](identity[5](7u64)));
+}

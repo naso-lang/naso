@@ -1,0 +1,8 @@
+// Minimal test - just a function returning u64
+fn test_u64() -> u64 {
+    42u64
+}
+
+fn main() -> () {
+    let _ = test_u64();
+}

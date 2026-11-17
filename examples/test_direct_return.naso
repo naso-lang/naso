@@ -1,0 +1,23 @@
+// Test - check function return type parsing
+trait Read {
+    fn read(&self, buf: *u8, len: u64) -> u64;
+}
+
+struct File {
+    fd: u64,
+}
+
+impl Read for File {
+    fn read(&self, buf: *u8, len: u64) -> u64 {
+        42u64
+    }
+}
+
+fn test_read(file: File) -> u64 {
+    42u64
+}
+
+fn main() -> () {
+    let f = File { fd: 1 };
+    let _ = test_read(f);
+}

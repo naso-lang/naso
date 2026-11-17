@@ -1,0 +1,21 @@
+// Test - Self::AssocType in trait (simpler return type)
+trait Iterator {
+    type Item[T];
+    
+    fn next(&self) -> Self::Item[u64];
+}
+
+struct MyIter {}
+
+impl Iterator for MyIter {
+    type Item[T] = T;
+    
+    fn next(&self) -> u64 {
+        42u64
+    }
+}
+
+fn main() -> () {
+    let iter = MyIter {};
+    let _ = iter.next();
+}

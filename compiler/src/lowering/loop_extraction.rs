@@ -152,7 +152,7 @@ fn build_nest(bindings: &[(Ident, Expr, Expr)], level: usize, source_body: &Bloc
 fn unit_step(span: crate::ast::Span) -> Expr {
     // `forall i in lo..hi` has no step syntax, so the stride is always 1.
     Expr::new(
-        ExprKind::Literal(Literal::Int(1)),
+        ExprKind::Literal(Literal::Int(1, None)),
         span,
         crate::parser::next_id(),
     )
@@ -443,7 +443,7 @@ enum BoundKind<'a> {
 /// Only an int literal or a bare variable is representable in the band's domain.
 fn bound_kind(expr: &Expr) -> BoundKind<'_> {
     match &expr.kind {
-        ExprKind::Literal(Literal::Int(n)) => BoundKind::Literal(*n),
+        ExprKind::Literal(Literal::Int(n, _)) => BoundKind::Literal(*n),
         ExprKind::Var(v) => BoundKind::Symbolic(&v.name),
         _ => BoundKind::Unrepresentable,
     }
@@ -567,7 +567,7 @@ mod tests {
     /// matches.
     fn int_value(expr: &Expr) -> Option<i64> {
         match &expr.kind {
-            ExprKind::Literal(Literal::Int(n)) => Some(*n),
+            ExprKind::Literal(Literal::Int(n, _)) => Some(*n),
             _ => None,
         }
     }

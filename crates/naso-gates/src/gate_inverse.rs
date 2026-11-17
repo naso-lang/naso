@@ -52,8 +52,11 @@ pub fn inverse_of(gate: Gate) -> Gate {
         Gate::Cz => Gate::Cz,
         Gate::Ccx => Gate::Ccx,
         Gate::Swap => Gate::Swap,
+        Gate::Iswap => Gate::IswapDag,
+            Gate::IswapDag => Gate::Iswap,
+        Gate::Cswap => Gate::Cswap,
 
-        // NOT self-inverse. `Sdg` is its own inverse and is not `S`.
+        // NOT self-inverse. Sdg is its own inverse and is not S.
         Gate::S => Gate::Sdg,
         Gate::Sdg => Gate::S,
         Gate::T => Gate::Tdg,
@@ -63,6 +66,13 @@ pub fn inverse_of(gate: Gate) -> Gate {
         Gate::Rx(theta) => Gate::Rx(-theta),
         Gate::Ry(theta) => Gate::Ry(-theta),
         Gate::Rz(theta) => Gate::Rz(-theta),
+        Gate::Crx(theta) => Gate::Crx(-theta),
+        Gate::Cry(theta) => Gate::Cry(-theta),
+        Gate::Crz(theta) => Gate::Crz(-theta),
+        Gate::Rxx(theta) => Gate::Rxx(-theta),
+        Gate::Ryy(theta) => Gate::Ryy(-theta),
+        Gate::Rzz(theta) => Gate::Rzz(-theta),
+        Gate::Cphase(theta) => Gate::Cphase(-theta),
     }
 }
 
@@ -76,13 +86,20 @@ pub fn apply_toffoli(state: &StateVector, c1: usize, c2: usize, target: usize) -
     state.apply_toffoli(c1, c2, target)
 }
 
+/// Apply the Fredkin gate (controlled-SWAP).
+/// Swaps target1 and target2 when control is |1>.
+pub fn apply_cswap(state: &StateVector, control: usize, target1: usize, target2: usize) -> StateVector {
+    state.apply_cswap(control, target1, target2)
+}
+
 /// How many qubits a gate acts on.
 ///
-/// `3` for the Toffoli, which is what a caller needs to know to size a state for it, and
+/// `3` for the Toffoli and Fredkin, which is what a caller needs to know to size a state for it, and
 /// what makes the three-qubit gate distinguishable from the two-qubit one.
 pub fn arity(gate: Gate) -> usize {
     match gate {
         Gate::Ccx => 3,
+        Gate::Cswap => 3,
         g if g.matrix().is_some() => 1,
         _ => 2,
     }
@@ -114,11 +131,21 @@ pub fn all_gates() -> Vec<Gate> {
         Gate::Ry(-0.4),
         Gate::Rz(2.2),
         Gate::Rz(-3.0),
+        Gate::Crx(0.5),
+        Gate::Cry(1.2),
+        Gate::Crz(0.8),
+        Gate::Rxx(0.6),
+        Gate::Ryy(1.5),
+        Gate::Rzz(2.0),
+        Gate::Cphase(0.9),
         Gate::Cx,
         Gate::Cy,
         Gate::Cz,
         Gate::Ccx,
         Gate::Swap,
+        Gate::Iswap,
+        Gate::IswapDag,
+        Gate::Cswap,
     ]
 }
 
@@ -140,7 +167,13 @@ pub fn apply_gate(
     }
 }
 
-/// Whether `gate` acts on one qubit or two.
+/// Whether a gate acts on one qubit or two.
+/// Three-qubit gates (Ccx, Cswap) are also considered "two-qubit" for the purpose of this
+/// function returning false (they need special handling).
 pub fn is_two_qubit(gate: Gate) -> bool {
-    gate.matrix().is_none()
+    match gate {
+        Gate::Ccx | Gate::Cswap => false,
+        Gate::Iswap | Gate::IswapDag => true,
+        _ => gate.matrix().is_none(),
+    }
 }

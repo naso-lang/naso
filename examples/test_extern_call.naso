@@ -1,0 +1,12 @@
+// Test - simple function call (no traits)
+extern "C" {
+    fn naso_write(fd: u64, buf: *u8, len: u64) -> u64;
+}
+
+fn test_call() -> u64 {
+    naso_write(1, 0 as *u8, 10)
+}
+
+fn main() -> () {
+    let _ = test_call();
+}

@@ -658,9 +658,20 @@ fn generate_quantum_adjoint(
         Gate::Cz => ("CZ".to_string(), args.to_vec()),
         Gate::Ccx => ("CCX".to_string(), args.to_vec()),
         Gate::Swap => ("SWAP".to_string(), args.to_vec()),
+        Gate::Iswap => ("ISWAP".to_string(), args.to_vec()),
         Gate::Rx(_) => ("RX".to_string(), negate_first_angle(args)),
         Gate::Ry(_) => ("RY".to_string(), negate_first_angle(args)),
         Gate::Rz(_) => ("RZ".to_string(), negate_first_angle(args)),
+        Gate::Crx(_) => ("CRX".to_string(), negate_first_angle(args)),
+        Gate::Cry(_) => ("CRY".to_string(), negate_first_angle(args)),
+        Gate::Crz(_) => ("CRZ".to_string(), negate_first_angle(args)),
+        Gate::Rxx(_) => ("RXX".to_string(), negate_first_angle(args)),
+        Gate::Ryy(_) => ("RYY".to_string(), negate_first_angle(args)),
+        Gate::Rzz(_) => ("RZZ".to_string(), negate_first_angle(args)),
+        Gate::Cphase(_) => ("CPHASE".to_string(), negate_first_angle(args)),
+        Gate::Iswap => ("ISWAP".to_string(), args.to_vec()),
+        Gate::IswapDag => ("ISWAPDAG".to_string(), args.to_vec()),
+        Gate::Cswap => ("CSWAP".to_string(), args.to_vec()),
     };
 
     Ok(InverseOperation {

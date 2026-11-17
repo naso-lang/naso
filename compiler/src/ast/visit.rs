@@ -7,7 +7,9 @@
 #![allow(clippy::collapsible_if)]
 
 use crate::ast::{
-    Block, ConstDef, Expr, Function, Item, Module, Param, Program, Stmt, Type, TypeDef,
+    AssociatedType, AssociatedTypeDef, Block, ConstDef, Expr, Function, GenericParam, ImplItem, Item, Module,
+    Param, Program, Stmt, Trait, TraitBound, TraitImpl, TraitItem, TraitMethod, Type, TypeArg,
+    TypeDef, WhereClause,
 };
 
 /// A visitor over the AST.
@@ -60,6 +62,50 @@ pub trait Visitor: Sized {
     fn visit_type(&mut self, ty: &Type) -> Result<VisitOutcome, Self::Err> {
         walk::walk_type(self, ty)
     }
+
+    fn visit_type_arg(&mut self, arg: &TypeArg) -> Result<VisitOutcome, Self::Err> {
+        walk::walk_type_arg(self, arg)
+    }
+
+    fn visit_generic_param(&mut self, param: &GenericParam) -> Result<VisitOutcome, Self::Err> {
+        walk::walk_generic_param(self, param)
+    }
+
+    fn visit_trait(&mut self, trait_: &Trait) -> Result<VisitOutcome, Self::Err> {
+        walk::walk_trait(self, trait_)
+    }
+
+    fn visit_trait_item(&mut self, item: &TraitItem) -> Result<VisitOutcome, Self::Err> {
+        walk::walk_trait_item(self, item)
+    }
+
+    fn visit_associated_type(&mut self, at: &AssociatedType) -> Result<VisitOutcome, Self::Err> {
+        walk::walk_associated_type(self, at)
+    }
+
+    fn visit_trait_method(&mut self, method: &TraitMethod) -> Result<VisitOutcome, Self::Err> {
+        walk::walk_trait_method(self, method)
+    }
+
+    fn visit_trait_bound(&mut self, bound: &TraitBound) -> Result<VisitOutcome, Self::Err> {
+        walk::walk_trait_bound(self, bound)
+    }
+
+    fn visit_trait_impl(&mut self, impl_: &TraitImpl) -> Result<VisitOutcome, Self::Err> {
+        walk::walk_trait_impl(self, impl_)
+    }
+
+    fn visit_impl_item(&mut self, item: &ImplItem) -> Result<VisitOutcome, Self::Err> {
+        walk::walk_impl_item(self, item)
+    }
+
+    fn visit_associated_type_def(&mut self, at: &AssociatedTypeDef) -> Result<VisitOutcome, Self::Err> {
+        walk::walk_associated_type_def(self, at)
+    }
+
+    fn visit_where_clause(&mut self, clause: &WhereClause) -> Result<VisitOutcome, Self::Err> {
+        walk::walk_where_clause(self, clause)
+    }
 }
 
 /// Control flow signal for the visitor traversal.
@@ -108,6 +154,36 @@ pub trait SimpleVisitor {
     fn visit_type(&mut self, ty: &Type) {
         let _ = ty;
     }
+    fn visit_type_arg(&mut self, arg: &TypeArg) {
+        let _ = arg;
+    }
+    fn visit_trait(&mut self, trait_: &Trait) {
+        let _ = trait_;
+    }
+    fn visit_trait_item(&mut self, item: &TraitItem) {
+        let _ = item;
+    }
+    fn visit_associated_type(&mut self, at: &AssociatedType) {
+        let _ = at;
+    }
+    fn visit_trait_method(&mut self, method: &TraitMethod) {
+        let _ = method;
+    }
+    fn visit_trait_bound(&mut self, bound: &TraitBound) {
+        let _ = bound;
+    }
+    fn visit_trait_impl(&mut self, impl_: &TraitImpl) {
+        let _ = impl_;
+    }
+    fn visit_impl_item(&mut self, item: &ImplItem) {
+        let _ = item;
+    }
+    fn visit_associated_type_def(&mut self, at: &AssociatedTypeDef) {
+        let _ = at;
+    }
+    fn visit_where_clause(&mut self, clause: &WhereClause) {
+        let _ = clause;
+    }
 }
 
 /// Default traversal helpers. These are re-implementations of the default
@@ -133,6 +209,8 @@ pub mod walk {
         match item {
             Item::Function(f) => visitor.visit_function(f),
             Item::TypeDef(t) => visitor.visit_type_def(t),
+            Item::Trait(t) => visitor.visit_trait(t),
+            Item::TraitImpl(t) => visitor.visit_trait_impl(t),
             Item::Module(m) => visitor.visit_module(m),
             Item::Import(_) => Ok(VisitOutcome::Continue),
             Item::Const(c) => visitor.visit_const(c),
@@ -144,6 +222,11 @@ pub mod walk {
         visitor: &mut V,
         function: &Function,
     ) -> Result<VisitOutcome, V::Err> {
+        for generic in &function.generics {
+            if visitor.visit_generic_param(generic)? == VisitOutcome::Stop {
+                return Ok(VisitOutcome::Stop);
+            }
+        }
         for param in &function.params {
             if visitor.visit_param(param)? == VisitOutcome::Stop {
                 return Ok(VisitOutcome::Stop);
@@ -183,6 +266,117 @@ pub mod walk {
                     return Ok(VisitOutcome::Stop);
                 }
             }
+        }
+        Ok(VisitOutcome::Continue)
+    }
+
+    pub fn walk_type_arg<V: Visitor>(visitor: &mut V, arg: &TypeArg) -> Result<VisitOutcome, V::Err> {
+        match arg {
+            TypeArg::Type(t) => visitor.visit_type(t),
+            TypeArg::Nat(n) => {
+                // NatExpr doesn't need walking for now
+                let _ = n;
+                Ok(VisitOutcome::Continue)
+            }
+            TypeArg::Quantity(_) => Ok(VisitOutcome::Continue),
+        }
+    }
+
+    pub fn walk_generic_param<V: Visitor>(visitor: &mut V, param: &GenericParam) -> Result<VisitOutcome, V::Err> {
+        // Visit trait bounds
+        for bound in &param.bounds {
+            visitor.visit_trait_bound(bound)?;
+        }
+        Ok(VisitOutcome::Continue)
+    }
+
+    pub fn walk_trait<V: Visitor>(visitor: &mut V, trait_: &Trait) -> Result<VisitOutcome, V::Err> {
+        for generic in &trait_.generics {
+            // Generic params don't need walking for now
+            let _ = generic;
+        }
+        for bound in &trait_.bounds {
+            visitor.visit_trait_bound(bound)?;
+        }
+        for item in &trait_.items {
+            visitor.visit_trait_item(item)?;
+        }
+        Ok(VisitOutcome::Continue)
+    }
+
+    pub fn walk_trait_item<V: Visitor>(visitor: &mut V, item: &TraitItem) -> Result<VisitOutcome, V::Err> {
+        match item {
+            TraitItem::AssociatedType(at) => visitor.visit_associated_type(at),
+            TraitItem::Method(m) => visitor.visit_trait_method(m),
+        }
+    }
+
+    pub fn walk_associated_type<V: Visitor>(visitor: &mut V, at: &AssociatedType) -> Result<VisitOutcome, V::Err> {
+        for generic in &at.generics {
+            let _ = generic;
+        }
+        for bound in &at.bounds {
+            visitor.visit_trait_bound(bound)?;
+        }
+        Ok(VisitOutcome::Continue)
+    }
+
+    pub fn walk_trait_method<V: Visitor>(visitor: &mut V, method: &TraitMethod) -> Result<VisitOutcome, V::Err> {
+        for generic in &method.generics {
+            let _ = generic;
+        }
+        for param in &method.params {
+            visitor.visit_param(param)?;
+        }
+        if let Some(ret) = &method.ret_ty {
+            visitor.visit_type(ret)?;
+        }
+        Ok(VisitOutcome::Continue)
+    }
+
+    pub fn walk_trait_bound<V: Visitor>(visitor: &mut V, bound: &TraitBound) -> Result<VisitOutcome, V::Err> {
+        for arg in &bound.args {
+            visitor.visit_type_arg(arg)?;
+        }
+        Ok(VisitOutcome::Continue)
+    }
+
+    pub fn walk_trait_impl<V: Visitor>(visitor: &mut V, impl_: &TraitImpl) -> Result<VisitOutcome, V::Err> {
+        for generic in &impl_.generics {
+            let _ = generic;
+        }
+        for arg in &impl_.trait_args {
+            visitor.visit_type_arg(arg)?;
+        }
+        visitor.visit_type(&impl_.for_ty)?;
+        for clause in &impl_.where_clauses {
+            visitor.visit_where_clause(clause)?;
+        }
+        for item in &impl_.items {
+            visitor.visit_impl_item(item)?;
+        }
+        Ok(VisitOutcome::Continue)
+    }
+
+    pub fn walk_impl_item<V: Visitor>(visitor: &mut V, item: &ImplItem) -> Result<VisitOutcome, V::Err> {
+        match item {
+            ImplItem::AssociatedTypeDef(at) => visitor.visit_associated_type_def(at),
+            ImplItem::Method(m) => visitor.visit_function(m),
+        }
+    }
+
+    pub fn walk_associated_type_def<V: Visitor>(visitor: &mut V, at: &AssociatedTypeDef) -> Result<VisitOutcome, V::Err> {
+        for generic in &at.generics {
+            let _ = generic;
+        }
+        visitor.visit_type(&at.ty)?;
+        Ok(VisitOutcome::Continue)
+    }
+
+    pub fn walk_where_clause<V: Visitor>(visitor: &mut V, clause: &WhereClause) -> Result<VisitOutcome, V::Err> {
+        visitor.visit_type(&clause.subject)?;
+        for bound in &clause.bounds {
+            visitor.visit_trait_bound(bound)?;
         }
         Ok(VisitOutcome::Continue)
     }
@@ -271,11 +465,16 @@ pub mod walk {
                 visitor.visit_expr(r)
             }
             ExprKind::Unary(_, e) => visitor.visit_expr(e),
-            ExprKind::Call(fun, args) => {
+            ExprKind::Call(fun, args, const_args) => {
                 if visitor.visit_expr(fun)? == VisitOutcome::Stop {
                     return Ok(VisitOutcome::Stop);
                 }
                 for arg in args {
+                    if visitor.visit_expr(arg)? == VisitOutcome::Stop {
+                        return Ok(VisitOutcome::Stop);
+                    }
+                }
+                for arg in const_args {
                     if visitor.visit_expr(arg)? == VisitOutcome::Stop {
                         return Ok(VisitOutcome::Stop);
                     }
@@ -523,6 +722,20 @@ pub mod walk {
                 visitor.visit_type(arg)
             }
             TypeKind::Array(elem, _) => visitor.visit_type(elem),
+            TypeKind::AssociatedTypeProjection { self_ty, trait_args, assoc_args, .. } => {
+                visitor.visit_type(self_ty)?;
+                for arg in trait_args {
+                    if let TypeArg::Type(t) = arg {
+                        visitor.visit_type(t)?;
+                    }
+                }
+                for arg in assoc_args {
+                    if let TypeArg::Type(t) = arg {
+                        visitor.visit_type(t)?;
+                    }
+                }
+                Ok(VisitOutcome::Continue)
+            }
             TypeKind::Tuple(elems) => {
                 for elem in elems {
                     if visitor.visit_type(elem)? == VisitOutcome::Stop {

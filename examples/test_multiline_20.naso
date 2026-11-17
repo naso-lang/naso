@@ -1,0 +1,26 @@
+// Test multi-line array literal with 20 elements
+extern "C" {
+    fn naso_write(fd: u64, buf: *u8, len: u64) -> u64;
+}
+
+fn test_multiline_20() -> [u8; 20] {
+    if true {
+        [
+            1u8, 2u8, 3u8, 4u8, 5u8,
+            6u8, 7u8, 8u8, 9u8, 10u8,
+            11u8, 12u8, 13u8, 14u8, 15u8,
+            16u8, 17u8, 18u8, 19u8, 20u8
+        ]
+    } else {
+        [
+            20u8, 19u8, 18u8, 17u8, 16u8,
+            15u8, 14u8, 13u8, 12u8, 11u8,
+            10u8, 9u8, 8u8, 7u8, 6u8,
+            5u8, 4u8, 3u8, 2u8, 1u8
+        ]
+    }
+}
+
+fn main() -> () {
+    let _ = test_multiline_20();
+}

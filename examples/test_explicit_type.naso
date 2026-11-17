@@ -1,0 +1,20 @@
+// Test - method call returning u64 (with explicit type)
+trait T {
+    fn m(&self) -> u64;
+}
+
+struct S {}
+
+impl T for S {
+    fn m(&self) -> u64 { 42u64 }
+}
+
+fn f(x: S) -> u64 {
+    let r: u64 = x.m();
+    r
+}
+
+fn main() -> () {
+    let s = S{};
+    let _ = f(s);
+}

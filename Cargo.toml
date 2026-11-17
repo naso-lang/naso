@@ -9,6 +9,7 @@ members = [
     "crates/nasoc-wasm",
     "crates/naso-ffi",
     "crates/async-runtime",
+    "crates/naso-quantum-runtime",
     "bench_runner",
 ]
 

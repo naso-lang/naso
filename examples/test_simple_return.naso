@@ -1,0 +1,8 @@
+// Test - function with u64 return type, no trait
+fn test_u64() -> u64 {
+    42u64
+}
+
+fn main() -> () {
+    let _ = test_u64();
+}

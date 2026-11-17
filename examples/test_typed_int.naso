@@ -1,0 +1,24 @@
+// Test typed integer literals
+extern "C" {
+    fn naso_write(fd: u64, buf: *u8, len: u64) -> u64;
+}
+
+fn test_typed_literals() -> () {
+    // Test u8 typed literals
+    let status_line: [u8; 17] = [72u8, 84u8, 84u8, 80u8, 47u8, 49u8, 46u8, 49u8, 32u8, 50u8, 48u8, 48u8, 32u8, 79u8, 75u8, 13u8, 10u8];
+    
+    // Test u16 typed literals
+    let port: u16 = 8099u16;
+    
+    // Test i32 typed literals
+    let negative: i32 = -42i32;
+    
+    // Test array with typed literals
+    let buf: [u8; 5] = [1u8, 2u8, 3u8, 4u8, 5u8];
+    
+    let _ = naso_write(1, buf as *u8, 5);
+}
+
+fn main() -> () {
+    test_typed_literals();
+}

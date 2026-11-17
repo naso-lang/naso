@@ -71,6 +71,10 @@ fn apply_on(gate: Gate, state: &StateVector, qubits: usize) -> Option<StateVecto
     if gate == Gate::Ccx {
         return Some(apply_toffoli(state, 0, 2, 1));
     }
+    if gate == Gate::Cswap {
+        // Cswap is a 3-qubit gate: control, target1, target2
+        return Some(state.apply_cswap(0, 1, 2));
+    }
     if arity(gate) == 1 {
         apply_gate(gate, state, 0, None)
     } else {

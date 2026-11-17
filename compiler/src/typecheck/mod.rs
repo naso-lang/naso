@@ -11,6 +11,7 @@
 #![allow(clippy::collapsible_if)]
 
 pub mod check;
+pub mod coherence;
 pub mod constraints;
 pub mod error;
 pub mod inference;
@@ -71,6 +72,8 @@ pub struct TypeChecker {
     pub in_proof: bool,
     /// Current function signature being checked (for return type)
     pub current_fn_ret: Option<Type>,
+    /// Expected array size during check mode (for array literal inference)
+    pub expected_array_size: Option<u64>,
 }
 
 impl TypeChecker {
@@ -85,6 +88,7 @@ impl TypeChecker {
             in_reversible: false,
             in_proof: false,
             current_fn_ret: None,
+            expected_array_size: None,
         }
     }
 
@@ -99,15 +103,25 @@ impl TypeChecker {
             in_reversible: false,
             in_proof: false,
             current_fn_ret: None,
+            expected_array_size: None,
         }
     }
 
     /// Enter check mode with expected type
     pub fn check_expr(&mut self, expr: &Expr, expected: &Type) -> Result<(), error::TypeError> {
         let prev_mode = self.mode;
+        let prev_expected_size = self.expected_array_size;
+        
+        // If expected type is an array with a known size, set it for array literal inference
+        self.expected_array_size = match &expected.kind {
+            TypeKind::Array(_, size) => size.as_ref().and_then(|n| n.to_u64()),
+            _ => None,
+        };
+        
         self.mode = Mode::Check;
         let result = check::check_expr(self, expr, expected);
         self.mode = prev_mode;
+        self.expected_array_size = prev_expected_size;
         result
     }
 
@@ -133,6 +147,158 @@ impl TypeChecker {
     /// Check a function definition
     pub fn check_function(&mut self, func: &Function) -> Result<(), error::TypeError> {
         check::check_function(self, func)
+    }
+
+    /// Normalize a type by resolving associated type projections
+    pub fn normalize_type(&mut self, ty: &Type) -> Result<Type, error::TypeError> {
+        match &ty.kind {
+            TypeKind::AssociatedTypeProjection {
+                self_ty,
+                trait_path,
+                trait_args,
+                assoc_name,
+                assoc_args,
+            } => {
+                // First normalize the self type
+                let normalized_self = self.normalize_type(self_ty)?;
+                // If the self type is a metavariable OR Self, we can't resolve the projection yet
+                let is_self = matches!(&normalized_self.kind, TypeKind::Named(name, _) if name.name == "Self");
+                if matches!(&normalized_self.kind, TypeKind::Meta(_)) || is_self {
+                    // Return the projection as-is with normalized args
+                    let mut normalized_trait_args = Vec::new();
+                    for arg in trait_args {
+                        if let TypeArg::Type(t) = arg {
+                            normalized_trait_args.push(TypeArg::Type(self.normalize_type(t)?));
+                        } else {
+                            normalized_trait_args.push(arg.clone());
+                        }
+                    }
+                    let mut normalized_assoc_args = Vec::new();
+                    for arg in assoc_args {
+                        if let TypeArg::Type(t) = arg {
+                            normalized_assoc_args.push(TypeArg::Type(self.normalize_type(t)?));
+                        } else {
+                            normalized_assoc_args.push(arg.clone());
+                        }
+                    }
+                    return Ok(Type::new(
+                        TypeKind::AssociatedTypeProjection {
+                            self_ty: Box::new(normalized_self),
+                            trait_path: trait_path.clone(),
+                            trait_args: normalized_trait_args,
+                            assoc_name: assoc_name.clone(),
+                            assoc_args: normalized_assoc_args,
+                        },
+                        ty.quantity,
+                        ty.span,
+                    ));
+                }
+                // Normalize trait args
+                let mut normalized_trait_args = Vec::new();
+                for arg in trait_args {
+                    if let TypeArg::Type(t) = arg {
+                        normalized_trait_args.push(TypeArg::Type(self.normalize_type(t)?));
+                    } else {
+                        normalized_trait_args.push(arg.clone());
+                    }
+                }
+                // Normalize assoc args
+                let mut normalized_assoc_args = Vec::new();
+                for arg in assoc_args {
+                    if let TypeArg::Type(t) = arg {
+                        normalized_assoc_args.push(TypeArg::Type(self.normalize_type(t)?));
+                    } else {
+                        normalized_assoc_args.push(arg.clone());
+                    }
+                }
+                // Look up the trait impl and get the associated type
+                self.env.normalize_assoc_type_projection(
+                    &normalized_self,
+                    trait_path,
+                    &normalized_trait_args,
+                    assoc_name,
+                    &normalized_assoc_args,
+                    ty.span,
+                )
+            }
+            TypeKind::Named(name, args) => {
+                let mut new_args = Vec::new();
+                for arg in args {
+                    if let TypeArg::Type(t) = arg {
+                        new_args.push(TypeArg::Type(self.normalize_type(t)?));
+                    } else {
+                        new_args.push(arg.clone());
+                    }
+                }
+                Ok(Type::new(TypeKind::Named(name.clone(), new_args), ty.quantity, ty.span))
+            }
+            TypeKind::Array(elem, size) => {
+                let new_elem = Box::new(self.normalize_type(elem)?);
+                Ok(Type::new(TypeKind::Array(new_elem, size.clone()), ty.quantity, ty.span))
+            }
+            TypeKind::Tuple(elems) => {
+                let mut new_elems = Vec::new();
+                for elem in elems {
+                    new_elems.push(self.normalize_type(elem)?);
+                }
+                Ok(Type::new(TypeKind::Tuple(new_elems), ty.quantity, ty.span))
+            }
+            TypeKind::Function(params, ret) => {
+                let mut new_params = Vec::new();
+                for param in params {
+                    new_params.push(self.normalize_type(param)?);
+                }
+                let new_ret = Box::new(self.normalize_type(ret)?);
+                Ok(Type::new(TypeKind::Function(new_params, new_ret), ty.quantity, ty.span))
+            }
+            TypeKind::Projection(inner) => {
+                let new_inner = Box::new(self.normalize_type(inner)?);
+                Ok(Type::new(TypeKind::Projection(new_inner), ty.quantity, ty.span))
+            }
+            TypeKind::Pointer(inner) => {
+                let new_inner = Box::new(self.normalize_type(inner)?);
+                Ok(Type::new(TypeKind::Pointer(new_inner), ty.quantity, ty.span))
+            }
+            TypeKind::Reversible(inner) => {
+                let new_inner = Box::new(self.normalize_type(inner)?);
+                Ok(Type::new(TypeKind::Reversible(new_inner), ty.quantity, ty.span))
+            }
+            TypeKind::Pi(name, domain, codomain) => {
+                let new_domain = Box::new(self.normalize_type(domain)?);
+                let new_codomain = Box::new(self.normalize_type(codomain)?);
+                Ok(Type::new(TypeKind::Pi(name.clone(), new_domain, new_codomain), ty.quantity, ty.span))
+            }
+            TypeKind::Sigma(name, fst, snd) => {
+                let new_fst = Box::new(self.normalize_type(fst)?);
+                let new_snd = Box::new(self.normalize_type(snd)?);
+                Ok(Type::new(TypeKind::Sigma(name.clone(), new_fst, new_snd), ty.quantity, ty.span))
+            }
+            TypeKind::Lambda(param, body) => {
+                let new_body = Box::new(self.normalize_type(body)?);
+                Ok(Type::new(TypeKind::Lambda(param.clone(), new_body), ty.quantity, ty.span))
+            }
+            TypeKind::App(fun, arg) => {
+                let new_fun = Box::new(self.normalize_type(fun)?);
+                let new_arg = Box::new(self.normalize_type(arg)?);
+                Ok(Type::new(TypeKind::App(new_fun, new_arg), ty.quantity, ty.span))
+            }
+            TypeKind::Tensor(dims) => {
+                let mut new_dims = Vec::new();
+                for dim in dims {
+                    new_dims.push(self.normalize_type(dim)?);
+                }
+                Ok(Type::new(TypeKind::Tensor(new_dims), ty.quantity, ty.span))
+            }
+            TypeKind::QRegister(dims) => {
+                let mut new_dims = Vec::new();
+                for dim in dims {
+                    new_dims.push(self.normalize_type(dim)?);
+                }
+                Ok(Type::new(TypeKind::QRegister(new_dims), ty.quantity, ty.span))
+            }
+            // For simple types and types that don't contain projections, return as-is
+            _ => Ok(ty.clone()),
+        }
     }
 
     /// Check a pattern against a scrutinee type
@@ -437,6 +603,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
         generics: vec![GenericParam {
             name: Ident::new("T", Span::default()),
             kind: GenericKind::Type,
+            bounds: Vec::new(),
             span: Span::default(),
         }],
         kind: TypeDefKind::Enum(vec![
@@ -470,11 +637,13 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
             GenericParam {
                 name: Ident::new("T", Span::default()),
                 kind: GenericKind::Type,
+                bounds: Vec::new(),
                 span: Span::default(),
             },
             GenericParam {
                 name: Ident::new("E", Span::default()),
                 kind: GenericKind::Type,
+                bounds: Vec::new(),
                 span: Span::default(),
             },
         ],
@@ -531,6 +700,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
         generics: vec![GenericParam {
             name: Ident::new("T", Span::default()),
             kind: GenericKind::Type,
+            bounds: Vec::new(),
             span: Span::default(),
         }],
     }
@@ -551,6 +721,7 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
         generics: vec![GenericParam {
             name: Ident::new("T", Span::default()),
             kind: GenericKind::Type,
+            bounds: Vec::new(),
             span: Span::default(),
         }],
     }
@@ -581,11 +752,13 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
             GenericParam {
                 name: Ident::new("T", Span::default()),
                 kind: GenericKind::Type,
+                bounds: Vec::new(),
                 span: Span::default(),
             },
             GenericParam {
                 name: Ident::new("E", Span::default()),
                 kind: GenericKind::Type,
+                bounds: Vec::new(),
                 span: Span::default(),
             },
         ],
@@ -615,11 +788,13 @@ fn load_prelude(env: &mut type_env::TypeEnv) {
             GenericParam {
                 name: Ident::new("T", Span::default()),
                 kind: GenericKind::Type,
+                bounds: Vec::new(),
                 span: Span::default(),
             },
             GenericParam {
                 name: Ident::new("E", Span::default()),
                 kind: GenericKind::Type,
+                bounds: Vec::new(),
                 span: Span::default(),
             },
         ],
@@ -1199,6 +1374,12 @@ pub fn check_program(program: &mut Program) -> CheckResult {
             Item::TypeDef(t) => {
                 checker.env.insert_type_def(t.clone());
             }
+            Item::Trait(t) => {
+                checker.env.insert_trait(t.clone());
+            }
+            Item::TraitImpl(t) => {
+                checker.env.insert_trait_impl(t.clone());
+            }
             Item::Const(c) => {
                 checker.env.insert_const(c.clone());
             }
@@ -1255,6 +1436,20 @@ pub fn check_program(program: &mut Program) -> CheckResult {
                 checker.error(e);
             }
         }
+    }
+
+    // Third pass: check trait implementations
+    for item in &program.items {
+        if let Item::TraitImpl(impl_def) = item {
+            if let Err(e) = check::check_trait_impl(&mut checker, impl_def) {
+                checker.error(e);
+            }
+        }
+    }
+
+    // Fourth pass: coherence checking (orphan rules, overlap detection)
+    if let Err(e) = coherence::check_coherence(&checker.env) {
+        checker.error(e);
     }
 
     // Solve constraints

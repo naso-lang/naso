@@ -1,0 +1,15 @@
+// Test - Simple associated type projection parsing
+trait Iterator {
+    type Item[T];
+}
+
+struct MyIter {}
+
+impl Iterator for MyIter {
+    type Item[T] = T;
+}
+
+fn main() -> () {
+    let x: <MyIter as Iterator>::Item[u64] = 42u64;
+    let _ = x;
+}

@@ -19,6 +19,20 @@ pub use stmt::*;
 pub use ty::*;
 pub use visit::*;
 
+/// Typed integer literal value
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedInt {
+    pub value: i64,
+    pub ty: Option<IntTy>,
+}
+
+/// Integer type suffix for typed literals (e.g., u8, u16, i32, i64)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IntTy {
+    U8, U16, U32, U64, USize,
+    I8, I16, I32, I64, ISize,
+}
+
 /// Unique identifier for AST nodes
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct NodeId(pub u32);
@@ -153,6 +167,10 @@ pub enum Item {
     Function(Function),
     /// Type definition (struct, enum, alias)
     TypeDef(TypeDef),
+    /// Trait definition
+    Trait(Trait),
+    /// Trait implementation
+    TraitImpl(TraitImpl),
     /// Module declaration
     Module(Module),
     /// Import declaration
@@ -168,6 +186,8 @@ impl Item {
         match self {
             Item::Function(f) => f.span,
             Item::TypeDef(t) => t.span,
+            Item::Trait(t) => t.span,
+            Item::TraitImpl(t) => t.span,
             Item::Module(m) => m.span,
             Item::Import(i) => i.span,
             Item::Const(c) => c.span,
@@ -205,6 +225,91 @@ pub struct ExternParam {
     pub span: Span,
 }
 
+/// Trait definition: trait Name<Params> { associated types; methods }
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Trait {
+    pub name: Ident,
+    pub generics: Vec<GenericParam>,
+    pub bounds: Vec<TraitBound>, // Supertraits
+    pub items: Vec<TraitItem>,
+    pub span: Span,
+}
+
+/// Trait item: associated type or method signature
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum TraitItem {
+    /// Associated type: type Name<Params>: Bounds;
+    AssociatedType(AssociatedType),
+    /// Method signature: fn name(...) -> Ret;
+    Method(TraitMethod),
+}
+
+/// Associated type definition in a trait
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssociatedType {
+    pub name: Ident,
+    pub generics: Vec<GenericParam>,
+    pub bounds: Vec<TraitBound>, // where Self: Trait bounds
+    pub span: Span,
+}
+
+/// Method signature in a trait (no body)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TraitMethod {
+    pub name: Ident,
+    pub generics: Vec<GenericParam>,
+    pub params: Vec<Param>,
+    pub ret_ty: Option<Type>,
+    pub span: Span,
+    pub is_async: bool,
+}
+
+/// Trait bound: Trait<Args> + Send + ...
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TraitBound {
+    pub path: Vec<Ident>,
+    pub args: Vec<TypeArg>,
+    pub span: Span,
+}
+
+/// Trait implementation: impl<Params> Trait<Args> for Type { items }
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TraitImpl {
+    pub generics: Vec<GenericParam>,
+    pub trait_path: Vec<Ident>,
+    pub trait_args: Vec<TypeArg>,
+    pub for_ty: Type,
+    pub where_clauses: Vec<WhereClause>,
+    pub items: Vec<ImplItem>,
+    pub span: Span,
+}
+
+/// Implementation item: associated type definition or method
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ImplItem {
+    /// Associated type definition: type Name = Type;
+    AssociatedTypeDef(AssociatedTypeDef),
+    /// Method implementation
+    Method(Function),
+}
+
+/// Associated type definition in an impl block
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssociatedTypeDef {
+    pub name: Ident,
+    pub generics: Vec<GenericParam>,
+    pub ty: Type,
+    pub span: Span,
+}
+
+/// Where clause: where Type: Trait<Args>, Type2: Trait2
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WhereClause {
+    pub subject: Type,
+    pub bounds: Vec<TraitBound>,
+    pub span: Span,
+}
+
 /// Function definition with quantitative parameters
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Function {
@@ -233,6 +338,8 @@ pub struct Function {
 pub struct GenericParam {
     pub name: Ident,
     pub kind: GenericKind,
+    /// Trait bounds for this generic parameter (e.g., `T: Iterator + Clone`)
+    pub bounds: Vec<TraitBound>,
     pub span: Span,
 }
 
@@ -400,8 +507,8 @@ impl fmt::Display for Ident {
 /// Literal values
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Literal {
-    Int(i64),
-    UInt(u64),
+    Int(i64, Option<IntTy>),
+    UInt(u64, Option<IntTy>),
     Float(f64),
     Bool(bool),
     String(String),
@@ -412,13 +519,64 @@ pub enum Literal {
 impl fmt::Display for Literal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Literal::Int(v) => write!(f, "{}", v),
-            Literal::UInt(v) => write!(f, "{}u", v),
+            Literal::Int(v, ty) => {
+                write!(f, "{}", v)?;
+                if let Some(ty) = ty {
+                    write!(f, "{}", ty)?;
+                }
+                Ok(())
+            }
+            Literal::UInt(v, ty) => {
+                write!(f, "{}", v)?;
+                if let Some(ty) = ty {
+                    write!(f, "{}", ty)?;
+                }
+                Ok(())
+            }
             Literal::Float(v) => write!(f, "{}", v),
             Literal::Bool(v) => write!(f, "{}", v),
             Literal::String(v) => write!(f, "\"{}\"", v.escape_debug()),
             Literal::Char(v) => write!(f, "'{}'", v.escape_debug()),
             Literal::Unit => write!(f, "()"),
         }
+    }
+}
+
+impl fmt::Display for IntTy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IntTy::U8 => write!(f, "u8"),
+            IntTy::U16 => write!(f, "u16"),
+            IntTy::U32 => write!(f, "u32"),
+            IntTy::U64 => write!(f, "u64"),
+            IntTy::USize => write!(f, "usize"),
+            IntTy::I8 => write!(f, "i8"),
+            IntTy::I16 => write!(f, "i16"),
+            IntTy::I32 => write!(f, "i32"),
+            IntTy::I64 => write!(f, "i64"),
+            IntTy::ISize => write!(f, "isize"),
+        }
+    }
+}
+
+impl fmt::Display for TraitBound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, ident) in self.path.iter().enumerate() {
+            if i > 0 {
+                write!(f, "::")?;
+            }
+            write!(f, "{}", ident)?;
+        }
+        if !self.args.is_empty() {
+            write!(f, "[")?;
+            for (i, arg) in self.args.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{}", arg)?;
+            }
+            write!(f, "]")?;
+        }
+        Ok(())
     }
 }

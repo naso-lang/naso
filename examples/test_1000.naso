@@ -1,0 +1,14 @@
+// Debug parser element counting - 1000 elements
+fn test_1000() -> [u8; 1000] {
+    let mut arr: [u8; 1000] = [0u8; 1000];
+    let mut i = 0;
+    while i < 1000 {
+        arr[i] = (i as u8) + 1u8;
+        i = i + 1;
+    }
+    arr
+}
+
+fn main() -> () {
+    let _ = test_1000();
+}

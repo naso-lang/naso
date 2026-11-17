@@ -242,7 +242,16 @@ fn collect_bound_names_expr(expr: &crate::ast::Expr, out: &mut Vec<String>) {
         ExprKind::Let(l) => out.push(l.name.name.clone()),
         ExprKind::LetInOut(l) => out.push(l.name.name.clone()),
         ExprKind::LetConsume(l) => out.push(l.name.name.clone()),
-        ExprKind::Call(callee, args) | ExprKind::MethodCall(callee, _, args) => {
+        ExprKind::Call(callee, args, const_args) => {
+            collect_bound_names_expr(callee, out);
+            for a in args {
+                collect_bound_names_expr(a, out);
+            }
+            for a in const_args {
+                collect_bound_names_expr(a, out);
+            }
+        }
+        ExprKind::MethodCall(callee, _, args) => {
             collect_bound_names_expr(callee, out);
             for a in args {
                 collect_bound_names_expr(a, out);
@@ -1553,8 +1562,12 @@ impl LoweringContext {
                     expr: Box::new(e),
                 })
             }
-            ExprKind::Call(func, args) => {
+            ExprKind::Call(func, args, const_args) => {
                 let args = args
+                    .iter()
+                    .map(|a| self.lower_expr(a))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let const_args = const_args
                     .iter()
                     .map(|a| self.lower_expr(a))
                     .collect::<Result<Vec<_>, _>>()?;
@@ -2153,8 +2166,8 @@ impl LoweringContext {
         use crate::ir::PirExpr;
 
         match lit {
-            Literal::Int(v) => Ok(PirExpr::IntLit(*v)),
-            Literal::UInt(v) => Ok(PirExpr::IntLit(*v as i64)),
+            Literal::Int(v, _) => Ok(PirExpr::IntLit(*v)),
+            Literal::UInt(v, _) => Ok(PirExpr::IntLit(*v as i64)),
             Literal::Float(v) => Ok(PirExpr::FloatLit(v.to_string())),
             Literal::Bool(v) => Ok(PirExpr::BoolLit(*v)),
             Literal::String(s) => Ok(PirExpr::StringLit(s.clone())),
@@ -2200,7 +2213,7 @@ impl LoweringContext {
             ExprKind::Literal(crate::ast::Literal::Float(f)) => {
                 Ok(PirExpr::FloatLit(f.to_string()))
             }
-            ExprKind::Literal(crate::ast::Literal::Int(i)) => {
+            ExprKind::Literal(crate::ast::Literal::Int(i, _)) => {
                 Ok(PirExpr::FloatLit(format!("{i}.0")))
             }
             other => Err(LoweringError::Unsupported(format!(

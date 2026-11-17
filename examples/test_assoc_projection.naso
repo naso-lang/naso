@@ -1,0 +1,26 @@
+// Test - Associated type projection parsing
+trait Iterator {
+    type Item[T];
+    
+    fn next(&self) -> Option<Self::Item[u64]>;
+}
+
+struct MyIter {}
+
+impl Iterator for MyIter {
+    type Item[T] = T;
+    
+    fn next(&self) -> Option<u64> {
+        None
+    }
+}
+
+fn use_projection(x: <MyIter as Iterator>::Item[u64]) -> u64 {
+    42u64
+}
+
+fn main() -> () {
+    let iter = MyIter {};
+    let _ = iter.next();
+    let _ = use_projection(0u64);
+}

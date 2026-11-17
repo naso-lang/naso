@@ -1,0 +1,6 @@
+// Test - trait with GAT and method
+trait Test {
+    type Item[T];
+    
+    fn next(&self) -> u64;
+}

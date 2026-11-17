@@ -1,0 +1,42 @@
+// Test - const generics with arithmetic expressions
+fn identity[N: nat](x: u64) -> u64 {
+    x
+}
+
+fn add_one[N: nat](x: u64) -> u64 {
+    x + 1
+}
+
+fn multiply_by_two[N: nat](x: u64) -> u64 {
+    x * 2
+}
+
+fn main() -> () {
+    // Simple const generic application
+    let a = identity[10](42u64);
+    let b = identity[100](100u64);
+    let c = identity[10](identity[20](5u64));
+    
+    // Test with arithmetic in const generics (N + 1, N * 2)
+    // These would need const evaluation - testing that they at least parse
+    let d = add_one[5](10u64);
+    let e = multiply_by_two[3](4u64);
+    
+    // Test with array elements - simpler test
+    let x: u64 = 1u64;
+    let f = identity[3](x);
+}
+
+fn square[N: nat](x: u64) -> u64 {
+    x * x
+}
+
+fn nested_test() {
+    let d = square[2](square[3](4u64));
+}
+
+fn generic_array_with_const() {
+    let x = identity[5](10u64);
+    let y = square[3](2u64);
+    let z = identity[1](identity[2](identity[5](7u64)));
+}

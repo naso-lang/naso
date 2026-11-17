@@ -1,0 +1,4 @@
+// Test - GAT (Generic Associated Type) - simple trait only
+trait Iterator {
+    type Item[T];  // GAT: associated type with generic parameter
+}

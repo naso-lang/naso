@@ -1,0 +1,18 @@
+// Test - Associated type projection in function return type (simpler)
+trait Iterator {
+    type Item[T];
+}
+
+struct MyIter {}
+
+impl Iterator for MyIter {
+    type Item[T] = T;
+}
+
+fn use_projection() -> <MyIter as Iterator>::Item[u64] {
+    42u64
+}
+
+fn main() -> () {
+    let _ = use_projection();
+}

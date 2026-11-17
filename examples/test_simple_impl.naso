@@ -1,0 +1,16 @@
+// Test - Simple impl with Self::Item return
+trait Container {
+    type Item;
+    fn get() -> Self::Item;
+}
+
+struct MyContainer {}
+
+impl Container for MyContainer {
+    type Item = u64;
+    fn get() -> Self::Item {
+        123u64
+    }
+}
+
+fn main() -> () {}

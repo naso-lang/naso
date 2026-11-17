@@ -1,0 +1,19 @@
+// Test - Overlapping trait implementations with generics (should FAIL)
+trait MyTrait {
+    fn method(&self) -> u64;
+}
+
+struct TypeA {}
+struct TypeB {}
+
+// Generic impl for all types - overlaps with concrete impls
+impl MyTrait for TypeA {
+    fn method(&self) -> u64 { 1 }
+}
+
+// This should overlap with the concrete impl above
+impl[T] MyTrait for T {
+    fn method(&self) -> u64 { 2 }
+}
+
+fn main() -> () {}

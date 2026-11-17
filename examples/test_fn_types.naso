@@ -1,0 +1,13 @@
+// Test - check if function return type is parsed
+fn test_u64() -> u64 {
+    42u64
+}
+
+fn test_unit() -> () {
+    ()
+}
+
+fn main() -> () {
+    let _ = test_u64();
+    let _ = test_unit();
+}

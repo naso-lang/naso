@@ -1,0 +1,18 @@
+// Test - Overlapping trait implementations (should be OK - different concrete types)
+trait MyTrait {
+    fn method(&self) -> u64;
+}
+
+struct TypeA {}
+struct TypeB {}
+
+// This should be fine - different concrete types
+impl MyTrait for TypeA {
+    fn method(&self) -> u64 { 1 }
+}
+
+impl MyTrait for TypeB {
+    fn method(&self) -> u64 { 2 }
+}
+
+fn main() -> () {}

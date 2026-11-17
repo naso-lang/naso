@@ -1,0 +1,41 @@
+// Test - Complex trait bounds (Naso uses [...] for generics)
+trait Iterator {
+    type Item;
+    fn next(&self) -> Option[Self::Item];
+}
+
+trait Clone {
+    fn clone(&self) -> Self;
+}
+
+trait Debug {
+    fn debug(&self) -> u64;
+}
+
+// Function with single trait bound
+fn process1[T: Iterator](iter: T) -> u64 {
+    42u64
+}
+
+// Function with multiple trait bounds
+fn process2[T: Iterator + Clone](iter: T) -> u64 {
+    42u64
+}
+
+// Function with three trait bounds
+fn process3[T: Iterator + Clone + Debug](iter: T) -> u64 {
+    42u64
+}
+
+// Function with nat parameter and trait bound
+fn process4[N: nat, T: Iterator](iter: T) -> u64 {
+    N as u64
+}
+
+// Function with type parameter with trait bound and nat parameter
+fn process5[T: Clone, N: nat](x: T, n: N) -> u64 {
+    42u64
+}
+
+fn main() -> () {
+}

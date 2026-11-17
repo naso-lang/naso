@@ -451,6 +451,26 @@ pub enum Gate {
     Cy,
     /// Toffoli (CCX).
     Ccx,
+    /// Controlled rotation about X.
+    Crx(f64),
+    /// Controlled rotation about Y.
+    Cry(f64),
+    /// Controlled rotation about Z.
+    Crz(f64),
+    /// Ising XX coupling.
+    Rxx(f64),
+    /// Ising YY coupling.
+    Ryy(f64),
+    /// Ising ZZ coupling.
+    Rzz(f64),
+    /// Controlled phase.
+    Cphase(f64),
+    /// iSwap gate.
+    Iswap,
+    /// iSwap-dagger (inverse of iSwap).
+    IswapDag,
+    /// Controlled-SWAP (Fredkin).
+    Cswap,
     /// Swap.
     Swap,
 }
@@ -494,6 +514,50 @@ impl StateVector {
         let destination = |index: usize| -> usize {
             if (index & abits) == abits {
                 index ^ tbit
+            } else {
+                index
+            }
+        };
+
+        let mut out = vec![Complex::ZERO; source.len()];
+        for (index, amp) in source.iter().enumerate() {
+            out[destination(index)] = *amp;
+        }
+        StateVector::from_amplitudes(qubits, out)
+    }
+
+    /// Apply the Fredkin gate (controlled-SWAP).
+    /// Swaps target1 and target2 when control is |1>.
+    ///
+    /// # Panics
+    ///
+    /// If the three qubit indices are not distinct, or any is out of range.
+    pub fn apply_cswap(&self, control: usize, target1: usize, target2: usize) -> Self {
+        assert!(
+            control != target1 && control != target2 && target1 != target2,
+            "the Fredkin gate needs three distinct qubits, got control {control}, targets {target1}, {target2}"
+        );
+        let qubits = self.qubits;
+        for q in [control, target1, target2] {
+            assert!(q < qubits, "qubit {q} is out of range for {qubits} qubits");
+        }
+
+        let cbit = 1usize << control;
+        let t1bit = 1usize << target1;
+        let t2bit = 1usize << target2;
+        let source = self.amplitudes();
+
+        let destination = |index: usize| -> usize {
+            if (index & cbit) != 0 {
+                // Control is set, swap target1 and target2
+                let b1 = (index & t1bit) != 0;
+                let b2 = (index & t2bit) != 0;
+                if b1 != b2 {
+                    // They differ, swap them
+                    index ^ t1bit ^ t2bit
+                } else {
+                    index
+                }
             } else {
                 index
             }
@@ -561,7 +625,7 @@ impl Gate {
                 let q = Complex::expi(theta / 2.0);
                 [p, Complex::ZERO, Complex::ZERO, q]
             }
-            Gate::Cx | Gate::Cz | Gate::Cy | Gate::Ccx | Gate::Swap => return None,
+            Gate::Cx | Gate::Cz | Gate::Cy | Gate::Ccx | Gate::Swap | Gate::Crx(_) | Gate::Cry(_) | Gate::Crz(_) | Gate::Rxx(_) | Gate::Ryy(_) | Gate::Rzz(_) | Gate::Cphase(_) | Gate::Iswap | Gate::IswapDag | Gate::Cswap => return None,
         })
     }
 
@@ -614,6 +678,88 @@ impl Gate {
             // `None` is the honest answer; the earlier version built a 4x4 that happened to
             // equal `cx`, which is how the two became indistinguishable.
             Gate::Ccx => return None,
+            // Controlled rotations
+            Gate::Crx(theta) => {
+                let c = (theta / 2.0).cos();
+                let s = (theta / 2.0).sin();
+                m[B00][B00] = Complex::ONE;
+                m[B01][B01] = Complex::ONE;
+                m[B10][B10] = Complex::real(c);
+                m[B10][B11] = -Complex::I.scale(s);
+                m[B11][B10] = -Complex::I.scale(s);
+                m[B11][B11] = Complex::real(c);
+            }
+            Gate::Cry(theta) => {
+                let c = (theta / 2.0).cos();
+                let s = (theta / 2.0).sin();
+                m[B00][B00] = Complex::ONE;
+                m[B01][B01] = Complex::ONE;
+                m[B10][B10] = Complex::real(c);
+                m[B10][B11] = -Complex::real(s);
+                m[B11][B10] = Complex::real(s);
+                m[B11][B11] = Complex::real(c);
+            }
+            Gate::Crz(theta) => {
+                let p = Complex::expi(-theta / 2.0);
+                let q = Complex::expi(theta / 2.0);
+                m[B00][B00] = Complex::ONE;
+                m[B01][B01] = Complex::ONE;
+                m[B10][B10] = p;
+                m[B11][B11] = q;
+            }
+            // Ising couplings
+            Gate::Rxx(theta) => {
+                let c = (theta / 2.0).cos();
+                let s = (theta / 2.0).sin();
+                m[B00][B00] = Complex::real(c);
+                m[B00][B11] = -Complex::I.scale(s);
+                m[B01][B01] = Complex::real(c);
+                m[B01][B10] = -Complex::I.scale(s);
+                m[B10][B10] = Complex::real(c);
+                m[B10][B01] = -Complex::I.scale(s);
+                m[B11][B11] = Complex::real(c);
+                m[B11][B00] = -Complex::I.scale(s);
+            }
+            Gate::Ryy(theta) => {
+                let c = (theta / 2.0).cos();
+                let s = (theta / 2.0).sin();
+                m[B00][B00] = Complex::real(c);
+                m[B00][B11] = Complex::I.scale(s);
+                m[B01][B01] = Complex::real(c);
+                m[B01][B10] = -Complex::I.scale(s);
+                m[B10][B10] = Complex::real(c);
+                m[B10][B01] = -Complex::I.scale(s);
+                m[B11][B11] = Complex::real(c);
+                m[B11][B00] = Complex::I.scale(s);
+            }
+            Gate::Rzz(theta) => {
+                let p = Complex::expi(-theta / 2.0);
+                let q = Complex::expi(theta / 2.0);
+                m[B00][B00] = p;
+                m[B01][B01] = q;
+                m[B10][B10] = q;
+                m[B11][B11] = p;
+            }
+            Gate::Cphase(theta) => {
+                let p = Complex::expi(theta);
+                m[B00][B00] = Complex::ONE;
+                m[B01][B01] = Complex::ONE;
+                m[B10][B10] = Complex::ONE;
+                m[B11][B11] = p;
+            }
+            Gate::Iswap => {
+                m[B00][B00] = Complex::ONE;
+                m[B01][B10] = Complex::I;
+                m[B10][B01] = Complex::I;
+                m[B11][B11] = Complex::ONE;
+            }
+            Gate::IswapDag => {
+                m[B00][B00] = Complex::ONE;
+                m[B01][B10] = -Complex::I;
+                m[B10][B01] = -Complex::I;
+                m[B11][B11] = Complex::ONE;
+            }
+            Gate::Cswap => return None, // 3-qubit gate
             Gate::H
             | Gate::X
             | Gate::Y
@@ -719,6 +865,161 @@ impl Gate {
                         -Complex::I
                     };
                     out[index ^ tbit] = coefficient * *amp;
+                }
+            }
+                        // Controlled rotations: apply the 2-qubit unitary directly
+            Gate::Crx(theta) => {
+                let c = (theta / 2.0).cos();
+                let s = (theta / 2.0).sin();
+                for (index, amp) in source.iter().enumerate() {
+                    let has_control = (index & cbit) != 0;
+                    if has_control {
+                        let idx0 = index & !tbit;
+                        let idx1 = idx0 | tbit;
+                        let a = source[idx0];
+                        let b = source[idx1];
+                        out[idx0] = Complex::real(c) * a - Complex::I.scale(s) * b;
+                        out[idx1] = -Complex::I.scale(s) * a + Complex::real(c) * b;
+                    } else {
+                        out[index] = *amp;
+                    }
+                }
+            }
+            Gate::Cry(theta) => {
+                let c = (theta / 2.0).cos();
+                let s = (theta / 2.0).sin();
+                for (index, amp) in source.iter().enumerate() {
+                    let has_control = (index & cbit) != 0;
+                    if has_control {
+                        let idx0 = index & !tbit;
+                        let idx1 = idx0 | tbit;
+                        let a = source[idx0];
+                        let b = source[idx1];
+                        out[idx0] = Complex::real(c) * a - Complex::real(s) * b;
+                        out[idx1] = Complex::real(s) * a + Complex::real(c) * b;
+                    } else {
+                        out[index] = *amp;
+                    }
+                }
+            }
+            Gate::Crz(theta) => {
+                let p = Complex::expi(-theta / 2.0);
+                let q = Complex::expi(theta / 2.0);
+                for (index, amp) in source.iter().enumerate() {
+                    let has_control = (index & cbit) != 0;
+                    let has_target = (index & tbit) != 0;
+                    if has_control {
+                        if has_target {
+                            out[index] = q * *amp;
+                        } else {
+                            out[index] = p * *amp;
+                        }
+                    } else {
+                        out[index] = *amp;
+                    }
+                }
+            }
+            // Ising couplings
+            Gate::Rxx(theta) => {
+                let c = (theta / 2.0).cos();
+                let s = (theta / 2.0).sin();
+                for (index, amp) in source.iter().enumerate() {
+                    let b0 = (index & cbit) != 0;
+                    let b1 = (index & tbit) != 0;
+                    let idx00 = index & !cbit & !tbit;
+                    let idx01 = idx00 | tbit;
+                    let idx10 = idx00 | cbit;
+                    let idx11 = idx00 | cbit | tbit;
+                    if (b0, b1) == (false, false) {
+                        out[idx00] = Complex::real(c) * source[idx00] - Complex::I.scale(s) * source[idx11];
+                        out[idx11] = -Complex::I.scale(s) * source[idx00] + Complex::real(c) * source[idx11];
+                    } else if (b0, b1) == (true, true) {
+                        // already handled above
+                    } else if (b0, b1) == (false, true) {
+                        out[idx01] = Complex::real(c) * source[idx01] - Complex::I.scale(s) * source[idx10];
+                        out[idx10] = -Complex::I.scale(s) * source[idx01] + Complex::real(c) * source[idx10];
+                    } else if (b0, b1) == (true, false) {
+                        out[idx10] = Complex::real(c) * source[idx10] - Complex::I.scale(s) * source[idx01];
+                        out[idx01] = -Complex::I.scale(s) * source[idx10] + Complex::real(c) * source[idx01];
+                    }
+                }
+            }
+            Gate::Ryy(theta) => {
+                let c = (theta / 2.0).cos();
+                let s = (theta / 2.0).sin();
+                for (index, amp) in source.iter().enumerate() {
+                    let b0 = (index & cbit) != 0;
+                    let b1 = (index & tbit) != 0;
+                    let idx00 = index & !cbit & !tbit;
+                    let idx01 = idx00 | tbit;
+                    let idx10 = idx00 | cbit;
+                    let idx11 = idx00 | cbit | tbit;
+                    if (b0, b1) == (false, false) {
+                        out[idx00] = Complex::real(c) * source[idx00] + Complex::I.scale(s) * source[idx11];
+                        out[idx11] = Complex::I.scale(s) * source[idx00] + Complex::real(c) * source[idx11];
+                    } else if (b0, b1) == (true, true) {
+                        // already handled above
+                    } else if (b0, b1) == (false, true) {
+                        out[idx01] = Complex::real(c) * source[idx01] - Complex::I.scale(s) * source[idx10];
+                        out[idx10] = -Complex::I.scale(s) * source[idx01] + Complex::real(c) * source[idx10];
+                    } else if (b0, b1) == (true, false) {
+                        out[idx10] = Complex::real(c) * source[idx10] - Complex::I.scale(s) * source[idx01];
+                        out[idx01] = -Complex::I.scale(s) * source[idx10] + Complex::real(c) * source[idx01];
+                    }
+                }
+            }
+            Gate::Rzz(theta) => {
+                let p = Complex::expi(-theta / 2.0);
+                let q = Complex::expi(theta / 2.0);
+                for (index, amp) in source.iter().enumerate() {
+                    let b0 = (index & cbit) != 0;
+                    let b1 = (index & tbit) != 0;
+                    out[index] = match (b0, b1) {
+                        (false, false) => p * *amp,
+                        (false, true) => q * *amp,
+                        (true, false) => q * *amp,
+                        (true, true) => p * *amp,
+                    };
+                }
+            }
+            Gate::Cphase(theta) => {
+                let p = Complex::expi(theta);
+                for (index, amp) in source.iter().enumerate() {
+                    let b0 = (index & cbit) != 0;
+                    let b1 = (index & tbit) != 0;
+                    out[index] = if b0 && b1 {
+                        p * *amp
+                    } else {
+                        *amp
+                    };
+                }
+            }
+            // iSwap: swap with phase
+            Gate::Iswap => {
+                for (index, amp) in source.iter().enumerate() {
+                    let b0 = (index & cbit) != 0;
+                    let b1 = (index & tbit) != 0;
+                    if b0 != b1 {
+                        // Swap the two qubits with phase i
+                        let swap_mask = cbit | tbit;
+                        out[index ^ swap_mask] = Complex::I * *amp;
+                    } else {
+                        out[index] = *amp;
+                    }
+                }
+            }
+            // iSwap-dagger: swap with phase -i
+            Gate::IswapDag => {
+                for (index, amp) in source.iter().enumerate() {
+                    let b0 = (index & cbit) != 0;
+                    let b1 = (index & tbit) != 0;
+                    if b0 != b1 {
+                        // Swap the two qubits with phase -i
+                        let swap_mask = cbit | tbit;
+                        out[index ^ swap_mask] = -Complex::I * *amp;
+                    } else {
+                        out[index] = *amp;
+                    }
                 }
             }
             // The Toffoli is a three-qubit gate and is handled before this match.

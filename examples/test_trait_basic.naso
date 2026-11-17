@@ -1,0 +1,34 @@
+// Test trait definition and implementation
+trait Read {
+    fn read(&self, buf: *u8, len: u64) -> u64;
+}
+
+trait Write {
+    fn write(&self, buf: *u8, len: u64) -> u64;
+}
+
+struct File {
+    fd: u64,
+}
+
+impl Read for File {
+    fn read(&self, buf: *u8, len: u64) -> u64 {
+        0
+    }
+}
+
+impl Write for File {
+    fn write(&self, buf: *u8, len: u64) -> u64 {
+        0
+    }
+}
+
+extern "C" {
+    fn naso_write(fd: u64, buf: *u8, len: u64) -> u64;
+}
+
+fn main() -> () {
+    let f = File { fd: 1 };
+    let _ = f.read(0 as *u8, 10);
+    let _ = f.write(0 as *u8, 10);
+}

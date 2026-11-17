@@ -1,0 +1,44 @@
+// Test trait method resolution
+trait Read {
+    fn read(&self, buf: *u8, len: u64) -> u64;
+}
+
+trait Write {
+    fn write(&self, buf: *u8, len: u64) -> u64;
+}
+
+struct File {
+    fd: u64,
+}
+
+impl Read for File {
+    fn read(&self, buf: *u8, len: u64) -> u64 {
+        0
+    }
+}
+
+impl Write for File {
+    fn write(&self, buf: *u8, len: u64) -> u64 {
+        0
+    }
+}
+
+extern "C" {
+    fn naso_write(fd: u64, buf: *u8, len: u64) -> u64;
+}
+
+fn test_read(file: File) -> u64 {
+    file.read(0 as *u8, 10)
+}
+
+fn test_write(file: File) -> u64 {
+    file.write(0 as *u8, 10)
+}
+
+fn main() -> () {
+    let f = File { fd: 1 };
+    let r = test_read(f);
+    let w = test_write(f);
+    let _ = r;
+    let _ = w;
+}

@@ -1,0 +1,541 @@
+// Hybrid Classical/Quantum Kernel
+// Demonstrates polyhedral classical scheduling fused with QIR quantum circuits.
+//
+// Naso's unified compiler allows classical pre/post-processing to be scheduled
+// together with quantum circuits in a single compilation unit.
+
+use std::quantum::{qalloc, qfree, qalloc_array, hadamard, cnot, measure, rx, ry, rz, rzz, pauli_x, pauli_z};
+use std::tensor::Tensor;
+use std::math::{sin, cos, sqrt, pi, exp, log};
+
+// ============================================================
+// Classical Pre-processing: State Preparation Data
+// ============================================================
+
+/// Classically compute rotation angles for amplitude encoding.
+/// Given a classical vector, compute the rotation angles needed to
+/// prepare the corresponding quantum state.
+fn compute_amplitude_encoding_angles(
+    data: [1] Tensor[f32, N]
+) -> [1] Tensor[f32, N]
+where N: Nat
+{
+    // Normalize the input vector
+    var norm_sq = 0.0;
+    for i in 0..N {
+        norm_sq += data[i] * data[i];
+    }
+    let norm = sqrt(norm_sq);
+    
+    var angles: Tensor[f32, N] = tensor_zeros();
+    
+    // Compute rotation angles for each amplitude
+    // Using the recursive formula for state preparation
+    var remaining_norm = 1.0;
+    for i in 0..N {
+        let amplitude = data[i] / norm;
+        let angle = 2.0 * (amplitude / remaining_norm).asin();
+        angles[i] = angle;
+        remaining_norm *= cos(angle / 2.0);
+    }
+    
+    angles
+}
+
+/// Classical computation of Hamiltonian coefficients from molecular integrals.
+/// This would typically be done by a quantum chemistry package.
+fn compute_molecular_hamiltonian(
+    geometry: [1] Tensor[f32, 3*N_ATOMS],
+    basis_set: str
+) -> [1] [PauliTerm; N_TERMS]
+where N_ATOMS: Nat, N_TERMS: Nat
+{
+    // Placeholder for actual quantum chemistry computation
+    // In practice, this would call into a classical library
+    // or use Naso's FFI to call Python (PySCF, etc.)
+    
+    var hamiltonian: [PauliTerm; N_TERMS];
+    
+    // Simplified: return a dummy Hamiltonian
+    // Real implementation would compute one- and two-electron integrals
+    // and perform Jordan-Wigner or Bravyi-Kitaev transformation
+    
+    hamiltonian
+}
+
+// ============================================================
+// Quantum Kernel: Variational Quantum Eigensolver
+// ============================================================
+
+/// VQE ansatz with classical parameter computation.
+/// The classical part computes optimal initial parameters,
+/// the quantum part evaluates the energy.
+fn vqe_with_classical_init(
+    hamiltonian: [1] [PauliTerm; N_TERMS],
+    molecule_geometry: [1] Tensor[f32, 3*N_ATOMS]
+) -> f32
+where N_TERMS: Nat, N_ATOMS: Nat
+{
+    // CLASSICAL: Compute initial parameters from Hartree-Fock
+    // This runs on the CPU during kernel execution
+    var hf_params: Tensor[f32, N_PARAMS] = compute_hartree_fock_params(molecule_geometry);
+    
+    // QUANTUM: Run VQE optimization
+    let optimal_params = vqe_optimize(
+        hamiltonian,
+        hf_params,
+        100,
+        0.01,
+        1e-6
+    );
+    
+    // QUANTUM: Final energy evaluation
+    let [1] qubits: [Qubit; N_QUBITS] = qalloc_array(N_QUBITS);
+    hardware_efficient_ansatz(optimal_params, qubits);
+    let energy = hamiltonian_expectation(hamiltonian, qubits);
+    qfree_array(qubits);
+    
+    energy
+}
+
+/// Classical Hartree-Fock parameter computation.
+fn compute_hartree_fock_params(
+    geometry: [1] Tensor[f32, 3*N_ATOMS]
+) -> [1] Tensor[f32, N_PARAMS]
+where N_ATOMS: Nat, N_PARAMS: Nat
+{
+    // Placeholder: in reality, this would:
+    // 1. Compute molecular integrals
+    // 2. Run HF calculation
+    // 3. Extract orbital rotation parameters
+    // 4. Map to ansatz parameters
+    
+    var params: Tensor[f32, N_PARAMS] = tensor_zeros();
+    // ... HF computation ...
+    params
+}
+
+// ============================================================
+// Quantum Error Mitigation: Zero-Noise Extrapolation
+// ============================================================
+
+/// Zero-Noise Extrapolation (ZNE) for error mitigation.
+/// Runs the same circuit at different noise levels and extrapolates to zero noise.
+fn zero_noise_extrapolation(
+    circuit_fn: fn([1] [Qubit; N_QUBITS]) -> [1] [Qubit; N_QUBITS],
+    observable: fn([1] [Qubit; N_QUBITS]) -> f32,
+    noise_factors: [1] [f32; N_SCALE],
+    shots_per_scale: usize
+) -> f32
+where N_QUBITS: Nat, N_SCALE: Nat
+{
+    var expectations: Tensor[f32, N_SCALE] = tensor_zeros();
+    
+    for scale_idx in 0..N_SCALE {
+        let scale = noise_factors[scale_idx];
+        
+        // Run circuit multiple times at this noise scale
+        var sum = 0.0;
+        for _ in 0..shots_per_scale {
+            let [1] qubits: [Qubit; N_QUBITS] = qalloc_array(N_QUBITS);
+            
+            // Apply noise scaling (e.g., by stretching gate durations)
+            apply_noise_scaling(scale);
+            
+            circuit_fn(qubits);
+            let exp_val = observable(qubits);
+            qfree_array(qubits);
+            
+            sum += exp_val;
+        }
+        
+        expectations[scale_idx] = sum / shots_per_scale as f32;
+    }
+    
+    // Richardson extrapolation to zero noise
+    richardson_extrapolation(noise_factors, expectations)
+}
+
+/// Apply noise scaling to quantum operations.
+fn apply_noise_scaling(scale: f32) {
+    // In a real implementation, this would:
+    // - Scale gate durations by `scale`
+    // - Scale measurement times
+    // - Or use pulse-level control on hardware
+    
+    // For simulation, we could add depolarizing noise proportional to scale
+}
+
+// ============================================================
+// Quantum Machine Learning: Quantum Kernel Methods
+// ============================================================
+
+/// Quantum kernel matrix computation for SVM.
+/// K(x, x') = |<phi(x)|phi(x')>|^2 where |phi> is a quantum feature map.
+fn quantum_kernel_matrix(
+    dataset: [1] Tensor[f32, N_SAMPLES, N_FEATURES],
+    feature_map: fn([1] Tensor[f32, N_FEATURES], [1] [Qubit; N_QUBITS]) -> [1] [Qubit; N_QUBITS]
+) -> [1] Tensor[f32, N_SAMPLES, N_SAMPLES]
+where N_SAMPLES: Nat, N_FEATURES: Nat, N_QUBITS: Nat
+{
+    var kernel_matrix: Tensor[f32, N_SAMPLES, N_SAMPLES] = tensor_zeros();
+    
+    for i in 0..N_SAMPLES {
+        for j in 0..N_SAMPLES {
+            // Prepare |phi(x_i)>
+            let [1] qi: [Qubit; N_QUBITS] = qalloc_array(N_QUBITS);
+            feature_map(dataset[i], qi);
+            
+            // Prepare |phi(x_j)>
+            let [1] qj: [Qubit; N_QUBITS] = qalloc_array(N_QUBITS);
+            feature_map(dataset[j], qj);
+            
+            // Compute overlap |<phi(x_i)|phi(x_j)>|^2
+            // Using SWAP test or Hadamard test
+            let overlap = swap_test(qi, qj);
+            
+            kernel_matrix[i, j] = overlap;
+            
+            qfree_array(qi);
+            qfree_array(qj);
+        }
+    }
+    
+    kernel_matrix
+}
+
+/// SWAP test for overlap estimation.
+fn swap_test(
+    reg_a: [1] [Qubit; N_QUBITS],
+    reg_b: [1] [Qubit; N_QUBITS]
+) -> f32
+where N_QUBITS: Nat
+{
+    // Allocate ancilla
+    let [1] ancilla: Qubit = qalloc();
+    
+    // SWAP test circuit
+    hadamard(ancilla);
+    
+    for i in 0..N_QUBITS {
+        cswap(ancilla, reg_a[i], reg_b[i]);
+    }
+    
+    hadamard(ancilla);
+    let m = measure(ancilla);
+    qfree(ancilla);
+    
+    // Probability of measuring 0 = (1 + |<a|b>|^2) / 2
+    // So |<a|b>|^2 = 2 * P(0) - 1
+    // This is a single shot; in practice, repeat many times
+    if m { 0.0 } else { 1.0 }  // Single-shot estimate
+}
+
+/// Controlled-SWAP gate (Fredkin gate).
+fn cswap(control: Qubit, target1: Qubit, target2: Qubit) {
+    // CSWAP = CCX(control, target1, target2) with appropriate basis changes
+    // Simplified implementation
+    cnot(target1, target2);
+    ccx(control, target2, target1);
+    cnot(target1, target2);
+}
+
+/// Toffoli gate (CCX).
+fn ccx(control1: Qubit, control2: Qubit, target: Qubit) {
+    // Decompose into H, T, CNOT
+    hadamard(target);
+    cnot(control2, target);
+    // ... T gates ...
+    cnot(control1, target);
+    // ... T† gates ...
+    cnot(control2, target);
+    // ... T gates ...
+    cnot(control1, target);
+    hadamard(target);
+}
+
+// ============================================================
+// Hybrid Quantum-Classical Optimization: Quantum Natural Gradient
+// ============================================================
+
+/// Quantum Natural Gradient (QNG) optimization.
+/// Uses the Fubini-Study metric tensor for parameter updates.
+fn quantum_natural_gradient_step(
+    hamiltonian: [1] [PauliTerm; N_TERMS],
+    params: inout [1] Tensor[f32, N_PARAMS],
+    learning_rate: f32
+) where N_TERMS: Nat, N_PARAMS: Nat
+{
+    // 1. Compute energy gradient (parameter shift)
+    let (_, gradient) = vqe_energy_and_gradient(
+        hamiltonian,
+        params,
+        qalloc_array(N_QUBITS)  // Would reuse qubits
+    );
+    
+    // 2. Compute Fubini-Study metric tensor
+    // F_ij = Re[<d_i psi| d_j psi> - <d_i psi|psi><psi|d_j psi>]
+    let metric = fubini_study_metric(params);
+    
+    // 3. Solve F * delta = gradient for delta
+    // Natural gradient: delta = F^{-1} * gradient
+    let delta = solve_linear_system(metric, gradient);
+    
+    // 4. Update parameters
+    for i in 0..N_PARAMS {
+        params[i] -= learning_rate * delta[i];
+    }
+}
+
+/// Fubini-Study metric tensor computation.
+fn fubini_study_metric(
+    params: [1] Tensor[f32, N_PARAMS]
+) -> [1] Tensor[f32, N_PARAMS, N_PARAMS]
+where N_PARAMS: Nat
+{
+    // F_ij = 4 * Re[<d_i psi| d_j psi> - <d_i psi|psi><psi|d_j psi>]
+    // Can be computed via parameter shift rule on the overlap
+    
+    var metric: Tensor[f32, N_PARAMS, N_PARAMS] = tensor_zeros();
+    
+    // Diagonal elements
+    for i in 0..N_PARAMS {
+        metric[i, i] = 1.0;  // Simplified
+    }
+    
+    // Off-diagonal elements (symmetric)
+    for i in 0..N_PARAMS {
+        for j in (i+1)..N_PARAMS {
+            metric[i, j] = 0.0;
+            metric[j, i] = 0.0;
+        }
+    }
+    
+    metric
+}
+
+/// Solve linear system F * x = b (simplified).
+fn solve_linear_system(
+    F: [1] Tensor[f32, N, N],
+    b: [1] Tensor[f32, N]
+) -> [1] Tensor[f32, N]
+where N: Nat
+{
+    // Placeholder: would use Cholesky decomposition or similar
+    // For now, return identity * b (standard gradient)
+    b
+}
+
+// ============================================================
+// Quantum Phase Estimation (QPE) with Classical Post-processing
+// ============================================================
+
+/// Quantum Phase Estimation for ground state energy.
+/// Uses classical post-processing to extract eigenvalue from phase.
+fn quantum_phase_estimation(
+    unitary: fn([1] [Qubit; N_QUBITS]) -> [1] [Qubit; N_QUBITS],
+    eigenstate_prep: fn([1] [Qubit; N_QUBITS]) -> [1] [Qubit; N_QUBITS],
+    n_ancilla: usize
+) -> f32
+where N_QUBITS: Nat
+{
+    // Allocate ancilla register for phase estimation
+    let [1] ancilla: [Qubit; n_ancilla] = qalloc_array(n_ancilla);
+    let [1] system: [Qubit; N_QUBITS] = qalloc_array(N_QUBITS);
+    
+    // Prepare eigenstate
+    eigenstate_prep(system);
+    
+    // Initialize ancilla in |+>^n
+    for i in 0..n_ancilla {
+        hadamard(ancilla[i]);
+    }
+    
+    // Controlled unitary applications
+    for i in 0..n_ancilla {
+        // Apply U^(2^i) controlled by ancilla[i]
+        for _ in 0..(1 << i) {
+            controlled_unitary(ancilla[i], system, unitary);
+        }
+    }
+    
+    // Inverse QFT on ancilla
+    inverse_qft(ancilla);
+    
+    // Measure ancilla
+    var phase_bits: [bool; n_ancilla];
+    for i in 0..n_ancilla {
+        phase_bits[i] = measure(ancilla[i]);
+    }
+    
+    // Classical post-processing: convert bits to phase
+    var phase = 0.0;
+    for i in 0..n_ancilla {
+        if phase_bits[i] {
+            phase += 1.0 / (1 << (i + 1)) as f32;
+        }
+    }
+    
+    // Eigenvalue = e^{2πi * phase}
+    // Energy = -log(eigenvalue) / (2π) for unitary = e^{-iHt}
+    let energy = -log(cos(2.0 * pi * phase) + sin(2.0 * pi * phase)) / (2.0 * pi);
+    
+    qfree_array(ancilla);
+    qfree_array(system);
+    
+    energy
+}
+
+/// Controlled application of a unitary.
+fn controlled_unitary(
+    control: Qubit,
+    target: [1] [Qubit; N_QUBITS],
+    unitary: fn([1] [Qubit; N_QUBITS]) -> [1] [Qubit; N_QUBITS]
+) where N_QUBITS: Nat
+{
+    // This would be lowered to controlled gates
+    // For each gate in the unitary decomposition, make it controlled
+    // Placeholder
+}
+
+// ============================================================
+// Example: Full Hybrid Workflow
+// ============================================================
+
+/// Complete workflow: Classical data -> Quantum kernel -> Classical ML
+fn hybrid_quantum_classical_workflow(
+    training_data: [1] Tensor[f32, N_TRAIN, N_FEATURES],
+    test_data: [1] Tensor[f32, N_TEST, N_FEATURES],
+    training_labels: [1] Tensor[f32, N_TRAIN]
+) -> [1] Tensor[f32, N_TEST]
+where N_TRAIN: Nat, N_TEST: Nat, N_FEATURES: Nat
+{
+    // 1. CLASSICAL: Feature scaling and preprocessing
+    let scaled_train = standardize_features(training_data);
+    let scaled_test = standardize_features(test_data);
+    
+    // 2. QUANTUM: Compute quantum kernel matrices
+    let K_train = quantum_kernel_matrix(scaled_train, angle_embedding_feature_map);
+    let K_test = quantum_kernel_matrix_cross(scaled_test, scaled_train, angle_embedding_feature_map);
+    
+    // 3. CLASSICAL: Train SVM on quantum kernel
+    let alpha = train_svm(K_train, training_labels);
+    
+    // 4. CLASSICAL: Predict on test set
+    let predictions = predict_svm(K_test, alpha);
+    
+    predictions
+}
+
+/// Standardize features (zero mean, unit variance).
+fn standardize_features(
+    data: [1] Tensor[f32, N_SAMPLES, N_FEATURES]
+) -> [1] Tensor[f32, N_SAMPLES, N_FEATURES]
+where N_SAMPLES: Nat, N_FEATURES: Nat
+{
+    var result: Tensor[f32, N_SAMPLES, N_FEATURES] = tensor_zeros();
+    
+    for f in 0..N_FEATURES {
+        // Compute mean
+        var mean = 0.0;
+        for s in 0..N_SAMPLES {
+            mean += data[s, f];
+        }
+        mean /= N_SAMPLES as f32;
+        
+        // Compute std
+        var var = 0.0;
+        for s in 0..N_SAMPLES {
+            var += (data[s, f] - mean).powi(2);
+        }
+        let std = sqrt(var / N_SAMPLES as f32);
+        
+        // Standardize
+        for s in 0..N_SAMPLES {
+            result[s, f] = (data[s, f] - mean) / (std + 1e-8);
+        }
+    }
+    
+    result
+}
+
+/// Angle embedding feature map.
+fn angle_embedding_feature_map(
+    x: [1] Tensor[f32, N_FEATURES],
+    qubits: [1] [Qubit; N_QUBITS]
+) -> [1] [Qubit; N_QUBITS]
+where N_FEATURES: Nat, N_QUBITS: Nat
+{
+    // Embed each feature as a rotation angle
+    for i in 0..min(N_FEATURES, N_QUBITS) {
+        ry(x[i], qubits[i]);
+    }
+    
+    // Add entangling layer
+    for i in 0..(N_QUBITS - 1) {
+        cnot(qubits[i], qubits[i + 1]);
+    }
+    
+    qubits
+}
+
+/// Cross kernel matrix between test and train.
+fn quantum_kernel_matrix_cross(
+    test_data: [1] Tensor[f32, N_TEST, N_FEATURES],
+    train_data: [1] Tensor[f32, N_TRAIN, N_FEATURES],
+    feature_map: fn([1] Tensor[f32, N_FEATURES], [1] [Qubit; N_QUBITS]) -> [1] [Qubit; N_QUBITS]
+) -> [1] Tensor[f32, N_TEST, N_TRAIN]
+where N_TEST: Nat, N_TRAIN: Nat, N_FEATURES: Nat, N_QUBITS: Nat
+{
+    var K: Tensor[f32, N_TEST, N_TRAIN] = tensor_zeros();
+    
+    for i in 0..N_TEST {
+        for j in 0..N_TRAIN {
+            let [1] qi: [Qubit; N_QUBITS] = qalloc_array(N_QUBITS);
+            feature_map(test_data[i], qi);
+            
+            let [1] qj: [Qubit; N_QUBITS] = qalloc_array(N_QUBITS);
+            feature_map(train_data[j], qj);
+            
+            K[i, j] = swap_test(qi, qj);
+            
+            qfree_array(qi);
+            qfree_array(qj);
+        }
+    }
+    
+    K
+}
+
+/// Train SVM (simplified).
+fn train_svm(
+    K: [1] Tensor[f32, N, N],
+    y: [1] Tensor[f32, N]
+) -> [1] Tensor[f32, N]
+where N: Nat
+{
+    // Placeholder: would solve quadratic programming problem
+    var alpha: Tensor[f32, N] = tensor_zeros();
+    // ... SVM training ...
+    alpha
+}
+
+/// Predict with SVM.
+fn predict_svm(
+    K_test: [1] Tensor[f32, M, N],
+    alpha: [1] Tensor[f32, N]
+) -> [1] Tensor[f32, M]
+where M: Nat, N: Nat
+{
+    var pred: Tensor[f32, M] = tensor_zeros();
+    
+    for i in 0..M {
+        var sum = 0.0;
+        for j in 0..N {
+            sum += alpha[j] * K_test[i, j];
+        }
+        pred[i] = if sum > 0.0 { 1.0 } else { -1.0 };
+    }
+    
+    pred
+}

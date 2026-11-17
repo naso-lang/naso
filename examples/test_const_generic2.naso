@@ -1,0 +1,8 @@
+// Test - Const generics with Nat
+fn identity[N: nat](x: u64) -> u64 {
+    x
+}
+
+fn main() -> () {
+    let _ = identity[10](42u64);
+}

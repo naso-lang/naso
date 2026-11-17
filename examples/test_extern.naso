@@ -1,0 +1,20 @@
+// Test with multiple extern functions
+extern "C" {
+    fn naso_tcp_bind(addr: *u8, len: u64) -> u64;
+    fn naso_tcp_accept(fd: u64, out: *u64) -> u64;
+    fn naso_accept_get_client(out: *u64) -> u64;
+    fn naso_read(fd: u64, buf: *u8, max_len: u64) -> u64;
+    fn naso_write(fd: u64, buf: *u8, len: u64) -> u64;
+    fn naso_close(fd: u64) -> u64;
+    fn naso_yield() -> u64;
+    fn naso_uring_init() -> u64;
+}
+
+fn main() {
+    let uring_init = naso_uring_init();
+    let mut running = 1;
+    while running != 0 {
+        naso_yield();
+        running = 0;
+    }
+}

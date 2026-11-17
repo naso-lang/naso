@@ -1,0 +1,14 @@
+// Simple trait test
+trait Test {
+    fn method(&self) -> u64;
+}
+
+struct S {}
+
+impl Test for S {
+    fn method(&self) -> u64 {
+        42
+    }
+}
+
+fn main() -> () {}

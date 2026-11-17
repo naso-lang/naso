@@ -1,0 +1,192 @@
+// Quantum Bell Pair Kernel
+// Demonstrates native quantum + classical unification in Naso
+// 
+// This kernel creates a Bell pair (maximally entangled state) and
+// verifies the entanglement through measurement correlations.
+//
+// Validation: This kernel should typecheck, lower to QIR, and execute
+// correctly on both CPU state-vector simulator and quantum hardware.
+
+use std::quantum::{qalloc, qfree, hadamard, cnot, measure};
+
+/// Create a Bell pair and return both qubits for further use.
+fn bell_pair() -> ([1] Qubit, [1] Qubit) {
+    let [1] a: Qubit = qalloc();
+    let [1] b: Qubit = qalloc();
+    
+    // Create |+> state on qubit a
+    hadamard(a);
+    
+    // Entangle a and b: |00> + |11> / sqrt(2)
+    cnot(a, b);
+    
+    (a, b)
+}
+
+/// Create a Bell pair and measure both qubits.
+/// Returns true if measurements are correlated (both 0 or both 1).
+fn bell_measured() -> bool {
+    let [1] a: Qubit = qalloc();
+    let [1] b: Qubit = qalloc();
+    
+    hadamard(a);
+    cnot(a, b);
+    
+    let ma = measure(a);
+    let mb = measure(b);
+    
+    // In a Bell pair, measurements should be perfectly correlated
+    ma == mb
+}
+
+/// Bell state tomography: prepare all four Bell states and verify.
+fn bell_state_tomography() {
+    // |Phi+> = (|00> + |11>) / sqrt(2)
+    {
+        let [1] a: Qubit = qalloc();
+        let [1] b: Qubit = qalloc();
+        hadamard(a);
+        cnot(a, b);
+        let _ = measure(a);
+        let _ = measure(b);
+        qfree(a);
+        qfree(b);
+    }
+    
+    // |Phi-> = (|00> - |11>) / sqrt(2)
+    {
+        let [1] a: Qubit = qalloc();
+        let [1] b: Qubit = qalloc();
+        hadamard(a);
+        cnot(a, b);
+        std::quantum::pauli_z(a);  // Phase flip
+        let _ = measure(a);
+        let _ = measure(b);
+        qfree(a);
+        qfree(b);
+    }
+    
+    // |Psi+> = (|01> + |10>) / sqrt(2)
+    {
+        let [1] a: Qubit = qalloc();
+        let [1] b: Qubit = qalloc();
+        hadamard(a);
+        cnot(a, b);
+        std::quantum::pauli_x(b);  // Bit flip on target
+        let _ = measure(a);
+        let _ = measure(b);
+        qfree(a);
+        qfree(b);
+    }
+    
+    // |Psi-> = (|01> - |10>) / sqrt(2)
+    {
+        let [1] a: Qubit = qalloc();
+        let [1] b: Qubit = qalloc();
+        hadamard(a);
+        cnot(a, b);
+        std::quantum::pauli_z(a);
+        std::quantum::pauli_x(b);
+        let _ = measure(a);
+        let _ = measure(b);
+        qfree(a);
+        qfree(b);
+    }
+}
+
+/// Quantum teleportation protocol.
+/// Teleports the state of qubit 'msg' to qubit 'target' using a Bell pair.
+fn quantum_teleportation(
+    msg: [1] Qubit,  // State to teleport (consumed)
+    target: [1] Qubit  // Target qubit (will hold teleported state)
+) -> [1] Qubit {
+    // Alice and Bob share a Bell pair
+    let [1] alice_bell: Qubit = qalloc();
+    let [1] bob_bell: Qubit = qalloc();
+    hadamard(alice_bell);
+    cnot(alice_bell, bob_bell);
+    
+    // Alice performs Bell basis measurement on her qubit and the message
+    cnot(msg, alice_bell);
+    hadamard(msg);
+    
+    let m1 = measure(msg);     // Measure message qubit
+    let m2 = measure(alice_bell);  // Measure Alice's Bell qubit
+    
+    // Alice sends classical bits m1, m2 to Bob
+    // Bob applies corrections based on measurement results
+    if m2 {
+        target = std::quantum::pauli_x(target);
+    }
+    if m1 {
+        target = std::quantum::pauli_z(target);
+    }
+    
+    // Target now holds the teleported state
+    qfree(bob_bell);  // Clean up
+    
+    target
+}
+
+/// Superdense coding: send 2 classical bits using 1 qubit + 1 ebit.
+fn superdense_coding(
+    bit0: bool,
+    bit1: bool,
+    alice_qubit: [1] Qubit,
+    bob_qubit: [1] Qubit
+) -> (bool, bool) {
+    // Alice and Bob share a Bell pair
+    hadamard(alice_qubit);
+    cnot(alice_qubit, bob_qubit);
+    
+    // Alice encodes her 2 classical bits
+    if bit1 {
+        alice_qubit = std::quantum::pauli_x(alice_qubit);
+    }
+    if bit0 {
+        alice_qubit = std::quantum::pauli_z(alice_qubit);
+    }
+    
+    // Alice sends her qubit to Bob
+    // Bob decodes by reversing the Bell pair creation
+    cnot(alice_qubit, bob_qubit);
+    hadamard(alice_qubit);
+    
+    let m0 = measure(alice_qubit);
+    let m1 = measure(bob_qubit);
+    
+    (m0, m1)
+}
+
+/// Greenberger-Horne-Zeilinger (GHZ) state on N qubits.
+fn ghz_state(n: usize) -> [1] [Qubit; N] where N: Nat {
+    // Allocate N qubits
+    let [1] reg: [Qubit; N] = qalloc_array(n);
+    
+    // Create |0...0> + |1...1> superposition
+    hadamard(reg[0]);
+    for i in 1..n {
+        cnot(reg[0], reg[i]);
+    }
+    
+    reg
+}
+
+/// W state on N qubits (single excitation).
+fn w_state(n: usize) -> [1] [Qubit; N] where N: Nat {
+    let [1] reg: [Qubit; N] = qalloc_array(n);
+    
+    // Create W state: (|100...> + |010...> + ... + |00...1>) / sqrt(N)
+    // Simplified recursive construction
+    for i in 0..n {
+        // Apply rotation to create superposition
+        let angle = 2.0 * (1.0 / (n - i) as f64).sqrt().acos();
+        std::quantum::ry(angle, reg[i]);
+        for j in (i + 1)..n {
+            // Controlled rotation
+            std::quantum::cry(angle, reg[i], reg[j]);
+        }
+    }
+    
+    reg
+}

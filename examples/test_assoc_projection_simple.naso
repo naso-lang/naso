@@ -1,0 +1,18 @@
+// Test associated type projection
+trait Iterator {
+    type Item;
+}
+
+struct MyIter {}
+
+impl Iterator for MyIter {
+    type Item = u64;
+}
+
+fn test_projection() -> u64 {
+    let _: <MyIter as Iterator>::Item = 42u64;
+    42u64
+}
+
+fn main() -> () {
+}

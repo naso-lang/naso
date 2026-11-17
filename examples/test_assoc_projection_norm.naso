@@ -1,0 +1,21 @@
+// Test - Impl with associated type
+trait Iterator {
+    type Item;
+    fn next(&self) -> Self::Item;
+}
+
+struct MyIter {
+    data: [u64; 3],
+    index: u64,
+}
+
+impl Iterator for MyIter {
+    type Item = u64;
+    fn next(&self) -> Self::Item {
+        42u64
+    }
+}
+
+fn main() -> () {
+    let iter = MyIter { data: [1u64, 2u64, 3u64], index: 0u64 };
+}

@@ -403,8 +403,8 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Quantity::Many
             }
-            Some(TK::Int(n)) => {
-                let n = *n;
+            Some(TK::Int(typed)) => {
+                let n = typed.value;
                 self.bump();
                 match n {
                     0 => Quantity::Zero,
@@ -451,6 +451,7 @@ impl<'a> Parser<'a> {
         let name = match self.bump() {
             Some(t) => match &t.kind {
                 TK::Ident(s) | TK::TypeIdent(s) => s.clone(),
+                TK::SelfLower => "self".to_string(),
                 TK::LParen => {
                     // Recovery: if we unexpectedly hit a '(', return a dummy identifier
                     // to allow parsing to continue and report more errors
@@ -478,9 +479,9 @@ impl<'a> Parser<'a> {
             items.push(self.parse_item());
         }
         items
-    }
+                }
 
-    /// Parse a single top-level item.
+            /// Parse a single top-level item.
     pub fn parse_item(&mut self) -> Item {
         match self.peek() {
             Some(TK::Fn) => Item::Function(self.parse_fn()),
@@ -492,11 +493,269 @@ impl<'a> Parser<'a> {
             Some(TK::Import) => Item::Import(self.parse_import()),
             Some(TK::Mod) => Item::Module(self.parse_module()),
             Some(TK::Extern) => Item::Extern(self.parse_extern_block()),
+            Some(TK::Trait) => Item::Trait(self.parse_trait()),
+            Some(TK::Impl) => Item::TraitImpl(self.parse_trait_impl()),
             _ => self.unexpected("a top-level item"),
         }
     }
 
-    // ===== Functions =====
+    // ===== Traits =====
+
+    /// Parse a `trait` definition: `trait Name<Params>: Bounds { items }`
+    fn parse_trait(&mut self) -> Trait {
+        let start = self.pos;
+        self.expect(TK::Trait);
+        let name = self.parse_ident();
+        let generics = if self.at(TK::LBracket) {
+            self.parse_generic_params()
+        } else {
+            Vec::new()
+        };
+        let bounds = if self.at(TK::Colon) {
+            self.bump();
+            self.parse_trait_bounds()
+        } else {
+            Vec::new()
+        };
+        self.expect(TK::LBrace);
+        let mut items = Vec::new();
+        while !self.loop_should_stop() {
+            if self.at(TK::RBrace) {
+                break;
+            }
+            items.push(self.parse_trait_item());
+            if self.at(TK::RBrace) {
+                break;
+            }
+            // Optional comma between trait items
+            self.eat(TK::Comma);
+        }
+        self.expect(TK::RBrace);
+        let span = self.span_from(start);
+        Trait {
+            name,
+            generics,
+            bounds,
+            items,
+            span,
+        }
+    }
+
+    /// Parse trait bounds: `Trait1 + Trait2<Args>`
+    fn parse_trait_bounds(&mut self) -> Vec<TraitBound> {
+        let mut bounds = Vec::new();
+        bounds.push(self.parse_trait_bound());
+        while self.eat(TK::Plus) {
+            bounds.push(self.parse_trait_bound());
+        }
+        bounds
+    }
+
+    /// Parse a single trait bound: `Trait<Args>`
+    fn parse_trait_bound(&mut self) -> TraitBound {
+        let start = self.pos;
+        let path = self.parse_path();
+        let args = if self.at(TK::LBracket) {
+            self.parse_generic_args()
+        } else {
+            Vec::new()
+        };
+        let span = self.span_from(start);
+        TraitBound { path, args, span }
+    }
+
+    /// Parse a path like `std::io::Read` or `Trait`
+    fn parse_path(&mut self) -> Vec<Ident> {
+        let mut path = Vec::new();
+        path.push(self.parse_ident());
+        while self.eat(TK::ColonColon) {
+            path.push(self.parse_ident());
+        }
+        path
+    }
+
+    /// Parse generic arguments: `<Type1, Type2, ...>` or `<Nat1, Nat2, ...>`
+    fn parse_generic_args(&mut self) -> Vec<TypeArg> {
+        self.expect(TK::LBracket);
+        let mut args = Vec::new();
+        while !self.loop_should_stop() {
+            if self.at(TK::RBracket) {
+                break;
+            }
+            args.push(self.parse_type_arg());
+            if self.at(TK::RBracket) {
+                break;
+            }
+            self.expect(TK::Comma);
+            if self.at(TK::RBracket) {
+                break;
+            }
+        }
+        self.expect(TK::RBracket);
+        args
+    }
+
+    /// Parse a trait item: associated type or method signature
+    fn parse_trait_item(&mut self) -> TraitItem {
+        if self.at(TK::Type) {
+            // Associated type: `type Name<Params>: Bounds;`
+            let start = self.pos;
+            self.bump(); // consume 'type'
+            let name = self.parse_ident();
+            let generics = if self.at(TK::LBracket) {
+                self.parse_generic_params()
+            } else {
+                Vec::new()
+            };
+            let bounds = if self.at(TK::Colon) {
+                self.bump();
+                self.parse_trait_bounds()
+            } else {
+                Vec::new()
+            };
+            self.eat(TK::Semicolon);
+            let span = self.span_from(start);
+            TraitItem::AssociatedType(AssociatedType {
+                name,
+                generics,
+                bounds,
+                span,
+            })
+        } else {
+            // Method signature
+            let start = self.pos;
+            let is_async = self.eat(TK::Async);
+            self.expect(TK::Fn);
+            let name = self.parse_ident();
+            let generics = if self.at(TK::LBracket) {
+                self.parse_generic_params()
+            } else {
+                Vec::new()
+            };
+            self.expect(TK::LParen);
+            let params = if self.at(TK::RParen) {
+                Vec::new()
+            } else {
+                self.parse_params()
+            };
+            self.expect(TK::RParen);
+            let ret_ty = if self.at(TK::Arrow) {
+                self.bump();
+                Some(self.parse_type())
+            } else {
+                None
+            };
+            self.eat(TK::Semicolon);
+            let span = self.span_from(start);
+            TraitItem::Method(TraitMethod {
+                name,
+                generics,
+                params,
+                ret_ty,
+                span,
+                is_async,
+            })
+        }
+    }
+
+    /// Parse a trait implementation: `impl<Params> Trait<Args> for Type where ... { items }`
+    fn parse_trait_impl(&mut self) -> TraitImpl {
+        let start = self.pos;
+        self.expect(TK::Impl);
+        let generics = if self.at(TK::LBracket) {
+            self.parse_generic_params()
+        } else {
+            Vec::new()
+        };
+        // Parse trait path: `Trait` or `std::trait::Trait`
+        let trait_path = self.parse_path();
+        let trait_args = if self.at(TK::LBracket) {
+            self.parse_generic_args()
+        } else {
+            Vec::new()
+        };
+        self.expect(TK::For);
+        let for_ty = self.parse_type();
+        let where_clauses = if self.at(TK::Where) {
+            self.bump();
+            self.parse_where_clauses()
+        } else {
+            Vec::new()
+        };
+        self.expect(TK::LBrace);
+        let mut items = Vec::new();
+        while !self.loop_should_stop() {
+            if self.at(TK::RBrace) {
+                break;
+            }
+            items.push(self.parse_impl_item());
+            if self.at(TK::RBrace) {
+                break;
+            }
+            // Optional comma between impl items
+            self.eat(TK::Comma);
+        }
+        self.expect(TK::RBrace);
+        let span = self.span_from(start);
+        TraitImpl {
+            generics,
+            trait_path,
+            trait_args,
+            for_ty,
+            where_clauses,
+            items,
+            span,
+        }
+    }
+
+    /// Parse where clauses: `where Type: Trait, Type2: Trait2`
+    fn parse_where_clauses(&mut self) -> Vec<WhereClause> {
+        let mut clauses = Vec::new();
+        clauses.push(self.parse_where_clause());
+        while self.eat(TK::Comma) {
+            clauses.push(self.parse_where_clause());
+        }
+        clauses
+    }
+
+    /// Parse a single where clause: `Type: Trait1 + Trait2`
+    fn parse_where_clause(&mut self) -> WhereClause {
+        let start = self.pos;
+        let subject = self.parse_type();
+        self.expect(TK::Colon);
+        let bounds = self.parse_trait_bounds();
+        let span = self.span_from(start);
+        WhereClause { subject, bounds, span }
+    }
+
+    /// Parse an impl item: associated type definition or method
+    fn parse_impl_item(&mut self) -> ImplItem {
+        if self.at(TK::Type) {
+            // Associated type definition: `type Name = Type;`
+            let start = self.pos;
+            self.bump(); // consume 'type'
+            let name = self.parse_ident();
+            let generics = if self.at(TK::LBracket) {
+                self.parse_generic_params()
+            } else {
+                Vec::new()
+            };
+            self.expect(TK::Assign);
+            let ty = self.parse_type();
+            self.eat(TK::Semicolon);
+            let span = self.span_from(start);
+            ImplItem::AssociatedTypeDef(AssociatedTypeDef {
+                name,
+                generics,
+                ty,
+                span,
+            })
+        } else {
+            // Method implementation
+            let func = self.parse_fn();
+            ImplItem::Method(func)
+        }
+    }
 
     /// Parse a `fn` item (optionally preceded by `async`).
     pub fn parse_fn(&mut self) -> Function {
@@ -597,7 +856,35 @@ impl<'a> Parser<'a> {
             Mutability::Immutable
         };
         let quantity = self.parse_quantity().unwrap_or(Quantity::Many);
-        let name = self.parse_ident();
+        
+        // Handle special case: &self or &mut self (reference receiver)
+        let name = if self.at(TK::Amp) {
+            // Consume '&' and optional 'mut'
+            let _ = self.eat(TK::Amp); // consume '&'
+            let mutability = if self.eat(TK::Mut) {
+                Mutability::Mut
+            } else {
+                Mutability::Immutable
+            };
+            // Expect 'self' as the name
+            let name = self.parse_ident();
+            // For &self, the type is implicitly Self
+            let ty = Type::new(
+                TypeKind::Named(Ident::new("Self", Span::default()), Vec::new()),
+                Quantity::Many,
+                Span::default(),
+            );
+            return Param {
+                name,
+                ty,
+                quantity,
+                mutability,
+                span: self.span_from(start),
+            };
+        } else {
+            self.parse_ident()
+        };
+        
         self.expect(TK::Colon);
         let mutability = if self.eat(TK::Consume) {
             Mutability::Consume
@@ -640,15 +927,40 @@ impl<'a> Parser<'a> {
         let start = self.pos;
         let _qty = self.parse_quantity();
         let name = self.parse_ident();
-        let kind = if self.at(TK::Colon) {
+        
+        let mut kind = GenericKind::Type;
+        let mut bounds = Vec::new();
+        
+        if self.at(TK::Colon) {
             self.bump();
-            self.parse_generic_kind()
-        } else {
-            GenericKind::Type
-        };
+            // Check if next token is a kind annotation (type, nat, [*])
+            // or a trait bound
+            let next_token = self.peek();
+            let is_kind_annotation = match next_token {
+                Some(TK::Type) => true,
+                Some(TK::Nat) => true,
+                Some(TK::QtyStar) => true,
+                Some(TK::Ident(_)) if self.at_ident("type") || self.at_ident("nat") => true,
+                _ => false,
+            };
+            
+            if is_kind_annotation {
+                kind = self.parse_generic_kind();
+                // After kind, check for trait bounds
+                if self.at(TK::Colon) {
+                    self.bump();
+                    bounds = self.parse_trait_bounds();
+                }
+            } else {
+                // It's a trait bound directly: `T: Iterator`
+                bounds = self.parse_trait_bounds();
+            }
+        }
+        
         GenericParam {
             name,
             kind,
+            bounds,
             span: self.span_from(start),
         }
     }

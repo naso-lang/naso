@@ -1813,8 +1813,10 @@ fn substitute_nat_expr_inner(ne: &crate::ast::ty::NatExpr, subst: &std::collecti
             if let Some(replacement_type) = subst.get(ident) {
                 // If the replacement is a Nat literal, extract its value
                 if let TypeKind::Nat = &replacement_type.kind {
-                    // We can't easily extract the value from a Nat type here
-                    // For now, return as-is and let unification handle it
+                    if let Some(value) = replacement_type.nat_const() {
+                        return NatExpr::Lit(value);
+                    }
+                    // Fall back to original if no value
                     ne.clone()
                 } else if let TypeKind::Named(name, args) = &replacement_type.kind {
                     if name.name == "Int" || name.name == "UInt" || name.name == "Nat" {

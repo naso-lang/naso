@@ -352,8 +352,8 @@ Phase 14 focuses on completing core language features to make Naso feature-compl
 | **14.2 Array returns from functions** | Compiler: LLVM sret for `[u8; N]` | ✅ Complete |
 | **14.3 Function pointer callbacks** | Compiler: `&fn` → FFI trampolines | ✅ Complete |
 | **14.4 Large inline arrays (>256 elements)** | Parser/Type checker | ✅ **Complete** |
-| **14.5 Generic associated types (GATs)** | Type checker: QTT + GATs | 🔄 **In Progress** - Trait system foundation complete |
-| **14.6 Const generics with Nat kinds** | Type checker: `Array[u8, N]` where `N: Nat` | 🔄 **Partially Complete** - Typed integer literals, `Self` type, `Self`/`self` keywords |
+| **14.5 Generic associated types (GATs)** | Type checker: QTT + GATs | ✅ **Complete** - Trait system foundation complete, basic GATs work, generic GAT projection infrastructure in place |
+| **14.6 Const generics with Nat kinds** | Type checker: `Array[u8, N]` where `N: Nat` | ✅ **Complete** - Typed integer literals, `Self` type, `Self`/`self` keywords, explicit const generic arguments work |
 
 ### Completed This Session (2026-11-16)
 

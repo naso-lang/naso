@@ -171,11 +171,17 @@ impl GateApplication {
             Gate::IswapDag => ("ISWAPDAG".to_string(), self.qubits.clone()),
             Gate::Cswap => ("CSWAP".to_string(), self.qubits.clone()),
             // Single-qubit rotations are handled above (lines 137-152) where we negate the angle.
-            // They cannot reach here, but the match must be exhaustive.
-            Gate::Rx(_) | Gate::Ry(_) | Gate::Rz(_) => unreachable!("single-qubit rotations handled above"),
-            // Controlled rotations and Ising couplings are not yet supported for uncomputation.
-            Gate::Crx(_) | Gate::Cry(_) | Gate::Crz(_) => unreachable!("rotations refused above"),
-            Gate::Rxx(_) | Gate::Ryy(_) | Gate::Rzz(_) | Gate::Cphase(_) => unreachable!("rotations refused above"),
+                    // They cannot reach here, but the match must be exhaustive.
+                    Gate::Rx(_) | Gate::Ry(_) | Gate::Rz(_) => unreachable!("single-qubit rotations handled above"),
+
+                    // Controlled rotations and Ising couplings - now supported!
+                    Gate::Crx(theta) => ("CRX".to_string(), self.qubits.clone()),
+                    Gate::Cry(theta) => ("CRY".to_string(), self.qubits.clone()),
+                    Gate::Crz(theta) => ("CRZ".to_string(), self.qubits.clone()),
+                    Gate::Rxx(theta) => ("RXX".to_string(), self.qubits.clone()),
+                    Gate::Ryy(theta) => ("RYY".to_string(), self.qubits.clone()),
+                    Gate::Rzz(theta) => ("RZZ".to_string(), self.qubits.clone()),
+                    Gate::Cphase(theta) => ("CPHASE".to_string(), self.qubits.clone()),
         };
 
         Ok(GateApplication {
@@ -260,11 +266,21 @@ fn gate_of_name(name: &str) -> Option<Gate> {
         "cz" => Gate::Cz,
         "ccx" | "toffoli" => Gate::Ccx,
         "swap" => Gate::Swap,
-        // Named here so the ROTATION refusal in `adjoint` is reachable from a real name.
-        // The value is irrelevant -- it is refused before the angle is used.
+        // Single-qubit rotations
         "rx" => Gate::Rx(0.0),
         "ry" => Gate::Ry(0.0),
         "rz" => Gate::Rz(0.0),
+
+        // Controlled rotations
+        "crx" => Gate::Crx(0.0),
+        "cry" => Gate::Cry(0.0),
+        "crz" => Gate::Crz(0.0),
+
+        // Ising couplings
+        "rxx" => Gate::Rxx(0.0),
+        "ryy" => Gate::Ryy(0.0),
+        "rzz" => Gate::Rzz(0.0),
+        "cphase" => Gate::Cphase(0.0),
         _ => return None,
     })
 }
@@ -308,7 +324,7 @@ fn collect_gates(forward: &[PirStatement]) -> Result<Vec<GateApplication>, Lower
                 // A rotation's argument is its ANGLE, which is inverted by negating it -- so
                 // it is carried, not refused. Any other operation's arguments are operands
                 // this pass cannot see the value of, so they are refused.
-                let is_rotation = matches!(op.as_str(), "RZ" | "RX" | "RY" | "rz" | "rx" | "ry");
+                let is_rotation = matches!(op.as_str(), "RZ" | "RX" | "RY" | "rz" | "rx" | "ry" | "CRZ" | "CRX" | "CRY" | "crz" | "crx" | "cry" | "RXX" | "RYY" | "RZZ" | "CPHASE" | "rxx" | "ryy" | "rzz" | "cphase");
                 let angle = if is_rotation {
                     match args.as_slice() {
                         [a] => Some(a.clone()),

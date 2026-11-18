@@ -8,6 +8,7 @@
 pub mod access_analysis;
 pub mod ast_to_pir;
 pub mod loop_extraction;
+pub mod polyhedral_scheduling;
 pub mod reversible_lowering;
 pub mod simd;
 pub mod uncomputation;

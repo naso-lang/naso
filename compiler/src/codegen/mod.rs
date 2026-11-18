@@ -73,35 +73,43 @@ impl CodegenPipeline {
     }
 
     /// Generate QIR from a PIR module.
-    ///
-    /// Linearity is checked BEFORE emission.
-    ///
-    /// This backend had no check at all, and that is not a stylistic gap. A QIR
-    /// program whose linear values are used twice is not a slower program -- it is a
-    /// program whose quantum state has been destroyed and then reused, and no
-    /// downstream consumer can detect it. LLVM's module verifier accepts such a
-    /// module, so the invalid circuit left this backend looking healthy:
-    ///
-    /// ```text
-    ///     emit_qir(uses [1] twice) == Ok(1461 chars of valid QIR)
-    /// ```
-    ///
-    /// The check used here is the same one the WGSL backend exposes.
-    ///
-    /// SCOPE, stated precisely so this is not oversold: the typechecker already
-    /// rejects a doubled `[1]` value, and the CLI runs it before selecting a target,
-    /// so no source program can reach here with this violation. What this closes is
-    /// the library path -- `CodegenPipeline::emit_qir` is public API, and a PIR
-    /// module built by hand, by a lowering pass, or by a fixture can carry a
-    /// violation that no typechecker ever saw. Emitting a QIR circuit from such a
-    /// module destroys and reuses quantum state, and nothing downstream can detect
-    /// it, so the check belongs at the emission boundary rather than only upstream.
-    pub fn emit_qir(&self, module: &PirModule) -> CodegenResult<String> {
-        verify_wgsl_linearity(module)?;
-        let mut builder = qir::QIRModuleBuilder::new(&self.context)?;
-        builder.build_module(module)?;
-        Ok(builder.module_to_string())
-    }
+        /// 
+        /// Linearity is checked BEFORE emission.
+        /// 
+        /// This backend had no check at all, and that is not a stylistic gap. A QIR
+        /// program whose linear values are used twice is not a slower program -- it is a
+        /// program whose quantum state has been destroyed and then reused, and no
+        /// downstream consumer can detect it. LLVM's module verifier accepts such a
+        /// module, so the invalid circuit left this backend looking healthy:
+        /// 
+        /// ```text
+        ///     emit_qir(uses [1] twice) == Ok(1461 chars of valid QIR)
+        /// ```
+        /// 
+        /// The check used here is the same one the WGSL backend exposes.
+        /// 
+        /// SCOPE, stated precisely so this is not oversold: the typechecker already
+        /// rejects a doubled `[1]` value, and the CLI runs it before selecting a target,
+        /// so no source program can reach here with this violation. What this closes is
+        /// the library path -- `CodegenPipeline::emit_qir` is public API, and a PIR
+        /// module built by hand, by a lowering pass, or by a fixture can carry a
+        /// violation that no typechecker ever saw. Emitting a QIR circuit from such a
+        /// module destroys and reuses quantum state, and nothing downstream can detect
+        /// it, so the check belongs at the emission boundary rather than only upstream.
+        pub fn emit_qir(&self, module: &PirModule) -> CodegenResult<String> {
+            verify_wgsl_linearity(module)?;
+            let mut builder = qir::QIRModuleBuilder::new(&self.context)?;
+            builder.build_module(module)?;
+            Ok(builder.module_to_string())
+        }
+
+        /// Generate QIR in portable JSON format for quantum runtime execution
+        pub fn emit_qir_json(&self, module: &PirModule) -> CodegenResult<String> {
+            verify_wgsl_linearity(module)?;
+            let mut builder = qir::QIRModuleBuilder::new(&self.context)?;
+            builder.build_module(module)?;
+            builder.emit_qir_json()
+        }
 
     #[cfg(feature = "cranelift")]
     /// Compile and execute via Cranelift JIT (stub)
@@ -172,6 +180,16 @@ pub struct CodegenConfig {
     pub opt_level: OptLevel,
     pub output_path: Option<std::path::PathBuf>,
     pub emit_debug: bool,
+    /// Output format for QIR backend (llvm-ir or json)
+    pub qir_output_format: QirOutputFormat,
+}
+
+/// Output format for QIR
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QirOutputFormat {
+    #[default]
+    LlvmIr,
+    Json,
 }
 
 impl Default for CodegenConfig {
@@ -182,6 +200,7 @@ impl Default for CodegenConfig {
             opt_level: OptLevel::Default,
             output_path: None,
             emit_debug: false,
+            qir_output_format: QirOutputFormat::default(),
         }
     }
 }

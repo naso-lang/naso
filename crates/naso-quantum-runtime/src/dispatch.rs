@@ -10,8 +10,7 @@ use crate::error_mitigation::{CompositeMitigation, ErrorMitigation, ZNEConfig, Z
 use crate::execution::{ExecutionConfig, ExecutionResult, ExpectationValue};
 use crate::hardware::{IBMBackend, IonQBackend, RigettiBackend};
 use crate::{BatchJob, BatchResult, JobHandle, JobManager, JobStatus, QuantumJob};
-use crate::simulator::StateVectorSimulator;
-use crate::simulator::SimulationConfig;
+use crate::simulator::{StateVectorSimulator, SimulationConfig, DDSequence};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -246,6 +245,127 @@ impl KernelDispatcher {
         }
     }
 
+    /// Execute circuit on simulator with Zero-Noise Extrapolation (ZNE)
+    /// Uses the simulator's built-in ZNE implementation
+    pub fn execute_simulator_zne(
+        &self,
+        circuit: &QuantumCircuit,
+        observable: &Observable,
+        config: Option<SimulationConfig>,
+    ) -> Result<f64> {
+        let simulator = self.simulator.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No simulator initialized"))?;
+        
+        let scale_factors = self.config.zne_config.scale_factors.clone();
+        let mut sim = simulator.clone();
+        sim.execute_zne(circuit, observable, &scale_factors)
+    }
+
+    /// Execute circuit on simulator with Probabilistic Error Cancellation (PEC)
+    /// Uses the simulator's built-in PEC implementation
+    pub fn execute_simulator_pec(
+        &self,
+        circuit: &QuantumCircuit,
+        observable: &Observable,
+        config: Option<SimulationConfig>,
+    ) -> Result<f64> {
+        let simulator = self.simulator.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No simulator initialized"))?;
+        
+        let quasi_probs = self.config.pec_config.quasi_probabilities.clone();
+        let mut sim = simulator.clone();
+        sim.execute_pec(circuit, observable, &quasi_probs)
+    }
+
+    /// Execute circuit on simulator with Dynamical Decoupling (DD)
+    /// Uses the simulator's built-in DD implementation
+    pub fn execute_simulator_dd(
+        &self,
+        circuit: &QuantumCircuit,
+        observable: &Observable,
+        config: Option<SimulationConfig>,
+    ) -> Result<f64> {
+        let simulator = self.simulator.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No simulator initialized"))?;
+        
+        // Convert DDConfig to simulator's DDSequence
+        let dd_sequence = match &self.config.dd_config.sequence {
+            crate::error_mitigation::DDSequence::XY4 => crate::simulator::DDSequence::CPMG { tau: 1.0 },
+            crate::error_mitigation::DDSequence::XY8 => crate::simulator::DDSequence::CPMG { tau: 2.0 },
+            crate::error_mitigation::DDSequence::CPMG => crate::simulator::DDSequence::CPMG { tau: 1.0 },
+            crate::error_mitigation::DDSequence::UDD => crate::simulator::DDSequence::UDD { tau: 1.0 },
+            crate::error_mitigation::DDSequence::Custom { pulses } => crate::simulator::DDSequence::Custom { pulses: pulses.clone() },
+        };
+        
+        let mut sim = simulator.clone();
+        sim.execute_dd(circuit, observable, &dd_sequence)
+    }
+
+    /// Execute with full error mitigation suite on simulator
+    /// Runs ZNE, PEC, and DD and returns all results
+    pub fn execute_simulator_full_mitigation(
+        &self,
+        circuit: &QuantumCircuit,
+        observable: &Observable,
+        config: Option<SimulationConfig>,
+    ) -> Result<FullMitigationResult> {
+        let zne_result = self.execute_simulator_zne(circuit, observable, config.clone())?;
+        let pec_result = self.execute_simulator_pec(circuit, observable, config.clone())?;
+        let dd_result = self.execute_simulator_dd(circuit, observable, config.clone())?;
+        
+        // Also get raw result for comparison
+        let raw_result = self.execute_simulator(circuit, config)?;
+        let raw_exp = self.compute_expectation(&raw_result, observable);
+        
+        Ok(FullMitigationResult {
+            raw_expectation: raw_exp,
+            zne_expectation: zne_result,
+            pec_expectation: pec_result,
+            dd_expectation: dd_result,
+        })
+    }
+
+    /// Compute expectation value from execution result
+    fn compute_expectation(&self, result: &ExecutionResult, observable: &Observable) -> f64 {
+        let total_shots: usize = result.counts.values().sum();
+        if total_shots == 0 {
+            return 0.0;
+        }
+
+        let mut expectation = 0.0;
+        for (bitstring, count) in &result.counts {
+            let eigenvalue = self.observable_eigenvalue(bitstring, observable);
+            expectation += eigenvalue * (*count as f64) / (total_shots as f64);
+        }
+        expectation
+    }
+
+    /// Compute eigenvalue of observable for a given bitstring
+    fn observable_eigenvalue(&self, bitstring: &str, observable: &Observable) -> f64 {
+        let pauli = &observable.pauli_string;
+        let coeff = observable.coefficient;
+
+        let mut eigenvalue = 1.0;
+        for (i, &qubit) in observable.qubits.iter().enumerate() {
+            if qubit < bitstring.len() {
+                let bit = bitstring.chars().rev().nth(qubit).unwrap_or('0');
+                let pauli_op = pauli.chars().nth(i).unwrap_or('I');
+
+                match pauli_op {
+                    'I' => eigenvalue *= 1.0,
+                    'Z' => eigenvalue *= if bit == '0' { 1.0 } else { -1.0 },
+                    'X' | 'Y' => {
+                        // X and Y measurements would need different basis
+                        // Simplified: assume Z basis
+                        eigenvalue *= if bit == '0' { 1.0 } else { -1.0 };
+                    }
+                    _ => eigenvalue *= 1.0,
+                }
+            }
+        }
+        eigenvalue * coeff
+    }
+
     /// Dispatch a batch of circuits
     pub async fn dispatch_batch(&self, batch: BatchJob) -> Result<BatchResult> {
         let mut handles = Vec::new();
@@ -374,6 +494,15 @@ pub struct QAOAResult {
     pub optimal_params: Vec<f64>,
     pub best_value: f64,
     pub iterations: usize,
+}
+
+/// Full error mitigation result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FullMitigationResult {
+    pub raw_expectation: f64,
+    pub zne_expectation: f64,
+    pub pec_expectation: f64,
+    pub dd_expectation: f64,
 }
 
 #[cfg(test)]

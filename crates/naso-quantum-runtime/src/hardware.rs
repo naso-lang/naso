@@ -568,10 +568,22 @@ impl QuantumBackend for RigettiBackend {
 
     async fn execute(
         &self,
-        _circuit: &QuantumCircuit,
-        _config: &ExecutionConfig,
+        circuit: &QuantumCircuit,
+        config: &ExecutionConfig,
     ) -> Result<ExecutionResult> {
-        Err(anyhow!("Rigetti backend not fully implemented"))
+        let job_id = self.submit_rigetti_job(circuit, config).await?;
+
+        // Poll for completion
+        loop {
+            let status = self.get_rigetti_job_status(&job_id).await?;
+            match status.status.as_str() {
+                "COMPLETED" => break,
+                "FAILED" | "CANCELLED" => return Err(anyhow!("Rigetti job failed: {}", status.status)),
+                _ => sleep(Duration::from_secs(self.config.poll_interval_secs)).await,
+            }
+        }
+
+        self.get_rigetti_job_result(&job_id).await
     }
 
     async fn execute_expectation(
@@ -583,20 +595,50 @@ impl QuantumBackend for RigettiBackend {
         Ok(vec![])
     }
 
-    async fn submit_job(&self, _job: QuantumJob) -> Result<JobHandle> {
-        Err(anyhow!("Rigetti backend not fully implemented"))
+    async fn submit_job(&self, job: QuantumJob) -> Result<JobHandle> {
+        let job_id = self.submit_rigetti_job(&job.circuit, &job.config).await?;
+        Ok(JobHandle {
+            id: job_id,
+            backend: "rigetti".to_string(),
+            submitted_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            estimated_completion: None,
+        })
     }
 
-    async fn job_status(&self, _handle: &JobHandle) -> Result<JobStatus> {
-        Ok(JobStatus::Unknown)
+    async fn job_status(&self, handle: &JobHandle) -> Result<JobStatus> {
+        let status = self.get_rigetti_job_status(&handle.id).await?;
+        Ok(match status.status.as_str() {
+            "QUEUED" => JobStatus::Queued,
+            "RUNNING" => JobStatus::Running,
+            "COMPLETED" => JobStatus::Completed,
+            "FAILED" => JobStatus::Failed(status.error_message.unwrap_or_default()),
+            "CANCELLED" => JobStatus::Cancelled,
+            _ => JobStatus::Unknown,
+        })
     }
 
-    async fn job_result(&self, _handle: &JobHandle) -> Result<ExecutionResult> {
-        Err(anyhow!("Rigetti backend not fully implemented"))
+    async fn job_result(&self, handle: &JobHandle) -> Result<ExecutionResult> {
+        self.get_rigetti_job_result(&handle.id).await
     }
 
-    async fn cancel_job(&self, _handle: &JobHandle) -> Result<()> {
-        Err(anyhow!("Rigetti backend not fully implemented"))
+    async fn cancel_job(&self, handle: &JobHandle) -> Result<()> {
+        let url = format!("{}/jobs/{}/cancel",
+            self.config.api_url.as_deref().unwrap_or("https://qcs.rigetti.com"),
+            handle.id);
+
+        let response = self.client
+            .delete(&url)
+            .header("Authorization", format!("Bearer {}", self.config.api_token.as_deref().unwrap_or("")))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!("Failed to cancel Rigetti job: {}", response.text().await?));
+        }
+        Ok(())
     }
 
     async fn calibrate(&self) -> Result<CalibrationData> {
@@ -628,4 +670,91 @@ impl QuantumBackend for RigettiBackend {
     async fn close(&self) -> Result<()> {
         Ok(())
     }
+}
+
+impl RigettiBackend {
+    async fn submit_rigetti_job(&self, circuit: &QuantumCircuit, config: &ExecutionConfig) -> Result<String> {
+        let url = format!("{}/jobs", self.config.api_url.as_deref().unwrap_or("https://qcs.rigetti.com"));
+
+        let payload = serde_json::json!({
+            "program": circuit.to_qasm(),
+            "shots": config.shots,
+        });
+
+        let response = self.client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.config.api_token.as_deref().unwrap_or("")))
+            .json(&payload)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!("Rigetti job submission failed: {}", response.text().await?));
+        }
+
+        let job: RigettiJobResponse = response.json().await?;
+        Ok(job.id)
+    }
+
+    async fn get_rigetti_job_status(&self, job_id: &str) -> Result<RigettiJobStatus> {
+        let url = format!("{}/jobs/{}", self.config.api_url.as_deref().unwrap_or("https://qcs.rigetti.com"), job_id);
+
+        let response = self.client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.config.api_token.as_deref().unwrap_or("")))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!("Failed to get Rigetti job status"));
+        }
+
+        let status: RigettiJobStatus = response.json().await?;
+        Ok(status)
+    }
+
+    async fn get_rigetti_job_result(&self, job_id: &str) -> Result<ExecutionResult> {
+        let url = format!("{}/jobs/{}/results", self.config.api_url.as_deref().unwrap_or("https://qcs.rigetti.com"), job_id);
+
+        let response = self.client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.config.api_token.as_deref().unwrap_or("")))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!("Failed to get Rigetti job result: {}", response.text().await?));
+        }
+
+        let result: RigettiJobResult = response.json().await?;
+
+        let mut counts = HashMap::new();
+        for (bitstring, count) in result.measurement_counts {
+            counts.insert(bitstring, count as usize);
+        }
+
+        Ok(ExecutionResult {
+            counts,
+            statevector: None,
+            probabilities: None,
+            expectation_values: vec![],
+            metadata: HashMap::new(),
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct RigettiJobResponse {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct RigettiJobStatus {
+    status: String,
+    error_message: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RigettiJobResult {
+    measurement_counts: HashMap<String, u64>,
 }

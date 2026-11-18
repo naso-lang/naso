@@ -59,6 +59,7 @@ fn print_usage() {
     eprintln!("  --opt <0|1|2|3>                Optimization level (default: 2)");
     eprintln!("  --triple <target>              Target triple (host, nvptx64, wasm32, aarch64)");
     eprintln!("  --debug                        Emit debug information");
+    eprintln!("  --qir-format <llvm-ir|json>    QIR output format (default: llvm-ir)");
 }
 
 fn run_frontend_command(command: &str, file: &str) {
@@ -370,6 +371,21 @@ fn run_build_command(args: &[String]) {
             "--debug" => {
                 config.emit_debug = true;
             }
+            "--qir-format" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("--qir-format requires an argument");
+                    std::process::exit(1);
+                }
+                config.qir_output_format = match args[i].as_str() {
+                    "llvm-ir" => QirOutputFormat::LlvmIr,
+                    "json" => QirOutputFormat::Json,
+                    other => {
+                        eprintln!("Invalid qir format: {other}. Use llvm-ir or json");
+                        std::process::exit(1);
+                    }
+                };
+            }
             arg if arg.starts_with('-') => {
                 eprintln!("Unknown option: {arg}");
                 std::process::exit(1);
@@ -476,7 +492,11 @@ fn run_build_command(args: &[String]) {
             }
         }
         Backend::Qir => {
-            let ir = match pipeline.emit_qir(&pir_module) {
+            let ir = match config.qir_output_format {
+                QirOutputFormat::LlvmIr => pipeline.emit_qir(&pir_module),
+                QirOutputFormat::Json => pipeline.emit_qir_json(&pir_module),
+            };
+            let ir = match ir {
                 Ok(ir) => ir,
                 Err(e) => {
                     eprintln!("QIR codegen error: {e}");

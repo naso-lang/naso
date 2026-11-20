@@ -237,7 +237,7 @@ fn walk_expr_for_calls(expr: &Expr, out: &mut Vec<(String, Vec<Expr>, Span)>) {
     }
     match &expr.kind {
         // The call itself.
-        EK::Call(callee, args) => {
+        EK::Call(callee, args, _) => {
             if let EK::Var(ident) = &callee.kind {
                 out.push((ident.name.clone(), args.clone(), expr.span));
             }
@@ -321,6 +321,30 @@ fn walk_expr_for_calls(expr: &Expr, out: &mut Vec<(String, Vec<Expr>, Span)>) {
             walk_expr_for_calls(lo, out);
             walk_expr_for_calls(hi, out);
         }
+        // Control flow constructs that can contain calls in their bodies.
+        EK::Loop(body) => {
+            // Loop body is a Block - walk its statements and tail expression
+            for stmt in &body.stmts {
+                collect_calls(&[stmt.clone()], out);
+            }
+            if let Some(tail) = &body.expr {
+                walk_expr_for_calls(tail, out);
+            }
+        }
+        EK::Async(block) => {
+            // Async block is a Block - walk its statements and tail expression
+            for stmt in &block.stmts {
+                collect_calls(&[stmt.clone()], out);
+            }
+            if let Some(tail) = &block.expr {
+                walk_expr_for_calls(tail, out);
+            }
+        }
+        EK::Await(future) => walk_expr_for_calls(future.as_ref(), out),
+        EK::ArrayRepeat(value, count) => {
+            walk_expr_for_calls(value, out);
+            walk_expr_for_calls(count, out);
+        }
     }
 }
 
@@ -397,9 +421,10 @@ fn substitute_expr(expr: &Expr, map: &HashMap<String, Expr>) -> Expr {
             Box::new(substitute_expr(lhs, map)),
             Box::new(substitute_expr(rhs, map)),
         ),
-        EK::Call(callee, args) => EK::Call(
+        EK::Call(callee, args, const_args) => EK::Call(
             Box::new(substitute_expr(callee, map)),
             args.iter().map(|a| substitute_expr(a, map)).collect(),
+            const_args.iter().map(|a| substitute_expr(a, map)).collect(),
         ),
         EK::Index(base, idx) => EK::Index(
             Box::new(substitute_expr(base, map)),
@@ -503,7 +528,7 @@ fn is_assert(expr: &Expr) -> bool {
 /// return value here.
 fn assert_argument(e: &Expr) -> Option<&Expr> {
     match &e.kind {
-        ExprKind::Call(callee, args) if is_assert(callee) && args.len() == 1 => Some(&args[0]),
+        ExprKind::Call(callee, args, _) if is_assert(callee) && args.len() == 1 => Some(&args[0]),
         _ => None,
     }
 }
@@ -531,7 +556,7 @@ fn collect_asserts(stmts: &[Stmt], out: &mut Vec<(Expr, Span)>) {
     for stmt in stmts {
         match &stmt.kind {
             StmtKind::Expr(expr) => match &expr.kind {
-                EK::Call(callee, args) => {
+                EK::Call(callee, args, _) => {
                     if is_assert(callee) && args.len() == 1 {
                         out.push((args[0].clone(), expr.span));
                     }
@@ -614,7 +639,7 @@ fn collect_asserts(stmts: &[Stmt], out: &mut Vec<(Expr, Span)>) {
 fn collect_asserts_expr(expr: &Expr, out: &mut Vec<(Expr, Span)>) {
     use naso_compiler::ast::ExprKind as EK;
     match &expr.kind {
-        EK::Call(callee, args) => {
+        EK::Call(callee, args, _) => {
             if is_assert(callee) && args.len() == 1 {
                 out.push((args[0].clone(), expr.span));
             }
@@ -719,7 +744,7 @@ fn predicate_uses_round(pred: &Expr) -> bool {
     match &pred.kind {
         ExprKind::Literal(_) | ExprKind::Var(_) => false,
         ExprKind::Binary(_, l, r) => predicate_uses_round(l) || predicate_uses_round(r),
-        ExprKind::Call(callee, args) => {
+        ExprKind::Call(callee, args, _) => {
             let callee_round = matches!(&callee.kind, ExprKind::Var(v) if v.name == "round");
             callee_round || args.iter().any(predicate_uses_round)
         }
@@ -1446,7 +1471,7 @@ fn encode_expr(expr: &Expr, scope: &HashMap<String, Term>) -> Result<Term, Encod
         //
         // Each definition below is the EXACT mathematical function, so anything proved using
         // it is a true statement about `abs`/`min`/`max`/`clamp`/`round`.
-        ExprKind::Call(callee, args) => {
+        ExprKind::Call(callee, args, _) => {
             let ExprKind::Var(name) = &callee.kind else {
                 return Err(EncodeErr::Unsupported {
                     reason: "call through a computed callee".to_string(),
@@ -2043,8 +2068,8 @@ fn term_sort(term: &Term) -> Option<Sort> {
 /// Encode a literal to an SMT term.
 fn encode_literal(lit: &Literal) -> Result<Term, EncodeErr> {
     match lit {
-        Literal::Int(i) => Ok(Term::Const(crate::smtlib::Constant::Int(*i))),
-        Literal::UInt(i) => Ok(Term::Const(crate::smtlib::Constant::Int(*i as i64))),
+        Literal::Int(i, _) => Ok(Term::Const(crate::smtlib::Constant::Int(*i))),
+        Literal::UInt(i, _) => Ok(Term::Const(crate::smtlib::Constant::Int(*i as i64))),
         Literal::Bool(b) => Ok(Term::Const(crate::smtlib::Constant::Bool(*b))),
         // A float becomes an EXACT real. See `encode_real_literal` for exactly what
         // that does and does not license.
@@ -2058,8 +2083,8 @@ fn encode_literal(lit: &Literal) -> Result<Term, EncodeErr> {
 
 fn describe(kind: &ExprKind) -> &'static str {
     match kind {
-        ExprKind::Call(_, _) => "call",
-        ExprKind::Index(_, _) => "tensor index",
+        ExprKind::Call(..) => "call",
+        ExprKind::Index(..) => "tensor index",
         ExprKind::Block(_) => "block",
         _ => "other",
     }

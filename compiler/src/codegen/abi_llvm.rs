@@ -37,21 +37,21 @@ impl LlvmAggregateType {
         &self,
         lowering: &LlvmTypeLowering<'ctx>,
     ) -> CodegenResult<BasicTypeEnum<'ctx>> {
-        match self {
-            LlvmAggregateType::Int(width) => Ok(lowering.int_type(*width).into()),
-            LlvmAggregateType::Float(width) => Ok(lowering.float_type(*width).into()),
-            LlvmAggregateType::Struct(fields) => {
+        match *self {
+            LlvmAggregateType::Int(width) => Ok(lowering.int_type(width).into()),
+            LlvmAggregateType::Float(width) => Ok(lowering.float_type(width).into()),
+            LlvmAggregateType::Struct(ref fields) => {
                 let field_types: CodegenResult<Vec<_>> =
                     fields.iter().map(|f| f.to_llvm_type(lowering)).collect();
                 let struct_type = lowering.context().struct_type(&field_types?, false);
                 Ok(struct_type.into())
             }
-            LlvmAggregateType::Array(elem, size) => {
+            LlvmAggregateType::Array(ref elem, size) => {
                 let elem_type = elem.to_llvm_type(lowering)?;
-                let array_type = elem_type.array_type(*size as u32);
+                let array_type = elem_type.array_type(size as u32);
                 Ok(array_type.into())
             }
-            LlvmAggregateType::Tuple(elems) => {
+            LlvmAggregateType::Tuple(ref elems) => {
                 let elem_types: CodegenResult<Vec<_>> =
                     elems.iter().map(|e| e.to_llvm_type(lowering)).collect();
                 let struct_type = lowering.context().struct_type(&elem_types?, false);

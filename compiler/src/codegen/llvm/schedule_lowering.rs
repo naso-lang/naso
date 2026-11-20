@@ -23,8 +23,7 @@ use crate::codegen::llvm::{
     type_lowering::LlvmTypeLowering,
     value_builder::LlvmValueBuilder,
 };
-use crate::ir::pir_types::ElemType;
-use crate::ir::pir_types::ParamKind;
+use crate::ir::pir_types::{ElemType, FnReturn, ParamKind};
 use crate::ir::{
     access_relation::AccessRelations,
     affine_domain::AffineDomain,
@@ -75,6 +74,7 @@ pub fn lower_schedule_tree<'ctx>(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -111,8 +111,9 @@ pub fn lower_schedule_tree_into<'ctx>(
     abi: &[EntryParam<'ctx>],
     return_value: Option<&PirExpr>,
     return_source: Option<ReturnSource>,
-    callee_params: Option<&HashMap<String, Vec<ParamKind>>>,
+    callee_params: Option<&HashMap<String, crate::codegen::llvm::module_builder::CalleeInfo>>,
     mut module_builder: Option<&mut LLVMModuleBuilder<'ctx>>,
+    return_type: Option<&FnReturn>,
 ) -> CodegenResult<()> {
     let llvm_context = ctx.llvm_context();
     
@@ -331,8 +332,8 @@ pub fn lower_schedule_tree_into<'ctx>(
         None
     };
     
-    let return_type = function.get_type().get_return_type();
-    let returned = match (return_type, return_value) {
+    let llvm_return_type = function.get_type().get_return_type();
+    let returned = match (llvm_return_type, return_value) {
         (None, _) => None,
         (Some(ty), Some(expr)) => {
             let mut lowerer = PirExprLowerer {
@@ -381,8 +382,40 @@ pub fn lower_schedule_tree_into<'ctx>(
     if uses_sret {
         // sret convention: store value to caller-allocated pointer, then ret void
         if let (Some(sret_ptr), Some(val)) = (sret_ptr, returned) {
-            lowering.value_builder.builder().build_store(sret_ptr, val)
-                .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+            // Check if this is an Array return - need to copy array data from tensor struct
+            match return_type {
+                Some(crate::ir::pir_types::FnReturn::Array { elem: _, size }) => {
+                    // val is a tensor struct { ptr: i64, len: i64 }
+                    // Extract the ptr and copy array data to sret buffer
+                    let struct_val = val.into_struct_value();
+                    let int_type = lowering.value_builder.type_lowering().int_type(crate::codegen::abi::IntWidth::I64);
+                    let ptr_val = lowering.value_builder.builder().build_extract_value(struct_val, 0, "array_ptr").map_err(|e| CodegenError::InstructionError(e.to_string()))?.into_int_value();
+                    let len_val = lowering.value_builder.builder().build_extract_value(struct_val, 1, "array_len").map_err(|e| CodegenError::InstructionError(e.to_string()))?.into_int_value();
+                    
+                    // Convert ptr to i8*
+                    let i8_type = lowering.value_builder.type_lowering().int_type(crate::codegen::abi::IntWidth::I8);
+                    let i8_ptr_type = lowering.value_builder.type_lowering().ptr_type(i8_type.into(), inkwell::AddressSpace::default());
+                    let src_ptr = lowering.value_builder.builder().build_int_to_ptr(ptr_val, i8_ptr_type, "array_src").map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                    
+                    // sret_ptr is already the correct type (pointer to array)
+                    // Copy elements one by one
+                    for i in 0..*size {
+                        let idx = int_type.const_int(i, false);
+                        let src_elem_ptr = unsafe {
+                            lowering.value_builder.builder().build_gep(i8_type, src_ptr, &[idx], &format!("src_elem_{i}")).map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                        };
+                        let dst_elem_ptr = unsafe {
+                            lowering.value_builder.builder().build_gep(i8_type, sret_ptr, &[int_type.const_int(0, false), idx], &format!("dst_elem_{i}")).map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                        };
+                        let elem = lowering.value_builder.builder().build_load(i8_type, src_elem_ptr, &format!("elem_{i}")).map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                        lowering.value_builder.builder().build_store(dst_elem_ptr, elem).map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                    }
+                }
+                _ => {
+                    // For Tensor and Struct returns, store directly
+                    lowering.value_builder.builder().build_store(sret_ptr, val).map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                }
+            }
         }
         lowering.value_builder.build_return(None)?;
     } else {
@@ -506,13 +539,13 @@ pub struct ScheduleLowering<'ctx, 'a> {
     pir_module: &'a PirModule,
     quantities: &'a QuantityMap,
     access_relations: &'a AccessRelations,
-    /// Each Naso function's declared parameter kinds, so a `Call` inside a loop body
+    /// Each Naso function's declared parameter kinds and return type, so a `Call` inside a loop body
     /// marshals its arguments the same way one at statement level does.
     ///
     /// Taken from the whole program rather than from this function alone: a loop body
     /// can call any function in the module, not only a sibling. `None` for a
     /// hand-built module with no `functions`, where every callee is an `extern`.
-    callee_params: Option<&'a HashMap<String, Vec<ParamKind>>>,
+    callee_params: Option<&'a HashMap<String, crate::codegen::llvm::module_builder::CalleeInfo>>,
     /// Module builder reference for async lowering (stored for async lowering, not for module access)
     module_builder: Option<&'a mut LLVMModuleBuilder<'ctx>>,
 
@@ -540,7 +573,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
         pir_module: &'a PirModule,
         quantities: &'a QuantityMap,
         access_relations: &'a AccessRelations,
-        callee_params: Option<&'a HashMap<String, Vec<ParamKind>>>,
+        callee_params: Option<&'a HashMap<String, crate::codegen::llvm::module_builder::CalleeInfo>>,
         module_builder: Option<&'a mut LLVMModuleBuilder<'ctx>>,
     ) -> CodegenResult<Self> {
         let loop_emitter = LoopEmitter::new(value_builder.type_lowering().context())?;

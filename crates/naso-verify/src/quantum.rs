@@ -333,7 +333,7 @@ pub fn encode_quantum_expr(
     let mut constraints = Vec::new();
 
     match &expr.kind {
-        ExprKind::Call(func, args) => {
+        ExprKind::Call(func, args, _) => {
             if let ExprKind::Var(fname) = &func.kind {
                 // Try to parse as a gate name
                 if let Some(gate) = parse_gate_name(&fname.name) {
@@ -354,7 +354,7 @@ pub fn encode_quantum_expr(
                     tracker.apply_gate(gate, &targets, &controls, expr.span);
                 } else if fname.name == "qalloc" {
                     for arg in args.iter() {
-                        if let ExprKind::Literal(naso_compiler::ast::Literal::Int(_n)) = &arg.kind {
+                        if let ExprKind::Literal(naso_compiler::ast::Literal::Int(_n, _)) = &arg.kind {
                             for _ in 0..*_n as u32 {
                                 tracker.allocate_qubit(true, expr.span);
                             }

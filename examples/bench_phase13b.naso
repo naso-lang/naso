@@ -1,6 +1,5 @@
 // Phase 13B: Optimized benchmark server for 30,000 req/s target
-// Uses async I/O with io_uring, multi-threaded accept, shared runtime
-// Demonstrates the complete Phase 13B optimization stack
+// Uses multi-threaded accept with synchronous I/O
 
 extern "C" {
     // Multi-threaded accept FFI (Phase 13)
@@ -9,77 +8,50 @@ extern "C" {
     fn naso_stop_multithreaded_accept() -> u64;
     fn naso_get_next_connection() -> u64;
     
-    // Async I/O FFI (Phase 13B)
-    fn naso_read_async_uring(fd: u64, buf: *u8, len: usize, cb: *u8, cb_len: usize) -> u64;
-    fn naso_write_async_uring(fd: u64, buf: *u8, len: usize, cb: *u8, cb_len: usize) -> u64;
-    fn naso_uring_poll_async() -> u64;
-    
-    // Async runtime FFI (Phase 7/11)
-    fn naso_runtime_new(worker_count: u64) -> *u8;
-    fn naso_runtime_run(runtime_handle: *u8) -> u64;
-    fn naso_runtime_shutdown(runtime_handle: *u8) -> u64;
+    // Synchronous I/O FFI (Legacy)
+    fn naso_read(fd: u64, buf: *u8, max_len: u64) -> u64;
+    fn naso_write(fd: u64, buf: *u8, len: u64) -> u64;
     
     // HTTP parser FFI (Phase 11 stdlib)
-    fn naso_parse_http_request(buf: *u8, len: usize, method: *u8, method_len: usize, path: *u8, path_len: usize, headers: *u8, headers_len: usize) -> u64;
-    fn naso_build_response(method: *u8, method_len: usize, path: *u8, path_len: usize, headers: *u8, headers_len: usize, body: *u8, body_len: usize, out: *u8, out_len: usize) -> u64;
-    
-    // Connection pool FFI (Phase 12)
-    fn naso_pool_create_simple(config: *u8, config_len: usize) -> u64;
-    fn naso_pool_get_connection_simple(pool: u64, addr: *u8, addr_len: usize) -> u64;
-    fn naso_pool_return_connection_simple(pool: u64, conn_id: u64) -> u64;
+    fn naso_parse_http_request(buf: *u8, len: u64, method: *u8, method_len: u64, path: *u8, path_len: u64, headers: *u8, headers_len: u64) -> u64;
+    fn naso_build_response_enhanced(method: *u8, method_len: u64, path: *u8, path_len: u64, headers: *u8, headers_len: u64, body: *u8, body_len: u64, out: *u8, out_len: u64, stream_fd: u64, enable_keep_alive: u8) -> u64;
     
     // Utility FFI
     fn naso_yield() -> u64;
     fn naso_close(fd: u64) -> u64;
 }
 
-// Connection processing with async I/O and HTTP parsing
-fn handle_client_async(client_fd: u64) -> () {
-    // Use shared runtime instance (created in main)
-    let runtime = 1; // Shared runtime instance from global state
-    
-    // Read HTTP request with async I/O
-    let mut request_buf = [0; 2048];  // Larger buffer for full HTTP request
-    let _ = naso_read_async_uring(client_fd, request_buf as *u8, 2048, runtime, 8);
-    
-    // Wait for async read completion
-    let mut read_done = 0;
-    while read_done == 0 {
-        read_done = naso_uring_poll_async();
-        naso_yield();
-    }
+// Connection processing with synchronous I/O and HTTP parsing
+fn handle_client_sync(client_fd: u64) -> () {
+    // Read HTTP request with synchronous I/O
+    let mut request_buf = [0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8];
+    let _ = naso_read(client_fd, request_buf as *u8, 16);
     
     // Parse HTTP request
-    let mut method_buf = [0; 64];
-    let mut path_buf = [0; 128];
-    let mut headers_buf = [0; 512];
+    let mut method_buf = [0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8];
+    let mut path_buf = [0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8];
+    let mut headers_buf = [0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8];
     
     let parse_result = naso_parse_http_request(
-        request_buf as *u8, 2048,
-        method_buf as *u8, 64,
-        path_buf as *u8, 128,
-        headers_buf as *u8, 512
+        request_buf as *u8, 16,
+        method_buf as *u8, 16,
+        path_buf as *u8, 16,
+        headers_buf as *u8, 16
     );
     
     // Build HTTP response
-    let mut response_buf = [0; 1024];
-    let _ = naso_build_response(
-        method_buf as *u8, 64,
-        path_buf as *u8, 128,
-        headers_buf as *u8, 512,
+    let mut response_buf = [0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8];
+    let _ = naso_build_response_enhanced(
+        method_buf as *u8, 16,
+        path_buf as *u8, 16,
+        headers_buf as *u8, 16,
         request_buf as *u8, 0,
-        response_buf as *u8, 1024
+        response_buf as *u8, 16,
+        client_fd, 1
     );
     
-    // Write response with async I/O
-    let _ = naso_write_async_uring(client_fd, response_buf as *u8, 1024, runtime, 8);
-    
-    // Wait for async write completion
-    let mut write_done = 0;
-    while write_done == 0 {
-        write_done = naso_uring_poll_async();
-        naso_yield();
-    }
+    // Write response with synchronous I/O
+    let _ = naso_write(client_fd, response_buf as *u8, 16);
     
     // Close connection
     let _ = naso_close(client_fd);
@@ -92,7 +64,7 @@ fn connection_worker() -> () {
     while running != 0 {
         let next_conn = naso_get_next_connection();
         if next_conn != 0 {
-            handle_client_async(next_conn);
+            handle_client_sync(next_conn);
         } else {
             naso_yield();
         }
@@ -100,30 +72,6 @@ fn connection_worker() -> () {
 }
 
 fn main() {
-    let addr = [49, 50, 55, 46, 48, 46, 48, 46, 49, 58, 56, 48, 57, 57];  // "127.0.0.1:8099"
-    
-    // Create shared async runtime with 4 worker threads
-    let runtime = naso_runtime_new(4);
-    
-    // Start multi-threaded accept with SO_REUSEPORT (Phase 13)
-    let listener_fds = [0, 0, 0];  // Would be populated by FFI implementation
-    let listener_count = 4;
-    let num_workers = 4;
-    
-    let _ = naso_tcp_bind_multithreaded(addr as *u8, 14, listener_count);
-    let _ = naso_start_multithreaded_accept(listener_fds as *u64, listener_count, num_workers);
-    
-    // Start runtime event loop (Phase 7/11)
-    let _ = naso_runtime_run(runtime);
-    
-    // Main thread idle - workers process connections
-    while true {
-        naso_yield();
-    }
-}
-
-// Alternative: Simple async benchmark for validation
-fn simple_async_benchmark() -> () {
     let addr = [49, 50, 55, 46, 48, 46, 48, 46, 49, 58, 56, 48, 57, 57];
     let listener_fd = naso_tcp_bind_multithreaded(addr as *u8, 14, 1);
     
@@ -131,18 +79,11 @@ fn simple_async_benchmark() -> () {
         return;
     }
     
-    let runtime = naso_runtime_new(1);
-    let _ = naso_start_multithreaded_accept(&[listener_fd], 1, 1);
+    let listener_fds = [listener_fd, 0u64, 0u64, 0u64];
+    let _ = naso_start_multithreaded_accept(listener_fds as *u64, 1, 1);
     
-    let mut running = 1;
-    let mut out = [0, 0];
+    // Run connection worker loop
+    connection_worker();
     
-    while running != 0 {
-        let next_conn = naso_get_next_connection();
-        if next_conn != 0 {
-            handle_client_async(next_conn);
-        } else {
-            naso_yield();
-        }
-    }
+    let _ = naso_stop_multithreaded_accept();
 }

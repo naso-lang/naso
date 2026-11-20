@@ -267,19 +267,19 @@ pub fn encode_polyhedral_expr(
 
             // Extract bounds from loop iterator - check if it's a range-like call
             #[allow(clippy::collapsible_if)]
-            if let ExprKind::Call(func, args) = &loop_expr.iter.kind {
+            if let ExprKind::Call(func, args, _) = &loop_expr.iter.kind {
                 if let ExprKind::Var(fname) = &func.kind {
                     if fname.name == "range" && args.len() >= 2 {
                         // range(start, end)
-                        if let ExprKind::Literal(naso_compiler::ast::Literal::Int(s)) =
+                        if let ExprKind::Literal(naso_compiler::ast::Literal::Int(s, _)) =
                             &args[0].kind
                         {
-                            iter_domain.add_constraint(vec![1], -*s); // i - s >= 0
+                            iter_domain.add_constraint(vec![1], -s); // i - s >= 0
                         }
-                        if let ExprKind::Literal(naso_compiler::ast::Literal::Int(e)) =
+                        if let ExprKind::Literal(naso_compiler::ast::Literal::Int(e, _)) =
                             &args[1].kind
                         {
-                            iter_domain.add_constraint(vec![-1], *e - 1); // -i + e - 1 >= 0
+                            iter_domain.add_constraint(vec![-1], e - 1); // -i + e - 1 >= 0
                         }
                     }
                 }
@@ -299,7 +299,7 @@ pub fn encode_polyhedral_expr(
 
             tracker.exit_forall();
         }
-        ExprKind::Call(_func, args) => {
+        ExprKind::Call(_func, args, _) => {
             for arg in args {
                 constraints.extend(encode_polyhedral_expr(arg, tracker)?);
             }

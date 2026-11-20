@@ -1,0 +1,89 @@
+// HashMap implementation using FFI to naso-ffi allocator
+// Provides a hash map type with string keys
+
+extern "C" {
+    fn naso_hashmap_new() -> *mut u8;
+    fn naso_hashmap_insert(map: *mut u8, key: *const u8, key_len: usize, value: *const u8, value_len: usize) -> u64;
+    fn naso_hashmap_get(map: *mut u8, key: *const u8, key_len: usize, out_value: *mut u8, out_value_len: usize) -> u64;
+    fn naso_hashmap_remove(map: *mut u8, key: *const u8, key_len: usize) -> u64;
+    fn naso_hashmap_contains(map: *mut u8, key: *const u8, key_len: usize) -> u64;
+    fn naso_hashmap_len(map: *mut u8) -> usize;
+    fn naso_hashmap_clear(map: *mut u8);
+    fn naso_hashmap_free(map: *mut u8);
+}
+
+struct HashMap<K, V> {
+    inner: *mut u8,
+    _phantom_k: PhantomData<K>,
+    _phantom_v: PhantomData<V>,
+}
+
+struct PhantomData<T> { _private: () }
+
+impl<K, V> HashMap<K, V> 
+where 
+    K: AsRef<str>,
+    V: Clone,
+{
+    pub fn new() -> Self {
+        let ptr = naso_hashmap_new();
+        HashMap { 
+            inner: ptr, 
+            _phantom_k: PhantomData { _private: () },
+            _phantom_v: PhantomData { _private: () },
+        }
+    }
+
+    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
+        let key_str = key.as_ref();
+        let key_bytes = key_str.as_bytes();
+        // For simplicity, we'll just return None (no previous value)
+        // In a real implementation, we'd check if key exists first
+        let _ = naso_hashmap_insert(
+            self.inner,
+            key_bytes.as_ptr(),
+            key_bytes.len(),
+            &value as *const V as *const u8,
+            std::mem::size_of::<V>(),
+        );
+        None
+    }
+
+    pub fn get(&self, key: &K) -> Option<&V> {
+        let key_str = key.as_ref();
+        let key_bytes = key_str.as_bytes();
+        // Placeholder - would need proper value retrieval
+        None
+    }
+
+    pub fn remove(&mut self, key: &K) -> Option<V> {
+        let key_str = key.as_ref();
+        let key_bytes = key_str.as_bytes();
+        let _ = naso_hashmap_remove(self.inner, key_bytes.as_ptr(), key_bytes.len());
+        None
+    }
+
+    pub fn contains_key(&self, key: &K) -> bool {
+        let key_str = key.as_ref();
+        let key_bytes = key_str.as_bytes();
+        naso_hashmap_contains(self.inner, key_bytes.as_ptr(), key_bytes.len()) != 0
+    }
+
+    pub fn len(&self) -> usize {
+        naso_hashmap_len(self.inner)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn clear(&mut self) {
+        naso_hashmap_clear(self.inner);
+    }
+}
+
+impl<K, V> Drop for HashMap<K, V> {
+    fn drop(&mut self) {
+        naso_hashmap_free(self.inner);
+    }
+}

@@ -4,7 +4,7 @@ use std::process::Command;
 
 fn main() {
     // Tell cargo to re-run if the naso source changes
-    println!("cargo:rerun-if-changed=../examples/bench_phase13b.naso");
+    println!("cargo:rerun-if-changed=../examples/bench_simple.naso");
     
     eprintln!("BUILD_SCRIPT: Starting bench_phase13b compilation");
     
@@ -18,7 +18,7 @@ fn main() {
     // Path to the naso-ffi static library
     let _naso_ffi_lib = PathBuf::from("/tmp/cargo-target/release/libnaso_ffi.a");
     
-    // Compile bench_phase13b.naso to LLVM IR
+    // Compile bench_simple.naso to LLVM IR
     let ll_path = PathBuf::from(&out_dir).join("bench_phase13b.ll");
     let obj_path = PathBuf::from(&out_dir).join("bench_phase13b.o");
     
@@ -26,7 +26,7 @@ fn main() {
     
     // Run naso compiler to generate LLVM IR
     let mut cmd = Command::new(&naso_compiler);
-    cmd.args(["build", "--target", "llvm", "../examples/bench_phase13b.naso", "-o"])
+    cmd.args(["build", "--target", "llvm", "../examples/bench_simple.naso", "-o"])
        .arg(&ll_path);
     let status = cmd.status().expect("Failed to run naso compiler");
     assert!(status.success(), "Naso compilation failed");

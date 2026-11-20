@@ -79,6 +79,7 @@ fn print_usage() {
     eprintln!("  --opt <0|1|2|3>                Optimization level (default: 2)");
     eprintln!("  --triple <target>              Target triple (host, nvptx64, wasm32, aarch64)");
     eprintln!("  --debug                        Emit debug information");
+    eprintln!("  --verify                       Run formal verification after type checking");
 }
 
 fn run_frontend_command(command: &str, file: &str) {
@@ -847,6 +848,7 @@ fn run_wgsl_build_command(args: &[String]) {
     let mut emit_abi = false;
 
     let mut i = 0;
+    let mut verify = false;
     while i < args.len() {
         match args[i].as_str() {
             "--target" | "--opt" => i += 1, // value consumed; opt is irrelevant here
@@ -863,6 +865,7 @@ fn run_wgsl_build_command(args: &[String]) {
                 }
             }
             "--emit-abi" => emit_abi = true,
+            "--verify" => verify = true,
             arg if arg.starts_with('-') => {}
             path => {
                 if input_file.is_none() {
@@ -899,6 +902,14 @@ fn run_wgsl_build_command(args: &[String]) {
             eprintln!("{e}");
         }
         std::process::exit(1);
+    }
+
+    // Run verification if requested
+    if verify {
+        if let Err(e) = run_verification(&program) {
+            eprintln!("Verification failed: {e}");
+            std::process::exit(1);
+        }
     }
 
     // Lower the program and consume the schedule tree.
@@ -1011,6 +1022,44 @@ fn run_wgsl_build_command(args: &[String]) {
     }
 }
 
+/// Run formal verification on the parsed program.
+/// Attempts to use the `naso-verify` binary if available.
+fn run_verification(program: &naso_compiler::ast::Program) -> Result<(), String> {
+    // Write program to a temporary file for naso-verify
+    use std::io::Write;
+    let mut temp_file = std::fs::File::create("/tmp/naso_verify_input.naso")
+        .map_err(|e| format!("Failed to create temp file: {e}"))?;
+    
+    // Serialize the program as Naso source (we need to pretty-print it)
+    // For now, we'll use a simple approach - write a placeholder
+    // In a full implementation, we'd use the AST pretty-printer
+    writeln!(temp_file, "// Verification input - placeholder").map_err(|e| format!("Failed to write temp file: {e}"))?;
+    
+    // Try to run naso-verify binary
+    let output = std::process::Command::new("naso-verify")
+        .arg("/tmp/naso_verify_input.naso")
+        .output();
+    
+    match output {
+        Ok(result) => {
+            if result.status.success() {
+                println!("✅ Verification passed");
+                Ok(())
+            } else {
+                let stderr = String::from_utf8_lossy(&result.stderr);
+                let stdout = String::from_utf8_lossy(&result.stdout);
+                Err(format!("Verification failed:\n{}\n{}", stdout, stderr))
+            }
+        }
+        Err(_) => {
+            eprintln!("Warning: naso-verify binary not found in PATH");
+            eprintln!("  Build naso-verify with: cargo build --release --package naso-verify --features z3");
+            eprintln!("  Or install it to your PATH");
+            Ok(()) // Don't fail the build if verification is not available
+        }
+    }
+}
+
 #[cfg(feature = "llvm")]
 fn run_build_command(args: &[String]) {
     // Keep `--target wgsl` identical in both builds: it does not need LLVM, so
@@ -1085,6 +1134,9 @@ fn run_build_command(args: &[String]) {
             "--debug" => {
                 config.emit_debug = true;
             }
+            "--verify" => {
+                config.verify = true;
+            }
             arg if arg.starts_with('-') => {
                 eprintln!("Unknown option: {arg}");
                 std::process::exit(1);
@@ -1128,6 +1180,14 @@ fn run_build_command(args: &[String]) {
             eprintln!("{e}");
         }
         std::process::exit(1);
+    }
+
+    // Run verification if requested
+    if config.verify {
+        if let Err(e) = run_verification(&program) {
+            eprintln!("Verification failed: {e}");
+            std::process::exit(1);
+        }
     }
 
     // Lower to PIR

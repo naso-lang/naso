@@ -290,12 +290,12 @@ pub fn encode_quantity_expr(
         }
         // A literal cannot hold or consume a linear resource.
         ExprKind::Literal(_) => {}
-        ExprKind::Call(func, args) => {
+        ExprKind::Call(func, args, _) => {
             if let ExprKind::Var(fname) = &func.kind {
                 match fname.name.as_str() {
                     "qalloc" | "linear_alloc" | "alloc" => {
                         for (_i, arg) in args.iter().enumerate() {
-                            if let ExprKind::Literal(naso_compiler::ast::Literal::Int(_n)) =
+                            if let ExprKind::Literal(naso_compiler::ast::Literal::Int(_n, _)) =
                                 &arg.kind
                             {
                                 let resource_id = tracker.allocate_linear(
@@ -512,6 +512,31 @@ pub fn encode_quantity_expr(
             // exist for exhaustiveness.
             constraints.extend(encode_quantity_expr(lo, tracker)?);
             constraints.extend(encode_quantity_expr(hi, tracker)?);
+        }
+        ExprKind::ArrayRepeat(value, count) => {
+            constraints.extend(encode_quantity_expr(value, tracker)?);
+            constraints.extend(encode_quantity_expr(count, tracker)?);
+        }
+        ExprKind::Loop(body) => {
+            // Loop body is a Block - walk its statements and tail expression
+            for stmt in &body.stmts {
+                constraints.extend(encode_quantity_stmt(stmt, tracker)?);
+            }
+            if let Some(tail) = &body.expr {
+                constraints.extend(encode_quantity_expr(tail, tracker)?);
+            }
+        }
+        ExprKind::Async(block) => {
+            // Async block is a Block - walk its statements and tail expression
+            for stmt in &block.stmts {
+                constraints.extend(encode_quantity_stmt(stmt, tracker)?);
+            }
+            if let Some(tail) = &block.expr {
+                constraints.extend(encode_quantity_expr(tail, tracker)?);
+            }
+        }
+        ExprKind::Await(future) => {
+            constraints.extend(encode_quantity_expr(future.as_ref(), tracker)?);
         } // NO CATCH-ALL ARM, ON PURPOSE.
           //
           // The arm that used to sit here said every unrecognised expression had "no special
@@ -560,6 +585,7 @@ fn describe_expr_kind(expr: &naso_compiler::ast::Expr) -> &'static str {
         ExprKind::Variant(..) => "enum variant",
         ExprKind::Tuple(..) => "tuple",
         ExprKind::Array(..) => "array literal",
+        ExprKind::ArrayRepeat(..) => "array repeat",
         ExprKind::Block(..) => "block",
         ExprKind::If(..) => "if",
         ExprKind::Match(..) => "match",
@@ -580,6 +606,9 @@ fn describe_expr_kind(expr: &naso_compiler::ast::Expr) -> &'static str {
         ExprKind::QuantumOp(..) => "quantum operation",
         ExprKind::Ascribe(..) => "ascription",
         ExprKind::Range(..) => "range",
+        ExprKind::Loop(..) => "loop",
+        ExprKind::Async(..) => "async block",
+        ExprKind::Await(..) => "await",
         ExprKind::Error => "parse-error node",
     }
 }

@@ -70,6 +70,9 @@ pub struct PendingOp {
     pub callback: usize,
     pub waker: Option<Waker>,
     pub out_ptr: usize, // For accept: *mut u64 to write [listener_fd, conn_fd]
+    // Completion result for synchronous use
+    pub completed: bool,
+    pub result: i32,
 }
 
 /// io_uring-based async poller
@@ -124,6 +127,8 @@ impl UringPoller {
             callback,
             waker: None,
             out_ptr: out_ptr as usize,
+            completed: false,
+            result: 0,
         });
         
         self.listener_fds.insert(user_data, listener_fd);
@@ -175,6 +180,8 @@ impl UringPoller {
             callback,
             waker: None,
             out_ptr: 0,
+            completed: false,
+            result: 0,
         });
         
         Ok(user_data)
@@ -212,6 +219,8 @@ impl UringPoller {
             callback,
             waker: None,
             out_ptr: 0,
+            completed: false,
+            result: 0,
         });
         
         Ok(user_data)
@@ -288,6 +297,10 @@ impl UringPoller {
                     if let Some(idx) = op.buf_idx {
                         self.buffer_pool.release(idx);
                     }
+                    
+                    // Store completion result for synchronous use
+                    op.completed = true;
+                    op.result = result;
                 }
                 
                 UringOp::Write => {
@@ -297,6 +310,10 @@ impl UringPoller {
                         let callback: extern "C" fn(*mut u8) = unsafe { std::mem::transmute(op.callback) };
                         callback(std::ptr::null_mut());
                     }
+                    
+                    // Store completion result for synchronous use
+                    op.completed = true;
+                    op.result = result;
                 }
                 
                 UringOp::Connect => {
@@ -327,22 +344,6 @@ static URING_POLLER: OnceLock<Mutex<Option<UringPoller>>> = OnceLock::new();
 
 pub fn uring_poller() -> &'static Mutex<Option<UringPoller>> {
     URING_POLLER.get_or_init(|| Mutex::new(UringPoller::new(4096).ok()))
-}
-
-/// FFI: Initialize io_uring backend
-#[unsafe(no_mangle)]
-pub extern "C" fn naso_uring_init() -> u64 {
-    match UringPoller::new(4096) {
-        Ok(poller) => {
-            let mut global = uring_poller().lock().unwrap();
-            *global = Some(poller);
-            1
-        }
-        Err(e) => {
-            eprintln!("naso_uring_init: io_uring not available, falling back to mio: {:?}", e);
-            0 // Return 0 to indicate fallback
-        }
-    }
 }
 
 /// FFI: Submit async accept with io_uring

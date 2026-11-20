@@ -92,7 +92,8 @@ impl Lexer {
 mod tests {
     use super::*;
 
-    use crate::token::{TokenKind, TypedInt};
+    use crate::ast::TypedInt;
+    use crate::lexer::token::TokenKind;
 
     #[test]
     fn lexes_quantity_markers() {

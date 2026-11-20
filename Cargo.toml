@@ -10,6 +10,7 @@ members = [
     "crates/naso-ffi",
     "crates/async-runtime",
     "crates/naso-quantum-runtime",
+    "crates/naso-verify",
     "bench_runner",
 ]
 
@@ -50,6 +51,18 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# PGO profiles
+[profile.pgo-generate]
+inherits = "release"
+debug = true
+rpath = false
+codegen-units = 1
+
+[profile.pgo-use]
+inherits = "release"
+rpath = false
+codegen-units = 1
 
 [profile.release.package.nasoc-wasm]
 opt-level = "s"

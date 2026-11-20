@@ -216,18 +216,40 @@ impl<'a> Parser<'a> {
         );
         if !is_control_flow {
             while !self.loop_should_stop() {
-                // Check for const generic arguments: fn[10](args)
+                // Check for const generic arguments: fn[10](args) OR index expression: arr[0]
                 if self.at(TK::LBracket) {
                     self.bump();
+                    // Peek ahead to see if this is a const generic call (followed by '(') or index
+                    let after_bracket = self.peek();
+                    // Save the tokens inside brackets for potential index use
+                    let bracket_start = self.pos;
                     let const_args = self.parse_const_generic_args();
                     self.expect(TK::RBracket);
-                    // After const args, expect a function call
+                    // After const args, check if followed by '(' for a function call
                     if self.at(TK::LParen) {
+                        // This is a const generic function call: fn[10](args)
                         self.bump();
                         let args = self.parse_args_until(TK::RParen);
                         self.expect(TK::RParen);
                         let span = expr.span;
                         expr = Expr::new(ExprKind::Call(Box::new(expr), args, const_args), span, next_id());
+                    } else {
+                        // Not a function call - treat as index expression
+                        // Re-parse the bracket contents as indices
+                        self.pos = bracket_start;
+                        let indices = self.parse_args_until(TK::RBracket);
+                        self.expect(TK::RBracket);
+                        let span = expr.span;
+                        let idx_expr = if indices.len() == 1 {
+                            indices.into_iter().next().unwrap()
+                        } else {
+                            Expr::new(ExprKind::Tuple(indices), span, next_id())
+                        };
+                        expr = Expr::new(
+                            ExprKind::Index(Box::new(expr), Box::new(idx_expr)),
+                            span,
+                            next_id(),
+                        );
                     }
                 } else if self.at(TK::LParen) {
                     self.bump();
@@ -364,23 +386,6 @@ impl<'a> Parser<'a> {
                             );
                         }
                     }
-                } else if self.at(TK::LBracket) {
-                    self.bump();
-                    // Parse comma-separated indices (supporting multi-dimensional indexing)
-                    let indices = self.parse_args_until(TK::RBracket);
-                    self.expect(TK::RBracket);
-                    let span = expr.span;
-                    // If multiple indices, wrap in a tuple
-                    let idx_expr = if indices.len() == 1 {
-                        indices.into_iter().next().unwrap()
-                    } else {
-                        Expr::new(ExprKind::Tuple(indices), span, next_id())
-                    };
-                    expr = Expr::new(
-                        ExprKind::Index(Box::new(expr), Box::new(idx_expr)),
-                        span,
-                        next_id(),
-                    );
                 } else if self.at(TK::As) {
                     // Numeric cast: `expr as i8`. Reuses ExprKind::Ascribe, which
                     // already existed in the AST and was wired into visiting and

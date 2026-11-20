@@ -47,6 +47,16 @@ fn openqasm_name_of_gate(gate: naso_gates::statevector::Gate) -> &'static str {
         Gate::Cz => "cz",
         Gate::Ccx => "ccx",
         Gate::Swap => "swap",
+        Gate::Crx(_) => "crx",
+        Gate::Cry(_) => "cry",
+        Gate::Crz(_) => "crz",
+        Gate::Rxx(_) => "rxx",
+        Gate::Ryy(_) => "ryy",
+        Gate::Rzz(_) => "rzz",
+        Gate::Cphase(_) => "cphase",
+        Gate::Iswap => "iswap",
+        Gate::IswapDag => "iswap",
+        Gate::Cswap => "cswap",
     }
 }
 
@@ -73,6 +83,14 @@ fn gate_from_openqasm_name(name: &str) -> Option<naso_gates::statevector::Gate> 
         "cz" => Gate::Cz,
         "ccx" => Gate::Ccx,
         "swap" => Gate::Swap,
+        "crx" => Gate::Crx(0.0),
+        "cry" => Gate::Cry(0.0),
+        "crz" => Gate::Crz(0.0),
+        "rxx" => Gate::Rxx(0.0),
+        "ryy" => Gate::Ryy(0.0),
+        "rzz" => Gate::Rzz(0.0),
+        "cphase" => Gate::Cphase(0.0),
+        "iswap" => Gate::Iswap,
         _ => return None,
     })
 }
@@ -392,7 +410,7 @@ impl HardwareExporter for OpenQASMExporter {
     fn supported_gates(&self) -> &'static [&'static str] {
         &[
             "h", "x", "y", "z", "s", "sdg", "t", "tdg", "rx", "ry", "rz", "r1", "rt1", "cx", "cy",
-            "cz", "ccx", "swap", "iswap", "cphase", "crx", "cry", "crz", "measure", "reset",
+            "cz", "ccx", "swap", "iswap", "cphase", "crx", "cry", "crz", "rxx", "ryy", "rzz", "cswap", "measure", "reset",
             "barrier",
         ]
     }

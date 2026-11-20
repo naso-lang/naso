@@ -1,14 +1,320 @@
 // ============================================================================
-// HTTP Parser FFI
+// HTTP Parser FFI with SIMD optimizations
 // ============================================================================
 // This module provides HTTP request parsing and response building functions
 // with C-compatible FFI interface for Naso.
+// Uses httparse for fast parsing and SIMD for CRLF detection.
 // ============================================================================
 
 use std::ptr;
 use std::time::{Instant, Duration};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
+use httparse;
+
+// SIMD-optimized CRLF detection for x86_64
+#[cfg(target_arch = "x86_64")]
+mod simd_crlf {
+    use std::arch::x86_64::*;
+    
+    /// Find double CRLF (\r\n\r\n) using SIMD (internal unsafe implementation)
+    /// Returns the index of the first byte of the double CRLF, or None if not found
+    #[target_feature(enable = "sse2,ssse3")]
+    unsafe fn find_double_crlf_simd(buf: &[u8]) -> Option<usize> {
+        if buf.len() < 4 {
+            return None;
+        }
+        
+        // We're looking for \r\n\r\n = 0x0D 0x0A 0x0D 0x0A
+        // Use SIMD to search for \r\n (0x0D 0x0A) pairs
+        let crlf = _mm_set1_epi8(0x0D); // \r
+        let lf = _mm_set1_epi8(0x0A);   // \n
+        
+        let mut i = 0;
+        while i + 16 <= buf.len() {
+            let chunk = _mm_loadu_si128(buf[i..].as_ptr() as *const __m128i);
+            
+            // Check for \r
+            let cr_mask = _mm_cmpeq_epi8(chunk, crlf);
+            // Check for \n
+            let lf_mask = _mm_cmpeq_epi8(chunk, lf);
+            
+            // Shift lf_mask by 1 to align with potential \r before \n
+            let lf_shifted = _mm_alignr_epi8(lf_mask, _mm_setzero_si128(), 15);
+            
+            // Look for \r followed by \n
+            let crlf_mask = _mm_and_si128(cr_mask, lf_shifted);
+            
+            let mask = _mm_movemask_epi8(crlf_mask);
+            if mask != 0 {
+                // Found at least one \r\n, check for double
+                let first_crlf = mask.trailing_zeros() as usize;
+                let abs_pos = i + first_crlf;
+                
+                // Check if there's another \r\n right after
+                if abs_pos + 4 <= buf.len() {
+                    if buf[abs_pos] == b'\r' && buf[abs_pos + 1] == b'\n' &&
+                       buf[abs_pos + 2] == b'\r' && buf[abs_pos + 3] == b'\n' {
+                        return Some(abs_pos);
+                    }
+                }
+                
+                // Check subsequent positions in this chunk
+                let mut check_pos = abs_pos + 1;
+                while check_pos < i + 16 && check_pos + 3 < buf.len() {
+                    if buf[check_pos] == b'\r' && buf[check_pos + 1] == b'\n' &&
+                       buf[check_pos + 2] == b'\r' && buf[check_pos + 3] == b'\n' {
+                        return Some(check_pos);
+                    }
+                    check_pos += 1;
+                }
+            }
+            
+            i += 16;
+        }
+        
+        // Fallback for remaining bytes
+        while i + 3 < buf.len() {
+            if buf[i] == b'\r' && buf[i + 1] == b'\n' &&
+               buf[i + 2] == b'\r' && buf[i + 3] == b'\n' {
+                return Some(i);
+            }
+            i += 1;
+        }
+        
+        None
+    }
+    
+    /// Safe wrapper for find_double_crlf_simd
+    pub fn find_double_crlf(buf: &[u8]) -> Option<usize> {
+        if is_x86_feature_detected!("sse2") && is_x86_feature_detected!("ssse3") {
+            unsafe { find_double_crlf_simd(buf) }
+        } else {
+            fallback_find_double_crlf(buf)
+        }
+    }
+    
+    fn fallback_find_double_crlf(buf: &[u8]) -> Option<usize> {
+        for i in 0..buf.len().saturating_sub(3) {
+            if buf[i] == b'\r' && buf[i + 1] == b'\n' &&
+               buf[i + 2] == b'\r' && buf[i + 3] == b'\n' {
+                return Some(i);
+            }
+        }
+        None
+    }
+}
+
+/// Fallback non-SIMD implementation
+#[cfg(not(target_arch = "x86_64"))]
+mod simd_crlf {
+    pub fn find_double_crlf(buf: &[u8]) -> Option<usize> {
+        for i in 0..buf.len().saturating_sub(3) {
+            if buf[i] == b'\r' && buf[i + 1] == b'\n' &&
+               buf[i + 2] == b'\r' && buf[i + 3] == b'\n' {
+                return Some(i);
+            }
+        }
+        None
+    }
+}
+
+/// AVX2-optimized CRLF detection for x86_64 (32-byte chunks)
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+mod simd_crlf_avx2 {
+    use std::arch::x86_64::*;
+    
+    /// Find double CRLF (\r\n\r\n) using AVX2 (internal unsafe implementation)
+    /// Returns the index of the first byte of the double CRLF, or None if not found
+    #[target_feature(enable = "avx2")]
+    unsafe fn find_double_crlf_avx2(buf: &[u8]) -> Option<usize> {
+        if buf.len() < 4 {
+            return None;
+        }
+        
+        // We're looking for \r\n\r\n = 0x0D 0x0A 0x0D 0x0A
+        // Use AVX2 to search for \r\n (0x0D 0x0A) pairs in 32-byte chunks
+        let crlf = _mm256_set1_epi8(0x0D); // \r
+        let lf = _mm256_set1_epi8(0x0A);   // \n
+        
+        let mut i = 0;
+        while i + 32 <= buf.len() {
+            let chunk = _mm256_loadu_si256(buf[i..].as_ptr() as *const __m256i);
+            
+            // Check for \r
+            let cr_mask = _mm256_cmpeq_epi8(chunk, crlf);
+            // Check for \n
+            let lf_mask = _mm256_cmpeq_epi8(chunk, lf);
+            
+            // Shift lf_mask by 1 to align with potential \r before \n
+            let lf_shifted = _mm256_alignr_epi8(lf_mask, _mm256_setzero_si256(), 31);
+            
+            // Look for \r followed by \n
+            let crlf_mask = _mm256_and_si256(cr_mask, lf_shifted);
+            
+            let mask = _mm256_movemask_epi8(crlf_mask);
+            if mask != 0 {
+                // Found at least one \r\n, check for double
+                let first_crlf = mask.trailing_zeros() as usize;
+                let abs_pos = i + first_crlf;
+                
+                // Check if there's another \r\n right after
+                if abs_pos + 4 <= buf.len() {
+                    if buf[abs_pos] == b'\r' && buf[abs_pos + 1] == b'\n' &&
+                       buf[abs_pos + 2] == b'\r' && buf[abs_pos + 3] == b'\n' {
+                        return Some(abs_pos);
+                    }
+                }
+                
+                // Check subsequent positions in this chunk
+                let mut check_pos = abs_pos + 1;
+                while check_pos < i + 32 && check_pos + 3 < buf.len() {
+                    if buf[check_pos] == b'\r' && buf[check_pos + 1] == b'\n' &&
+                       buf[check_pos + 2] == b'\r' && buf[check_pos + 3] == b'\n' {
+                        return Some(check_pos);
+                    }
+                    check_pos += 1;
+                }
+            }
+            
+            i += 32;
+        }
+        
+        // Fallback for remaining bytes - use SSE2 version
+        if i + 16 <= buf.len() {
+            // Could call SSE2 version here, but for simplicity use fallback
+        }
+        
+        // Fallback for remaining bytes
+        while i + 3 < buf.len() {
+            if buf[i] == b'\r' && buf[i + 1] == b'\n' &&
+               buf[i + 2] == b'\r' && buf[i + 3] == b'\n' {
+                return Some(i);
+            }
+            i += 1;
+        }
+        
+        None
+    }
+    
+    /// Safe wrapper for find_double_crlf_avx2
+    pub fn find_double_crlf(buf: &[u8]) -> Option<usize> {
+        if is_x86_feature_detected!("avx2") {
+            unsafe { find_double_crlf_avx2(buf) }
+        } else if is_x86_feature_detected!("sse2") && is_x86_feature_detected!("ssse3") {
+            // Fall through to SSE2 version in parent module
+            crate::simd_crlf::find_double_crlf(buf)
+        } else {
+            fallback_find_double_crlf(buf)
+        }
+    }
+    
+    fn fallback_find_double_crlf(buf: &[u8]) -> Option<usize> {
+        for i in 0..buf.len().saturating_sub(3) {
+            if buf[i] == b'\r' && buf[i + 1] == b'\n' &&
+               buf[i + 2] == b'\r' && buf[i + 3] == b'\n' {
+                return Some(i);
+            }
+        }
+        None
+    }
+}
+
+/// AVX-512 optimized CRLF detection for x86_64 (64-byte chunks)
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+mod simd_crlf_avx512 {
+    use std::arch::x86_64::*;
+    
+    /// Find double CRLF (\r\n\r\n) using AVX-512 (internal unsafe implementation)
+    /// Returns the index of the first byte of the double CRLF, or None if not found
+    #[target_feature(enable = "avx512f")]
+    unsafe fn find_double_crlf_avx512(buf: &[u8]) -> Option<usize> {
+        if buf.len() < 4 {
+            return None;
+        }
+        
+        // We're looking for \r\n\r\n = 0x0D 0x0A 0x0D 0x0A
+        // Use AVX-512 to search for \r\n (0x0D 0x0A) pairs in 64-byte chunks
+        let crlf = _mm512_set1_epi8(0x0D); // \r
+        let lf = _mm512_set1_epi8(0x0A);   // \n
+        
+        let mut i = 0;
+        while i + 64 <= buf.len() {
+            let chunk = _mm512_loadu_si512(buf[i..].as_ptr() as *const __m512i);
+            
+            // Check for \r
+            let cr_mask = _mm512_cmpeq_epi8_mask(chunk, crlf);
+            // Check for \n
+            let lf_mask = _mm512_cmpeq_epi8_mask(chunk, lf);
+            
+            // Shift lf_mask by 1 to align with potential \r before \n
+            let lf_shifted = (lf_mask >> 1) | ((lf_mask & 1) << 63);
+            
+            // Look for \r followed by \n
+            let crlf_mask = cr_mask & lf_shifted;
+            
+            if crlf_mask != 0 {
+                // Found at least one \r\n, check for double
+                let first_crlf = crlf_mask.trailing_zeros() as usize;
+                let abs_pos = i + first_crlf;
+                
+                // Check if there's another \r\n right after
+                if abs_pos + 4 <= buf.len() {
+                    if buf[abs_pos] == b'\r' && buf[abs_pos + 1] == b'\n' &&
+                       buf[abs_pos + 2] == b'\r' && buf[abs_pos + 3] == b'\n' {
+                        return Some(abs_pos);
+                    }
+                }
+                
+                // Check subsequent positions in this chunk
+                let mut check_pos = abs_pos + 1;
+                while check_pos < i + 64 && check_pos + 3 < buf.len() {
+                    if buf[check_pos] == b'\r' && buf[check_pos + 1] == b'\n' &&
+                       buf[check_pos + 2] == b'\r' && buf[check_pos + 3] == b'\n' {
+                        return Some(check_pos);
+                    }
+                    check_pos += 1;
+                }
+            }
+            
+            i += 64;
+        }
+        
+        // Fallback for remaining bytes
+        while i + 3 < buf.len() {
+            if buf[i] == b'\r' && buf[i + 1] == b'\n' &&
+               buf[i + 2] == b'\r' && buf[i + 3] == b'\n' {
+                return Some(i);
+            }
+            i += 1;
+        }
+        
+        None
+    }
+    
+    /// Safe wrapper for find_double_crlf_avx512
+    pub fn find_double_crlf(buf: &[u8]) -> Option<usize> {
+        if is_x86_feature_detected!("avx512f") {
+            unsafe { find_double_crlf_avx512(buf) }
+        } else if is_x86_feature_detected!("avx2") {
+            crate::simd_crlf_avx2::find_double_crlf(buf)
+        } else if is_x86_feature_detected!("sse2") && is_x86_feature_detected!("ssse3") {
+            crate::simd_crlf::find_double_crlf(buf)
+        } else {
+            fallback_find_double_crlf(buf)
+        }
+    }
+    
+    fn fallback_find_double_crlf(buf: &[u8]) -> Option<usize> {
+        for i in 0..buf.len().saturating_sub(3) {
+            if buf[i] == b'\r' && buf[i + 1] == b'\n' &&
+               buf[i + 2] == b'\r' && buf[i + 3] == b'\n' {
+                return Some(i);
+            }
+        }
+        None
+    }
+}
 
 // Connection state for Keep-Alive support
 #[derive(Debug, Clone)]
@@ -191,8 +497,8 @@ fn parse_connection_header(request_data: &[u8]) -> (bool, u64, u64) {
     (has_keep_alive, timeout_ms, max_requests)
 }
 
-/// Parse HTTP request into method, path, and headers
-/// Returns 1 on success, 0 on failure
+/// Parse HTTP request into method, path, and headers using httparse
+/// Returns bytes consumed on success, 0 on failure
 #[unsafe(no_mangle)]
 pub extern "C" fn naso_parse_http_request(
     buf: *const u8,
@@ -210,42 +516,30 @@ pub extern "C" fn naso_parse_http_request(
 
     let buf_slice = unsafe { std::slice::from_raw_parts(buf, len) };
 
-    // Find first line (method + path)
-    let request_line_end = buf_slice.iter().position(|&b| b == b'\n');
-    if request_line_end.is_none() {
-        return 0;
-    }
-    let request_line_end = request_line_end.unwrap();
-    let request_line = &buf_slice[..request_line_end];
-    // Remove trailing \r if present
-    let request_line = if request_line.ends_with(&[b'\r']) {
-        &request_line[..request_line.len() - 1]
-    } else {
-        request_line
+    // Use SIMD to find end of headers (double CRLF)
+    let headers_end = match simd_crlf::find_double_crlf(buf_slice) {
+        Some(pos) => pos + 4, // Position after double CRLF
+        None => return 0, // Incomplete request
     };
 
-    // Parse method (first word)
-    let method_end = request_line.iter().position(|&b| b == b' ');
-    if method_end.is_none() {
+    if headers_end > len {
         return 0;
     }
-    let method_end = method_end.unwrap();
-    let method = &request_line[..method_end];
 
-    // Parse path (second word)
-    let path_start = method_end + 1;
-    let path_end = request_line[path_start..].iter().position(|&b| b == b' ');
-    if path_end.is_none() {
+    // Parse with httparse
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut req = httparse::Request::new(&mut headers);
+    let parse_result = req.parse(&buf_slice[..headers_end]);
+    
+    if parse_result.is_err() {
         return 0;
     }
-    let path_end = path_start + path_end.unwrap();
-    let path = &request_line[path_start..path_end];
+    
+    let method = req.method.unwrap_or("");
+    let path = req.path.unwrap_or("");
 
     // Check output buffer sizes
-    if method.len() >= out_method_len - 1 {
-        return 0;
-    }
-    if path.len() >= out_path_len - 1 {
+    if method.len() >= out_method_len - 1 || path.len() >= out_path_len - 1 {
         return 0;
     }
 
@@ -261,47 +555,21 @@ pub extern "C" fn naso_parse_http_request(
         out_path.add(path.len()).write(0);
     }
 
-    // Find headers start (after CRLF)
-    let headers_start = request_line_end + 1;
-    if headers_start < len && buf_slice[headers_start] == b'\r' {
-        // Empty headers (CRLF immediately after request line)
-        unsafe {
-            out_headers.write(0);
-        };
-        return 1;
-    }
-
-    // Find end of headers (double CRLF)
-    let mut line_end = headers_start;
-    let mut total_headers_len = 0;
-    while line_end + 1 < len {
-        if buf_slice[line_end] == b'\r' && buf_slice[line_end + 1] == b'\n' {
-            if line_end + 2 < len && buf_slice[line_end + 2] == b'\r' && buf_slice[line_end + 3] == b'\n' {
-                // Found double CRLF - end of headers
-                break;
-            }
-            line_end += 2;
-        } else {
-            line_end += 1;
-        }
-    }
-
-    if line_end >= len {
-        return 0;
-    }
-
-    let headers_len = line_end - headers_start;
+    // Copy headers (raw from buffer)
+    let headers_len = headers_end - (buf_slice.iter().position(|&b| b == b'\n').unwrap_or(0) + 1);
+    let headers_start = buf_slice.iter().position(|&b| b == b'\n').unwrap_or(0) + 1;
+    let headers_end_pos = headers_start + headers_len;
+    
     if headers_len >= out_headers_len - 1 {
         return 0;
     }
 
     unsafe {
-        ptr::copy_nonoverlapping(buf_slice.as_ptr().add(headers_start), out_headers, headers_len);
+        ptr::copy_nonoverlapping(buf_slice[headers_start..headers_end_pos].as_ptr(), out_headers, headers_len);
         out_headers.add(headers_len).write(0);
     }
 
-    // Found valid request line + headers
-    (line_end + 2) as u64
+    headers_end as u64
 }
 
 // Check if a connection supports Keep-Alive

@@ -1269,10 +1269,14 @@ fn normalize_trait_return_type(
     impl_def: &TraitImpl,
 ) -> Result<Type, TypeError> {
     // Build substitution map from impl's associated type definitions
+    // Store both the concrete type and its generic parameters
     let mut assoc_subst = std::collections::HashMap::new();
     for item in &impl_def.items {
         if let ImplItem::AssociatedTypeDef(assoc_def) = item {
-            assoc_subst.insert(assoc_def.name.clone(), assoc_def.ty.clone());
+            assoc_subst.insert(
+                assoc_def.name.clone(),
+                (assoc_def.ty.clone(), assoc_def.generics.clone()),
+            );
         }
     }
     
@@ -1285,7 +1289,7 @@ fn normalize_type_with_subst(
     ty: &Type,
     for_ty: &Type,
     trait_path: &[Ident],
-    assoc_subst: &std::collections::HashMap<Ident, Type>,
+    assoc_subst: &std::collections::HashMap<Ident, (Type, Vec<GenericParam>)>,
     env: &crate::typecheck::type_env::TypeEnv,
     span: Span,
 ) -> Result<Type, TypeError> {
@@ -1302,10 +1306,18 @@ fn normalize_type_with_subst(
             if is_self_proj && !assoc_subst.is_empty() {
                 // This is a Self::AssocType projection in a trait impl context
                 // Try to resolve using the assoc_subst map
-                if let Some(concrete_ty) = assoc_subst.get(assoc_name) {
-                    // Substitute assoc type generics if needed
+                if let Some((concrete_ty, assoc_generics)) = assoc_subst.get(assoc_name) {
+                    // Substitute assoc type generics with the provided args
                     let mut result = concrete_ty.clone();
-                    // For now, just return the concrete type
+                    
+                    // For each generic parameter in the associated type definition,
+                    // substitute it with the corresponding argument from assoc_args
+                    for (param, arg) in assoc_generics.iter().zip(assoc_args.iter()) {
+                        if let TypeArg::Type(arg_ty) = arg {
+                            result = substitute_type_param_in_type(result, &param.name, arg_ty);
+                        }
+                    }
+                    
                     return Ok(result);
                 }
             }
@@ -1390,5 +1402,84 @@ fn normalize_type_with_subst(
             Ok(Type::new(TypeKind::Projection(new_inner), ty.quantity, ty.span))
         }
         _ => Ok(ty.clone()),
+    }
+}
+
+/// Substitute a type parameter with a concrete type in a type
+fn substitute_type_param_in_type(ty: Type, param_name: &Ident, replacement: &Type) -> Type {
+    match ty.kind {
+        TypeKind::Named(name, args) => {
+            // Check if this is the type parameter we're substituting
+            if name.name == param_name.name && args.is_empty() {
+                return replacement.clone();
+            }
+            // Recursively substitute in type arguments
+            let mut new_args = Vec::new();
+            for arg in args {
+                if let TypeArg::Type(t) = arg {
+                    new_args.push(TypeArg::Type(substitute_type_param_in_type(t, param_name, replacement)));
+                } else {
+                    new_args.push(arg);
+                }
+            }
+            Type::new(TypeKind::Named(name, new_args), ty.quantity, ty.span)
+        }
+        TypeKind::Array(elem, size) => {
+            let new_elem = Box::new(substitute_type_param_in_type(*elem, param_name, replacement));
+            Type::new(TypeKind::Array(new_elem, size), ty.quantity, ty.span)
+        }
+        TypeKind::Tuple(elems) => {
+            let mut new_elems = Vec::new();
+            for elem in elems {
+                new_elems.push(substitute_type_param_in_type(elem, param_name, replacement));
+            }
+            Type::new(TypeKind::Tuple(new_elems), ty.quantity, ty.span)
+        }
+        TypeKind::Function(params, ret) => {
+            let mut new_params = Vec::new();
+            for param in params {
+                new_params.push(substitute_type_param_in_type(param, param_name, replacement));
+            }
+            let new_ret = Box::new(substitute_type_param_in_type(*ret, param_name, replacement));
+            Type::new(TypeKind::Function(new_params, new_ret), ty.quantity, ty.span)
+        }
+        TypeKind::Pointer(inner) => {
+            let new_inner = Box::new(substitute_type_param_in_type(*inner, param_name, replacement));
+            Type::new(TypeKind::Pointer(new_inner), ty.quantity, ty.span)
+        }
+        TypeKind::Projection(inner) => {
+            let new_inner = Box::new(substitute_type_param_in_type(*inner, param_name, replacement));
+            Type::new(TypeKind::Projection(new_inner), ty.quantity, ty.span)
+        }
+        TypeKind::AssociatedTypeProjection { self_ty, trait_path, trait_args, assoc_name, assoc_args } => {
+            let mut new_trait_args = Vec::new();
+            for arg in trait_args {
+                if let TypeArg::Type(t) = arg {
+                    new_trait_args.push(TypeArg::Type(substitute_type_param_in_type(t, param_name, replacement)));
+                } else {
+                    new_trait_args.push(arg);
+                }
+            }
+            let mut new_assoc_args = Vec::new();
+            for arg in assoc_args {
+                if let TypeArg::Type(t) = arg {
+                    new_assoc_args.push(TypeArg::Type(substitute_type_param_in_type(t, param_name, replacement)));
+                } else {
+                    new_assoc_args.push(arg);
+                }
+            }
+            Type::new(
+                TypeKind::AssociatedTypeProjection {
+                    self_ty: Box::new(substitute_type_param_in_type(*self_ty, param_name, replacement)),
+                    trait_path,
+                    trait_args: new_trait_args,
+                    assoc_name,
+                    assoc_args: new_assoc_args,
+                },
+                ty.quantity,
+                ty.span,
+            )
+        }
+        _ => ty,
     }
 }

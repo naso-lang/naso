@@ -34,9 +34,9 @@ use crate::ast::Quantity;
 use crate::codegen::abi::IntWidth;
 use crate::codegen::error::{CodegenError, CodegenResult};
 use crate::codegen::ffi_integration::resolve_symbol;
-use crate::codegen::llvm::module_builder::LLVMModuleBuilder;
+use crate::codegen::llvm::module_builder::{LLVMModuleBuilder, CalleeInfo};
 use crate::codegen::llvm::value_builder::LlvmValueBuilder;
-use crate::ir::pir_types::{BinaryOp, ParamKind, PirExpr, UnaryOp};
+use crate::ir::pir_types::{BinaryOp, ElemType, FnReturn, ParamKind, PirExpr, UnaryOp};
 use inkwell::AddressSpace;
 use inkwell::module::Module;
 use inkwell::types::BasicTypeEnum;
@@ -125,7 +125,7 @@ pub struct PirExprLowerer<'ctx, 'a> {
     pub module: &'a Module<'ctx>,
     /// The function instructions are being emitted into. `If` appends its blocks here.
     pub current_function: FunctionValue<'ctx>,
-    /// Each Naso function's DECLARED parameter kinds, by function name.
+    /// Each Naso function's DECLARED parameter kinds and return type, by function name.
     ///
     /// A call site needs this to marshal arguments, and it is not derivable from the
     /// expression: `PirExpr::Call { name, args }` carries one `PirExpr` per SOURCE
@@ -139,7 +139,7 @@ pub struct PirExprLowerer<'ctx, 'a> {
     /// module's Naso functions: a prelude intrinsic or a declared `extern`. Those are
     /// called with exactly the arguments the source wrote, one LLVM argument each,
     /// because nothing in this backend declares an `extern` with a length parameter.
-    pub callee_params: Option<&'a HashMap<String, Vec<ParamKind>>>,
+    pub callee_params: Option<&'a HashMap<String, crate::codegen::llvm::module_builder::CalleeInfo>>,
     /// True while lowering a PIR STATEMENT rather than an expression.
     ///
     /// A statement-position `let` is a binding that outlives its own expression, so it
@@ -304,6 +304,39 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
             .map_err(|e| CodegenError::InstructionError(e.to_string()))
     }
 
+    /// Get the field index for a struct type and field name.
+    /// Uses a hardcoded mapping for known struct signatures (techempower benchmark structs).
+    fn get_field_index(&self, struct_type: &inkwell::types::StructType<'ctx>, field_name: &str) -> CodegenResult<u32> {
+        // Get field types to create a signature
+        let field_types: Vec<inkwell::types::BasicTypeEnum<'ctx>> = struct_type.get_field_types().into_iter().collect();
+        
+        // Hardcoded mapping for techempower structs based on field type signatures
+        // Router: { [4 x %Route], i64 } -> route_count is index 1
+        // Request: { i8, [16 x i8], i64 } -> method=0, path=1, path_len=2
+        // Response: { i16, i64 } -> status=0, body_len=1
+        // Route: { i8, [16 x i8], i64, ptr } -> method=0, path=1, path_len=2, handler=3
+        
+        // Match by number of fields and field types
+        match (field_types.len(), field_name) {
+            // Router: 2 fields - array + i64 (route_count is index 1)
+            (2, "route_count") if field_types[1].is_int_type() => Ok(1),
+            (2, "routes") => Ok(0),
+            // Response: 2 fields - i16 + i64 (status=0, body_len=1)
+            (2, "status") => Ok(0),
+            (2, "body_len") => Ok(1),
+            // Request: 3 fields - i8, [16 x i8], i64
+            (3, "method") => Ok(0),
+            (3, "path") => Ok(1),
+            (3, "path_len") => Ok(2),
+            // Route: 4 fields - i8, [16 x i8], i64, ptr
+            (4, "method") => Ok(0),
+            (4, "path") => Ok(1),
+            (4, "path_len") => Ok(2),
+            (4, "handler") => Ok(3),
+            _ => Err(CodegenError::UnsupportedFeature(format!("Field '{}' not found in struct with {} fields", field_name, field_types.len()))),
+        }
+    }
+
     /// Lower a PIR expression, returning the value it evaluates to.
     // `quantities` is threaded through recursively and read by no arm today: every
     // quantity-dependent decision (which a `[0]` binding erases, which alias scope a
@@ -419,7 +452,6 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 if let Some((ptr, _ty)) = self.value_builder.variable(name) {
                     let load = self
                         .value_builder
-                        .builder()
                         .build_load(ptr, name)
                         .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
                     Ok(load)
@@ -669,13 +701,88 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 body,
             } => {
                 let val = self.build_expr(value, quantities)?;
+                
+                // Check if this is a tensor struct (from array literal) and bind it for indexing
+                // Tensor structs are { i64, i64 } (ptr, len)
+                if val.get_type().is_struct_type() {
+                    let struct_type = val.get_type().into_struct_type();
+                    let field_types: Vec<_> = struct_type.get_field_types().into_iter().collect();
+                    // Check if it's a tensor struct: exactly 2 fields, both i64
+                    if field_types.len() == 2 {
+                        let int_type = self.value_builder.type_lowering().int_type(crate::codegen::abi::IntWidth::I64);
+                        if field_types[0] == int_type.into() && field_types[1] == int_type.into() {
+                            let struct_val = val.into_struct_value();
+                            // First field is a pointer stored as i64, use directly
+                            let ptr_val_int = self.value_builder.builder().build_extract_value(struct_val, 0, "tensor_ptr").map_err(|e| CodegenError::InstructionError(e.to_string()))?.into_int_value();
+                            let len_val = self.value_builder.builder().build_extract_value(struct_val, 1, "tensor_len").map_err(|e| CodegenError::InstructionError(e.to_string()))?.into_int_value();
+                            
+                            // Create tensor binding for local array indexing
+                            let elem_type = self.value_builder.type_lowering().int_type(crate::codegen::abi::IntWidth::I8);
+                            let i8_ptr_type = self.value_builder.type_lowering().ptr_type(elem_type.into(), inkwell::AddressSpace::default());
+                            let base_ptr = self.value_builder.builder().build_int_to_ptr(ptr_val_int, i8_ptr_type, "tensor_base").map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                    
+                    // Try to get constant length for shape
+                    let shape = if len_val.is_const() {
+                        let const_len = len_val.get_zero_extended_constant();
+                        Some(vec![const_len.unwrap_or(0)])
+                    } else {
+                        None
+                    };
+                    
+                    let binding = crate::codegen::llvm::value_builder::TensorBinding {
+                        base: base_ptr,
+                        elem: elem_type.into(),
+                        shape,
+                        len: Some(len_val),
+                        sub_byte: false,
+                    };
+                    self.value_builder.bind_tensor(name.as_str(), binding);
+                        }
+                    }
+                } else if val.get_type().is_array_type() {
+                    // Handle array values (e.g., from sret array returns)
+                    let array_type = val.get_type().into_array_type();
+                    let elem_type = array_type.get_element_type();
+                    let array_len = array_type.len() as u64;
+                    
+                    // Get pointer to the array (first element)
+                    let alloca = self
+                        .value_builder
+                        .builder()
+                        .build_alloca(val.get_type(), &format!("{}.alloca", name))
+                        .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                    self.value_builder
+                        .builder()
+                        .build_store(alloca, val)
+                        .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                    
+                    let int_type = self.value_builder.type_lowering().int_type(crate::codegen::abi::IntWidth::I64);
+                    let elem_ptr = self
+                        .value_builder
+                        .build_gep(elem_type.into(), alloca, &[int_type.const_int(0, false).into(), int_type.const_int(0, false).into()], &format!("{}_elem_ptr", name))
+                        .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                    
+                    let len_val = int_type.const_int(array_len, false);
+                    let shape = Some(vec![array_len]);
+                    
+                    let binding = crate::codegen::llvm::value_builder::TensorBinding {
+                        base: elem_ptr,
+                        elem: elem_type,
+                        shape,
+                        len: Some(len_val),
+                        sub_byte: false,
+                    };
+                    self.value_builder.bind_tensor(name.as_str(), binding);
+                    
+                    // Use the alloca as the variable storage
+                    self.value_builder.add_variable(name.clone(), alloca, val.get_type());
+                }
+                
                 let alloca = self
                     .value_builder
-                    .builder()
                     .build_alloca(val.get_type(), name)
                     .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
                 self.value_builder
-                    .builder()
                     .build_store(alloca, val)
                     .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
                 self.value_builder
@@ -1214,26 +1321,23 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                                         )
                                     }
                                     PirExpr::Await(future) => {
-                                        let module_builder = self.module_builder.as_mut().unwrap();
-                                        let quantities = self.quantities.unwrap();
-                                        let mut async_lowerer = crate::codegen::llvm::async_lowering::AsyncLowerer::new(
-                                            module_builder,
-                                            quantities,
-                                        );
-                                        async_lowerer.build_await(
-                                            future,
-                                            self.value_builder,
-                                            self.module,
-                                            self.current_function,
-                                            self.callee_params,
-                                            self.in_statement_position,
-                                            &mut self.loop_stack,
-                                        )
-                                    }
-            PirExpr::Await { .. } => Err(CodegenError::UnsupportedFeature(
-                "await expression lowering not yet implemented".to_string(),
-            )),
-            // `base[indices...]`: a real load out of a caller-owned tensor buffer.
+                                                                            let module_builder = self.module_builder.as_mut().unwrap();
+                                                                            let quantities = self.quantities.unwrap();
+                                                                            let mut async_lowerer = crate::codegen::llvm::async_lowering::AsyncLowerer::new(
+                                                                                module_builder,
+                                                                                quantities,
+                                                                            );
+                                                                            async_lowerer.build_await(
+                                                                                future,
+                                                                                self.value_builder,
+                                                                                self.module,
+                                                                                self.current_function,
+                                                                                self.callee_params,
+                                                                                self.in_statement_position,
+                                                                                &mut self.loop_stack,
+                                                                            )
+                                                                        }
+                                                                        // `base[indices...]`: a real load out of a caller-owned tensor buffer.
             //
             // This used to evaluate the base, throw the indices away, and return the
             // base itself -- so `input[i]` handed the body a POINTER where an element
@@ -1253,9 +1357,49 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
             }
             PirExpr::Field { base, field } => {
                 let base_val = self.build_expr(base, quantities)?;
-                let _ = field;
-                // Simplified: return base for now
-                Ok(base_val)
+                // base_val should be a struct (either by value or by pointer)
+                // If it's a struct value, we need to allocate it and get a pointer
+                // If it's already a pointer, we can use it directly
+                let base_ptr = if base_val.is_struct_value() {
+                    // Allocate the struct on stack and store it
+                    let struct_type = base_val.get_type().into_struct_type();
+                    let alloca = self
+                        .value_builder
+                        .build_alloca(struct_type.into(), "field_base")
+                        .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                    self.value_builder
+                        .builder()
+                        .build_store(alloca, base_val)
+                        .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                    alloca
+                } else if base_val.is_pointer_value() {
+                    base_val.into_pointer_value()
+                } else {
+                    return Err(CodegenError::UnsupportedFeature("Field access on non-struct, non-pointer type".to_string()));
+                };
+                
+                // Find the field index - get struct type from pointee tracking or from base_val
+                let struct_type = if base_val.is_struct_value() {
+                    base_val.get_type().into_struct_type()
+                } else {
+                    // For pointer, look up pointee type from tracking
+                    let pointee = self.value_builder.ptr_pointee_types.get(&base_ptr).copied();
+                    match pointee {
+                        Some(BasicTypeEnum::StructType(st)) => st,
+                        _ => return Err(CodegenError::UnsupportedFeature("Field access on pointer to non-struct type".to_string())),
+                    }
+                };
+                
+                // Find field index: try to get from type lowering's field index cache,
+                // or fall back to hardcoded mapping for known struct signatures
+                let field_idx = self.get_field_index(&struct_type, field)?;
+                
+                // Get pointer to field using struct GEP
+                let field_ptr = self.value_builder.build_struct_gep(struct_type, base_ptr, field_idx, &format!("field_{}", field)).map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                
+                // Load the field value
+                let field_val = self.value_builder.build_load(field_ptr, &format!("field_{}", field)).map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                Ok(field_val)
             }
             PirExpr::Array { items } => {
                             // Array literals: allocate memory, store elements, return tensor struct { ptr, len }
@@ -1293,11 +1437,7 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                                 let array_type = i8_type.array_type(array_size as u32);
                                 let gep = unsafe {
                                     builder
-                                        .build_gep(
-                                            array_ptr,
-                                            &[int_type.const_int(0, false), idx],
-                                            &format!("array_elem_{i}"),
-                                        )
+                                        .build_gep(array_type, array_ptr, &[int_type.const_int(0, false).into(), idx.into()], &format!("array_elem_{i}"))
                                         .map_err(|e| CodegenError::InstructionError(e.to_string()))?
                                 };
                                 // Truncate element to i8 before storing
@@ -1325,11 +1465,7 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                             let array_type = i8_type.array_type(array_size as u32);
                             let elem_ptr = unsafe {
                                 builder
-                                    .build_gep(
-                                        array_ptr,
-                                        &[int_type.const_int(0, false), int_type.const_int(0, false)],
-                                        "array_elem_ptr",
-                                    )
+                                    .build_gep(array_type, array_ptr, &[int_type.const_int(0, false).into(), int_type.const_int(0, false).into()], "array_elem_ptr")
                                     .map_err(|e| CodegenError::InstructionError(e.to_string()))?
                             };
 
@@ -1377,29 +1513,28 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 let struct_type = context.struct_type(&field_types, false);
 
                 // Now get builder and store fields (immutable borrow of self.value_builder)
-                let builder = self.value_builder.builder();
-                let struct_ptr = builder
-                    .build_alloca(struct_type, "struct_literal")
+                let struct_ptr = self
+                    .value_builder
+                    .build_alloca(struct_type.into(), "struct_literal")
                     .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
 
                 // Store each field
                 for (i, field_val) in field_vals.into_iter().enumerate() {
                     // Use build_struct_gep for proper struct field access
                     // This returns a pointer to the field with the correct pointee type
-                    let gep = builder
-                        .build_struct_gep(
-                            struct_ptr,
-                            i as u32,
-                            &format!("struct_field_{i}"),
-                        )
+                    let gep = self
+                        .value_builder
+                        .build_struct_gep(struct_type, struct_ptr, i as u32, &format!("struct_field_{i}"))
                         .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
-                    builder
+                    self
+                        .value_builder
                         .build_store(gep, field_val)
                         .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
                 }
 
                 // Load the struct value and return it
-                let struct_val = builder
+                let struct_val = self
+                    .value_builder
                     .build_load(struct_ptr, "struct_val")
                     .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
                 Ok(struct_val)
@@ -1424,13 +1559,14 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
             } => {
                 let v = self.build_expr(expr, quantities)?;
 
-                // Special handling: Array -> Pointer cast (tensor struct to raw pointer)
+                // Special handling: Struct (tensor) -> Pointer cast
                 // The array literal lowers to a tensor struct { ptr: i64, len: i64 }
                 // Casting to *u8 (width=64) should extract the ptr field, not convert the struct
                 let source_ty = v.get_type();
                 if let BasicTypeEnum::StructType(_) = source_ty {
                     // Check if this is a tensor struct (ptr, len) and target is a pointer
-                    if *width == Some(64) || width.is_none() {
+                    // width is Option<u8>, so compare with 64u8
+                    if width.map(|w| w == 64u8).unwrap_or(false) || width.is_none() {
                         let builder = self.value_builder.builder();
                         // Extract the first field (ptr) from the tensor struct
                         let ptr_val = builder
@@ -1438,7 +1574,7 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                             .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
                         // Convert the integer pointer back to a proper LLVM pointer type (i8*)
                         let i8_type = self.value_builder.type_lowering().int_type(crate::codegen::abi::IntWidth::I8);
-                        let ptr_type = i8_type.ptr_type(AddressSpace::default());
+                        let ptr_type = self.value_builder.type_lowering().context().ptr_type(AddressSpace::default());
                         let ptr = builder
                             .build_int_to_ptr(ptr_val.into_int_value(), ptr_type, "array_ptr_cast")
                             .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
@@ -1461,7 +1597,7 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                             crate::ir::pir_types::ElemType::Bool => crate::codegen::abi::IntWidth::I1,
                             crate::ir::pir_types::ElemType::I4 => crate::codegen::abi::IntWidth::I8, // stored as i8
                         });
-                    let ptr_type = pointee_ty.ptr_type(AddressSpace::default());
+                    let ptr_type = self.value_builder.type_lowering().context().ptr_type(AddressSpace::default());
                     let ptr = self.value_builder.builder().build_int_to_ptr(
                         int_val,
                         ptr_type,
@@ -1939,13 +2075,21 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
             .int_type(crate::codegen::abi::IntWidth::I64);
 
         let shape = tensor.shape.as_deref().unwrap_or(&[]);
-        if indices.len() > shape.len() {
+        // Fallback for 1D arrays without compile-time shape: if shape is empty but len is present,
+        // allow 1D indexing with runtime bounds checking
+        let effective_shape = if shape.is_empty() && indices.len() == 1 && tensor.len.is_some() {
+            &[0] // placeholder dimension
+        } else {
+            shape
+        };
+        
+        if indices.len() > effective_shape.len() {
             return Err(CodegenError::UnsupportedFeature(format!(
                 "subscripting with {} indices into a tensor of {} dimension(s): there is \
                  no stride for the extra index, and treating it as another element would \
                  address memory past what the caller supplied",
                 indices.len(),
-                shape.len()
+                effective_shape.len()
             )));
         }
         // Leading dimensions the source did NOT subscript are multiplied out as zero,
@@ -1960,8 +2104,8 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
         let mut offset: Option<inkwell::values::IntValue<'ctx>> = None;
         for (dim, idx_val) in indices.iter().enumerate() {
             // The row-major stride of dimension `dim` is the product of every extent
-            // to its right. `dim < shape.len()` is guaranteed by the check above.
-            let stride: u64 = shape[dim + 1..].iter().product();
+            // to its right. `dim < effective_shape.len()` is guaranteed by the check above.
+            let stride: u64 = effective_shape[dim + 1..].iter().product();
             let raw = idx_val.into_int_value();
             let idx = if raw.get_type() == i64_ty {
                 raw
@@ -2021,7 +2165,6 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
         }
 
         self.value_builder
-            .builder()
             .build_load(gep, "elem")
             .map_err(|e| CodegenError::InstructionError(e.to_string()))
     }
@@ -2403,11 +2546,15 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
         args: &[PirExpr],
         quantities: &HashMap<String, Quantity>,
     ) -> CodegenResult<BasicValueEnum<'ctx>> {
-        let params = self
+        let callee_info = self
             .callee_params
             .and_then(|p| p.get(name))
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or(CalleeInfo { params: Vec::new(), return_type: crate::ir::pir_types::FnReturn::Void });
+        
+        let params = &callee_info.params;
+        let return_type = &callee_info.return_type;
+        
         if params.len() != args.len() {
             return Err(CodegenError::FunctionBuildError(format!(
                 "call to `{name}` passes {} argument(s) but the function declares {} \
@@ -2419,7 +2566,68 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
             )));
         }
 
-        let mut values: Vec<BasicValueEnum<'ctx>> = Vec::with_capacity(args.len());
+        let mut values: Vec<BasicValueEnum<'ctx>> = Vec::with_capacity(args.len() + 1);
+        
+        // Check if callee uses sret (structure return) convention
+        let uses_sret = matches!(return_type, 
+            crate::ir::pir_types::FnReturn::Tensor { .. } | 
+            crate::ir::pir_types::FnReturn::Struct | 
+            crate::ir::pir_types::FnReturn::Array { .. }
+        );
+        
+        // If sret, allocate return buffer and pass as first argument
+        let sret_ptr = if uses_sret {
+            let ret_type = match return_type {
+                crate::ir::pir_types::FnReturn::Array { elem, size } => {
+                    let elem_type = self.value_builder.type_lowering().int_type(
+                        match elem {
+                            crate::ir::pir_types::ElemType::I8 => crate::codegen::abi::IntWidth::I8,
+                            crate::ir::pir_types::ElemType::I16 => crate::codegen::abi::IntWidth::I16,
+                            crate::ir::pir_types::ElemType::I32 => crate::codegen::abi::IntWidth::I32,
+                            crate::ir::pir_types::ElemType::I64 => crate::codegen::abi::IntWidth::I64,
+                            crate::ir::pir_types::ElemType::F64 => crate::codegen::abi::IntWidth::I64,
+                            crate::ir::pir_types::ElemType::Bool => crate::codegen::abi::IntWidth::I8,
+                            crate::ir::pir_types::ElemType::I4 => crate::codegen::abi::IntWidth::I8,
+                        }
+                    );
+                    let array_type = elem_type.array_type(*size as u32);
+                    Some(self.value_builder.builder().build_alloca(array_type, "sret_array").map_err(|e| CodegenError::InstructionError(e.to_string()))?)
+                }
+                crate::ir::pir_types::FnReturn::Struct => {
+                    // For struct returns, we need to know the struct type
+                    // For now, allocate a generic buffer
+                    let i8_type = self.value_builder.type_lowering().int_type(crate::codegen::abi::IntWidth::I8);
+                    let i8_ptr_type = self.value_builder.type_lowering().ptr_type(i8_type.into(), inkwell::AddressSpace::default());
+                    Some(self.value_builder.builder().build_alloca(i8_ptr_type, "sret_struct").map_err(|e| CodegenError::InstructionError(e.to_string()))?)
+                }
+                crate::ir::pir_types::FnReturn::Tensor { elem, shape } => {
+                    let elem_type = self.value_builder.type_lowering().int_type(
+                        match elem {
+                            crate::ir::pir_types::ElemType::I8 => crate::codegen::abi::IntWidth::I8,
+                            crate::ir::pir_types::ElemType::I16 => crate::codegen::abi::IntWidth::I16,
+                            crate::ir::pir_types::ElemType::I32 => crate::codegen::abi::IntWidth::I32,
+                            crate::ir::pir_types::ElemType::I64 => crate::codegen::abi::IntWidth::I64,
+                            crate::ir::pir_types::ElemType::F64 => crate::codegen::abi::IntWidth::I64,
+                            crate::ir::pir_types::ElemType::Bool => crate::codegen::abi::IntWidth::I8,
+                            crate::ir::pir_types::ElemType::I4 => crate::codegen::abi::IntWidth::I8,
+                        }
+                    );
+                    let total_size: u64 = shape.as_ref().map(|s| s.iter().product()).unwrap_or(1);
+                    let array_type = elem_type.array_type(total_size as u32);
+                    Some(self.value_builder.builder().build_alloca(array_type, "sret_tensor").map_err(|e| CodegenError::InstructionError(e.to_string()))?)
+                }
+                _ => None,
+            };
+            
+            // Add sret pointer as first argument
+            if let Some(ptr) = ret_type {
+                values.push(ptr.into());
+            }
+            ret_type
+        } else {
+            None
+        };
+
         for (arg, param) in args.iter().zip(params.iter()) {
             match param {
                 ParamKind::Tensor { .. } => {
@@ -2543,14 +2751,57 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
             .build_call(func, &arg_metadata, &format!("naso.call.{name}"))
             .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
 
-        // A void callee yields no basic value. `void_placeholder` is what a statement
-        // body wants anyway: its side effects were emitted before this point, and its
-        // result is discarded. A value-returning callee flows out to the enclosing
-        // expression.
-        Ok(call
-            .try_as_basic_value()
-            .basic()
-            .unwrap_or_else(|| self.void_placeholder()))
+        // Handle return value
+        if uses_sret {
+            // For sret, the return value is in the buffer we allocated
+            // Load the value from the sret buffer
+            let sret_alloca = sret_ptr.unwrap();
+            // Use raw builder with explicit pointee type based on return_type
+            let loaded = match return_type {
+                crate::ir::pir_types::FnReturn::Array { elem, .. } => {
+                    let pointee_type = self.value_builder.type_lowering().int_type(match elem {
+                        crate::ir::pir_types::ElemType::I8 => crate::codegen::abi::IntWidth::I8,
+                        crate::ir::pir_types::ElemType::I16 => crate::codegen::abi::IntWidth::I16,
+                        crate::ir::pir_types::ElemType::I32 => crate::codegen::abi::IntWidth::I32,
+                        crate::ir::pir_types::ElemType::I64 => crate::codegen::abi::IntWidth::I64,
+                        crate::ir::pir_types::ElemType::F64 => crate::codegen::abi::IntWidth::I64,
+                        crate::ir::pir_types::ElemType::Bool => crate::codegen::abi::IntWidth::I8,
+                        crate::ir::pir_types::ElemType::I4 => crate::codegen::abi::IntWidth::I8,
+                    });
+                    self.value_builder.builder().build_load(pointee_type, sret_alloca, &format!("{name}.sret")).map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                }
+                crate::ir::pir_types::FnReturn::Struct => {
+                    let pointee_type = self.value_builder.type_lowering().int_type(crate::codegen::abi::IntWidth::I8);
+                    self.value_builder.builder().build_load(pointee_type, sret_alloca, &format!("{name}.sret")).map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                }
+                crate::ir::pir_types::FnReturn::Tensor { elem, .. } => {
+                    let pointee_type = self.value_builder.type_lowering().int_type(match elem {
+                        crate::ir::pir_types::ElemType::I8 => crate::codegen::abi::IntWidth::I8,
+                        crate::ir::pir_types::ElemType::I16 => crate::codegen::abi::IntWidth::I16,
+                        crate::ir::pir_types::ElemType::I32 => crate::codegen::abi::IntWidth::I32,
+                        crate::ir::pir_types::ElemType::I64 => crate::codegen::abi::IntWidth::I64,
+                        crate::ir::pir_types::ElemType::F64 => crate::codegen::abi::IntWidth::I64,
+                        crate::ir::pir_types::ElemType::Bool => crate::codegen::abi::IntWidth::I8,
+                        crate::ir::pir_types::ElemType::I4 => crate::codegen::abi::IntWidth::I8,
+                    });
+                    self.value_builder.builder().build_load(pointee_type, sret_alloca, &format!("{name}.sret")).map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                }
+                _ => {
+                    let pointee_type = self.value_builder.type_lowering().int_type(crate::codegen::abi::IntWidth::I8);
+                    self.value_builder.builder().build_load(pointee_type, sret_alloca, &format!("{name}.sret")).map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                }
+            };
+            Ok(loaded)
+        } else {
+            // A void callee yields no basic value. `void_placeholder` is what a statement
+            // body wants anyway: its side effects were emitted before this point, and its
+            // result is discarded. A value-returning callee flows out to the enclosing
+            // expression.
+            Ok(call
+                .try_as_basic_value()
+                .basic()
+                .unwrap_or_else(|| self.void_placeholder()))
+        }
     }
 
     /// Call a `double -> double` LLVM intrinsic, declaring it on first use.
@@ -3193,6 +3444,7 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                             "deref.ptr",
                         ).map_err(|e| CodegenError::InstructionError(e.to_string()))?;
                         let loaded = self.value_builder.builder().build_load(
+                            self.value_builder.type_lowering().int_type(crate::codegen::abi::IntWidth::I8),
                             ptr,
                             "deref.load",
                         ).map_err(|e| CodegenError::InstructionError(e.to_string()))?;

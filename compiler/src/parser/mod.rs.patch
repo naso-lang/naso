@@ -1,0 +1,56 @@
+fn parse_generic_kind(&mut self) -> GenericKind {
+        match self.peek() {
+            Some(TK::Const) => {
+                self.bump(); // consume 'const'
+                // Expect a type after const, e.g., `const N: u64`
+                match self.peek() {
+                    Some(TK::UInt64) | Some(TK::UInt32) | Some(TK::UInt16) | Some(TK::UInt8) |
+                    Some(TK::UInt4) | Some(TK::USize) | Some(TK::Int64) | Some(TK::Int32) |
+                    Some(TK::Int16) | Some(TK::Int8) | Some(TK::Int4) | Some(TK::ISize) |
+                    Some(TK::Nat) => {
+                        self.bump();
+                        GenericKind::Nat
+                    }
+                    Some(TK::Ident(_)) if self.at_ident("nat") => {
+                        self.bump();
+                        GenericKind::Nat
+                    }
+                    Some(TK::Ident(_)) if self.at_ident("u64") => {
+                        self.bump();
+                        GenericKind::Nat
+                    }
+                    _ => self.unexpected("a const type (`u64`, `nat`, etc.)"),
+                }
+            }
+            Some(TK::Type) => {
+                self.bump();
+                GenericKind::Type
+            }
+            Some(TK::Nat) => {
+                self.bump();
+                GenericKind::Nat
+            }
+            Some(TK::QtyStar) => {
+                self.bump();
+                GenericKind::Quantity
+            }
+            // Integer types directly (when `const` was already consumed before the identifier)
+            Some(TK::UInt64) | Some(TK::UInt32) | Some(TK::UInt16) | Some(TK::UInt8) |
+            Some(TK::UInt4) | Some(TK::USize) | Some(TK::Int64) | Some(TK::Int32) |
+            Some(TK::Int16) | Some(TK::Int8) | Some(TK::Int4) | Some(TK::ISize) => {
+                self.bump();
+                GenericKind::Nat
+            }
+            Some(TK::Ident(_)) if self.at_ident("nat") => {
+                self.bump();
+                GenericKind::Nat
+            }
+            Some(TK::Ident(_)) if self.at_ident("type") => {
+                self.bump();
+                GenericKind::Type
+            }
+            _ => self.unexpected("a generic kind (`type`, `nat`, `const u64`, or `[*]`)"),
+        }
+    }
+
+    // ===== Type definitions =====

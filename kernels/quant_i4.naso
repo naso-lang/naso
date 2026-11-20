@@ -1,0 +1,96 @@
+// INT4 Symmetric Quantization Kernel with Proof-Carrying Quantization
+//
+// This kernel demonstrates proof-carrying quantization for i4 (4-bit signed) types.
+// The i4 range is [-8, 7] (two's complement 4-bit).
+//
+// The proof obligations verify:
+// 1. The clamping keeps values within the i4 range
+// 2. The quantization error bound (half-step) is maintained
+// 3. The packing into 4-bit nibbles preserves the quantized values
+
+/// Quantize f32 -> i4 with a symmetric scale.
+///
+/// The cast can overflow unless the precondition holds, which is what a
+/// proof should establish:
+///
+///   forall i in 0..N { abs(input[i] / scale) <= 7.5 }
+///
+/// This obligation is DISCHARGED as a premise (`requires`) discharged
+/// against a matching goal. It is not proved from the data: nothing in this
+/// function bounds `input`, so the range is a contract the CALLER owes, and
+/// `naso-verify` checks it at every call site.
+fn quantize_i4_symmetric(
+    input: [1] Tensor[f32, 16],
+    output: inout [1] Tensor[i4, 16],
+    scale: f32
+) requires {
+    assert(scale > 0.0);
+    forall i in 0..16 { assert(abs(input[i] / scale) <= 7.5); }
+} {
+    proof {
+        // The range follows from the premise, so this is discharged rather than assumed.
+        forall i in 0..16 { assert(abs(input[i] / scale) <= 7.5); }
+        // The rounding step's error is bounded by a half unit.
+        forall i in 0..16 {
+            assert(round(input[i] / scale) <= input[i] / scale + 0.5);
+        }
+    }
+
+    forall i in 0..16 {
+        let v = round(input[i] / scale);
+        output[i] = clamp(v, -8.0, 7.0) as i4;
+    }
+}
+
+/// The clamp makes the narrowing well-defined for EVERY input, not only in-range ones.
+///
+/// This is the one statement in this file that needs NO premise at all, and it is the one that
+/// makes the `as i4` above safe: `clamp(v, -8, 7)` lies in `[-8, 7]` whatever `v` is, so
+/// the clamp -- not the precondition -- is what actually guarantees the cast does not wrap.
+fn clamp_keeps_the_narrowing_in_range_i4(v: f32) -> bool {
+    proof {
+        assert(clamp(v, -8.0, 7.0) <= 7.0);
+        assert(clamp(v, -8.0, 7.0) >= -8.0);
+        // `round`'s bounding axiom, exercised on a scalar.
+        assert(round(v) <= v + 0.5);
+        assert(v - 0.5 <= round(v));
+    }
+    return true;
+}
+
+/// Dequantize i4 -> f32, widening each element and rescaling.
+fn dequantize_i4_symmetric(
+    input: [1] Tensor[i4, 16],
+    output: inout [1] Tensor[f32, 16],
+    scale: f32
+) {
+    forall i in 0..16 {
+        let v = input[i] as f32;
+        output[i] = v * scale;
+    }
+}
+
+/// Half-step error bound for i4 quantization.
+///
+/// PROVED over exact reals. The dequantised value `q * s` is within half a step of `x`.
+fn dequantise_half_step_i4(
+    x: f32,
+    q: f32,
+    s: f32
+) -> f32
+    requires {
+        assert(s > 0.0);
+        // The caller states what rounding produced: q is within half a step of
+        // x / s, written without division so the premise is exact.
+        assert(x <= (q + 0.5) * s);
+        assert(x >= (q - 0.5) * s);
+    }
+{
+    proof {
+        // The upper half of the stated bound, discharged as a goal rather than
+        // assumed as a premise.
+        assert(x <= (q + 0.5) * s);
+    }
+
+    return q * s;
+}

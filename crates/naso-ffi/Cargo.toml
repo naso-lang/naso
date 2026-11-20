@@ -6,7 +6,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/naso-lang/naso"
 
 [lib]
-crate-type = ["staticlib", "rlib"]
+crate-type = ["staticlib"]
 
 [dependencies]
 tokio = { version = "1.35", features = ["rt", "net", "io-util", "rt-multi-thread"] }
@@ -21,11 +21,22 @@ crossbeam = { version = "0.8", optional = true }
 base64 = "0.22"
 rand = "0.8"
 naso_std = { path = "../stdlib" }
+httparse = "1.8"
+mimalloc = { version = "0.1", optional = true }
+
+[profile.release]
+codegen-units = 1
+lto = true
 
 [features]
 default = []
 lockfree = ["crossbeam"]
+mimalloc = ["dep:mimalloc"]
 
 [[test]]
 name = "multi_threaded_accept_test"
 path = "tests/multi_threaded_accept_test.rs"
+
+[[test]]
+name = "lockfree_test"
+path = "tests/test_lockfree.rs"

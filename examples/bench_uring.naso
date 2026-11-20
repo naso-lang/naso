@@ -1,0 +1,87 @@
+// Minimal async io_uring benchmark server
+extern "C" {
+    // io_uring functions
+    fn naso_uring_init() -> u64;
+    fn naso_tcp_accept_uring(listener_fd: u64, out_ptr: *u64, callback: *u8) -> u64;
+    fn naso_read_uring(fd: u64, buf_ptr: *u8, len: u64, callback: *u8) -> u64;
+    fn naso_write_uring(fd: u64, buf_ptr: *u8, len: u64, callback: *u8) -> u64;
+    fn naso_uring_submit() -> u64;
+    fn naso_uring_wait(min_completions: u64) -> u64;
+    fn naso_uring_poll() -> u64;
+    
+    // Standard functions
+    fn naso_tcp_bind(addr: *u8, len: u64) -> u64;
+    fn naso_close(fd: u64) -> u64;
+    fn naso_yield() -> u64;
+    
+    // For managing client state
+    fn naso_accept_get_client(out_ptr: *u64) -> u64;
+}
+
+// Callback trampolines
+extern "C" fn accept_callback(state: *u8) {
+    // Accept completed - client fd is available
+}
+
+extern "C" fn read_callback(state: *u8) {
+    // Read completed - process request
+}
+
+extern "C" fn write_callback(state: *u8) {
+    // Write completed - can close or continue
+}
+
+struct ClientState {
+    fd: u64,
+    read_buf: [u8; 1024],
+    write_buf: [u8; 512],
+    read_bytes: u64,
+    write_bytes: u64,
+    stage: u8, // 0=reading, 1=writing, 2=done
+}
+
+fn handle_client_async(client_fd: u64) -> () {
+    // For now, use sync fallback for simplicity
+    // In a full implementation, this would use async state machine
+    let mut read_buf = [0u8; 1024];
+    let bytes_read = unsafe { naso_read(client_fd, read_buf as *u8, 1024) };
+    
+    if bytes_read == 0 {
+        let _ = unsafe { naso_close(client_fd) };
+        return;
+    }
+    
+    // Build response
+    let status_line = [72, 84, 84, 80, 47, 49, 46, 49, 32, 50, 48, 48, 32, 79, 75, 13, 10]; // "HTTP/1.1 200 OK\r\n"
+    let content_length = [67, 111, 110, 116, 101, 110, 116, 45, 76, 101, 110, 103, 116, 104, 58, 32, 49, 51, 13, 10]; // "Content-Length: 13\r\n"
+    let blank_line = [13, 10]; // "\r\n"
+    let body = [72, 101, 108, 108, 111, 44, 32, 87, 111, 114, 108, 100, 33]; // "Hello, World!"
+    
+    let _ = unsafe { naso_write(client_fd, status_line as *u8, 17) };
+    let _ = unsafe { naso_write(client_fd, content_length as *u8, 20) };
+    let _ = unsafe { naso_write(client_fd, blank_line as *u8, 2) };
+    let _ = unsafe { naso_write(client_fd, body as *u8, 13) };
+    let _ = unsafe { naso_close(client_fd) };
+}
+
+fn main() {
+    // Initialize io_uring
+    let _uring = naso_uring_init();
+    
+    let addr = [49, 50, 55, 46, 48, 46, 48, 46, 49, 58, 56, 48, 57, 57];
+    let listener_fd = naso_tcp_bind(addr as *u8, 14);
+    
+    let mut running = 1;
+    let mut out = [0u64; 2];
+    let out_ptr = out as *u64;
+    
+    while running != 0 {
+        if unsafe { naso_tcp_accept(listener_fd, out_ptr) } != 0 {
+            let client_fd = naso_accept_get_client(out_ptr);
+            if client_fd != 0 {
+                handle_client_async(client_fd);
+            }
+        }
+        naso_yield();
+    }
+}

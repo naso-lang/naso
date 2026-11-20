@@ -299,11 +299,11 @@ impl PolyhedralScheduler {
             upper[d] = -1;
             constraints.push(AffineConstraint::inequality(upper, -(extent as i64 - 1)));
         }
-        AffineDomain::new(dims, 0, constraints)
+        AffineDomain::new(dims, 1, constraints)
     }
 
     fn create_identity_map(&self, domain: &AffineDomain, dim: usize) -> AffineMap {
-        let mut m = Matrix::new(1, domain.dims + 1);
+        let mut m = Matrix::new(1, domain.dims);
         m.set(0, dim, 1);
         AffineMap::total(domain.clone(), m)
     }
@@ -362,10 +362,10 @@ pub mod transformations {
     ) -> Result<ScheduleTree, ScheduleValidationError> {
         let domain = AffineDomain::new(
             1,
-            0,
+            1,
             vec![
-                AffineConstraint::inequality(vec![1, 0], 0),
-                AffineConstraint::inequality(vec![-1, 1], gate_count as i64 - 1),
+                AffineConstraint::inequality(vec![1, 0], 0),                    // i >= 0
+                AffineConstraint::inequality(vec![-1, 1], gate_count as i64),  // -i + N >= N  =>  i <= N-1 where N=gate_count
             ],
         );
 
@@ -424,12 +424,13 @@ mod tests {
         let scheduler = PolyhedralScheduler::new();
         
         // Create a simple hybrid schedule
+        // 1 iterator (i), 1 parameter (N)
         let domain = AffineDomain::new(
             1,
-            0,
+            1,
             vec![
-                AffineConstraint::inequality(vec![1, 0], 0),
-                AffineConstraint::inequality(vec![-1, 1], 7),
+                AffineConstraint::inequality(vec![1, 0], 0),       // i >= 0
+                AffineConstraint::inequality(vec![-1, 1], 1),      // -i + N >= 1  =>  i <= N-1
             ],
         );
         

@@ -1,0 +1,111 @@
+// Channel implementation for async communication
+// Provides MPSC (multi-producer, single-consumer) channels
+
+extern "C" {
+    fn naso_channel_new(capacity: usize) -> *mut u8;
+    fn naso_channel_send(sender: *mut u8, value: *const u8, value_len: usize) -> u64;
+    fn naso_channel_recv(receiver: *mut u8, out: *mut u8, out_len: usize) -> u64;
+    fn naso_channel_try_send(sender: *mut u8, value: *const u8, value_len: usize) -> u64;
+    fn naso_channel_try_recv(receiver: *mut u8, out: *mut u8, out_len: usize) -> u64;
+    fn naso_channel_free(channel: *mut u8);
+    fn naso_sender_clone(sender: *mut u8) -> *mut u8;
+}
+
+struct Sender<T> {
+    inner: *mut u8,
+    _phantom: PhantomData<T>,
+}
+
+struct Receiver<T> {
+    inner: *mut u8,
+    _phantom: PhantomData<T>,
+}
+
+struct PhantomData<T> { _private: () }
+
+impl<T> Sender<T> {
+    pub fn send(&self, value: T) -> Result<(), SendError<T>> {
+        let result = naso_channel_send(
+            self.inner,
+            &value as *const T as *const u8,
+            std::mem::size_of::<T>(),
+        );
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(SendError(value))
+        }
+    }
+
+    pub fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
+        let result = naso_channel_try_send(
+            self.inner,
+            &value as *const T as *const u8,
+            std::mem::size_of::<T>(),
+        );
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(TrySendError::Full(value))
+        }
+    }
+
+    pub fn clone(&self) -> Self {
+        let new_inner = naso_sender_clone(self.inner);
+        Sender { inner: new_inner, _phantom: PhantomData { _private: () } }
+    }
+}
+
+impl<T> Receiver<T> {
+    pub fn recv(&self) -> Option<T> {
+        let mut buffer = vec![0u8; std::mem::size_of::<T>()];
+        let result = naso_channel_recv(
+            self.inner,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+        );
+        if result == 0 {
+            Some(unsafe { std::ptr::read(buffer.as_ptr() as *const T) })
+        } else {
+            None
+        }
+    }
+
+    pub fn try_recv(&self) -> Result<T, TryRecvError> {
+        let mut buffer = vec![0u8; std::mem::size_of::<T>()];
+        let result = naso_channel_try_recv(
+            self.inner,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+        );
+        if result == 0 {
+            Ok(unsafe { std::ptr::read(buffer.as_ptr() as *const T) })
+        } else {
+            Err(TryRecvError::Empty)
+        }
+    }
+}
+
+struct SendError<T>(T);
+struct TrySendError<T> { value: T, is_full: bool }
+struct TryRecvError;
+
+impl<T> Drop for Sender<T> {
+    fn drop(&mut self) {
+        // Sender drop doesn't free the channel - only when all senders and receiver are dropped
+    }
+}
+
+impl<T> Drop for Receiver<T> {
+    fn drop(&mut self) {
+        naso_channel_free(self.inner);
+    }
+}
+
+pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
+    let inner = naso_channel_new(capacity);
+    (
+        Sender { inner, _phantom: PhantomData { _private: () } },
+        Receiver { inner, _phantom: PhantomData { _private: () } },
+    )
+}

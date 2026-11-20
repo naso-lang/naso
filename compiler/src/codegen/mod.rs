@@ -182,6 +182,8 @@ pub struct CodegenConfig {
     pub emit_debug: bool,
     /// Output format for QIR backend (llvm-ir or json)
     pub qir_output_format: QirOutputFormat,
+    /// Run formal verification after type checking
+    pub verify: bool,
 }
 
 /// Output format for QIR
@@ -201,6 +203,7 @@ impl Default for CodegenConfig {
             output_path: None,
             emit_debug: false,
             qir_output_format: QirOutputFormat::default(),
+            verify: false,
         }
     }
 }

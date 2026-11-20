@@ -101,14 +101,12 @@ impl QirIntrinsic {
             QirIntrinsicRetType::Ptr => Some(
                 builder
                     .llvm_context()
-                    .i8_type()
                     .ptr_type(AddressSpace::from(0))
                     .into(),
             ),
             QirIntrinsicRetType::QubitArray => Some(
                 builder
                     .llvm_context()
-                    .i8_type()
                     .ptr_type(AddressSpace::from(0))
                     .into(),
             ),
@@ -124,17 +122,14 @@ impl QirIntrinsic {
                 QirIntrinsicParamType::Int(w) => Self::int_type_of_width(builder, *w).into(),
                 QirIntrinsicParamType::Ptr => builder
                     .llvm_context()
-                    .i8_type()
                     .ptr_type(AddressSpace::from(0))
                     .into(),
                 QirIntrinsicParamType::QubitArray => builder
                     .llvm_context()
-                    .i8_type()
                     .ptr_type(AddressSpace::from(0))
                     .into(),
                 QirIntrinsicParamType::ResultArray => builder
                     .llvm_context()
-                    .i8_type()
                     .ptr_type(AddressSpace::from(0))
                     .into(),
             })

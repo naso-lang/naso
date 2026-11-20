@@ -26,7 +26,7 @@ pub struct LlvmValueBuilder<'ctx> {
     /// LLVM 17 uses opaque pointers, so a `PointerValue` no longer carries the
     /// type it points at. Loads and GEPs need that type explicitly, so we
     /// remember it for every pointer we mint here (allocas, GEPs, struct GEPs).
-    ptr_pointee_types: HashMap<PointerValue<'ctx>, BasicTypeEnum<'ctx>>,
+    pub ptr_pointee_types: HashMap<PointerValue<'ctx>, BasicTypeEnum<'ctx>>,
     /// Named variable allocations (name -> pointer, pointee type).
     ///
     /// This lives here, next to the builder that emits the loads and stores, so that
@@ -404,8 +404,12 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
         ptr: PointerValue<'ctx>,
         name: &str,
     ) -> CodegenResult<BasicValueEnum<'ctx>> {
+        let pointee_type = self.ptr_pointee_types.get(&ptr).copied().unwrap_or_else(|| {
+            // Fallback: if we don't know the pointee type, use i8 (opaque pointer)
+            self.type_lowering.int_type(crate::codegen::abi::IntWidth::I8).into()
+        });
         self.builder
-            .build_load(ptr, name)
+            .build_load(pointee_type, ptr, name)
             .map_err(|e| CodegenError::InstructionError(e.to_string()))
     }
 
@@ -478,7 +482,7 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
         for (i, field) in fields.iter().enumerate() {
             let gep = self
                 .builder
-                .build_struct_gep(alloca, i as u32, "field_gep")
+                .build_struct_gep(struct_ty, alloca, i as u32, "field_gep")
                 .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
             self.ptr_pointee_types.insert(gep, struct_ty.into());
             self.build_store(gep, *field)?;
@@ -541,7 +545,7 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
         // integers, which is what LLVMBuildGEP2 requires.
         let gep = unsafe {
             self.builder
-                .build_gep(ptr, &indices, name)
+                .build_gep(ty, ptr, &indices, name)
                 .map_err(|e| CodegenError::InstructionError(e.to_string()))?
         };
         self.ptr_pointee_types.insert(gep, ty);
@@ -558,7 +562,7 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
     ) -> CodegenResult<PointerValue<'ctx>> {
         let gep = self
             .builder
-            .build_struct_gep(ptr, index, name)
+            .build_struct_gep(struct_ty, ptr, index, name)
             .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
         self.ptr_pointee_types.insert(gep, struct_ty.into());
         Ok(gep)

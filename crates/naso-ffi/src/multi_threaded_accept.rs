@@ -68,11 +68,9 @@ impl ShardedFdTable {
         }
     }
     
-    /// Get shard index for a given fd
+    /// Get shard index for a given fd (deterministic)
     pub fn get_shard_index(&self, fd: u64) -> usize {
-        let mut hasher = DefaultHasher::new();
-        fd.hash(&mut hasher);
-        (hasher.finish() as usize) % SHARD_COUNT
+        (fd as usize) % SHARD_COUNT
     }
     
     /// Generate a new globally unique fd
@@ -119,6 +117,56 @@ impl ShardedFdTable {
         let shard_index = self.get_shard_index(fd);
         let shard = self.shards[shard_index].lock().unwrap();
         shard.listeners.get(&fd).map(|l| l.try_clone().unwrap_or_else(|_| panic!("Failed to clone listener")))
+    }
+
+    /// Write to a stream (operates inside the shard's lock)
+    pub fn write_stream(&self, fd: u64, buf: &[u8]) -> Option<usize> {
+        let shard_index = self.get_shard_index(fd);
+        let mut shard = self.shards[shard_index].lock().unwrap();
+        // Use entry API to avoid HashMap lookup issues
+        match shard.streams.entry(fd) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let stream = entry.get_mut();
+                use std::io::Write;
+                stream.write_all(buf).ok().map(|_| buf.len())
+            }
+            std::collections::hash_map::Entry::Vacant(_) => None,
+        }
+    }
+
+    /// Flush a stream (operates inside the shard's lock)
+    pub fn flush_stream(&self, fd: u64) -> Option<()> {
+        let shard_index = self.get_shard_index(fd);
+        let mut shard = self.shards[shard_index].lock().unwrap();
+        match shard.streams.entry(fd) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let stream = entry.get_mut();
+                use std::io::Write;
+                stream.flush().ok()
+            }
+            std::collections::hash_map::Entry::Vacant(_) => None,
+        }
+    }
+
+    /// Read from a stream (operates inside the shard's lock)
+    pub fn read_stream(&self, fd: u64, buf: &mut [u8]) -> Option<usize> {
+        let shard_index = self.get_shard_index(fd);
+        let mut shard = self.shards[shard_index].lock().unwrap();
+        match shard.streams.entry(fd) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let stream = entry.get_mut();
+                use std::io::Read;
+                stream.read(buf).ok()
+            }
+            std::collections::hash_map::Entry::Vacant(_) => None,
+        }
+    }
+
+    /// Close and remove a stream (operates inside the shard's lock)
+    pub fn close_stream(&self, fd: u64) -> Option<std::net::TcpStream> {
+        let shard_index = self.get_shard_index(fd);
+        let mut shard = self.shards[shard_index].lock().unwrap();
+        shard.streams.remove(&fd)
     }
 }
 

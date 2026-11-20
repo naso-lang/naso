@@ -1,0 +1,79 @@
+// Mutex implementation for thread synchronization
+// Provides mutual exclusion primitive
+
+extern "C" {
+    fn naso_mutex_new() -> *mut u8;
+    fn naso_mutex_lock(mutex: *mut u8) -> u64;
+    fn naso_mutex_try_lock(mutex: *mut u8) -> u64;
+    fn naso_mutex_unlock(mutex: *mut u8) -> u64;
+    fn naso_mutex_free(mutex: *mut u8);
+}
+
+struct Mutex<T> {
+    inner: *mut u8,
+    _phantom: PhantomData<T>,
+}
+
+struct MutexGuard<'a, T> {
+    mutex: &'a Mutex<T>,
+    _phantom: PhantomData<&'a mut T>,
+}
+
+struct PhantomData<T> { _private: () }
+
+impl<T> Mutex<T> {
+    pub fn new(value: T) -> Self {
+        let ptr = naso_mutex_new();
+        // In a real implementation, we'd store the initial value
+        Mutex { inner: ptr, _phantom: PhantomData { _private: () } }
+    }
+
+    pub fn lock(&self) -> MutexGuard<'_, T> {
+        let _ = naso_mutex_lock(self.inner);
+        MutexGuard { 
+            mutex: self, 
+            _phantom: PhantomData { _private: () } 
+        }
+    }
+
+    pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
+        let result = naso_mutex_try_lock(self.inner);
+        if result == 0 {
+            Some(MutexGuard { 
+                mutex: self, 
+                _phantom: PhantomData { _private: () } 
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl<'a, T> std::ops::Deref for MutexGuard<'a, T> {
+    type Target = T;
+    
+    fn deref(&self) -> &T {
+        // In a real implementation, this would return a reference to the protected value
+        // For now, this is a placeholder
+        unsafe { &*(self.mutex as *const T) }
+    }
+}
+
+impl<'a, T> std::ops::DerefMut for MutexGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // In a real implementation, this would return a mutable reference to the protected value
+        unsafe { &mut *(self.mutex as *mut T) }
+    }
+}
+
+impl<'a, T> Drop for MutexGuard<'a, T> {
+    fn drop(&mut self) {
+        let _ = naso_mutex_unlock(self.mutex.inner);
+    }
+}
+
+impl<T> Drop for Mutex<T> {
+    fn drop(&mut self) {
+        naso_mutex_free(self.inner);
+    }
+}

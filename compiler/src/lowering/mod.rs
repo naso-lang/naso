@@ -263,6 +263,9 @@ fn collect_bound_names_expr(expr: &crate::ast::Expr, out: &mut Vec<String>) {
                 collect_bound_names_expr(item, out);
             }
         }
+        ExprKind::ArrayRepeat(value, _) => {
+            collect_bound_names_expr(value, out);
+        }
         ExprKind::If(c, t, e) => {
             collect_bound_names_expr(c, out);
             collect_bound_names_expr(t, out);
@@ -1630,6 +1633,20 @@ impl LoweringContext {
                     .iter()
                     .map(|a| self.lower_expr(a))
                     .collect::<Result<Vec<_>, _>>()?;
+                Ok(PirExpr::Array { items })
+            }
+            ExprKind::ArrayRepeat(value, count) => {
+                let value_expr = self.lower_expr(value)?;
+                let count_expr = self.lower_expr(count)?;
+                // Lower ArrayRepeat to an Array with repeated elements
+                // We need to evaluate the count at compile time
+                let count_val = match &count_expr {
+                    PirExpr::IntLit(n) => *n as usize,
+                    _ => return Err(LoweringError::Unsupported(
+                        "ArrayRepeat count must be a compile-time constant".to_string()
+                    )),
+                };
+                let items = vec![value_expr; count_val];
                 Ok(PirExpr::Array { items })
             }
             ExprKind::Struct(name, fields) => {

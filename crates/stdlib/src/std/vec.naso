@@ -1,0 +1,74 @@
+// Vec implementation using FFI to naso-ffi allocator
+// Provides a dynamically-sized array type
+
+extern "C" {
+    fn naso_vec_new(elem_size: usize) -> *mut u8;
+    fn naso_vec_push(vec: *mut u8, elem: *const u8) -> u64;
+    fn naso_vec_pop(vec: *mut u8) -> *mut u8;
+    fn naso_vec_get(vec: *mut u8, index: usize) -> *mut u8;
+    fn naso_vec_len(vec: *mut u8) -> usize;
+    fn naso_vec_capacity(vec: *mut u8) -> usize;
+    fn naso_vec_reserve(vec: *mut u8, additional: usize) -> u64;
+    fn naso_vec_clear(vec: *mut u8);
+    fn naso_vec_free(vec: *mut u8);
+}
+
+struct Vec<T> {
+    inner: *mut u8,
+    _phantom: PhantomData<T>,
+}
+
+// PhantomData for type safety
+struct PhantomData<T> { _private: () }
+
+impl<T> Vec<T> {
+    pub fn new() -> Self {
+        let elem_size = std::mem::size_of::<T>();
+        let ptr = naso_vec_new(elem_size);
+        Vec { inner: ptr, _phantom: PhantomData { _private: () } }
+    }
+
+    pub fn push(&mut self, value: T) {
+        let _ = naso_vec_push(self.inner, &value as *const T as *const u8);
+    }
+
+    pub fn pop(&mut self) -> Option<T> {
+        let ptr = naso_vec_pop(self.inner);
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { std::ptr::read(ptr as *const T) })
+        }
+    }
+
+    pub fn get(&self, index: usize) -> Option<&T> {
+        let ptr = naso_vec_get(self.inner, index);
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { &*(ptr as *const T) })
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        naso_vec_len(self.inner)
+    }
+
+    pub fn capacity(&self) -> usize {
+        naso_vec_capacity(self.inner)
+    }
+
+    pub fn reserve(&mut self, additional: usize) {
+        let _ = naso_vec_reserve(self.inner, additional);
+    }
+
+    pub fn clear(&mut self) {
+        naso_vec_clear(self.inner);
+    }
+}
+
+impl<T> Drop for Vec<T> {
+    fn drop(&mut self) {
+        naso_vec_free(self.inner);
+    }
+}

@@ -11,7 +11,7 @@ use crate::codegen::llvm::schedule_lowering::{
 };
 use crate::codegen::llvm::type_lowering::LlvmTypeLowering;
 use crate::codegen::llvm::value_builder::LlvmValueBuilder;
-use crate::ir::pir_types::{ParamKind, PirModule};
+use crate::ir::pir_types::{FnReturn, ParamKind, PirModule};
 use crate::ir::schedule_tree::StmtId;
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder as LlvmBuilder;
@@ -66,7 +66,14 @@ pub struct LLVMModuleBuilder<'ctx> {
     // a tensor. Held here rather than recomputed at each call because a call inside a
     // loop body is lowered deep inside `ScheduleLowering`, which has no access to the
     // module's function list.
-    callee_params: Option<HashMap<String, Vec<ParamKind>>>,
+    callee_params: Option<HashMap<String, CalleeInfo>>,
+}
+
+/// Information about a callee function for call-site marshalling.
+#[derive(Debug, Clone)]
+pub struct CalleeInfo {
+    pub params: Vec<ParamKind>,
+    pub return_type: FnReturn,
 }
 
 /// One DECLARED parameter's share of the entry function's signature.
@@ -174,10 +181,14 @@ pub fn build_entry_signature<'ctx>(
             kind: ParamKind::Scalar(crate::ir::pir_types::ElemType::I8),
         });
         next_arg = 1;
-    } else if let Some(crate::ir::pir_types::FnReturn::Array { elem, size: _ }) = return_type {
+    } else if let Some(crate::ir::pir_types::FnReturn::Array { elem, size }) = return_type {
         // Array return: use typed pointer to caller-allocated array memory
+        // For sret convention, the caller allocates the full array and passes a pointer to it
+        let elem_type = elem_to_llvm_type(type_lowering, *elem);
+        let int_type = elem_type.into_int_type();
+        let array_type = int_type.array_type(*size as u32);
         let ptr_type = type_lowering.ptr_type(
-            elem_to_llvm_type(type_lowering, *elem),
+            inkwell::types::BasicTypeEnum::ArrayType(array_type),
             inkwell::AddressSpace::default(),
         );
         out.push(EntryParam {
@@ -761,7 +772,10 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
                 .map(|f| {
                     (
                         f.name.clone(),
-                        f.params.iter().map(|p| p.kind.clone()).collect(),
+                        CalleeInfo {
+                            params: f.params.iter().map(|p| p.kind.clone()).collect(),
+                            return_type: f.return_type.clone(),
+                        },
                     )
                 })
                 .collect(),
@@ -799,12 +813,16 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
             // count, and which is a trip count. Named by the recorded index rather than
             // by position, because a tensor's count is the argument AFTER its pointer.
             name_arguments(function, &abi);
-            // Add sret attribute to the first parameter if this is a tensor or struct return
-            if let crate::ir::pir_types::FnReturn::Tensor { elem, shape: _ } = &func.return_type {
+            // Add sret attribute to the first parameter if this is a tensor, struct, or array return
+            if let crate::ir::pir_types::FnReturn::Tensor { elem: _, shape: _ } = &func.return_type {
                 let sret_attr = self.context.llvm_context().create_string_attribute("sret", "");
                 // Add sret attribute to the function's first parameter (index 0)
                 function.add_attribute(inkwell::attributes::AttributeLoc::Param(0), sret_attr);
             } else if let crate::ir::pir_types::FnReturn::Struct = &func.return_type {
+                let sret_attr = self.context.llvm_context().create_string_attribute("sret", "");
+                // Add sret attribute to the function's first parameter (index 0)
+                function.add_attribute(inkwell::attributes::AttributeLoc::Param(0), sret_attr);
+            } else if let crate::ir::pir_types::FnReturn::Array { elem: _, size: _ } = &func.return_type {
                 let sret_attr = self.context.llvm_context().create_string_attribute("sret", "");
                 // Add sret attribute to the function's first parameter (index 0)
                 function.add_attribute(inkwell::attributes::AttributeLoc::Param(0), sret_attr);
@@ -996,6 +1014,7 @@ impl<'ctx> LLVMModuleBuilder<'ctx> {
             return_source,
             callee_params.as_ref(),
             Some(self),
+            Some(&func.return_type),
         )?;
         self.value_builder = Some(value_builder);
         Ok(())

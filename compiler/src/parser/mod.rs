@@ -926,6 +926,9 @@ impl<'a> Parser<'a> {
     fn parse_generic_param(&mut self) -> GenericParam {
         let start = self.pos;
         let _qty = self.parse_quantity();
+        
+        // Check for `const` keyword before the identifier (for const generics like `const N: u64`)
+        let is_const = self.eat(TK::Const);
         let name = self.parse_ident();
         
         let mut kind = GenericKind::Type;
@@ -933,13 +936,16 @@ impl<'a> Parser<'a> {
         
         if self.at(TK::Colon) {
             self.bump();
-            // Check if next token is a kind annotation (type, nat, [*])
+            // Check if next token is a kind annotation (type, nat, [*], u64, etc.)
             // or a trait bound
             let next_token = self.peek();
             let is_kind_annotation = match next_token {
                 Some(TK::Type) => true,
                 Some(TK::Nat) => true,
                 Some(TK::QtyStar) => true,
+                Some(TK::UInt64) | Some(TK::UInt32) | Some(TK::UInt16) | Some(TK::UInt8) |
+                Some(TK::UInt4) | Some(TK::USize) | Some(TK::Int64) | Some(TK::Int32) |
+                Some(TK::Int16) | Some(TK::Int8) | Some(TK::Int4) | Some(TK::ISize) => true,
                 Some(TK::Ident(_)) if self.at_ident("type") || self.at_ident("nat") => true,
                 _ => false,
             };
@@ -955,6 +961,9 @@ impl<'a> Parser<'a> {
                 // It's a trait bound directly: `T: Iterator`
                 bounds = self.parse_trait_bounds();
             }
+        } else if is_const {
+            // If we saw `const` but no colon, it's an error or default to Nat
+            kind = GenericKind::Nat;
         }
         
         GenericParam {
@@ -967,6 +976,28 @@ impl<'a> Parser<'a> {
 
     fn parse_generic_kind(&mut self) -> GenericKind {
         match self.peek() {
+            Some(TK::Const) => {
+                self.bump(); // consume 'const'
+                // Expect a type after const, e.g., `const N: u64`
+                match self.peek() {
+                    Some(TK::UInt64) | Some(TK::UInt32) | Some(TK::UInt16) | Some(TK::UInt8) |
+                    Some(TK::UInt4) | Some(TK::USize) | Some(TK::Int64) | Some(TK::Int32) |
+                    Some(TK::Int16) | Some(TK::Int8) | Some(TK::Int4) | Some(TK::ISize) |
+                    Some(TK::Nat) => {
+                        self.bump();
+                        GenericKind::Nat
+                    }
+                    Some(TK::Ident(_)) if self.at_ident("nat") => {
+                        self.bump();
+                        GenericKind::Nat
+                    }
+                    Some(TK::Ident(_)) if self.at_ident("u64") => {
+                        self.bump();
+                        GenericKind::Nat
+                    }
+                    _ => self.unexpected("a const type (`u64`, `nat`, etc.)"),
+                }
+            }
             Some(TK::Type) => {
                 self.bump();
                 GenericKind::Type
@@ -979,6 +1010,13 @@ impl<'a> Parser<'a> {
                 self.bump();
                 GenericKind::Quantity
             }
+            // Integer types directly (when `const` was already consumed before the identifier)
+            Some(TK::UInt64) | Some(TK::UInt32) | Some(TK::UInt16) | Some(TK::UInt8) |
+            Some(TK::UInt4) | Some(TK::USize) | Some(TK::Int64) | Some(TK::Int32) |
+            Some(TK::Int16) | Some(TK::Int8) | Some(TK::Int4) | Some(TK::ISize) => {
+                self.bump();
+                GenericKind::Nat
+            }
             Some(TK::Ident(_)) if self.at_ident("nat") => {
                 self.bump();
                 GenericKind::Nat
@@ -987,11 +1025,11 @@ impl<'a> Parser<'a> {
                 self.bump();
                 GenericKind::Type
             }
-            _ => self.unexpected("a generic kind (`type`, `nat`, or `[*]`)"),
+            _ => self.unexpected("a generic kind (`type`, `nat`, `const u64`, or `[*]`)"),
         }
     }
 
-    // ===== Type definitions =====
+            // ===== Type definitions =====
 
     fn parse_struct(&mut self) -> TypeDef {
         let start = self.pos;

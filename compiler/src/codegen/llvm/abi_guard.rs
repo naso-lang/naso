@@ -363,7 +363,8 @@ fn declare_violation_runtime<'ctx>(
     type_lowering: &LlvmTypeLowering<'ctx>,
     module: &LlvmModule<'ctx>,
 ) -> CodegenResult<()> {
-    let ptr_type = type_lowering.ptr_type(type_lowering.context().i8_type().into(), AddressSpace::from(0));
+    let ctx = type_lowering.context();
+    let ptr_type = ctx.ptr_type(AddressSpace::from(0));
 
     if module.get_function("exit").is_none() {
         let exit_type = type_lowering
@@ -428,11 +429,9 @@ fn emit_violation<'ctx>(
     let stderr_global = module
         .get_global("stderr")
         .ok_or_else(|| CodegenError::InternalError("stderr was not declared".to_string()))?;
+    // stderr is a global of type ptr (opaque pointer to FILE*), load it directly
     let stderr_ptr: PointerValue<'ctx> = builder
-        .build_load(
-            stderr_global.as_pointer_value(),
-            "stderr",
-        )
+        .build_load(stderr_global.get_value_type().into_pointer_type(), stderr_global.as_pointer_value(), "stderr")
         .map_err(|e| CodegenError::InstructionError(e.to_string()))?
         .into_pointer_value();
 

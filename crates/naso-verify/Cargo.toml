@@ -43,8 +43,8 @@ naso-gates = { path = "../naso-gates" }
 #
 # To move to Z3 5.x: bump these to 0.21/0.13 with features = ["vendored"],
 # drop the Z3_SYS_Z3_VERSION pin, and require GCC 13+ on all builders.
-z3 = { version = "0.19", optional = true, features = ["gh-release"] }
-z3-sys = { version = "0.10", optional = true, features = ["gh-release"] }
+z3 = { version = "0.19", optional = true, features = ["z3_4_8_15"] }
+z3-sys = { version = "0.10", optional = true }
 
 # Serialization
 serde = { workspace = true, features = ["derive"] }

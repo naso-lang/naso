@@ -1,0 +1,988 @@
+// ============================================================================
+// Naso Tracing (naso_tracing) - Phase 19.6
+// ============================================================================
+// Structured, hierarchical logging and distributed tracing
+// Compatible with OpenTelemetry, Jaeger, Zipkin, and custom exporters
+// ============================================================================
+
+extern "C" {
+    fn naso_tracing_subscriber_new() -> u64;
+    fn naso_tracing_span_new(name_ptr: *const u8, name_len: usize, parent_ptr: *const u8, parent_len: usize, level: u8, fields_ptr: *const u8, fields_len: usize) -> u64;
+    fn naso_tracing_span_enter(span: u64) -> u64;
+    fn naso_tracing_span_exit(span: u64) -> u64;
+    fn naso_tracing_span_record(span: u64, key_ptr: *const u8, key_len: usize, value_ptr: *const u8, value_len: usize, value_type: u8) -> u64;
+    fn naso_tracing_span_event(span: u64, name_ptr: *const u8, name_len: usize, fields_ptr: *const u8, fields_len: usize) -> u64;
+    fn naso_tracing_span_set_status(span: u64, status: u8, message_ptr: *const u8, message_len: usize) -> u64;
+    fn naso_tracing_subscriber_register(subscriber: u64) -> u64;
+    fn naso_tracing_subscriber_free(subscriber: u64);
+    fn naso_tracing_layer_console_new() -> u64;
+    fn naso_tracing_layer_json_new(output_ptr: *const u8, output_len: usize) -> u64;
+    fn naso_tracing_layer_otlp_new(endpoint_ptr: *const u8, endpoint_len: usize) -> u64;
+    fn naso_tracing_layer_jaeger_new(agent_endpoint_ptr: *const u8, agent_endpoint_len: usize) -> u64;
+    fn naso_tracing_layer_free(layer: u64);
+}
+
+// ============================================================================
+// Tracing Levels
+// ============================================================================
+
+enum Level {
+    Trace = 0,
+    Debug = 1,
+    Info = 2,
+    Warn = 3,
+    Error = 4,
+}
+
+impl Level {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Level::Trace => "TRACE",
+            Level::Debug => "DEBUG",
+            Level::Info => "INFO",
+            Level::Warn => "WARN",
+            Level::Error => "ERROR",
+        }
+    }
+    
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_uppercase().as_str() {
+            "TRACE" => Some(Level::Trace),
+            "DEBUG" => Some(Level::Debug),
+            "INFO" => Some(Level::Info),
+            "WARN" | "WARNING" => Some(Level::Warn),
+            "ERROR" => Some(Level::Error),
+            _ => None,
+        }
+    }
+}
+
+// ============================================================================
+// Span
+// ============================================================================
+
+struct Span {
+    inner: u64,
+    name: String,
+    parent: Option<SpanContext>,
+    level: Level,
+}
+
+struct SpanContext {
+    trace_id: [u8; 16],
+    span_id: [u8; 8],
+    trace_flags: u8,
+    trace_state: Option<String>,
+}
+
+impl Span {
+    pub fn new(name: &str) -> SpanBuilder {
+        SpanBuilder::new(name)
+    }
+    
+    pub fn root(name: &str, level: Level) -> Self {
+        SpanBuilder::new(name).level(level).build_root()
+    }
+    
+    pub fn child_of(parent: &SpanContext, name: &str, level: Level) -> Self {
+        SpanBuilder::new(name).level(level).parent(parent.clone()).build()
+    }
+    
+    pub fn enter(&self) -> SpanGuard {
+        naso_tracing_span_enter(self.inner);
+        SpanGuard { span: self.inner }
+    }
+    
+    pub fn record(&self, key: &str, value: &impl ToValue) -> Result<(), TracingError> {
+        let value_bytes = value.to_value_bytes();
+        let result = naso_tracing_span_record(
+            self.inner,
+            key.as_ptr(), key.len(),
+            value_bytes.as_ptr(), value_bytes.len(),
+            value.value_type(),
+        );
+        if result == 0 {
+            return Err(TracingError::RecordFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn record_bool(&self, key: &str, value: bool) -> Result<(), TracingError> {
+        self.record(key, &value)
+    }
+    
+    pub fn record_i64(&self, key: &str, value: i64) -> Result<(), TracingError> {
+        self.record(key, &value)
+    }
+    
+    pub fn record_u64(&self, key: &str, value: u64) -> Result<(), TracingError> {
+        self.record(key, &value)
+    }
+    
+    pub fn record_f64(&self, key: &str, value: f64) -> Result<(), TracingError> {
+        self.record(key, &value)
+    }
+    
+    pub fn record_str(&self, key: &str, value: &str) -> Result<(), TracingError> {
+        self.record(key, &value)
+    }
+    
+    pub fn event(&self, name: &str, fields: &[(&str, &impl ToValue)]) -> Result<(), TracingError> {
+        let fields_json = fields_to_json(fields);
+        let result = naso_tracing_span_event(
+            self.inner,
+            name.as_ptr(), name.len(),
+            fields_json.as_ptr(), fields_json.len(),
+        );
+        if result == 0 {
+            return Err(TracingError::EventFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn set_status_ok(&self) -> Result<(), TracingError> {
+        let result = naso_tracing_span_set_status(self.inner, 0, std::ptr::null(), 0);
+        if result == 0 {
+            return Err(TracingError::StatusFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn set_status_error(&self, message: &str) -> Result<(), TracingError> {
+        let result = naso_tracing_span_set_status(self.inner, 1, message.as_ptr(), message.len());
+        if result == 0 {
+            return Err(TracingError::StatusFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn context(&self) -> SpanContext {
+        // Would extract from inner
+        SpanContext {
+            trace_id: [0; 16],
+            span_id: [0; 8],
+            trace_flags: 1, // Sampled
+            trace_state: None,
+        }
+    }
+}
+
+struct SpanGuard {
+    span: u64,
+}
+
+impl Drop for SpanGuard {
+    fn drop(&mut self) {
+        naso_tracing_span_exit(self.span);
+    }
+}
+
+// ============================================================================
+// Span Builder
+// ============================================================================
+
+struct SpanBuilder {
+    name: String,
+    parent: Option<SpanContext>,
+    level: Level,
+    fields: Vec<(String, String)>,
+    target: Option<String>,
+}
+
+impl SpanBuilder {
+    pub fn new(name: &str) -> Self {
+        SpanBuilder {
+            name: name.into(),
+            parent: None,
+            level: Level::Info,
+            fields: Vec::new(),
+            target: None,
+        }
+    }
+    
+    pub fn parent(mut self, parent: SpanContext) -> Self {
+        self.parent = Some(parent);
+        self
+    }
+    
+    pub fn level(mut self, level: Level) -> Self {
+        self.level = level;
+        self
+    }
+    
+    pub fn field(mut self, key: &str, value: impl ToValue) -> Self {
+        self.fields.push((key.into(), value.to_string()));
+        self
+    }
+    
+    pub fn target(mut self, target: &str) -> Self {
+        self.target = Some(target.into());
+        self
+    }
+    
+    pub fn build(self) -> Span {
+        let parent_json = self.parent.as_ref().map(|p| context_to_json(p)).unwrap_or_default();
+        let fields_json = fields_to_json(&self.fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>());
+        
+        let inner = naso_tracing_span_new(
+            self.name.as_ptr(), self.name.len(),
+            parent_json.as_ptr(), parent_json.len(),
+            self.level as u8,
+            fields_json.as_ptr(), fields_json.len(),
+        );
+        
+        Span {
+            inner,
+            name: self.name,
+            parent: self.parent,
+            level: self.level,
+        }
+    }
+    
+    pub fn build_root(self) -> Span {
+        let fields_json = fields_to_json(&self.fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>());
+        
+        let inner = naso_tracing_span_new(
+            self.name.as_ptr(), self.name.len(),
+            std::ptr::null(), 0,
+            self.level as u8,
+            fields_json.as_ptr(), fields_json.len(),
+        );
+        
+        Span {
+            inner,
+            name: self.name,
+            parent: None,
+            level: self.level,
+        }
+    }
+}
+
+fn context_to_json(ctx: &SpanContext) -> String {
+    let trace_id_hex = hex_encode(&ctx.trace_id);
+    let span_id_hex = hex_encode(&ctx.span_id);
+    format!(
+        "{{\"trace_id\":\"{}\",\"span_id\":\"{}\",\"trace_flags\":{},\"trace_state\":{}}}",
+        trace_id_hex,
+        span_id_hex,
+        ctx.trace_flags,
+        ctx.trace_state.as_ref().map(|s| format!("\"{}\"", s)).unwrap_or("null".into())
+    )
+}
+
+fn fields_to_json(fields: &[(&str, &str)]) -> String {
+    let mut json = String::from("{");
+    for (i, (k, v)) in fields.iter().enumerate() {
+        if i > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!("\"{}\":{}", k, v));
+    }
+    json.push('}');
+    json
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
+
+// ============================================================================
+// Value Trait for Span Fields
+// ============================================================================
+
+trait ToValue {
+    fn to_value_bytes(&self) -> Vec<u8>;
+    fn to_string(&self) -> String;
+    fn value_type(&self) -> u8;
+}
+
+impl ToValue for bool {
+    fn to_value_bytes(&self) -> Vec<u8> {
+        vec![if *self { 1 } else { 0 }]
+    }
+    
+    fn to_string(&self) -> String {
+        self.to_string()
+    }
+    
+    fn value_type(&self) -> u8 {
+        0 // Bool
+    }
+}
+
+impl ToValue for i64 {
+    fn to_value_bytes(&self) -> Vec<u8> {
+        self.to_le_bytes().to_vec()
+    }
+    
+    fn to_string(&self) -> String {
+        self.to_string()
+    }
+    
+    fn value_type(&self) -> u8 {
+        1 // I64
+    }
+}
+
+impl ToValue for u64 {
+    fn to_value_bytes(&self) -> Vec<u8> {
+        self.to_le_bytes().to_vec()
+    }
+    
+    fn to_string(&self) -> String {
+        self.to_string()
+    }
+    
+    fn value_type(&self) -> u8 {
+        2 // U64
+    }
+}
+
+impl ToValue for f64 {
+    fn to_value_bytes(&self) -> Vec<u8> {
+        self.to_le_bytes().to_vec()
+    }
+    
+    fn to_string(&self) -> String {
+        self.to_string()
+    }
+    
+    fn value_type(&self) -> u8 {
+        3 // F64
+    }
+}
+
+impl ToValue for &str {
+    fn to_value_bytes(&self) -> Vec<u8> {
+        self.as_bytes().to_vec()
+    }
+    
+    fn to_string(&self) -> String {
+        format!("\"{}\"", self)
+    }
+    
+    fn value_type(&self) -> u8 {
+        4 // String
+    }
+}
+
+impl ToValue for String {
+    fn to_value_bytes(&self) -> Vec<u8> {
+        self.as_bytes().to_vec()
+    }
+    
+    fn to_string(&self) -> String {
+        format!("\"{}\"", self)
+    }
+    
+    fn value_type(&self) -> u8 {
+        4 // String
+    }
+}
+
+// ============================================================================
+// Subscriber
+// ============================================================================
+
+struct Subscriber {
+    inner: u64,
+    layers: Vec<TracingLayer>,
+}
+
+impl Subscriber {
+    pub fn new() -> Result<Self, TracingError> {
+        let inner = naso_tracing_subscriber_new();
+        if inner == 0 {
+            return Err(TracingError::SubscriberCreationFailed);
+        }
+        Ok(Subscriber {
+            inner,
+            layers: Vec::new(),
+        })
+    }
+    
+    pub fn with_layer(mut self, layer: TracingLayer) -> Self {
+        self.layers.push(layer);
+        self
+    }
+    
+    pub fn register(&self) -> Result<(), TracingError> {
+        // Register layers first
+        for layer in &self.layers {
+            // Layer registration would happen here
+        }
+        
+        let result = naso_tracing_subscriber_register(self.inner);
+        if result == 0 {
+            return Err(TracingError::RegistrationFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn global(self) -> Result<(), TracingError> {
+        self.register()?;
+        // Set as global default (would use thread-local or global)
+        Ok(())
+    }
+}
+
+impl Drop for Subscriber {
+    fn drop(&mut self) {
+        naso_tracing_subscriber_free(self.inner);
+    }
+}
+
+// ============================================================================
+// Layers
+// ============================================================================
+
+struct TracingLayer {
+    inner: u64,
+    layer_type: LayerType,
+}
+
+enum LayerType {
+    Console,
+    Json,
+    Otlp,
+    Jaeger,
+    Custom,
+}
+
+impl TracingLayer {
+    pub fn console() -> Result<Self, TracingError> {
+        let inner = naso_tracing_layer_console_new();
+        if inner == 0 {
+            return Err(TracingError::LayerCreationFailed);
+        }
+        Ok(TracingLayer { inner, layer_type: LayerType::Console })
+    }
+    
+    pub fn json(output: &str) -> Result<Self, TracingError> {
+        let inner = naso_tracing_layer_json_new(output.as_ptr(), output.len());
+        if inner == 0 {
+            return Err(TracingError::LayerCreationFailed);
+        }
+        Ok(TracingLayer { inner, layer_type: LayerType::Json })
+    }
+    
+    pub fn otlp(endpoint: &str) -> Result<Self, TracingError> {
+        let inner = naso_tracing_layer_otlp_new(endpoint.as_ptr(), endpoint.len());
+        if inner == 0 {
+            return Err(TracingError::LayerCreationFailed);
+        }
+        Ok(TracingLayer { inner, layer_type: LayerType::Otlp })
+    }
+    
+    pub fn jaeger(agent_endpoint: &str) -> Result<Self, TracingError> {
+        let inner = naso_tracing_layer_jaeger_new(agent_endpoint.as_ptr(), agent_endpoint.len());
+        if inner == 0 {
+            return Err(TracingError::LayerCreationFailed);
+        }
+        Ok(TracingLayer { inner, layer_type: LayerType::Jaeger })
+    }
+}
+
+impl Drop for TracingLayer {
+    fn drop(&mut self) {
+        naso_tracing_layer_free(self.inner);
+    }
+}
+
+// ============================================================================
+// Event Recording (for structured logging)
+// ============================================================================
+
+struct Event {
+    name: String,
+    fields: Vec<(String, String)>,
+    timestamp: u64,
+    level: Level,
+    target: String,
+}
+
+impl Event {
+    pub fn new(name: &str, level: Level) -> Self {
+        Event {
+            name: name.into(),
+            fields: Vec::new(),
+            timestamp: current_timestamp(),
+            level,
+            target: "default".into(),
+        }
+    }
+    
+    pub fn field(mut self, key: &str, value: impl ToValue) -> Self {
+        self.fields.push((key.into(), value.to_string()));
+        self
+    }
+    
+    pub fn target(mut self, target: &str) -> Self {
+        self.target = target.into();
+        self
+    }
+    
+    pub fn emit(self) {
+        // Emit to current span or global logger
+        if let Some(span) = current_span() {
+            span.event(&self.name, &self.fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>()).ok();
+        } else {
+            // Global event
+            emit_global_event(&self);
+        }
+    }
+}
+
+fn current_timestamp() -> u64 {
+    // Would use system time
+    0
+}
+
+fn current_span() -> Option<Span> {
+    // Thread-local current span
+    None
+}
+
+fn emit_global_event(event: &Event) {
+    // Write to global logger
+}
+
+// ============================================================================
+// Instrumentation Macros/Functions
+// ============================================================================
+
+// #[instrument]
+// async fn my_function() { ... }
+
+fn instrument<F, Fut, T>(name: &str, f: F) -> Fut
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = T>,
+{
+    let span = Span::root(name, Level::Info);
+    let _guard = span.enter();
+    f()
+}
+
+fn instrument_with_level<F, Fut, T>(name: &str, level: Level, f: F) -> Fut
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = T>,
+{
+    let span = Span::root(name, level);
+    let _guard = span.enter();
+    f()
+}
+
+// ============================================================================
+// Field Helpers
+// ============================================================================
+
+fn field(key: &str, value: impl ToValue) -> (String, String) {
+    (key.into(), value.to_string())
+}
+
+fn fields(fields: &[(&str, impl ToValue)]) -> Vec<(String, String)> {
+    fields.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+}
+
+// ============================================================================
+// Context Propagation
+// ============================================================================
+
+struct TraceContext {
+    trace_id: [u8; 16],
+    span_id: [u8; 8],
+    trace_flags: u8,
+    trace_state: Option<String>,
+}
+
+impl TraceContext {
+    pub fn new() -> Self {
+        TraceContext {
+            trace_id: generate_trace_id(),
+            span_id: generate_span_id(),
+            trace_flags: 1, // Sampled
+            trace_state: None,
+        }
+    }
+    
+    pub fn from_headers(headers: &HttpHeaders) -> Option<Self> {
+        // Parse traceparent and tracestate headers
+        let traceparent = headers.get("traceparent")?;
+        let parts: Vec<&str> = traceparent.split('-').collect();
+        if parts.len() >= 3 {
+            let trace_id = hex_decode(parts[1])?;
+            let span_id = hex_decode(parts[2])?;
+            let trace_flags = parts[3].parse().ok()?;
+            
+            let trace_state = headers.get("tracestate").map(|s| s.into());
+            
+            let mut ctx = TraceContext {
+                trace_id: [0; 16],
+                span_id: [0; 8],
+                trace_flags,
+                trace_state,
+            };
+            ctx.trace_id.copy_from_slice(&trace_id);
+            ctx.span_id.copy_from_slice(&span_id);
+            Some(ctx)
+        } else {
+            None
+        }
+    }
+    
+    pub fn to_headers(&self) -> HttpHeaders {
+        let mut headers = HttpHeaders::new();
+        let trace_id_hex = hex_encode(&self.trace_id);
+        let span_id_hex = hex_encode(&self.span_id);
+        headers.insert("traceparent", &format!("00-{}-{}-{:02x}", trace_id_hex, span_id_hex, self.trace_flags));
+        if let Some(ref ts) = self.trace_state {
+            headers.insert("tracestate", ts);
+        }
+        headers
+    }
+    
+    pub fn child_span(&self) -> TraceContext {
+        TraceContext {
+            trace_id: self.trace_id,
+            span_id: generate_span_id(),
+            trace_flags: self.trace_flags,
+            trace_state: self.trace_state.clone(),
+        }
+    }
+}
+
+fn generate_trace_id() -> [u8; 16] {
+    let mut id = [0u8; 16];
+    naso_crypto_random_bytes(id.as_mut_ptr(), 16);
+    id
+}
+
+fn generate_span_id() -> [u8; 8] {
+    let mut id = [0u8; 8];
+    naso_crypto_random_bytes(id.as_mut_ptr(), 8);
+    id
+}
+
+fn hex_decode(hex: &str) -> Option<Vec<u8>> {
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for i in (0..hex.len()).step_by(2) {
+        let byte = u8::from_str_radix(&hex[i..i+2], 16).ok()?;
+        bytes.push(byte);
+    }
+    Some(bytes)
+}
+
+// ============================================================================
+// Sampling
+// ============================================================================
+
+trait Sampler {
+    fn should_sample(&self, trace_id: &[u8; 16], parent: Option<&TraceContext>, name: &str) -> SamplingDecision;
+}
+
+struct SamplingDecision {
+    sample: bool,
+    record: bool,
+}
+
+struct AlwaysSample;
+
+impl Sampler for AlwaysSample {
+    fn should_sample(&self, _trace_id: &[u8; 16], _parent: Option<&TraceContext>, _name: &str) -> SamplingDecision {
+        SamplingDecision { sample: true, record: true }
+    }
+}
+
+struct NeverSample;
+
+impl Sampler for NeverSample {
+    fn should_sample(&self, _trace_id: &[u8; 16], _parent: Option<&TraceContext>, _name: &str) -> SamplingDecision {
+        SamplingDecision { sample: false, record: false }
+    }
+}
+
+struct ParentBasedSampler {
+    root: Box<dyn Sampler>,
+}
+
+impl ParentBasedSampler {
+    pub fn new(root: Box<dyn Sampler>) -> Self {
+        ParentBasedSampler { root }
+    }
+}
+
+impl Sampler for ParentBasedSampler {
+    fn should_sample(&self, trace_id: &[u8; 16], parent: Option<&TraceContext>, _name: &str) -> SamplingDecision {
+        if let Some(parent) = parent {
+            if parent.trace_flags & 1 != 0 {
+                // Parent was sampled
+                return SamplingDecision { sample: true, record: true };
+            }
+        }
+        self.root.should_sample(trace_id, parent, _name)
+    }
+}
+
+struct TraceIdRatioSampler {
+    ratio: f64,
+}
+
+impl TraceIdRatioSampler {
+    pub fn new(ratio: f64) -> Self {
+        TraceIdRatioSampler { ratio }
+    }
+}
+
+impl Sampler for TraceIdRatioSampler {
+    fn should_sample(&self, trace_id: &[u8; 16], _parent: Option<&TraceContext>, _name: &str) -> SamplingDecision {
+        // Use first 8 bytes of trace_id as hash
+        let hash = u64::from_le_bytes([
+            trace_id[0], trace_id[1], trace_id[2], trace_id[3],
+            trace_id[4], trace_id[5], trace_id[6], trace_id[7],
+        ]);
+        let normalized = (hash as f64) / (u64::MAX as f64);
+        SamplingDecision { sample: normalized < self.ratio, record: normalized < self.ratio }
+    }
+}
+
+// ============================================================================
+// Resource and Attributes
+// ============================================================================
+
+struct Resource {
+    attributes: HashMap<String, String>,
+}
+
+impl Resource {
+    pub fn new() -> Self {
+        Resource {
+            attributes: HashMap::new(),
+        }
+    }
+    
+    pub fn service_name(mut self, name: &str) -> Self {
+        self.attributes.insert("service.name".into(), name.into());
+        self
+    }
+    
+    pub fn service_version(mut self, version: &str) -> Self {
+        self.attributes.insert("service.version".into(), version.into());
+        self
+    }
+    
+    pub fn service_instance_id(mut self, id: &str) -> Self {
+        self.attributes.insert("service.instance.id".into(), id.into());
+        self
+    }
+    
+    pub fn deployment_environment(mut self, env: &str) -> Self {
+        self.attributes.insert("deployment.environment".into(), env.into());
+        self
+    }
+    
+    pub fn attribute(mut self, key: &str, value: &str) -> Self {
+        self.attributes.insert(key.into(), value.into());
+        self
+    }
+    
+    pub fn build(self) -> Resource {
+        self
+    }
+}
+
+// ============================================================================
+// Error Types
+// ============================================================================
+
+enum TracingError {
+    SubscriberCreationFailed,
+    LayerCreationFailed,
+    RegistrationFailed,
+    SpanCreationFailed,
+    RecordFailed,
+    EventFailed,
+    StatusFailed,
+    InvalidContext,
+    InvalidTraceId,
+    InvalidSpanId,
+    SamplingError,
+    ExporterError(String),
+    IoError(IoError),
+}
+
+impl TracingError {
+    pub fn to_string(&self) -> String {
+        match self {
+            TracingError::SubscriberCreationFailed => "Failed to create subscriber".into(),
+            TracingError::LayerCreationFailed => "Failed to create layer".into(),
+            TracingError::RegistrationFailed => "Failed to register subscriber".into(),
+            TracingError::SpanCreationFailed => "Failed to create span".into(),
+            TracingError::RecordFailed => "Failed to record field".into(),
+            TracingError::EventFailed => "Failed to emit event".into(),
+            TracingError::StatusFailed => "Failed to set span status".into(),
+            TracingError::InvalidContext => "Invalid trace context".into(),
+            TracingError::InvalidTraceId => "Invalid trace ID".into(),
+            TracingError::InvalidSpanId => "Invalid span ID".into(),
+            TracingError::SamplingError => "Sampling error".into(),
+            TracingError::ExporterError(msg) => format!("Exporter error: {}", msg),
+            TracingError::IoError(e) => format!("I/O error: {}", e.to_string()),
+        }
+    }
+}
+
+// ============================================================================
+// Logging Integration (tracing-log)
+// ============================================================================
+
+enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl From<Level> for LogLevel {
+    fn from(level: Level) -> Self {
+        match level {
+            Level::Trace => LogLevel::Trace,
+            Level::Debug => LogLevel::Debug,
+            Level::Info => LogLevel::Info,
+            Level::Warn => LogLevel::Warn,
+            Level::Error => LogLevel::Error,
+        }
+    }
+}
+
+struct LogRecord {
+    level: LogLevel,
+    target: String,
+    message: String,
+    fields: Vec<(String, String)>,
+    timestamp: u64,
+    span_context: Option<TraceContext>,
+}
+
+impl LogRecord {
+    pub fn new(level: Level, target: &str, message: &str) -> Self {
+        LogRecord {
+            level: level.into(),
+            target: target.into(),
+            message: message.into(),
+            fields: Vec::new(),
+            timestamp: current_timestamp(),
+            span_context: current_span().map(|s| s.context()),
+        }
+    }
+    
+    pub fn field(mut self, key: &str, value: impl ToValue) -> Self {
+        self.fields.push((key.into(), value.to_string()));
+        self
+    }
+    
+    pub fn emit(self) {
+        // Emit via tracing subscriber
+        if let Some(span) = current_span() {
+            span.event(&self.message, &self.fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>()).ok();
+        }
+    }
+}
+
+// Convenience logging macros
+fn trace(target: &str, message: &str) -> LogRecord {
+    LogRecord::new(Level::Trace, target, message)
+}
+
+fn debug(target: &str, message: &str) -> LogRecord {
+    LogRecord::new(Level::Debug, target, message)
+}
+
+fn info(target: &str, message: &str) -> LogRecord {
+    LogRecord::new(Level::Info, target, message)
+}
+
+fn warn(target: &str, message: &str) -> LogRecord {
+    LogRecord::new(Level::Warn, target, message)
+}
+
+fn error(target: &str, message: &str) -> LogRecord {
+    LogRecord::new(Level::Error, target, message)
+}
+
+// ============================================================================
+// OpenTelemetry Integration
+// ============================================================================
+
+struct OtelExporter {
+    endpoint: String,
+    headers: HttpHeaders,
+    protocol: OtelProtocol,
+}
+
+enum OtelProtocol {
+    Grpc,
+    HttpProtobuf,
+    HttpJson,
+}
+
+impl OtelExporter {
+    pub fn new(endpoint: &str) -> Self {
+        OtelExporter {
+            endpoint: endpoint.into(),
+            headers: HttpHeaders::new(),
+            protocol: OtelProtocol::Grpc,
+        }
+    }
+    
+    pub fn with_headers(mut self, headers: HttpHeaders) -> Self {
+        self.headers = headers;
+        self
+    }
+    
+    pub fn with_protocol(mut self, protocol: OtelProtocol) -> Self {
+        self.protocol = protocol;
+        self
+    }
+    
+    pub fn build_layer(self) -> Result<TracingLayer, TracingError> {
+        TracingLayer::otlp(&self.endpoint)
+    }
+}
+
+// ============================================================================
+// Jaeger Integration
+// ============================================================================
+
+struct JaegerExporter {
+    agent_endpoint: String,
+    service_name: String,
+    tags: HashMap<String, String>,
+}
+
+impl JaegerExporter {
+    pub fn new(agent_endpoint: &str, service_name: &str) -> Self {
+        JaegerExporter {
+            agent_endpoint: agent_endpoint.into(),
+            service_name: service_name.into(),
+            tags: HashMap::new(),
+        }
+    }
+    
+    pub fn tag(mut self, key: &str, value: &str) -> Self {
+        self.tags.insert(key.into(), value.into());
+        self
+    }
+    
+    pub fn build_layer(self) -> Result<TracingLayer, TracingError> {
+        TracingLayer::jaeger(&self.agent_endpoint)
+    }
+}

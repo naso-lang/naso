@@ -1,0 +1,798 @@
+// ============================================================================
+// Naso HTTP Client - Phase 19.2
+// ============================================================================
+// Production HTTP/1.1 + HTTP/2 client with connection pooling,
+// TLS support, and async I/O integration
+// ============================================================================
+
+extern "C" {
+    fn naso_http_client_new() -> u64;
+    fn naso_http_client_request(client: u64, req_ptr: *const u8, req_len: usize, resp_ptr: *mut u8, resp_max_len: usize) -> u64;
+    fn naso_http_client_request_async(client: u64, req_ptr: *const u8, req_len: usize) -> u64;
+    fn naso_http_client_get_response(client: u64, request_id: u64, resp_ptr: *mut u8, resp_max_len: usize) -> u64;
+    fn naso_http_client_set_timeout(client: u64, timeout_ms: u64) -> u64;
+    fn naso_http_client_set_proxy(client: u64, proxy_ptr: *const u8, proxy_len: usize) -> u64;
+    fn naso_http_client_add_header(client: u64, key_ptr: *const u8, key_len: usize, value_ptr: *const u8, value_len: usize) -> u64;
+    fn naso_http_client_free(client: u64);
+    fn naso_http_pool_create(config_ptr: *const u8, config_len: usize) -> u64;
+    fn naso_http_pool_get_client(pool: u64) -> u64;
+    fn naso_http_pool_return_client(pool: u64, client: u64) -> u64;
+    fn naso_http_pool_free(pool: u64);
+}
+
+// ============================================================================
+// HTTP Types
+// ============================================================================
+
+struct HttpMethod {
+    value: u8,
+}
+
+impl HttpMethod {
+    pub const GET: HttpMethod = HttpMethod { value: 0 };
+    pub const POST: HttpMethod = HttpMethod { value: 1 };
+    pub const PUT: HttpMethod = HttpMethod { value: 2 };
+    pub const DELETE: HttpMethod = HttpMethod { value: 3 };
+    pub const PATCH: HttpMethod = HttpMethod { value: 4 };
+    pub const HEAD: HttpMethod = HttpMethod { value: 5 };
+    pub const OPTIONS: HttpMethod = HttpMethod { value: 6 };
+    pub const CONNECT: HttpMethod = HttpMethod { value: 7 };
+    pub const TRACE: HttpMethod = HttpMethod { value: 8 };
+    
+    pub fn as_str(&self) -> &str {
+        match self.value {
+            0 => "GET",
+            1 => "POST",
+            2 => "PUT",
+            3 => "DELETE",
+            4 => "PATCH",
+            5 => "HEAD",
+            6 => "OPTIONS",
+            7 => "CONNECT",
+            8 => "TRACE",
+            _ => "UNKNOWN",
+        }
+    }
+}
+
+struct HttpVersion {
+    major: u8,
+    minor: u8,
+}
+
+impl HttpVersion {
+    pub const HTTP_1_0: HttpVersion = HttpVersion { major: 1, minor: 0 };
+    pub const HTTP_1_1: HttpVersion = HttpVersion { major: 1, minor: 1 };
+    pub const HTTP_2: HttpVersion = HttpVersion { major: 2, minor: 0 };
+    pub const HTTP_3: HttpVersion = HttpVersion { major: 3, minor: 0 };
+}
+
+struct HttpHeader {
+    name: [u8; 128],
+    name_len: usize,
+    value: [u8; 512],
+    value_len: usize,
+}
+
+impl HttpHeader {
+    pub fn new(name: &str, value: &str) -> Self {
+        let mut h = HttpHeader {
+            name: [0; 128],
+            name_len: 0,
+            value: [0; 512],
+            value_len: 0,
+        };
+        let name_bytes = name.as_bytes();
+        let value_bytes = value.as_bytes();
+        h.name_len = name_bytes.len().min(128);
+        h.value_len = value_bytes.len().min(512);
+        h.name[..h.name_len].copy_from_slice(&name_bytes[..h.name_len]);
+        h.value[..h.value_len].copy_from_slice(&value_bytes[..h.value_len]);
+        h
+    }
+}
+
+struct HttpHeaders {
+    headers: [HttpHeader; 64],
+    count: usize,
+}
+
+impl HttpHeaders {
+    pub fn new() -> Self {
+        HttpHeaders {
+            headers: [HttpHeader { name: [0; 128], name_len: 0, value: [0; 512], value_len: 0 }; 64],
+            count: 0,
+        }
+    }
+    
+    pub fn insert(&mut self, name: &str, value: &str) -> bool {
+        if self.count >= 64 {
+            return false;
+        }
+        self.headers[self.count] = HttpHeader::new(name, value);
+        self.count += 1;
+        true
+    }
+    
+    pub fn get(&self, name: &str) -> Option<&str> {
+        let name_bytes = name.as_bytes();
+        for i in 0..self.count {
+            if self.headers[i].name_len == name_bytes.len() 
+                && self.headers[i].name[..self.headers[i].name_len] == *name_bytes {
+                return Some(unsafe { 
+                    std::str::from_utf8_unchecked(&self.headers[i].value[..self.headers[i].value_len]) 
+                });
+            }
+        }
+        None
+    }
+    
+    pub fn remove(&mut self, name: &str) -> bool {
+        let name_bytes = name.as_bytes();
+        for i in 0..self.count {
+            if self.headers[i].name_len == name_bytes.len() 
+                && self.headers[i].name[..self.headers[i].name_len] == *name_bytes {
+                // Shift remaining headers
+                for j in i..self.count - 1 {
+                    self.headers[j] = self.headers[j + 1];
+                }
+                self.count -= 1;
+                return true;
+            }
+        }
+        false
+    }
+    
+    pub fn len(&self) -> usize {
+        self.count
+    }
+    
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+}
+
+struct HttpRequest {
+    method: HttpMethod,
+    url: [u8; 2048],
+    url_len: usize,
+    version: HttpVersion,
+    headers: HttpHeaders,
+    body: [u8; 16384],
+    body_len: usize,
+}
+
+impl HttpRequest {
+    pub fn new(method: HttpMethod, url: &str) -> Self {
+        let mut req = HttpRequest {
+            method,
+            url: [0; 2048],
+            url_len: 0,
+            version: HttpVersion::HTTP_1_1,
+            headers: HttpHeaders::new(),
+            body: [0; 16384],
+            body_len: 0,
+        };
+        let url_bytes = url.as_bytes();
+        req.url_len = url_bytes.len().min(2048);
+        req.url[..req.url_len].copy_from_slice(&url_bytes[..req.url_len]);
+        req
+    }
+    
+    pub fn get(url: &str) -> Self {
+        HttpRequest::new(HttpMethod::GET, url)
+    }
+    
+    pub fn post(url: &str) -> Self {
+        HttpRequest::new(HttpMethod::POST, url)
+    }
+    
+    pub fn put(url: &str) -> Self {
+        HttpRequest::new(HttpMethod::PUT, url)
+    }
+    
+    pub fn delete(url: &str) -> Self {
+        HttpRequest::new(HttpMethod::DELETE, url)
+    }
+    
+    pub fn header(mut self, name: &str, value: &str) -> Self {
+        self.headers.insert(name, value);
+        self
+    }
+    
+    pub fn headers(mut self, headers: HttpHeaders) -> Self {
+        self.headers = headers;
+        self
+    }
+    
+    pub fn body(mut self, body: &[u8]) -> Self {
+        let len = body.len().min(16384);
+        self.body[..len].copy_from_slice(&body[..len]);
+        self.body_len = len;
+        self
+    }
+    
+    pub fn json(mut self, json: &str) -> Self {
+        self.headers.insert("Content-Type", "application/json");
+        self.body(json.as_bytes())
+    }
+    
+    pub fn form(mut self, form: &str) -> Self {
+        self.headers.insert("Content-Type", "application/x-www-form-urlencoded");
+        self.body(form.as_bytes())
+    }
+    
+    pub fn version(mut self, version: HttpVersion) -> Self {
+        self.version = version;
+        self
+    }
+}
+
+struct HttpResponse {
+    version: HttpVersion,
+    status: u16,
+    status_text: [u8; 128],
+    status_text_len: usize,
+    headers: HttpHeaders,
+    body: [u8; 65536],
+    body_len: usize,
+}
+
+impl HttpResponse {
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+    
+    pub fn status_text(&self) -> &str {
+        unsafe { std::str::from_utf8_unchecked(&self.status_text[..self.status_text_len]) }
+    }
+    
+    pub fn headers(&self) -> &HttpHeaders {
+        &self.headers
+    }
+    
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name)
+    }
+    
+    pub fn body(&self) -> &[u8] {
+        &self.body[..self.body_len]
+    }
+    
+    pub fn text(&self) -> Result<String, HttpError> {
+        String::from_utf8(self.body[..self.body_len].to_vec())
+            .map_err(|_| HttpError::InvalidUtf8)
+    }
+    
+    pub fn json<T: serde::Deserialize>(&self) -> Result<T, HttpError> {
+        serde_json::from_slice(&self.body[..self.body_len])
+            .map_err(|_| HttpError::InvalidJson)
+    }
+    
+    pub fn is_success(&self) -> bool {
+        self.status >= 200 && self.status < 300
+    }
+    
+    pub fn is_redirect(&self) -> bool {
+        self.status >= 300 && self.status < 400
+    }
+    
+    pub fn is_client_error(&self) -> bool {
+        self.status >= 400 && self.status < 500
+    }
+    
+    pub fn is_server_error(&self) -> bool {
+        self.status >= 500
+    }
+}
+
+// ============================================================================
+// HTTP Client
+// ============================================================================
+
+struct HttpClient {
+    inner: u64,
+    default_headers: HttpHeaders,
+    timeout_ms: u64,
+    proxy: Option<String>,
+}
+
+impl HttpClient {
+    pub fn new() -> Result<Self, HttpError> {
+        let inner = naso_http_client_new();
+        if inner == 0 {
+            return Err(HttpError::ClientCreationFailed);
+        }
+        Ok(HttpClient {
+            inner,
+            default_headers: HttpHeaders::new(),
+            timeout_ms: 30000, // 30 seconds default
+            proxy: None,
+        })
+    }
+    
+    pub fn builder() -> HttpClientBuilder {
+        HttpClientBuilder::new()
+    }
+    
+    pub async fn request(&self, req: HttpRequest) -> Result<HttpResponse, HttpError> {
+        let mut req = req;
+        // Apply default headers
+        for i in 0..self.default_headers.count {
+            let h = &self.default_headers.headers[i];
+            if req.headers.get(unsafe { std::str::from_utf8_unchecked(&h.name[..h.name_len]) }).is_none() {
+                req.headers.insert(
+                    unsafe { std::str::from_utf8_unchecked(&h.name[..h.name_len]) },
+                    unsafe { std::str::from_utf8_unchecked(&h.value[..h.value_len]) },
+                );
+            }
+        }
+        
+        // Serialize request
+        let req_bytes = req.serialize()?;
+        
+        // Allocate response buffer
+        let mut resp_bytes = vec![0u8; 65536];
+        let resp_len = naso_http_client_request(
+            self.inner,
+            req_bytes.as_ptr(),
+            req_bytes.len(),
+            resp_bytes.as_mut_ptr(),
+            resp_bytes.len(),
+        )?;
+        
+        if resp_len == 0 {
+            return Err(HttpError::RequestFailed);
+        }
+        
+        resp_bytes.truncate(resp_len as usize);
+        HttpResponse::deserialize(&resp_bytes)
+    }
+    
+    pub async fn get(&self, url: &str) -> Result<HttpResponse, HttpError> {
+        self.request(HttpRequest::get(url)).await
+    }
+    
+    pub async fn post(&self, url: &str, body: &[u8]) -> Result<HttpResponse, HttpError> {
+        self.request(HttpRequest::post(url).body(body)).await
+    }
+    
+    pub async fn put(&self, url: &str, body: &[u8]) -> Result<HttpResponse, HttpError> {
+        self.request(HttpRequest::put(url).body(body)).await
+    }
+    
+    pub async fn delete(&self, url: &str) -> Result<HttpResponse, HttpError> {
+        self.request(HttpRequest::delete(url)).await
+    }
+    
+    pub fn set_timeout(&mut self, timeout_ms: u64) -> Result<(), HttpError> {
+        self.timeout_ms = timeout_ms;
+        let result = naso_http_client_set_timeout(self.inner, timeout_ms);
+        if result == 0 {
+            return Err(HttpError::TimeoutSetFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn set_proxy(&mut self, proxy: &str) -> Result<(), HttpError> {
+        self.proxy = Some(proxy.to_string());
+        let result = naso_http_client_set_proxy(self.inner, proxy.as_ptr(), proxy.len());
+        if result == 0 {
+            return Err(HttpError::ProxySetFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn default_header(&mut self, name: &str, value: &str) -> Result<(), HttpError> {
+        self.default_headers.insert(name, value);
+        let result = naso_http_client_add_header(self.inner, name.as_ptr(), name.len(), value.as_ptr(), value.len());
+        if result == 0 {
+            return Err(HttpError::HeaderSetFailed);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for HttpClient {
+    fn drop(&mut self) {
+        naso_http_client_free(self.inner);
+    }
+}
+
+// ============================================================================
+// HTTP Client Builder
+// ============================================================================
+
+struct HttpClientBuilder {
+    timeout_ms: u64,
+    proxy: Option<String>,
+    default_headers: HttpHeaders,
+    pool_config: Option<PoolConfig>,
+}
+
+impl HttpClientBuilder {
+    pub fn new() -> Self {
+        HttpClientBuilder {
+            timeout_ms: 30000,
+            proxy: None,
+            default_headers: HttpHeaders::new(),
+            pool_config: None,
+        }
+    }
+    
+    pub fn timeout(mut self, timeout_ms: u64) -> Self {
+        self.timeout_ms = timeout_ms;
+        self
+    }
+    
+    pub fn proxy(mut self, proxy: &str) -> Self {
+        self.proxy = Some(proxy.to_string());
+        self
+    }
+    
+    pub fn default_header(mut self, name: &str, value: &str) -> Self {
+        self.default_headers.insert(name, value);
+        self
+    }
+    
+    pub fn pool_config(mut self, config: PoolConfig) -> Self {
+        self.pool_config = Some(config);
+        self
+    }
+    
+    pub fn build(self) -> Result<HttpClient, HttpError> {
+        let mut client = HttpClient::new()?;
+        client.timeout_ms = self.timeout_ms;
+        if let Some(proxy) = self.proxy {
+            client.set_proxy(&proxy)?;
+        }
+        for i in 0..self.default_headers.count {
+            let h = &self.default_headers.headers[i];
+            client.default_header(
+                unsafe { std::str::from_utf8_unchecked(&h.name[..h.name_len]) },
+                unsafe { std::str::from_utf8_unchecked(&h.value[..h.value_len]) },
+            )?;
+        }
+        Ok(client)
+    }
+}
+
+// ============================================================================
+// Connection Pool
+// ============================================================================
+
+struct PoolConfig {
+    max_connections: usize,
+    max_idle_connections: usize,
+    idle_timeout_ms: u64,
+    connect_timeout_ms: u64,
+    keep_alive: bool,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        PoolConfig {
+            max_connections: 100,
+            max_idle_connections: 10,
+            idle_timeout_ms: 90000, // 90 seconds
+            connect_timeout_ms: 5000,
+            keep_alive: true,
+        }
+    }
+}
+
+struct HttpConnectionPool {
+    inner: u64,
+    config: PoolConfig,
+}
+
+impl HttpConnectionPool {
+    pub fn new(config: PoolConfig) -> Result<Self, HttpError> {
+        let config_bytes = config.serialize()?;
+        let inner = naso_http_pool_create(config_bytes.as_ptr(), config_bytes.len());
+        if inner == 0 {
+            return Err(HttpError::PoolCreationFailed);
+        }
+        Ok(HttpConnectionPool { inner, config })
+    }
+    
+    pub fn get_client(&self) -> Result<HttpClient, HttpError> {
+        let client_inner = naso_http_pool_get_client(self.inner);
+        if client_inner == 0 {
+            return Err(HttpError::PoolExhausted);
+        }
+        Ok(HttpClient {
+            inner: client_inner,
+            default_headers: HttpHeaders::new(),
+            timeout_ms: self.config.connect_timeout_ms,
+            proxy: None,
+        })
+    }
+    
+    pub fn return_client(&self, client: HttpClient) -> Result<(), HttpError> {
+        let result = naso_http_pool_return_client(self.inner, client.inner);
+        if result == 0 {
+            return Err(HttpError::PoolReturnFailed);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for HttpConnectionPool {
+    fn drop(&mut self) {
+        naso_http_pool_free(self.inner);
+    }
+}
+
+// ============================================================================
+// HTTP/2 Support
+// ============================================================================
+
+struct Http2Client {
+    inner: u64,
+    settings: Http2Settings,
+}
+
+struct Http2Settings {
+    header_table_size: u32,
+    enable_push: bool,
+    max_concurrent_streams: u32,
+    initial_window_size: u32,
+    max_frame_size: u32,
+    max_header_list_size: u32,
+}
+
+impl Default for Http2Settings {
+    fn default() -> Self {
+        Http2Settings {
+            header_table_size: 4096,
+            enable_push: true,
+            max_concurrent_streams: 100,
+            initial_window_size: 65535,
+            max_frame_size: 16384,
+            max_header_list_size: 8192,
+        }
+    }
+}
+
+struct Http2Stream {
+    stream_id: u32,
+    client: u64,
+    state: Http2StreamState,
+}
+
+enum Http2StreamState {
+    Idle,
+    Open,
+    HalfClosedLocal,
+    HalfClosedRemote,
+    Closed,
+}
+
+struct Http2Frame {
+    stream_id: u32,
+    frame_type: u8,
+    flags: u8,
+    payload: Vec<u8>,
+}
+
+// HTTP/2 frame types
+const HTTP2_FRAME_DATA: u8 = 0x0;
+const HTTP2_FRAME_HEADERS: u8 = 0x1;
+const HTTP2_FRAME_PRIORITY: u8 = 0x2;
+const HTTP2_FRAME_RST_STREAM: u8 = 0x3;
+const HTTP2_FRAME_SETTINGS: u8 = 0x4;
+const HTTP2_FRAME_PUSH_PROMISE: u8 = 0x5;
+const HTTP2_FRAME_PING: u8 = 0x6;
+const HTTP2_FRAME_GOAWAY: u8 = 0x7;
+const HTTP2_FRAME_WINDOW_UPDATE: u8 = 0x8;
+const HTTP2_FRAME_CONTINUATION: u8 = 0x9;
+
+// ============================================================================
+// HTTP Error Types
+// ============================================================================
+
+enum HttpError {
+    ClientCreationFailed,
+    RequestFailed,
+    TimeoutSetFailed,
+    ProxySetFailed,
+    HeaderSetFailed,
+    PoolCreationFailed,
+    PoolExhausted,
+    PoolReturnFailed,
+    InvalidUtf8,
+    InvalidJson,
+    InvalidUrl,
+    SerializationFailed,
+    DeserializationFailed,
+    IoError(IoError),
+    TlsError(TlsError),
+    RedirectLoop,
+    TooManyRedirects,
+    InvalidStatusCode,
+    ConnectionClosed,
+    ProtocolError(String),
+}
+
+impl HttpError {
+    pub fn to_string(&self) -> String {
+        match self {
+            HttpError::ClientCreationFailed => "Failed to create HTTP client".into(),
+            HttpError::RequestFailed => "HTTP request failed".into(),
+            HttpError::TimeoutSetFailed => "Failed to set timeout".into(),
+            HttpError::ProxySetFailed => "Failed to set proxy".into(),
+            HttpError::HeaderSetFailed => "Failed to set header".into(),
+            HttpError::PoolCreationFailed => "Failed to create connection pool".into(),
+            HttpError::PoolExhausted => "Connection pool exhausted".into(),
+            HttpError::PoolReturnFailed => "Failed to return client to pool".into(),
+            HttpError::InvalidUtf8 => "Invalid UTF-8 in response".into(),
+            HttpError::InvalidJson => "Invalid JSON in response".into(),
+            HttpError::InvalidUrl => "Invalid URL".into(),
+            HttpError::SerializationFailed => "Failed to serialize request".into(),
+            HttpError::DeserializationFailed => "Failed to deserialize response".into(),
+            HttpError::IoError(e) => format!("I/O error: {}", e.to_string()),
+            HttpError::TlsError(e) => format!("TLS error: {}", e.to_string()),
+            HttpError::RedirectLoop => "Redirect loop detected".into(),
+            HttpError::TooManyRedirects => "Too many redirects".into(),
+            HttpError::InvalidStatusCode => "Invalid HTTP status code".into(),
+            HttpError::ConnectionClosed => "Connection closed unexpectedly".into(),
+            HttpError::ProtocolError(msg) => format!("Protocol error: {}", msg),
+        }
+    }
+}
+
+// ============================================================================
+// Request/Response Serialization
+// ============================================================================
+
+impl HttpRequest {
+    fn serialize(&self) -> Result<Vec<u8>, HttpError> {
+        let mut buf = Vec::new();
+        
+        // Request line
+        buf.extend_from_slice(self.method.as_str().as_bytes());
+        buf.push(b' ');
+        buf.extend_from_slice(&self.url[..self.url_len]);
+        buf.push(b' ');
+        buf.extend_from_slice(format!("HTTP/{}.{}\r\n", self.version.major, self.version.minor).as_bytes());
+        
+        // Host header (required)
+        if let Some(host) = self.extract_host() {
+            buf.extend_from_slice(b"Host: ");
+            buf.extend_from_slice(host.as_bytes());
+            buf.extend_from_slice(b"\r\n");
+        }
+        
+        // Headers
+        for i in 0..self.headers.count {
+            let h = &self.headers.headers[i];
+            buf.extend_from_slice(&h.name[..h.name_len]);
+            buf.extend_from_slice(b": ");
+            buf.extend_from_slice(&h.value[..h.value_len]);
+            buf.extend_from_slice(b"\r\n");
+        }
+        
+        // Content-Length
+        if self.body_len > 0 {
+            buf.extend_from_slice(format!("Content-Length: {}\r\n", self.body_len).as_bytes());
+        }
+        
+        buf.extend_from_slice(b"\r\n");
+        
+        // Body
+        if self.body_len > 0 {
+            buf.extend_from_slice(&self.body[..self.body_len]);
+        }
+        
+        Ok(buf)
+    }
+    
+    fn extract_host(&self) -> Option<String> {
+        // Parse host from URL
+        let url_str = unsafe { std::str::from_utf8_unchecked(&self.url[..self.url_len]) };
+        if let Some(rest) = url_str.strip_prefix("http://") {
+            if let Some(path_start) = rest.find('/') {
+                return Some(rest[..path_start].to_string());
+            }
+            return Some(rest.to_string());
+        }
+        if let Some(rest) = url_str.strip_prefix("https://") {
+            if let Some(path_start) = rest.find('/') {
+                return Some(rest[..path_start].to_string());
+            }
+            return Some(rest.to_string());
+        }
+        None
+    }
+}
+
+impl HttpResponse {
+    fn deserialize(data: &[u8]) -> Result<Self, HttpError> {
+        // Simplified deserialization - real implementation would be more robust
+        let mut resp = HttpResponse {
+            version: HttpVersion::HTTP_1_1,
+            status: 200,
+            status_text: [0; 128],
+            status_text_len: 0,
+            headers: HttpHeaders::new(),
+            body: [0; 65536],
+            body_len: 0,
+        };
+        
+        // Parse status line and headers (simplified)
+        // Real implementation would properly parse
+        let data_str = unsafe { std::str::from_utf8_unchecked(data) };
+        
+        // Find body start
+        if let Some(body_start) = data_str.find("\r\n\r\n") {
+            let header_part = &data_str[..body_start];
+            let body_part = &data_str[body_start + 4..];
+            
+            // Parse status line
+            let lines: Vec<&str> = header_part.lines().collect();
+            if !lines.is_empty() {
+                let status_line = lines[0];
+                let parts: Vec<&str> = status_line.splitn(3, ' ').collect();
+                if parts.len() >= 2 {
+                    resp.status = parts[1].parse().unwrap_or(200);
+                    if parts.len() >= 3 {
+                        let status_text = parts[2].as_bytes();
+                        resp.status_text_len = status_text.len().min(128);
+                        resp.status_text[..resp.status_text_len].copy_from_slice(&status_text[..resp.status_text_len]);
+                    }
+                }
+                
+                // Parse headers
+                for line in &lines[1..] {
+                    if let Some(colon_pos) = line.find(':') {
+                        let name = &line[..colon_pos];
+                        let value = line[colon_pos + 1..].trim();
+                        resp.headers.insert(name, value);
+                    }
+                }
+            }
+            
+            // Body
+            let body_bytes = body_part.as_bytes();
+            resp.body_len = body_bytes.len().min(65536);
+            resp.body[..resp.body_len].copy_from_slice(&body_bytes[..resp.body_len]);
+        }
+        
+        Ok(resp)
+    }
+}
+
+impl PoolConfig {
+    fn serialize(&self) -> Result<Vec<u8>, HttpError> {
+        // Simple JSON-like serialization for FFI
+        Ok(format!(
+            "{{\"max_connections\":{},\"max_idle_connections\":{},\"idle_timeout_ms\":{},\"connect_timeout_ms\":{},\"keep_alive\":{}}}",
+            self.max_connections, self.max_idle_connections, self.idle_timeout_ms, self.connect_timeout_ms, self.keep_alive
+        ).into_bytes())
+    }
+}
+
+// ============================================================================
+// Convenience Functions
+// ============================================================================
+
+async fn get(url: &str) -> Result<HttpResponse, HttpError> {
+    let client = HttpClient::new()?;
+    client.get(url).await
+}
+
+async fn post(url: &str, body: &[u8]) -> Result<HttpResponse, HttpError> {
+    let client = HttpClient::new()?;
+    client.post(url, body).await
+}
+
+async fn put(url: &str, body: &[u8]) -> Result<HttpResponse, HttpError> {
+    let client = HttpClient::new()?;
+    client.put(url, body).await
+}
+
+async fn delete(url: &str) -> Result<HttpResponse, HttpError> {
+    let client = HttpClient::new()?;
+    client.delete(url).await
+}

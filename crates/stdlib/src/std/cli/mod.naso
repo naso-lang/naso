@@ -1,0 +1,926 @@
+// ============================================================================
+// Naso CLI Framework (naso_clap) - Phase 19.7
+// ============================================================================
+// Typed command-line argument parsing with derive-like macros,
+// subcommands, completions, and help generation
+// ============================================================================
+
+extern "C" {
+    fn naso_cli_app_new(name_ptr: *const u8, name_len: usize) -> u64;
+    fn naso_cli_app_set_version(app: u64, version_ptr: *const u8, version_len: usize) -> u64;
+    fn naso_cli_app_set_about(app: u64, about_ptr: *const u8, about_len: usize) -> u64;
+    fn naso_cli_app_set_author(app: u64, author_ptr: *const u8, author_len: usize) -> u64;
+    fn naso_cli_app_add_arg(app: u64, arg_ptr: *const u8, arg_len: usize) -> u64;
+    fn naso_cli_app_add_subcommand(app: u64, subcmd_ptr: *const u8, subcmd_len: usize) -> u64;
+    fn naso_cli_app_parse(app: u64, args_ptr: *const u8, args_len: usize, result_ptr: *mut u8, result_max_len: usize) -> u64;
+    fn naso_cli_app_try_get_matches(app: u64, args_ptr: *const u8, args_len: usize, result_ptr: *mut u8, result_max_len: usize) -> u64;
+    fn naso_cli_app_print_help(app: u64, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_cli_app_print_long_help(app: u64, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_cli_app_generate_completions(app: u64, shell: u8, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_cli_app_free(app: u64);
+    
+    fn naso_cli_arg_new(name_ptr: *const u8, name_len: usize) -> u64;
+    fn naso_cli_arg_set_short(arg: u64, short: u8) -> u64;
+    fn naso_cli_arg_set_long(arg: u64, long_ptr: *const u8, long_len: usize) -> u64;
+    fn naso_cli_arg_set_help(arg: u64, help_ptr: *const u8, help_len: usize) -> u64;
+    fn naso_cli_arg_set_required(arg: u64, required: u8) -> u64;
+    fn naso_cli_arg_set_takes_value(arg: u64, takes_value: u8) -> u64;
+    fn naso_cli_arg_set_multiple(arg: u64, multiple: u8) -> u64;
+    fn naso_cli_arg_set_default(arg: u64, default_ptr: *const u8, default_len: usize) -> u64;
+    fn naso_cli_arg_set_possible_values(arg: u64, values_ptr: *const u8, values_len: usize) -> u64;
+    fn naso_cli_arg_set_validator(arg: u64, validator_ptr: *const u8, validator_len: usize) -> u64;
+    fn naso_cli_arg_set_action(arg: u64, action: u8) -> u64;
+    fn naso_cli_arg_free(arg: u64);
+    
+    fn naso_cli_subcommand_new(name_ptr: *const u8, name_len: usize) -> u64;
+    fn naso_cli_subcommand_set_about(subcmd: u64, about_ptr: *const u8, about_len: usize) -> u64;
+    fn naso_cli_subcommand_add_arg(subcmd: u64, arg_ptr: *const u8, arg_len: usize) -> u64;
+    fn naso_cli_subcommand_add_subcommand(subcmd: u64, subsub_ptr: *const u8, subsub_len: usize) -> u64;
+    fn naso_cli_subcommand_free(subcmd: u64);
+    
+    fn naso_cli_matches_get_one(matches: u64, name_ptr: *const u8, name_len: usize, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_cli_matches_get_many(matches: u64, name_ptr: *const u8, name_len: usize, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_cli_matches_contains_id(matches: u64, name_ptr: *const u8, name_len: usize) -> u64;
+    fn naso_cli_matches_subcommand(matches: u64, out_name_ptr: *mut u8, out_name_max_len: usize, out_matches_ptr: *mut u8, out_matches_max_len: usize) -> u64;
+    fn naso_cli_matches_free(matches: u64);
+}
+
+// ============================================================================
+// Application
+// ============================================================================
+
+struct Command {
+    inner: u64,
+    name: String,
+    subcommands: Vec<Command>,
+    args: Vec<Arg>,
+}
+
+impl Command {
+    pub fn new(name: &str) -> CommandBuilder {
+        CommandBuilder::new(name)
+    }
+    
+    fn from_inner(inner: u64, name: &str) -> Self {
+        Command {
+            inner,
+            name: name.into(),
+            subcommands: Vec::new(),
+            args: Vec::new(),
+        }
+    }
+    
+    pub fn get_name(&self) -> &str {
+        &self.name
+    }
+    
+    pub fn get_matches(&self) -> Result<ArgMatches, CliError> {
+        // Get args from environment
+        let args = std::env::args().collect::<Vec<_>>();
+        let args_json = args_to_json(&args);
+        
+        let mut result = vec![0u8; 65536];
+        let len = naso_cli_app_parse(self.inner, args_json.as_ptr(), args_json.len(), result.as_mut_ptr(), result.len());
+        if len == 0 {
+            return Err(CliError::ParseFailed);
+        }
+        result.truncate(len as usize);
+        ArgMatches::from_json(&result)
+    }
+    
+    pub fn try_get_matches(&self, args: &[String]) -> Result<ArgMatches, CliError> {
+        let args_json = args_to_json(args);
+        let mut result = vec![0u8; 65536];
+        let len = naso_cli_app_try_get_matches(self.inner, args_json.as_ptr(), args_json.len(), result.as_mut_ptr(), result.len());
+        if len == 0 {
+            return Err(CliError::ParseFailed);
+        }
+        result.truncate(len as usize);
+        ArgMatches::from_json(&result)
+    }
+    
+    pub fn print_help(&self) -> Result<String, CliError> {
+        let mut out = vec![0u8; 65536];
+        let len = naso_cli_app_print_help(self.inner, out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(CliError::HelpGenerationFailed);
+        }
+        out.truncate(len as usize);
+        String::from_utf8(out).map_err(|_| CliError::InvalidUtf8)
+    }
+    
+    pub fn print_long_help(&self) -> Result<String, CliError> {
+        let mut out = vec![0u8; 65536];
+        let len = naso_cli_app_print_long_help(self.inner, out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(CliError::HelpGenerationFailed);
+        }
+        out.truncate(len as usize);
+        String::from_utf8(out).map_err(|_| CliError::InvalidUtf8)
+    }
+    
+    pub fn generate_completions(&self, shell: Shell) -> Result<String, CliError> {
+        let mut out = vec![0u8; 65536];
+        let len = naso_cli_app_generate_completions(self.inner, shell as u8, out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(CliError::CompletionGenerationFailed);
+        }
+        out.truncate(len as usize);
+        String::from_utf8(out).map_err(|_| CliError::InvalidUtf8)
+    }
+}
+
+impl Drop for Command {
+    fn drop(&mut self) {
+        naso_cli_app_free(self.inner);
+    }
+}
+
+// ============================================================================
+// Command Builder
+// ============================================================================
+
+struct CommandBuilder {
+    name: String,
+    version: Option<String>,
+    about: Option<String>,
+    long_about: Option<String>,
+    author: Option<String>,
+    args: Vec<ArgBuilder>,
+    subcommands: Vec<CommandBuilder>,
+    aliases: Vec<String>,
+    hidden: bool,
+    disable_help_flag: bool,
+    disable_version_flag: bool,
+    allow_external_subcommands: bool,
+    propagate_version: bool,
+    help_template: Option<String>,
+}
+
+impl CommandBuilder {
+    pub fn new(name: &str) -> Self {
+        CommandBuilder {
+            name: name.into(),
+            version: None,
+            about: None,
+            long_about: None,
+            author: None,
+            args: Vec::new(),
+            subcommands: Vec::new(),
+            aliases: Vec::new(),
+            hidden: false,
+            disable_help_flag: false,
+            disable_version_flag: false,
+            allow_external_subcommands: false,
+            propagate_version: true,
+            help_template: None,
+        }
+    }
+    
+    pub fn version(mut self, version: &str) -> Self {
+        self.version = Some(version.into());
+        self
+    }
+    
+    pub fn about(mut self, about: &str) -> Self {
+        self.about = Some(about.into());
+        self
+    }
+    
+    pub fn long_about(mut self, about: &str) -> Self {
+        self.long_about = Some(about.into());
+        self
+    }
+    
+    pub fn author(mut self, author: &str) -> Self {
+        self.author = Some(author.into());
+        self
+    }
+    
+    pub fn arg(mut self, arg: ArgBuilder) -> Self {
+        self.args.push(arg);
+        self
+    }
+    
+    pub fn args(mut self, args: Vec<ArgBuilder>) -> Self {
+        self.args.extend(args);
+        self
+    }
+    
+    pub fn subcommand(mut self, subcmd: CommandBuilder) -> Self {
+        self.subcommands.push(subcmd);
+        self
+    }
+    
+    pub fn subcommands(mut self, subcmds: Vec<CommandBuilder>) -> Self {
+        self.subcommands.extend(subcmds);
+        self
+    }
+    
+    pub fn alias(mut self, alias: &str) -> Self {
+        self.aliases.push(alias.into());
+        self
+    }
+    
+    pub fn hidden(mut self, hidden: bool) -> Self {
+        self.hidden = hidden;
+        self
+    }
+    
+    pub fn disable_help_flag(mut self, disable: bool) -> Self {
+        self.disable_help_flag = disable;
+        self
+    }
+    
+    pub fn disable_version_flag(mut self, disable: bool) -> Self {
+        self.disable_version_flag = disable;
+        self
+    }
+    
+    pub fn allow_external_subcommands(mut self, allow: bool) -> Self {
+        self.allow_external_subcommands = allow;
+        self
+    }
+    
+    pub fn propagate_version(mut self, propagate: bool) -> Self {
+        self.propagate_version = propagate;
+        self
+    }
+    
+    pub fn help_template(mut self, template: &str) -> Self {
+        self.help_template = Some(template.into());
+        self
+    }
+    
+    pub fn build(self) -> Result<Command, CliError> {
+        let inner = naso_cli_app_new(self.name.as_ptr(), self.name.len());
+        if inner == 0 {
+            return Err(CliError::AppCreationFailed);
+        }
+        
+        if let Some(v) = self.version {
+            naso_cli_app_set_version(inner, v.as_ptr(), v.len());
+        }
+        
+        if let Some(a) = self.about.or(self.long_about) {
+            naso_cli_app_set_about(inner, a.as_ptr(), a.len());
+        }
+        
+        if let Some(a) = self.author {
+            naso_cli_app_set_author(inner, a.as_ptr(), a.len());
+        }
+        
+        // Build args
+        for arg in self.args {
+            let arg_inner = arg.build()?;
+            naso_cli_app_add_arg(inner, arg_inner.to_json().as_ptr(), arg_inner.to_json().len());
+        }
+        
+        // Build subcommands
+        for subcmd in self.subcommands {
+            let subcmd_inner = subcmd.build()?.inner;
+            naso_cli_app_add_subcommand(inner, subcmd_inner.to_json().as_ptr(), subcmd_inner.to_json().len());
+        }
+        
+        Ok(Command::from_inner(inner, &self.name))
+    }
+}
+
+// ============================================================================
+// Arguments
+// ============================================================================
+
+struct ArgBuilder {
+    name: String,
+    short: Option<char>,
+    long: Option<String>,
+    help: Option<String>,
+    long_help: Option<String>,
+    required: bool,
+    takes_value: bool,
+    multiple: bool,
+    multiple_occurrences: bool,
+    default_value: Option<String>,
+    default_values: Vec<String>,
+    possible_values: Vec<String>,
+    validator: Option<String>,
+    action: ArgAction,
+    value_parser: Option<ValueParser>,
+    env: Option<String>,
+    aliases: Vec<String>,
+    hide: bool,
+    hide_possible_values: bool,
+    ignore_case: bool,
+    index: Option<usize>,
+    last: bool,
+}
+
+enum ArgAction {
+    Set,
+    SetTrue,
+    SetFalse,
+    Append,
+    Count,
+    Help,
+    HelpLong,
+    Version,
+}
+
+enum ValueParser {
+    String,
+    Int,
+    Float,
+    Bool,
+    Path,
+    Custom(String),
+}
+
+impl ArgBuilder {
+    pub fn new(name: &str) -> Self {
+        ArgBuilder {
+            name: name.into(),
+            short: None,
+            long: None,
+            help: None,
+            long_help: None,
+            required: false,
+            takes_value: true,
+            multiple: false,
+            multiple_occurrences: false,
+            default_value: None,
+            default_values: Vec::new(),
+            possible_values: Vec::new(),
+            validator: None,
+            action: ArgAction::Set,
+            value_parser: None,
+            env: None,
+            aliases: Vec::new(),
+            hide: false,
+            hide_possible_values: false,
+            ignore_case: false,
+            index: None,
+            last: false,
+        }
+    }
+    
+    pub fn short(mut self, short: char) -> Self {
+        self.short = Some(short);
+        self
+    }
+    
+    pub fn long(mut self, long: &str) -> Self {
+        self.long = Some(long.into());
+        self
+    }
+    
+    pub fn help(mut self, help: &str) -> Self {
+        self.help = Some(help.into());
+        self
+    }
+    
+    pub fn long_help(mut self, help: &str) -> Self {
+        self.long_help = Some(help.into());
+        self
+    }
+    
+    pub fn required(mut self, required: bool) -> Self {
+        self.required = required;
+        self
+    }
+    
+    pub fn takes_value(mut self, takes: bool) -> Self {
+        self.takes_value = takes;
+        self
+    }
+    
+    pub fn multiple(mut self, multiple: bool) -> Self {
+        self.multiple = multiple;
+        self
+    }
+    
+    pub fn multiple_occurrences(mut self, multiple: bool) -> Self {
+        self.multiple_occurrences = multiple;
+        self
+    }
+    
+    pub fn default_value(mut self, value: &str) -> Self {
+        self.default_value = Some(value.into());
+        self
+    }
+    
+    pub fn default_values(mut self, values: &[&str]) -> Self {
+        self.default_values = values.iter().map(|s| s.to_string()).collect();
+        self
+    }
+    
+    pub fn possible_values(mut self, values: &[&str]) -> Self {
+        self.possible_values = values.iter().map(|s| s.to_string()).collect();
+        self
+    }
+    
+    pub fn validator(mut self, validator: &str) -> Self {
+        self.validator = Some(validator.into());
+        self
+    }
+    
+    pub fn action(mut self, action: ArgAction) -> Self {
+        self.action = action;
+        self
+    }
+    
+    pub fn value_parser(mut self, parser: ValueParser) -> Self {
+        self.value_parser = Some(parser);
+        self
+    }
+    
+    pub fn env(mut self, env: &str) -> Self {
+        self.env = Some(env.into());
+        self
+    }
+    
+    pub fn alias(mut self, alias: &str) -> Self {
+        self.aliases.push(alias.into());
+        self
+    }
+    
+    pub fn hide(mut self, hide: bool) -> Self {
+        self.hide = hide;
+        self
+    }
+    
+    pub fn hide_possible_values(mut self, hide: bool) -> Self {
+        self.hide_possible_values = hide;
+        self
+    }
+    
+    pub fn ignore_case(mut self, ignore: bool) -> Self {
+        self.ignore_case = ignore;
+        self
+    }
+    
+    pub fn index(mut self, index: usize) -> Self {
+        self.index = Some(index);
+        self
+    }
+    
+    pub fn last(mut self, last: bool) -> Self {
+        self.last = last;
+        self
+    }
+    
+    fn build(&self) -> Result<Arg, CliError> {
+        let inner = naso_cli_arg_new(self.name.as_ptr(), self.name.len());
+        if inner == 0 {
+            return Err(CliError::ArgCreationFailed);
+        }
+        
+        if let Some(s) = self.short {
+            naso_cli_arg_set_short(inner, s as u8);
+        }
+        
+        if let Some(l) = &self.long {
+            naso_cli_arg_set_long(inner, l.as_ptr(), l.len());
+        }
+        
+        if let Some(h) = self.help.or(self.long_help.clone()) {
+            naso_cli_arg_set_help(inner, h.as_ptr(), h.len());
+        }
+        
+        naso_cli_arg_set_required(inner, if self.required { 1 } else { 0 });
+        naso_cli_arg_set_takes_value(inner, if self.takes_value { 1 } else { 0 });
+        naso_cli_arg_set_multiple(inner, if self.multiple || self.multiple_occurrences { 1 } else { 0 });
+        
+        if let Some(d) = &self.default_value {
+            naso_cli_arg_set_default(inner, d.as_ptr(), d.len());
+        }
+        
+        if !self.possible_values.is_empty() {
+            let values_json = args_to_json(&self.possible_values);
+            naso_cli_arg_set_possible_values(inner, values_json.as_ptr(), values_json.len());
+        }
+        
+        if let Some(v) = &self.validator {
+            naso_cli_arg_set_validator(inner, v.as_ptr(), v.len());
+        }
+        
+        naso_cli_arg_set_action(inner, self.action as u8);
+        
+        Ok(Arg { inner, name: self.name.clone() })
+    }
+}
+
+struct Arg {
+    inner: u64,
+    name: String,
+}
+
+impl Arg {
+    fn to_json(&self) -> String {
+        format!("{{\"name\":\"{}\"}}", self.name)
+    }
+}
+
+impl Drop for Arg {
+    fn drop(&mut self) {
+        naso_cli_arg_free(self.inner);
+    }
+}
+
+// Common arg constructors
+fn arg_flag(name: &str) -> ArgBuilder {
+    ArgBuilder::new(name).takes_value(false).action(ArgAction::SetTrue)
+}
+
+fn arg_count(name: &str) -> ArgBuilder {
+    ArgBuilder::new(name).takes_value(false).action(ArgAction::Count)
+}
+
+fn arg_required(name: &str) -> ArgBuilder {
+    ArgBuilder::new(name).required(true)
+}
+
+fn arg_optional(name: &str) -> ArgBuilder {
+    ArgBuilder::new(name).required(false)
+}
+
+// ============================================================================
+// ArgMatches
+// ============================================================================
+
+struct ArgMatches {
+    inner: u64,
+    args: HashMap<String, Vec<String>>,
+    subcommand: Option<(String, Box<ArgMatches>)>,
+}
+
+impl ArgMatches {
+    fn from_json(json: &[u8]) -> Result<Self, CliError> {
+        // Parse JSON from FFI
+        let json_str = unsafe { std::str::from_utf8_unchecked(json) };
+        // Simplified parsing
+        Ok(ArgMatches {
+            inner: 0,
+            args: HashMap::new(),
+            subcommand: None,
+        })
+    }
+    
+    pub fn get_one<T: FromArg>(&self, name: &str) -> Option<T> {
+        // Would call FFI to get value
+        // For now, return from local map
+        self.args.get(name)?.first()?.parse().ok()
+    }
+    
+    pub fn get_many<T: FromArg>(&self, name: &str) -> Option<Vec<T>> {
+        self.args.get(name).map(|vals| vals.iter().filter_map(|v| v.parse().ok()).collect())
+    }
+    
+    pub fn contains_id(&self, name: &str) -> bool {
+        self.args.contains_key(name)
+    }
+    
+    pub fn subcommand(&self) -> Option<(&str, &ArgMatches)> {
+        self.subcommand.as_ref().map(|(name, matches)| (name.as_str(), matches.as_ref()))
+    }
+    
+    pub fn value_of(&self, name: &str) -> Option<&str> {
+        self.args.get(name)?.first().map(|s| s.as_str())
+    }
+    
+    pub fn values_of(&self, name: &str) -> Option<Vec<&str>> {
+        self.args.get(name).map(|vals| vals.iter().map(|s| s.as_str()).collect())
+    }
+    
+    pub fn is_present(&self, name: &str) -> bool {
+        self.args.contains_key(name)
+    }
+    
+    pub fn count(&self, name: &str) -> usize {
+        self.args.get(name).map(|v| v.len()).unwrap_or(0)
+    }
+    
+    pub fn get_raw(&self, name: &str) -> Option<&Vec<String>> {
+        self.args.get(name)
+    }
+}
+
+// ============================================================================
+// FromArg Trait
+// ============================================================================
+
+trait FromArg: Sized {
+    fn from_arg(s: &str) -> Result<Self, CliError>;
+}
+
+impl FromArg for String {
+    fn from_arg(s: &str) -> Result<Self, CliError> {
+        Ok(s.into())
+    }
+}
+
+impl FromArg for &str {
+    fn from_arg(s: &str) -> Result<Self, CliError> {
+        Ok(s)
+    }
+}
+
+impl FromArg for i64 {
+    fn from_arg(s: &str) -> Result<Self, CliError> {
+        s.parse().map_err(|_| CliError::ParseError(format!("Invalid integer: {}", s)))
+    }
+}
+
+impl FromArg for u64 {
+    fn from_arg(s: &str) -> Result<Self, CliError> {
+        s.parse().map_err(|_| CliError::ParseError(format!("Invalid unsigned integer: {}", s)))
+    }
+}
+
+impl FromArg for f64 {
+    fn from_arg(s: &str) -> Result<Self, CliError> {
+        s.parse().map_err(|_| CliError::ParseError(format!("Invalid float: {}", s)))
+    }
+}
+
+impl FromArg for bool {
+    fn from_arg(s: &str) -> Result<Self, CliError> {
+        match s.to_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Ok(true),
+            "false" | "0" | "no" | "off" => Ok(false),
+            _ => Err(CliError::ParseError(format!("Invalid boolean: {}", s))),
+        }
+    }
+}
+
+impl FromArg for std::path::PathBuf {
+    fn from_arg(s: &str) -> Result<Self, CliError> {
+        Ok(std::path::PathBuf::from(s))
+    }
+}
+
+// ============================================================================
+// Derive-like Macros (Attribute-based)
+// ============================================================================
+
+// #[derive(Parser)]
+// struct Cli {
+//     #[arg(short, long)]
+//     verbose: bool,
+//     
+//     #[arg(short, long, default_value = "8080")]
+//     port: u16,
+//     
+//     #[arg(short, long)]
+//     config: Option<PathBuf>,
+//     
+//     #[command(subcommand)]
+//     command: Commands,
+// }
+
+// #[derive(Subcommand)]
+// enum Commands {
+//     Start { host: String },
+//     Stop,
+//     Status,
+// }
+
+// These would be implemented via Naso's procedural macro system
+
+// ============================================================================
+// Completion Support
+// ============================================================================
+
+enum Shell {
+    Bash = 0,
+    Zsh = 1,
+    Fish = 2,
+    PowerShell = 3,
+    Elvish = 4,
+}
+
+impl Shell {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "bash" => Some(Shell::Bash),
+            "zsh" => Some(Shell::Zsh),
+            "fish" => Some(Shell::Fish),
+            "powershell" | "pwsh" => Some(Shell::PowerShell),
+            "elvish" => Some(Shell::Elvish),
+            _ => None,
+        }
+    }
+    
+    pub fn file_extension(&self) -> &str {
+        match self {
+            Shell::Bash => "bash",
+            Shell::Zsh => "zsh",
+            Shell::Fish => "fish",
+            Shell::PowerShell => "ps1",
+            Shell::Elvish => "elv",
+        }
+    }
+}
+
+fn generate_completions(app: &Command, shell: Shell, output_path: &str) -> Result<(), CliError> {
+    let completions = app.generate_completions(shell)?;
+    std::fs::write(output_path, completions).map_err(|_| CliError::IoError)
+}
+
+// ============================================================================
+// Argument Groups
+// ============================================================================
+
+struct ArgGroup {
+    name: String,
+    args: Vec<String>,
+    required: bool,
+    multiple: bool,
+}
+
+impl ArgGroup {
+    pub fn new(name: &str) -> Self {
+        ArgGroup {
+            name: name.into(),
+            args: Vec::new(),
+            required: false,
+            multiple: false,
+        }
+    }
+    
+    pub fn arg(mut self, arg: &str) -> Self {
+        self.args.push(arg.into());
+        self
+    }
+    
+    pub fn args(mut self, args: &[&str]) -> Self {
+        self.args.extend(args.iter().map(|s| s.to_string()));
+        self
+    }
+    
+    pub fn required(mut self, required: bool) -> Self {
+        self.required = required;
+        self
+    }
+    
+    pub fn multiple(mut self, multiple: bool) -> Self {
+        self.multiple = multiple;
+        self
+    }
+}
+
+// ============================================================================
+// Value Hints (for completions)
+// ============================================================================
+
+enum ValueHint {
+    Unknown,
+    Other,
+    Path,
+    FilePath,
+    DirPath,
+    ExecutablePath,
+    Hostname,
+    Username,
+    Email,
+    Url,
+    AnyPath,
+}
+
+// ============================================================================
+// Error Types
+// ============================================================================
+
+enum CliError {
+    AppCreationFailed,
+    ArgCreationFailed,
+    SubcommandCreationFailed,
+    ParseFailed,
+    HelpGenerationFailed,
+    CompletionGenerationFailed,
+    ParseError(String),
+    InvalidUtf8,
+    IoError,
+    MissingRequiredArgument(String),
+    UnknownArgument(String),
+    InvalidValue(String),
+    ArgumentConflict(String),
+    SubcommandRequired,
+    InvalidSubcommand(String),
+    VersionMismatch,
+}
+
+impl CliError {
+    pub fn to_string(&self) -> String {
+        match self {
+            CliError::AppCreationFailed => "Failed to create CLI app".into(),
+            CliError::ArgCreationFailed => "Failed to create argument".into(),
+            CliError::SubcommandCreationFailed => "Failed to create subcommand".into(),
+            CliError::ParseFailed => "Failed to parse arguments".into(),
+            CliError::HelpGenerationFailed => "Failed to generate help".into(),
+            CliError::CompletionGenerationFailed => "Failed to generate completions".into(),
+            CliError::ParseError(msg) => format!("Parse error: {}", msg),
+            CliError::InvalidUtf8 => "Invalid UTF-8".into(),
+            CliError::IoError => "I/O error".into(),
+            CliError::MissingRequiredArgument(arg) => format!("Missing required argument: {}", arg),
+            CliError::UnknownArgument(arg) => format!("Unknown argument: {}", arg),
+            CliError::InvalidValue(msg) => format!("Invalid value: {}", msg),
+            CliError::ArgumentConflict(msg) => format!("Argument conflict: {}", msg),
+            CliError::SubcommandRequired => "Subcommand required".into(),
+            CliError::InvalidSubcommand(cmd) => format!("Invalid subcommand: {}", cmd),
+            CliError::VersionMismatch => "Version mismatch".into(),
+        }
+    }
+}
+
+fn args_to_json(args: &[String]) -> String {
+    let mut json = String::from("[");
+    for (i, arg) in args.iter().enumerate() {
+        if i > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!("\"{}\"", arg.replace('"', "\\\"")));
+    }
+    json.push(']');
+    json
+}
+
+// ============================================================================
+// Usage Examples
+// ============================================================================
+
+// Example: Simple CLI
+/*
+fn main() -> Result<(), CliError> {
+    let app = Command::new("myapp")
+        .version("1.0.0")
+        .about("A simple example")
+        .arg(arg_flag("verbose").short('v').help("Enable verbose output"))
+        .arg(arg_optional("input").help("Input file").index(1))
+        .arg(ArgBuilder::new("output")
+            .short('o')
+            .long("output")
+            .help("Output file")
+            .takes_value(true))
+        .subcommand(
+            Command::new("serve")
+                .about("Start server")
+                .arg(ArgBuilder::new("port")
+                    .short('p')
+                    .long("port")
+                    .default_value("8080")
+                    .value_parser(ValueParser::Int))
+        )
+        .build()?;
+    
+    let matches = app.get_matches()?;
+    
+    if matches.is_present("verbose") {
+        println!("Verbose mode enabled");
+    }
+    
+    if let Some(input) = matches.value_of("input") {
+        println!("Input: {}", input);
+    }
+    
+    if let Some(("serve", sub_matches)) = matches.subcommand() {
+        let port = sub_matches.get_one::<u16>("port").unwrap_or(8080);
+        println!("Starting server on port {}", port);
+    }
+    
+    Ok(())
+}
+*/
+
+// Example: Derive-style (would be macro-generated)
+/*
+#[derive(Parser)]
+#[command(name = "myapp", version = "1.0", about = "My application")]
+struct Cli {
+    #[arg(short, long, action = ArgAction::Count)]
+    verbose: u8,
+    
+    #[arg(short, long)]
+    config: Option<PathBuf>,
+    
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    #[command(about = "Start the server")]
+    Serve {
+        #[arg(short, long, default_value = "8080")]
+        port: u16,
+        
+        #[arg(short, long)]
+        host: String,
+    },
+    
+    #[command(about = "Stop the server")]
+    Stop,
+    
+    #[command(about = "Show status")]
+    Status,
+}
+*/

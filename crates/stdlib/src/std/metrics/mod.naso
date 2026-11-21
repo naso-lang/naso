@@ -1,0 +1,733 @@
+// ============================================================================
+// Naso Metrics (naso_metrics) - Phase 19.6
+// ============================================================================
+// High-performance metrics collection with Prometheus, OpenTelemetry,
+// and custom exporters support
+// ============================================================================
+
+extern "C" {
+    fn naso_metrics_registry_new() -> u64;
+    fn naso_metrics_counter_new(registry: u64, name_ptr: *const u8, name_len: usize, help_ptr: *const u8, help_len: usize, labels_ptr: *const u8, labels_len: usize) -> u64;
+    fn naso_metrics_gauge_new(registry: u64, name_ptr: *const u8, name_len: usize, help_ptr: *const u8, help_len: usize, labels_ptr: *const u8, labels_len: usize) -> u64;
+    fn naso_metrics_histogram_new(registry: u64, name_ptr: *const u8, name_len: usize, help_ptr: *const u8, help_len: usize, labels_ptr: *const u8, labels_len: usize, buckets_ptr: *const f64, buckets_len: usize) -> u64;
+    fn naso_metrics_summary_new(registry: u64, name_ptr: *const u8, name_len: usize, help_ptr: *const u8, help_len: usize, labels_ptr: *const u8, labels_len: usize, quantiles_ptr: *const f64, quantiles_len: usize) -> u64;
+    fn naso_metrics_counter_inc(counter: u64, labels_ptr: *const u8, labels_len: usize) -> u64;
+    fn naso_metrics_counter_add(counter: u64, value: f64, labels_ptr: *const u8, labels_len: usize) -> u64;
+    fn naso_metrics_gauge_set(gauge: u64, value: f64, labels_ptr: *const u8, labels_len: usize) -> u64;
+    fn naso_metrics_gauge_inc(gauge: u64, labels_ptr: *const u8, labels_len: usize) -> u64;
+    fn naso_metrics_gauge_dec(gauge: u64, labels_ptr: *const u8, labels_len: usize) -> u64;
+    fn naso_metrics_gauge_add(gauge: u64, value: f64, labels_ptr: *const u8, labels_len: usize) -> u64;
+    fn naso_metrics_gauge_sub(gauge: u64, value: f64, labels_ptr: *const u8, labels_len: usize) -> u64;
+    fn naso_metrics_histogram_observe(histogram: u64, value: f64, labels_ptr: *const u8, labels_len: usize) -> u64;
+    fn naso_metrics_summary_observe(summary: u64, value: f64, labels_ptr: *const u8, labels_len: usize) -> u64;
+    fn naso_metrics_registry_gather(registry: u64, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_metrics_registry_free(registry: u64);
+    fn naso_metrics_exporter_prometheus_new(registry: u64, path: *const u8, path_len: usize) -> u64;
+    fn naso_metrics_exporter_otlp_new(registry: u64, endpoint: *const u8, endpoint_len: usize) -> u64;
+    fn naso_metrics_exporter_free(exporter: u64);
+}
+
+// ============================================================================
+// Metrics Registry
+// ============================================================================
+
+struct MetricsRegistry {
+    inner: u64,
+    counters: HashMap<String, Counter>,
+    gauges: HashMap<String, Gauge>,
+    histograms: HashMap<String, Histogram>,
+    summaries: HashMap<String, Summary>,
+}
+
+impl MetricsRegistry {
+    pub fn new() -> Result<Self, MetricsError> {
+        let inner = naso_metrics_registry_new();
+        if inner == 0 {
+            return Err(MetricsError::RegistryCreationFailed);
+        }
+        Ok(MetricsRegistry {
+            inner,
+            counters: HashMap::new(),
+            gauges: HashMap::new(),
+            histograms: HashMap::new(),
+            summaries: HashMap::new(),
+        })
+    }
+    
+    pub fn register_counter(&mut self, name: &str, help: &str, labels: &[(&str, &str)]) -> Result<Counter, MetricsError> {
+        let labels_json = labels_to_json(labels);
+        let counter = naso_metrics_counter_new(
+            self.inner,
+            name.as_ptr(), name.len(),
+            help.as_ptr(), help.len(),
+            labels_json.as_ptr(), labels_json.len(),
+        );
+        if counter == 0 {
+            return Err(MetricsError::CounterCreationFailed);
+        }
+        let c = Counter { inner: counter, name: name.into() };
+        self.counters.insert(name.into(), c.clone());
+        Ok(c)
+    }
+    
+    pub fn register_gauge(&mut self, name: &str, help: &str, labels: &[(&str, &str)]) -> Result<Gauge, MetricsError> {
+        let labels_json = labels_to_json(labels);
+        let gauge = naso_metrics_gauge_new(
+            self.inner,
+            name.as_ptr(), name.len(),
+            help.as_ptr(), help.len(),
+            labels_json.as_ptr(), labels_json.len(),
+        );
+        if gauge == 0 {
+            return Err(MetricsError::GaugeCreationFailed);
+        }
+        let g = Gauge { inner: gauge, name: name.into() };
+        self.gauges.insert(name.into(), g.clone());
+        Ok(g)
+    }
+    
+    pub fn register_histogram(&mut self, name: &str, help: &str, labels: &[(&str, &str)], buckets: &[f64]) -> Result<Histogram, MetricsError> {
+        let labels_json = labels_to_json(labels);
+        let histogram = naso_metrics_histogram_new(
+            self.inner,
+            name.as_ptr(), name.len(),
+            help.as_ptr(), help.len(),
+            labels_json.as_ptr(), labels_json.len(),
+            buckets.as_ptr(), buckets.len(),
+        );
+        if histogram == 0 {
+            return Err(MetricsError::HistogramCreationFailed);
+        }
+        let h = Histogram { inner: histogram, name: name.into() };
+        self.histograms.insert(name.into(), h.clone());
+        Ok(h)
+    }
+    
+    pub fn register_summary(&mut self, name: &str, help: &str, labels: &[(&str, &str)], quantiles: &[f64]) -> Result<Summary, MetricsError> {
+        let labels_json = labels_to_json(labels);
+        let summary = naso_metrics_summary_new(
+            self.inner,
+            name.as_ptr(), name.len(),
+            help.as_ptr(), help.len(),
+            labels_json.as_ptr(), labels_json.len(),
+            quantiles.as_ptr(), quantiles.len(),
+        );
+        if summary == 0 {
+            return Err(MetricsError::SummaryCreationFailed);
+        }
+        let s = Summary { inner: summary, name: name.into() };
+        self.summaries.insert(name.into(), s.clone());
+        Ok(s)
+    }
+    
+    pub fn gather(&self) -> Result<String, MetricsError> {
+        let mut out = vec![0u8; 65536];
+        let len = naso_metrics_registry_gather(self.inner, out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(MetricsError::GatherFailed);
+        }
+        out.truncate(len as usize);
+        String::from_utf8(out).map_err(|_| MetricsError::InvalidUtf8)
+    }
+    
+    pub fn prometheus_exporter(&self, path: &str) -> Result<MetricsExporter, MetricsError> {
+        let exporter = naso_metrics_exporter_prometheus_new(self.inner, path.as_ptr(), path.len());
+        if exporter == 0 {
+            return Err(MetricsError::ExporterCreationFailed);
+        }
+        Ok(MetricsExporter { inner: exporter, exporter_type: ExporterType::Prometheus })
+    }
+    
+    pub fn otlp_exporter(&self, endpoint: &str) -> Result<MetricsExporter, MetricsError> {
+        let exporter = naso_metrics_exporter_otlp_new(self.inner, endpoint.as_ptr(), endpoint.len());
+        if exporter == 0 {
+            return Err(MetricsError::ExporterCreationFailed);
+        }
+        Ok(MetricsExporter { inner: exporter, exporter_type: ExporterType::Otlp })
+    }
+}
+
+impl Drop for MetricsRegistry {
+    fn drop(&mut self) {
+        naso_metrics_registry_free(self.inner);
+    }
+}
+
+fn labels_to_json(labels: &[(&str, &str)]) -> String {
+    let mut json = String::from("{");
+    for (i, (k, v)) in labels.iter().enumerate() {
+        if i > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!("\"{}\":\"{}\"", k, v));
+    }
+    json.push('}');
+    json
+}
+
+// ============================================================================
+// Counter
+// ============================================================================
+
+struct Counter {
+    inner: u64,
+    name: String,
+}
+
+impl Counter {
+    pub fn inc(&self, labels: &[(&str, &str)]) -> Result<(), MetricsError> {
+        let labels_json = labels_to_json(labels);
+        let result = naso_metrics_counter_inc(self.inner, labels_json.as_ptr(), labels_json.len());
+        if result == 0 {
+            return Err(MetricsError::IncrementFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn add(&self, value: f64, labels: &[(&str, &str)]) -> Result<(), MetricsError> {
+        let labels_json = labels_to_json(labels);
+        let result = naso_metrics_counter_add(self.inner, value, labels_json.as_ptr(), labels_json.len());
+        if result == 0 {
+            return Err(MetricsError::IncrementFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn with_labels(&self, labels: &[(&str, &str)]) -> LabeledCounter {
+        LabeledCounter {
+            counter: self.inner,
+            labels: labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        }
+    }
+}
+
+struct LabeledCounter {
+    counter: u64,
+    labels: Vec<(String, String)>,
+}
+
+impl LabeledCounter {
+    pub fn inc(&self) -> Result<(), MetricsError> {
+        let labels_json = labels_to_json(&self.labels.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>());
+        let result = naso_metrics_counter_inc(self.counter, labels_json.as_ptr(), labels_json.len());
+        if result == 0 {
+            return Err(MetricsError::IncrementFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn add(&self, value: f64) -> Result<(), MetricsError> {
+        let labels_json = labels_to_json(&self.labels.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>());
+        let result = naso_metrics_counter_add(self.counter, value, labels_json.as_ptr(), labels_json.len());
+        if result == 0 {
+            return Err(MetricsError::IncrementFailed);
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Gauge
+// ============================================================================
+
+struct Gauge {
+    inner: u64,
+    name: String,
+}
+
+impl Gauge {
+    pub fn set(&self, value: f64, labels: &[(&str, &str)]) -> Result<(), MetricsError> {
+        let labels_json = labels_to_json(labels);
+        let result = naso_metrics_gauge_set(self.inner, value, labels_json.as_ptr(), labels_json.len());
+        if result == 0 {
+            return Err(MetricsError::SetFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn inc(&self, labels: &[(&str, &str)]) -> Result<(), MetricsError> {
+        let labels_json = labels_to_json(labels);
+        let result = naso_metrics_gauge_inc(self.inner, labels_json.as_ptr(), labels_json.len());
+        if result == 0 {
+            return Err(MetricsError::IncrementFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn dec(&self, labels: &[(&str, &str)]) -> Result<(), MetricsError> {
+        let labels_json = labels_to_json(labels);
+        let result = naso_metrics_gauge_dec(self.inner, labels_json.as_ptr(), labels_json.len());
+        if result == 0 {
+            return Err(MetricsError::IncrementFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn add(&self, value: f64, labels: &[(&str, &str)]) -> Result<(), MetricsError> {
+        let labels_json = labels_to_json(labels);
+        let result = naso_metrics_gauge_add(self.inner, value, labels_json.as_ptr(), labels_json.len());
+        if result == 0 {
+            return Err(MetricsError::IncrementFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn sub(&self, value: f64, labels: &[(&str, &str)]) -> Result<(), MetricsError> {
+        let labels_json = labels_to_json(labels);
+        let result = naso_metrics_gauge_sub(self.inner, value, labels_json.as_ptr(), labels_json.len());
+        if result == 0 {
+            return Err(MetricsError::IncrementFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn with_labels(&self, labels: &[(&str, &str)]) -> LabeledGauge {
+        LabeledGauge {
+            gauge: self.inner,
+            labels: labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        }
+    }
+}
+
+struct LabeledGauge {
+    gauge: u64,
+    labels: Vec<(String, String)>,
+}
+
+impl LabeledGauge {
+    pub fn set(&self, value: f64) -> Result<(), MetricsError> {
+        let labels_json = labels_to_json(&self.labels.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>());
+        let result = naso_metrics_gauge_set(self.gauge, value, labels_json.as_ptr(), labels_json.len());
+        if result == 0 {
+            return Err(MetricsError::SetFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn inc(&self) -> Result<(), MetricsError> {
+        let labels_json = labels_to_json(&self.labels.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>());
+        let result = naso_metrics_gauge_inc(self.gauge, labels_json.as_ptr(), labels_json.len());
+        if result == 0 {
+            return Err(MetricsError::IncrementFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn dec(&self) -> Result<(), MetricsError> {
+        let labels_json = labels_to_json(&self.labels.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>());
+        let result = naso_metrics_gauge_dec(self.gauge, labels_json.as_ptr(), labels_json.len());
+        if result == 0 {
+            return Err(MetricsError::IncrementFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn add(&self, value: f64) -> Result<(), MetricsError> {
+        let labels_json = labels_to_json(&self.labels.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>());
+        let result = naso_metrics_gauge_add(self.gauge, value, labels_json.as_ptr(), labels_json.len());
+        if result == 0 {
+            return Err(MetricsError::IncrementFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn sub(&self, value: f64) -> Result<(), MetricsError> {
+        let labels_json = labels_to_json(&self.labels.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>());
+        let result = naso_metrics_gauge_sub(self.gauge, value, labels_json.as_ptr(), labels_json.len());
+        if result == 0 {
+            return Err(MetricsError::IncrementFailed);
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Histogram
+// ============================================================================
+
+struct Histogram {
+    inner: u64,
+    name: String,
+}
+
+impl Histogram {
+    pub fn observe(&self, value: f64, labels: &[(&str, &str)]) -> Result<(), MetricsError> {
+        let labels_json = labels_to_json(labels);
+        let result = naso_metrics_histogram_observe(self.inner, value, labels_json.as_ptr(), labels_json.len());
+        if result == 0 {
+            return Err(MetricsError::ObserveFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn with_labels(&self, labels: &[(&str, &str)]) -> LabeledHistogram {
+        LabeledHistogram {
+            histogram: self.inner,
+            labels: labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        }
+    }
+}
+
+struct LabeledHistogram {
+    histogram: u64,
+    labels: Vec<(String, String)>,
+}
+
+impl LabeledHistogram {
+    pub fn observe(&self, value: f64) -> Result<(), MetricsError> {
+        let labels_json = labels_to_json(&self.labels.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>());
+        let result = naso_metrics_histogram_observe(self.histogram, value, labels_json.as_ptr(), labels_json.len());
+        if result == 0 {
+            return Err(MetricsError::ObserveFailed);
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Summary
+// ============================================================================
+
+struct Summary {
+    inner: u64,
+    name: String,
+}
+
+impl Summary {
+    pub fn observe(&self, value: f64, labels: &[(&str, &str)]) -> Result<(), MetricsError> {
+        let labels_json = labels_to_json(labels);
+        let result = naso_metrics_summary_observe(self.inner, value, labels_json.as_ptr(), labels_json.len());
+        if result == 0 {
+            return Err(MetricsError::ObserveFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn with_labels(&self, labels: &[(&str, &str)]) -> LabeledSummary {
+        LabeledSummary {
+            summary: self.inner,
+            labels: labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        }
+    }
+}
+
+struct LabeledSummary {
+    summary: u64,
+    labels: Vec<(String, String)>,
+}
+
+impl LabeledSummary {
+    pub fn observe(&self, value: f64) -> Result<(), MetricsError> {
+        let labels_json = labels_to_json(&self.labels.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>());
+        let result = naso_metrics_summary_observe(self.summary, value, labels_json.as_ptr(), labels_json.len());
+        if result == 0 {
+            return Err(MetricsError::ObserveFailed);
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Exporter
+// ============================================================================
+
+enum ExporterType {
+    Prometheus,
+    Otlp,
+    Json,
+    Statsd,
+}
+
+struct MetricsExporter {
+    inner: u64,
+    exporter_type: ExporterType,
+}
+
+impl Drop for MetricsExporter {
+    fn drop(&mut self) {
+        naso_metrics_exporter_free(self.inner);
+    }
+}
+
+// ============================================================================
+// Standard Metrics (RED, USE)
+// ============================================================================
+
+// RED: Rate, Errors, Duration
+struct RedMetrics {
+    requests_total: Counter,
+    requests_duration: Histogram,
+    errors_total: Counter,
+}
+
+impl RedMetrics {
+    pub fn new(registry: &mut MetricsRegistry, subsystem: &str) -> Result<Self, MetricsError> {
+        let requests_total = registry.register_counter(
+            &format!("{}_requests_total", subsystem),
+            "Total number of requests",
+            &[("method", ""), ("endpoint", ""), ("status", "")],
+        )?;
+        
+        let requests_duration = registry.register_histogram(
+            &format!("{}_request_duration_seconds", subsystem),
+            "Request duration in seconds",
+            &[("method", ""), ("endpoint", "")],
+            &[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
+        )?;
+        
+        let errors_total = registry.register_counter(
+            &format!("{}_errors_total", subsystem),
+            "Total number of errors",
+            &[("method", ""), ("endpoint", ""), ("error_type", "")],
+        )?;
+        
+        Ok(RedMetrics {
+            requests_total,
+            requests_duration,
+            errors_total,
+        })
+    }
+    
+    pub fn record_request(&self, method: &str, endpoint: &str, status: u16, duration_secs: f64) -> Result<(), MetricsError> {
+        self.requests_total.inc(&[("method", method), ("endpoint", endpoint), ("status", &status.to_string())])?;
+        self.requests_duration.observe(duration_secs, &[("method", method), ("endpoint", endpoint)])?;
+        
+        if status >= 400 {
+            let error_type = if status >= 500 { "server_error" } else { "client_error" };
+            self.errors_total.inc(&[("method", method), ("endpoint", endpoint), ("error_type", error_type)])?;
+        }
+        
+        Ok(())
+    }
+}
+
+// USE: Utilization, Saturation, Errors
+struct UseMetrics {
+    utilization: Gauge,
+    saturation: Gauge,
+    errors: Counter,
+}
+
+impl UseMetrics {
+    pub fn new(registry: &mut MetricsRegistry, resource: &str) -> Result<Self, MetricsError> {
+        let utilization = registry.register_gauge(
+            &format!("{}_utilization", resource),
+            "Resource utilization (0-1)",
+            &[],
+        )?;
+        
+        let saturation = registry.register_gauge(
+            &format!("{}_saturation", resource),
+            "Resource saturation (queue length, etc.)",
+            &[],
+        )?;
+        
+        let errors = registry.register_counter(
+            &format!("{}_errors_total", resource),
+            "Total number of resource errors",
+            &[("error_type", "")],
+        )?;
+        
+        Ok(UseMetrics {
+            utilization,
+            saturation,
+            errors,
+        })
+    }
+}
+
+// ============================================================================
+// Common Metric Builders
+// ============================================================================
+
+struct CounterBuilder {
+    registry: Option<&'static mut MetricsRegistry>, // Simplified
+    name: String,
+    help: String,
+    labels: Vec<(String, String)>,
+}
+
+impl CounterBuilder {
+    pub fn new(name: &str) -> Self {
+        CounterBuilder {
+            registry: None,
+            name: name.into(),
+            help: String::new(),
+            labels: Vec::new(),
+        }
+    }
+    
+    pub fn help(mut self, help: &str) -> Self {
+        self.help = help.into();
+        self
+    }
+    
+    pub fn label(mut self, key: &str, value: &str) -> Self {
+        self.labels.push((key.into(), value.into()));
+        self
+    }
+    
+    pub fn register(self, registry: &mut MetricsRegistry) -> Result<Counter, MetricsError> {
+        registry.register_counter(&self.name, &self.help, &self.labels.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>())
+    }
+}
+
+struct GaugeBuilder {
+    registry: Option<&'static mut MetricsRegistry>,
+    name: String,
+    help: String,
+    labels: Vec<(String, String)>,
+}
+
+impl GaugeBuilder {
+    pub fn new(name: &str) -> Self {
+        GaugeBuilder {
+            registry: None,
+            name: name.into(),
+            help: String::new(),
+            labels: Vec::new(),
+        }
+    }
+    
+    pub fn help(mut self, help: &str) -> Self {
+        self.help = help.into();
+        self
+    }
+    
+    pub fn label(mut self, key: &str, value: &str) -> Self {
+        self.labels.push((key.into(), value.into()));
+        self
+    }
+    
+    pub fn register(self, registry: &mut MetricsRegistry) -> Result<Gauge, MetricsError> {
+        registry.register_gauge(&self.name, &self.help, &self.labels.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>())
+    }
+}
+
+struct HistogramBuilder {
+    registry: Option<&'static mut MetricsRegistry>,
+    name: String,
+    help: String,
+    labels: Vec<(String, String)>,
+    buckets: Vec<f64>,
+}
+
+impl HistogramBuilder {
+    pub fn new(name: &str) -> Self {
+        HistogramBuilder {
+            registry: None,
+            name: name.into(),
+            help: String::new(),
+            labels: Vec::new(),
+            buckets: vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
+        }
+    }
+    
+    pub fn help(mut self, help: &str) -> Self {
+        self.help = help.into();
+        self
+    }
+    
+    pub fn label(mut self, key: &str, value: &str) -> Self {
+        self.labels.push((key.into(), value.into()));
+        self
+    }
+    
+    pub fn buckets(mut self, buckets: &[f64]) -> Self {
+        self.buckets = buckets.into();
+        self
+    }
+    
+    pub fn exponential_buckets(mut self, start: f64, factor: f64, count: usize) -> Self {
+        self.buckets = (0..count).map(|i| start * factor.powi(i as i32)).collect();
+        self
+    }
+    
+    pub fn linear_buckets(mut self, start: f64, width: f64, count: usize) -> Self {
+        self.buckets = (0..count).map(|i| start + width * i as f64).collect();
+        self
+    }
+    
+    pub fn register(self, registry: &mut MetricsRegistry) -> Result<Histogram, MetricsError> {
+        registry.register_histogram(&self.name, &self.help, &self.labels.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>(), &self.buckets)
+    }
+}
+
+// ============================================================================
+// Error Types
+// ============================================================================
+
+enum MetricsError {
+    RegistryCreationFailed,
+    CounterCreationFailed,
+    GaugeCreationFailed,
+    HistogramCreationFailed,
+    SummaryCreationFailed,
+    IncrementFailed,
+    SetFailed,
+    ObserveFailed,
+    GatherFailed,
+    ExporterCreationFailed,
+    InvalidUtf8,
+    InvalidLabel,
+    DuplicateMetric,
+    MetricNotFound,
+    IoError(IoError),
+}
+
+impl MetricsError {
+    pub fn to_string(&self) -> String {
+        match self {
+            MetricsError::RegistryCreationFailed => "Failed to create metrics registry".into(),
+            MetricsError::CounterCreationFailed => "Failed to create counter".into(),
+            MetricsError::GaugeCreationFailed => "Failed to create gauge".into(),
+            MetricsError::HistogramCreationFailed => "Failed to create histogram".into(),
+            MetricsError::SummaryCreationFailed => "Failed to create summary".into(),
+            MetricsError::IncrementFailed => "Failed to increment metric".into(),
+            MetricsError::SetFailed => "Failed to set metric".into(),
+            MetricsError::ObserveFailed => "Failed to observe metric".into(),
+            MetricsError::GatherFailed => "Failed to gather metrics".into(),
+            MetricsError::ExporterCreationFailed => "Failed to create exporter".into(),
+            MetricsError::InvalidUtf8 => "Invalid UTF-8".into(),
+            MetricsError::InvalidLabel => "Invalid label".into(),
+            MetricsError::DuplicateMetric => "Metric already exists".into(),
+            MetricsError::MetricNotFound => "Metric not found".into(),
+            MetricsError::IoError(e) => format!("I/O error: {}", e.to_string()),
+        }
+    }
+}
+
+// ============================================================================
+// Global Metrics Instance (for convenience)
+// ============================================================================
+
+static mut GLOBAL_REGISTRY: Option<MetricsRegistry> = None;
+
+fn init_global_registry() -> Result<(), MetricsError> {
+    unsafe {
+        GLOBAL_REGISTRY = Some(MetricsRegistry::new()?);
+        Ok(())
+    }
+}
+
+fn global_registry() -> Result<&'static mut MetricsRegistry, MetricsError> {
+    unsafe {
+        GLOBAL_REGISTRY.as_mut().ok_or(MetricsError::RegistryCreationFailed)
+    }
+}
+
+fn counter(name: &str, help: &str, labels: &[(&str, &str)]) -> Result<Counter, MetricsError> {
+    global_registry()?.register_counter(name, help, labels)
+}
+
+fn gauge(name: &str, help: &str, labels: &[(&str, &str)]) -> Result<Gauge, MetricsError> {
+    global_registry()?.register_gauge(name, help, labels)
+}
+
+fn histogram(name: &str, help: &str, labels: &[(&str, &str)], buckets: &[f64]) -> Result<Histogram, MetricsError> {
+    global_registry()?.register_histogram(name, help, labels, buckets)
+}
+
+fn summary(name: &str, help: &str, labels: &[(&str, &str)], quantiles: &[f64]) -> Result<Summary, MetricsError> {
+    global_registry()?.register_summary(name, help, labels, quantiles)
+}

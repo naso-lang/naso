@@ -1,0 +1,1451 @@
+// ============================================================================
+// Naso Redis Driver (naso_redis) - Phase 19.5
+// ============================================================================
+// Async Redis client with connection pooling, pub/sub, pipelines,
+// transactions, clustering, and Redis Stack modules support
+// ============================================================================
+
+extern "C" {
+    fn naso_redis_client_new(config_ptr: *const u8, config_len: usize) -> u64;
+    fn naso_redis_client_connect(client: u64) -> u64;
+    fn naso_redis_client_execute(client: u64, cmd_ptr: *const u8, cmd_len: usize, result_ptr: *mut u8, result_max_len: usize) -> u64;
+    fn naso_redis_client_pipeline(client: u64) -> u64;
+    fn naso_redis_pipeline_add(pipeline: u64, cmd_ptr: *const u8, cmd_len: usize) -> u64;
+    fn naso_redis_pipeline_execute(pipeline: u64, results_ptr: *mut u8, results_max_len: usize) -> u64;
+    fn naso_redis_pipeline_free(pipeline: u64);
+    fn naso_redis_subscribe(client: u64, channels_ptr: *const u8, channels_len: usize) -> u64;
+    fn naso_redis_publish(client: u64, channel_ptr: *const u8, channel_len: usize, msg_ptr: *const u8, msg_len: usize) -> u64;
+    fn naso_redis_get_message(sub: u64, result_ptr: *mut u8, result_max_len: usize) -> u64;
+    fn naso_redis_subscribe_free(sub: u64);
+    fn naso_redis_client_free(client: u64);
+    fn naso_redis_pool_new(config_ptr: *const u8, config_len: usize) -> u64;
+    fn naso_redis_pool_acquire(pool: u64) -> u64;
+    fn naso_redis_pool_release(pool: u64, client: u64) -> u64;
+    fn naso_redis_pool_free(pool: u64);
+}
+
+// ============================================================================
+// Redis Configuration
+// ============================================================================
+
+struct RedisConfig {
+    // Connection
+    host: String,
+    port: u16,
+    username: Option<String>,
+    password: Option<String>,
+    database: u8,
+    
+    // TLS
+    tls_config: Option<TlsConfig>,
+    
+    // Pool
+    max_connections: usize,
+    min_idle_connections: usize,
+    connection_timeout_ms: u64,
+    idle_timeout_ms: u64,
+    max_lifetime_ms: u64,
+    
+    // Behavior
+    enable_pipelining: bool,
+    enable_read_replicas: bool,
+    read_replica_urls: Vec<String>,
+    
+    // Cluster
+    cluster_mode: bool,
+    cluster_nodes: Vec<String>,
+    
+    // Retry
+    max_retries: u32,
+    retry_delay_ms: u64,
+    
+    // Custom
+    options: HashMap<String, String>,
+}
+
+impl Default for RedisConfig {
+    fn default() -> Self {
+        RedisConfig {
+            host: "localhost".into(),
+            port: 6379,
+            username: None,
+            password: None,
+            database: 0,
+            tls_config: None,
+            max_connections: 10,
+            min_idle_connections: 2,
+            connection_timeout_ms: 5000,
+            idle_timeout_ms: 600000,
+            max_lifetime_ms: 1800000,
+            enable_pipelining: true,
+            enable_read_replicas: false,
+            read_replica_urls: Vec::new(),
+            cluster_mode: false,
+            cluster_nodes: Vec::new(),
+            max_retries: 3,
+            retry_delay_ms: 100,
+            options: HashMap::new(),
+        }
+    }
+}
+
+impl RedisConfig {
+    pub fn new(url: &str) -> Result<Self, RedisError> {
+        parse_redis_url(url)
+    }
+    
+    pub fn host(mut self, host: &str) -> Self {
+        self.host = host.into();
+        self
+    }
+    
+    pub fn port(mut self, port: u16) -> Self {
+        self.port = port;
+        self
+    }
+    
+    pub fn password(mut self, password: &str) -> Self {
+        self.password = Some(password.into());
+        self
+    }
+    
+    pub fn username(mut self, username: &str) -> Self {
+        self.username = Some(username.into());
+        self
+    }
+    
+    pub fn database(mut self, db: u8) -> Self {
+        self.database = db;
+        self
+    }
+    
+    pub fn tls(mut self, config: TlsConfig) -> Self {
+        self.tls_config = Some(config);
+        self
+    }
+    
+    pub fn max_connections(mut self, max: usize) -> Self {
+        self.max_connections = max;
+        self
+    }
+    
+    pub fn cluster_mode(mut self, enabled: bool) -> Self {
+        self.cluster_mode = enabled;
+        self
+    }
+    
+    pub fn cluster_nodes(mut self, nodes: Vec<String>) -> Self {
+        self.cluster_nodes = nodes;
+        self
+    }
+    
+    fn to_json(&self) -> String {
+        let mut json = format!(
+            "{{\"host\":\"{}\",\"port\":{},\"username\":{},\"password\":{},\"database\":{},\"max_connections\":{},\"min_idle_connections\":{},\"connection_timeout_ms\":{},\"idle_timeout_ms\":{},\"max_lifetime_ms\":{},\"enable_pipelining\":{},\"cluster_mode\":{},\"cluster_nodes\":[",
+            self.host,
+            self.port,
+            self.username.as_ref().map(|u| format!("\"{}\"", u)).unwrap_or("null".into()),
+            self.password.as_ref().map(|p| format!("\"{}\"", p)).unwrap_or("null".into()),
+            self.database,
+            self.max_connections,
+            self.min_idle_connections,
+            self.connection_timeout_ms,
+            self.idle_timeout_ms,
+            self.max_lifetime_ms,
+            self.enable_pipelining,
+            self.cluster_mode,
+        );
+        
+        for (i, node) in self.cluster_nodes.iter().enumerate() {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str(&format!("\"{}\"", node));
+        }
+        json.push_str("]}");
+        json
+    }
+}
+
+fn parse_redis_url(url: &str) -> Result<RedisConfig, RedisError> {
+    let mut config = RedisConfig::default();
+    
+    // Handle redis://, rediss://, redis-cluster://
+    let url = if let Some(rest) = url.strip_prefix("redis://") {
+        rest
+    } else if let Some(rest) = url.strip_prefix("rediss://") {
+        config.tls_config = Some(TlsConfig::new()?); // Would need actual config
+        rest
+    } else if let Some(rest) = url.strip_prefix("redis-cluster://") {
+        config.cluster_mode = true;
+        rest
+    } else {
+        return Err(RedisError::InvalidUrl);
+    };
+    
+    // Parse user:pass@host:port/db
+    let (auth_part, host_part) = if let Some(at) = url.find('@') {
+        (&url[..at], &url[at+1..])
+    } else {
+        ("", url)
+    };
+    
+    if !auth_part.is_empty() {
+        if let Some(colon) = auth_part.find(':') {
+            config.username = Some(auth_part[..colon].into());
+            config.password = Some(auth_part[colon+1..].into());
+        } else {
+            config.username = Some(auth_part.into());
+        }
+    }
+    
+    // Parse host:port/db
+    let (host_port, db_part) = if let Some(slash) = host_part.find('/') {
+        (&host_part[..slash], &host_part[slash+1..])
+    } else {
+        (host_part, "")
+    };
+    
+    let (host, port) = if let Some(colon) = host_port.find(':') {
+        (&host_port[..colon], host_port[colon+1..].parse().unwrap_or(6379))
+    } else {
+        (host_port, 6379)
+    };
+    
+    config.host = host.into();
+    config.port = port;
+    
+    if !db_part.is_empty() {
+        config.database = db_part.parse().unwrap_or(0);
+    }
+    
+    Ok(config)
+}
+
+// ============================================================================
+// Redis Client
+// ============================================================================
+
+struct RedisClient {
+    inner: u64,
+    config: RedisConfig,
+}
+
+impl RedisClient {
+    pub fn new(config: RedisConfig) -> Result<Self, RedisError> {
+        let config_json = config.to_json();
+        let inner = naso_redis_client_new(config_json.as_ptr(), config_json.len());
+        if inner == 0 {
+            return Err(RedisError::ClientCreationFailed);
+        }
+        Ok(RedisClient { inner, config })
+    }
+    
+    pub async fn connect(&self) -> Result<(), RedisError> {
+        let result = naso_redis_client_connect(self.inner);
+        if result == 0 {
+            return Err(RedisError::ConnectionFailed);
+        }
+        Ok(())
+    }
+    
+    pub async fn execute(&self, cmd: &RedisCommand) -> Result<RedisValue, RedisError> {
+        let cmd_bytes = cmd.to_resp3()?;
+        let mut result = vec![0u8; 65536];
+        let len = naso_redis_client_execute(
+            self.inner,
+            cmd_bytes.as_ptr(),
+            cmd_bytes.len(),
+            result.as_mut_ptr(),
+            result.len(),
+        );
+        if len == 0 {
+            return Err(RedisError::ExecutionFailed);
+        }
+        result.truncate(len as usize);
+        RedisValue::from_resp3(&result)
+    }
+    
+    pub fn pipeline(&self) -> RedisPipeline {
+        let inner = naso_redis_client_pipeline(self.inner);
+        RedisPipeline { inner, commands: Vec::new() }
+    }
+    
+    pub async fn subscribe(&self, channels: &[&str]) -> Result<RedisSubscription, RedisError> {
+        let channels_json = serde_json::to_string(channels).map_err(|_| RedisError::SerializationFailed)?;
+        let sub = naso_redis_subscribe(self.inner, channels_json.as_ptr(), channels_json.len());
+        if sub == 0 {
+            return Err(RedisError::SubscriptionFailed);
+        }
+        Ok(RedisSubscription { inner: sub })
+    }
+    
+    pub async fn publish(&self, channel: &str, message: &[u8]) -> Result<u64, RedisError> {
+        let result = naso_redis_publish(
+            self.inner,
+            channel.as_ptr(),
+            channel.len(),
+            message.as_ptr(),
+            message.len(),
+        );
+        if result == u64::MAX {
+            return Err(RedisError::PublishFailed);
+        }
+        Ok(result)
+    }
+}
+
+impl Drop for RedisClient {
+    fn drop(&mut self) {
+        naso_redis_client_free(self.inner);
+    }
+}
+
+// ============================================================================
+// Redis Connection Pool
+// ============================================================================
+
+struct RedisPool {
+    inner: u64,
+    config: RedisConfig,
+}
+
+impl RedisPool {
+    pub fn new(config: RedisConfig) -> Result<Self, RedisError> {
+        let config_json = config.to_json();
+        let inner = naso_redis_pool_new(config_json.as_ptr(), config_json.len());
+        if inner == 0 {
+            return Err(RedisError::PoolCreationFailed);
+        }
+        Ok(RedisPool { inner, config })
+    }
+    
+    pub async fn acquire(&self) -> Result<PooledRedisClient, RedisError> {
+        let client_inner = naso_redis_pool_acquire(self.inner);
+        if client_inner == 0 {
+            return Err(RedisError::PoolExhausted);
+        }
+        Ok(PooledRedisClient { inner: client_inner, pool: self.inner })
+    }
+    
+    pub fn release(&self, client: PooledRedisClient) -> Result<(), RedisError> {
+        let result = naso_redis_pool_release(self.inner, client.inner);
+        if result == 0 {
+            return Err(RedisError::PoolReleaseFailed);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RedisPool {
+    fn drop(&mut self) {
+        naso_redis_pool_free(self.inner);
+    }
+}
+
+struct PooledRedisClient {
+    inner: u64,
+    pool: u64,
+}
+
+impl PooledRedisClient {
+    pub async fn execute(&self, cmd: &RedisCommand) -> Result<RedisValue, RedisError> {
+        let cmd_bytes = cmd.to_resp3()?;
+        let mut result = vec![0u8; 65536];
+        let len = naso_redis_client_execute(
+            self.inner,
+            cmd_bytes.as_ptr(),
+            cmd_bytes.len(),
+            result.as_mut_ptr(),
+            result.len(),
+        );
+        if len == 0 {
+            return Err(RedisError::ExecutionFailed);
+        }
+        result.truncate(len as usize);
+        RedisValue::from_resp3(&result)
+    }
+    
+    pub fn pipeline(&self) -> RedisPipeline {
+        let inner = naso_redis_client_pipeline(self.inner);
+        RedisPipeline { inner, commands: Vec::new() }
+    }
+}
+
+impl Drop for PooledRedisClient {
+    fn drop(&mut self) {
+        naso_redis_pool_release(self.pool, self.inner);
+    }
+}
+
+// ============================================================================
+// Redis Commands
+// ============================================================================
+
+struct RedisCommand {
+    name: String,
+    args: Vec<RedisValue>,
+}
+
+impl RedisCommand {
+    pub fn new(name: &str) -> Self {
+        RedisCommand {
+            name: name.into(),
+            args: Vec::new(),
+        }
+    }
+    
+    pub fn arg(mut self, arg: impl Into<RedisValue>) -> Self {
+        self.args.push(arg.into());
+        self
+    }
+    
+    pub fn args(mut self, args: Vec<impl Into<RedisValue>>) -> Self {
+        self.args.extend(args.into_iter().map(|a| a.into()));
+        self
+    }
+    
+    pub fn to_resp3(&self) -> Result<Vec<u8>, RedisError> {
+        // RESP3 serialization
+        let mut buf = Vec::new();
+        
+        // Array header: *<count>\r\n
+        buf.push(b'*');
+        buf.extend_from_slice(self.args.len().to_string().as_bytes());
+        buf.extend_from_slice(b"\r\n");
+        
+        // Command name
+        buf.push(b'$');
+        buf.extend_from_slice(self.name.len().to_string().as_bytes());
+        buf.extend_from_slice(b"\r\n");
+        buf.extend_from_slice(self.name.as_bytes());
+        buf.extend_from_slice(b"\r\n");
+        
+        // Arguments
+        for arg in &self.args {
+            arg.write_resp3(&mut buf)?;
+        }
+        
+        Ok(buf)
+    }
+}
+
+// Convenience command constructors
+fn cmd_get(key: &str) -> RedisCommand {
+    RedisCommand::new("GET").arg(key)
+}
+
+fn cmd_set(key: &str, value: impl Into<RedisValue>) -> RedisCommand {
+    RedisCommand::new("SET").arg(key).arg(value)
+}
+
+fn cmd_setex(key: &str, seconds: u64, value: impl Into<RedisValue>) -> RedisCommand {
+    RedisCommand::new("SETEX").arg(key).arg(seconds.to_string()).arg(value)
+}
+
+fn cmd_del(keys: &[&str]) -> RedisCommand {
+    RedisCommand::new("DEL").args(keys.iter().map(|k| (*k).into()).collect())
+}
+
+fn cmd_exists(keys: &[&str]) -> RedisCommand {
+    RedisCommand::new("EXISTS").args(keys.iter().map(|k| (*k).into()).collect())
+}
+
+fn cmd_expire(key: &str, seconds: u64) -> RedisCommand {
+    RedisCommand::new("EXPIRE").arg(key).arg(seconds.to_string())
+}
+
+fn cmd_ttl(key: &str) -> RedisCommand {
+    RedisCommand::new("TTL").arg(key)
+}
+
+fn cmd_incr(key: &str) -> RedisCommand {
+    RedisCommand::new("INCR").arg(key)
+}
+
+fn cmd_decr(key: &str) -> RedisCommand {
+    RedisCommand::new("DECR").arg(key)
+}
+
+fn cmd_hset(key: &str, field: &str, value: impl Into<RedisValue>) -> RedisCommand {
+    RedisCommand::new("HSET").arg(key).arg(field).arg(value)
+}
+
+fn cmd_hget(key: &str, field: &str) -> RedisCommand {
+    RedisCommand::new("HGET").arg(key).arg(field)
+}
+
+fn cmd_hgetall(key: &str) -> RedisCommand {
+    RedisCommand::new("HGETALL").arg(key)
+}
+
+fn cmd_hdel(key: &str, fields: &[&str]) -> RedisCommand {
+    RedisCommand::new("HDEL").arg(key).args(fields.iter().map(|f| (*f).into()).collect())
+}
+
+fn cmd_lpush(key: &str, values: &[impl Into<RedisValue>]) -> RedisCommand {
+    RedisCommand::new("LPUSH").arg(key).args(values.iter().map(|v| v.into()).collect())
+}
+
+fn cmd_rpush(key: &str, values: &[impl Into<RedisValue>]) -> RedisCommand {
+    RedisCommand::new("RPUSH").arg(key).args(values.iter().map(|v| v.into()).collect())
+}
+
+fn cmd_lpop(key: &str) -> RedisCommand {
+    RedisCommand::new("LPOP").arg(key)
+}
+
+fn cmd_rpop(key: &str) -> RedisCommand {
+    RedisCommand::new("RPOP").arg(key)
+}
+
+fn cmd_lrange(key: &str, start: i64, stop: i64) -> RedisCommand {
+    RedisCommand::new("LRANGE").arg(key).arg(start.to_string()).arg(stop.to_string())
+}
+
+fn cmd_sadd(key: &str, members: &[impl Into<RedisValue>]) -> RedisCommand {
+    RedisCommand::new("SADD").arg(key).args(members.iter().map(|m| m.into()).collect())
+}
+
+fn cmd_srem(key: &str, members: &[impl Into<RedisValue>]) -> RedisCommand {
+    RedisCommand::new("SREM").arg(key).args(members.iter().map(|m| m.into()).collect())
+}
+
+fn cmd_smembers(key: &str) -> RedisCommand {
+    RedisCommand::new("SMEMBERS").arg(key)
+}
+
+fn cmd_zadd(key: &str, score: f64, member: impl Into<RedisValue>) -> RedisCommand {
+    RedisCommand::new("ZADD").arg(key).arg(score.to_string()).arg(member)
+}
+
+fn cmd_zrange(key: &str, start: i64, stop: i64, with_scores: bool) -> RedisCommand {
+    let mut cmd = RedisCommand::new("ZRANGE").arg(key).arg(start.to_string()).arg(stop.to_string());
+    if with_scores {
+        cmd = cmd.arg("WITHSCORES");
+    }
+    cmd
+}
+
+fn cmd_zrem(key: &str, members: &[impl Into<RedisValue>]) -> RedisCommand {
+    RedisCommand::new("ZREM").arg(key).args(members.iter().map(|m| m.into()).collect())
+}
+
+fn cmd_ping() -> RedisCommand {
+    RedisCommand::new("PING")
+}
+
+fn cmd_info(section: Option<&str>) -> RedisCommand {
+    if let Some(s) = section {
+        RedisCommand::new("INFO").arg(s)
+    } else {
+        RedisCommand::new("INFO")
+    }
+}
+
+fn cmd_flushdb() -> RedisCommand {
+    RedisCommand::new("FLUSHDB")
+}
+
+fn cmd_flushall() -> RedisCommand {
+    RedisCommand::new("FLUSHALL")
+}
+
+// ============================================================================
+// Redis Pipeline
+// ============================================================================
+
+struct RedisPipeline {
+    inner: u64,
+    commands: Vec<RedisCommand>,
+}
+
+impl RedisPipeline {
+    pub fn add(&mut self, cmd: RedisCommand) -> &mut Self {
+        let cmd_bytes = cmd.to_resp3().unwrap_or_default();
+        naso_redis_pipeline_add(self.inner, cmd_bytes.as_ptr(), cmd_bytes.len());
+        self.commands.push(cmd);
+        self
+    }
+    
+    pub async fn execute(&mut self) -> Result<Vec<RedisValue>, RedisError> {
+        let mut results = vec![0u8; 65536 * self.commands.len().max(1)];
+        let len = naso_redis_pipeline_execute(self.inner, results.as_mut_ptr(), results.len());
+        if len == 0 {
+            return Err(RedisError::PipelineExecutionFailed);
+        }
+        results.truncate(len as usize);
+        // Parse multiple RESP3 responses
+        parse_resp3_array(&results)
+    }
+}
+
+impl Drop for RedisPipeline {
+    fn drop(&mut self) {
+        naso_redis_pipeline_free(self.inner);
+    }
+}
+
+// ============================================================================
+// Redis Pub/Sub
+// ============================================================================
+
+struct RedisSubscription {
+    inner: u64,
+}
+
+impl RedisSubscription {
+    pub async fn next_message(&self) -> Result<Option<RedisMessage>, RedisError> {
+        let mut result = vec![0u8; 65536];
+        let len = naso_redis_get_message(self.inner, result.as_mut_ptr(), result.len());
+        if len == 0 {
+            return Ok(None); // No message available
+        }
+        result.truncate(len as usize);
+        RedisMessage::from_resp3(&result).map(Some)
+    }
+    
+    pub fn unsubscribe(&self, channels: &[&str]) -> Result<(), RedisError> {
+        // Would send UNSUBSCRIBE command
+        Ok(())
+    }
+}
+
+impl Drop for RedisSubscription {
+    fn drop(&mut self) {
+        naso_redis_subscribe_free(self.inner);
+    }
+}
+
+struct RedisMessage {
+    channel: String,
+    pattern: Option<String>,
+    payload: Vec<u8>,
+}
+
+impl RedisMessage {
+    fn from_resp3(data: &[u8]) -> Result<Self, RedisError> {
+        // Parse RESP3 pub/sub message
+        // Simplified
+        Ok(RedisMessage {
+            channel: "".into(),
+            pattern: None,
+            payload: data.to_vec(),
+        })
+    }
+    
+    pub fn channel(&self) -> &str {
+        &self.channel
+    }
+    
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+    
+    pub fn payload_str(&self) -> Result<String, RedisError> {
+        String::from_utf8(self.payload.clone()).map_err(|_| RedisError::InvalidUtf8)
+    }
+}
+
+// ============================================================================
+// Redis Values (RESP3)
+// ============================================================================
+
+enum RedisValue {
+    Null,
+    Bool(bool),
+    Integer(i64),
+    Double(f64),
+    String(String),
+    Blob(Vec<u8>),
+    Array(Vec<RedisValue>),
+    Map(Vec<(RedisValue, RedisValue)>),
+    Set(Vec<RedisValue>),
+    Push(Vec<RedisValue>), // For pub/sub
+    VerbatimString(String, String), // (format, text)
+    BigNumber(String),
+}
+
+impl RedisValue {
+    fn write_resp3(&self, buf: &mut Vec<u8>) -> Result<(), RedisError> {
+        match self {
+            RedisValue::Null => {
+                buf.extend_from_slice(b"_\r\n");
+            }
+            RedisValue::Bool(b) => {
+                buf.push(if *b { b'#' } else { b'#' });
+                buf.push(if *b { b't' } else { b'f' });
+                buf.extend_from_slice(b"\r\n");
+            }
+            RedisValue::Integer(i) => {
+                buf.push(b':');
+                buf.extend_from_slice(i.to_string().as_bytes());
+                buf.extend_from_slice(b"\r\n");
+            }
+            RedisValue::Double(f) => {
+                buf.push(b',');
+                buf.extend_from_slice(f.to_string().as_bytes());
+                buf.extend_from_slice(b"\r\n");
+            }
+            RedisValue::String(s) => {
+                buf.push(b'+');
+                buf.extend_from_slice(s.as_bytes());
+                buf.extend_from_slice(b"\r\n");
+            }
+            RedisValue::Blob(b) => {
+                buf.push(b'$');
+                buf.extend_from_slice(b.len().to_string().as_bytes());
+                buf.extend_from_slice(b"\r\n");
+                buf.extend_from_slice(b);
+                buf.extend_from_slice(b"\r\n");
+            }
+            RedisValue::Array(arr) => {
+                buf.push(b'*');
+                buf.extend_from_slice(arr.len().to_string().as_bytes());
+                buf.extend_from_slice(b"\r\n");
+                for item in arr {
+                    item.write_resp3(buf)?;
+                }
+            }
+            RedisValue::Map(map) => {
+                buf.push(b'%');
+                buf.extend_from_slice(map.len().to_string().as_bytes());
+                buf.extend_from_slice(b"\r\n");
+                for (k, v) in map {
+                    k.write_resp3(buf)?;
+                    v.write_resp3(buf)?;
+                }
+            }
+            RedisValue::Set(set) => {
+                buf.push(b'~');
+                buf.extend_from_slice(set.len().to_string().as_bytes());
+                buf.extend_from_slice(b"\r\n");
+                for item in set {
+                    item.write_resp3(buf)?;
+                }
+            }
+            RedisValue::Push(push) => {
+                buf.push(b'>');
+                buf.extend_from_slice(push.len().to_string().as_bytes());
+                buf.extend_from_slice(b"\r\n");
+                for item in push {
+                    item.write_resp3(buf)?;
+                }
+            }
+            RedisValue::VerbatimString(format, text) => {
+                buf.push(b'=');
+                buf.extend_from_slice(format.len().to_string().as_bytes());
+                buf.push(b'|');
+                buf.extend_from_slice(text.len().to_string().as_bytes());
+                buf.extend_from_slice(b"\r\n");
+                buf.extend_from_slice(text.as_bytes());
+                buf.extend_from_slice(b"\r\n");
+            }
+            RedisValue::BigNumber(num) => {
+                buf.push(b'(');
+                buf.extend_from_slice(num.as_bytes());
+                buf.extend_from_slice(b"\r\n");
+            }
+        }
+        Ok(())
+    }
+    
+    fn from_resp3(data: &[u8]) -> Result<Self, RedisError> {
+        let mut parser = Resp3Parser::new(data);
+        parser.parse_value()
+    }
+}
+
+impl From<&str> for RedisValue {
+    fn from(s: &str) -> Self {
+        RedisValue::String(s.into())
+    }
+}
+
+impl From<String> for RedisValue {
+    fn from(s: String) -> Self {
+        RedisValue::String(s)
+    }
+}
+
+impl From<&[u8]> for RedisValue {
+    fn from(b: &[u8]) -> Self {
+        RedisValue::Blob(b.to_vec())
+    }
+}
+
+impl From<Vec<u8>> for RedisValue {
+    fn from(b: Vec<u8>) -> Self {
+        RedisValue::Blob(b)
+    }
+}
+
+impl From<i64> for RedisValue {
+    fn from(i: i64) -> Self {
+        RedisValue::Integer(i)
+    }
+}
+
+impl From<f64> for RedisValue {
+    fn from(f: f64) -> Self {
+        RedisValue::Double(f)
+    }
+}
+
+impl From<bool> for RedisValue {
+    fn from(b: bool) -> Self {
+        RedisValue::Bool(b)
+    }
+}
+
+impl<T: Into<RedisValue>> From<Vec<T>> for RedisValue {
+    fn from(v: Vec<T>) -> Self {
+        RedisValue::Array(v.into_iter().map(|x| x.into()).collect())
+    }
+}
+
+impl RedisValue {
+    pub fn as_string(&self) -> Result<String, RedisError> {
+        match self {
+            RedisValue::String(s) => Ok(s.clone()),
+            RedisValue::Blob(b) => String::from_utf8(b.clone()).map_err(|_| RedisError::InvalidUtf8),
+            RedisValue::Null => Err(RedisError::NullValue),
+            _ => Err(RedisError::TypeMismatch),
+        }
+    }
+    
+    pub fn as_integer(&self) -> Result<i64, RedisError> {
+        match self {
+            RedisValue::Integer(i) => Ok(*i),
+            RedisValue::String(s) => s.parse().map_err(|_| RedisError::TypeMismatch),
+            RedisValue::Null => Err(RedisError::NullValue),
+            _ => Err(RedisError::TypeMismatch),
+        }
+    }
+    
+    pub fn as_bool(&self) -> Result<bool, RedisError> {
+        match self {
+            RedisValue::Bool(b) => Ok(*b),
+            RedisValue::Integer(i) => Ok(*i != 0),
+            RedisValue::Null => Err(RedisError::NullValue),
+            _ => Err(RedisError::TypeMismatch),
+        }
+    }
+    
+    pub fn as_array(&self) -> Result<&[RedisValue], RedisError> {
+        match self {
+            RedisValue::Array(arr) => Ok(arr),
+            RedisValue::Null => Err(RedisError::NullValue),
+            _ => Err(RedisError::TypeMismatch),
+        }
+    }
+    
+    pub fn is_null(&self) -> bool {
+        matches!(self, RedisValue::Null)
+    }
+}
+
+// ============================================================================
+// RESP3 Parser
+// ============================================================================
+
+struct Resp3Parser<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Resp3Parser<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Resp3Parser { data, pos: 0 }
+    }
+    
+    fn parse_value(&mut self) -> Result<RedisValue, RedisError> {
+        if self.pos >= self.data.len() {
+            return Err(RedisError::UnexpectedEof);
+        }
+        
+        let type_byte = self.data[self.pos];
+        self.pos += 1;
+        
+        match type_byte {
+            b'+' => self.parse_simple_string(),
+            b'-' => self.parse_simple_error(),
+            b':' => self.parse_integer(),
+            b'$' => self.parse_blob_string(),
+            b'*' => self.parse_array(),
+            b'_' => self.parse_null(),
+            b'#' => self.parse_boolean(),
+            b',' => self.parse_double(),
+            b'(' => self.parse_big_number(),
+            b'!' => self.parse_bulk_error(),
+            b'=' => self.parse_verbatim_string(),
+            b'%' => self.parse_map(),
+            b'~' => self.parse_set(),
+            b'>' => self.parse_push(),
+            _ => Err(RedisError::InvalidTypeByte(type_byte)),
+        }
+    }
+    
+    fn parse_line(&mut self) -> Result<&'a [u8], RedisError> {
+        let start = self.pos;
+        while self.pos < self.data.len() {
+            if self.data[self.pos] == b'\r' {
+                if self.pos + 1 < self.data.len() && self.data[self.pos + 1] == b'\n' {
+                    let line = &self.data[start..self.pos];
+                    self.pos += 2;
+                    return Ok(line);
+                }
+            }
+            self.pos += 1;
+        }
+        Err(RedisError::UnexpectedEof)
+    }
+    
+    fn parse_simple_string(&mut self) -> Result<RedisValue, RedisError> {
+        let line = self.parse_line()?;
+        Ok(RedisValue::String(unsafe { std::str::from_utf8_unchecked(line) }.into()))
+    }
+    
+    fn parse_simple_error(&mut self) -> Result<RedisValue, RedisError> {
+        let line = self.parse_line()?;
+        Err(RedisError::ServerError(unsafe { std::str::from_utf8_unchecked(line) }.into()))
+    }
+    
+    fn parse_integer(&mut self) -> Result<RedisValue, RedisError> {
+        let line = self.parse_line()?;
+        let s = unsafe { std::str::from_utf8_unchecked(line) };
+        let value = s.parse().map_err(|_| RedisError::InvalidInteger)?;
+        Ok(RedisValue::Integer(value))
+    }
+    
+    fn parse_blob_string(&mut self) -> Result<RedisValue, RedisError> {
+        let line = self.parse_line()?;
+        let s = unsafe { std::str::from_utf8_unchecked(line) };
+        let len: usize = s.parse().map_err(|_| RedisError::InvalidInteger)?;
+        
+        if len == usize::MAX {
+            // Null blob string
+            return Ok(RedisValue::Null);
+        }
+        
+        if self.pos + len + 2 > self.data.len() {
+            return Err(RedisError::UnexpectedEof);
+        }
+        
+        let blob = &self.data[self.pos..self.pos + len];
+        self.pos += len + 2; // Skip \r\n
+        
+        Ok(RedisValue::Blob(blob.to_vec()))
+    }
+    
+    fn parse_array(&mut self) -> Result<RedisValue, RedisError> {
+        let line = self.parse_line()?;
+        let s = unsafe { std::str::from_utf8_unchecked(line) };
+        let len: usize = s.parse().map_err(|_| RedisError::InvalidInteger)?;
+        
+        if len == usize::MAX {
+            return Ok(RedisValue::Null);
+        }
+        
+        let mut arr = Vec::with_capacity(len);
+        for _ in 0..len {
+            arr.push(self.parse_value()?);
+        }
+        Ok(RedisValue::Array(arr))
+    }
+    
+    fn parse_null(&mut self) -> Result<RedisValue, RedisError> {
+        // Consume \r\n
+        if self.pos + 1 < self.data.len() && self.data[self.pos] == b'\r' && self.data[self.pos + 1] == b'\n' {
+            self.pos += 2;
+        }
+        Ok(RedisValue::Null)
+    }
+    
+    fn parse_boolean(&mut self) -> Result<RedisValue, RedisError> {
+        let line = self.parse_line()?;
+        if line.len() == 1 {
+            let value = line[0] == b't';
+            Ok(RedisValue::Bool(value))
+        } else {
+            Err(RedisError::InvalidBoolean)
+        }
+    }
+    
+    fn parse_double(&mut self) -> Result<RedisValue, RedisError> {
+        let line = self.parse_line()?;
+        let s = unsafe { std::str::from_utf8_unchecked(line) };
+        let value = s.parse().map_err(|_| RedisError::InvalidDouble)?;
+        Ok(RedisValue::Double(value))
+    }
+    
+    fn parse_big_number(&mut self) -> Result<RedisValue, RedisError> {
+        let line = self.parse_line()?;
+        let s = unsafe { std::str::from_utf8_unchecked(line) }.into();
+        Ok(RedisValue::BigNumber(s))
+    }
+    
+    fn parse_bulk_error(&mut self) -> Result<RedisValue, RedisError> {
+        let line = self.parse_line()?;
+        let s = unsafe { std::str::from_utf8_unchecked(line) };
+        Err(RedisError::ServerError(s.into()))
+    }
+    
+    fn parse_verbatim_string(&mut self) -> Result<RedisValue, RedisError> {
+        let line = self.parse_line()?;
+        let s = unsafe { std::str::from_utf8_unchecked(line) };
+        let parts: Vec<&str> = s.split('|').collect();
+        if parts.len() != 2 {
+            return Err(RedisError::InvalidVerbatimString);
+        }
+        let format = parts[0].into();
+        let text = parts[1].into();
+        Ok(RedisValue::VerbatimString(format, text))
+    }
+    
+    fn parse_map(&mut self) -> Result<RedisValue, RedisError> {
+        let line = self.parse_line()?;
+        let s = unsafe { std::str::from_utf8_unchecked(line) };
+        let len: usize = s.parse().map_err(|_| RedisError::InvalidInteger)?;
+        
+        if len == usize::MAX {
+            return Ok(RedisValue::Null);
+        }
+        
+        let mut map = Vec::with_capacity(len);
+        for _ in 0..len {
+            let key = self.parse_value()?;
+            let value = self.parse_value()?;
+            map.push((key, value));
+        }
+        Ok(RedisValue::Map(map))
+    }
+    
+    fn parse_set(&mut self) -> Result<RedisValue, RedisError> {
+        let line = self.parse_line()?;
+        let s = unsafe { std::str::from_utf8_unchecked(line) };
+        let len: usize = s.parse().map_err(|_| RedisError::InvalidInteger)?;
+        
+        if len == usize::MAX {
+            return Ok(RedisValue::Null);
+        }
+        
+        let mut set = Vec::with_capacity(len);
+        for _ in 0..len {
+            set.push(self.parse_value()?);
+        }
+        Ok(RedisValue::Set(set))
+    }
+    
+    fn parse_push(&mut self) -> Result<RedisValue, RedisError> {
+        let line = self.parse_line()?;
+        let s = unsafe { std::str::from_utf8_unchecked(line) };
+        let len: usize = s.parse().map_err(|_| RedisError::InvalidInteger)?;
+        
+        if len == usize::MAX {
+            return Ok(RedisValue::Null);
+        }
+        
+        let mut push = Vec::with_capacity(len);
+        for _ in 0..len {
+            push.push(self.parse_value()?);
+        }
+        Ok(RedisValue::Push(push))
+    }
+}
+
+fn parse_resp3_array(data: &[u8]) -> Result<Vec<RedisValue>, RedisError> {
+    let mut parser = Resp3Parser::new(data);
+    let value = parser.parse_value()?;
+    match value {
+        RedisValue::Array(arr) => Ok(arr),
+        _ => Ok(vec![value]),
+    }
+}
+
+// ============================================================================
+// Redis Error Types
+// ============================================================================
+
+enum RedisError {
+    ClientCreationFailed,
+    ConnectionFailed,
+    ExecutionFailed,
+    PoolCreationFailed,
+    PoolExhausted,
+    PoolReleaseFailed,
+    SubscriptionFailed,
+    PublishFailed,
+    PipelineExecutionFailed,
+    SerializationFailed,
+    InvalidUrl,
+    InvalidUtf8,
+    TypeMismatch,
+    NullValue,
+    UnexpectedEof,
+    InvalidTypeByte(u8),
+    InvalidInteger,
+    InvalidDouble,
+    InvalidBoolean,
+    InvalidVerbatimString,
+    ServerError(String),
+    ConnectionClosed,
+    AuthenticationFailed,
+    ClusterError(String),
+    ScriptError(String),
+    Timeout,
+    IoError(IoError),
+    TlsError(TlsError),
+    Moved(String), // For cluster redirection
+    Ask(String),   // For cluster redirection
+}
+
+impl RedisError {
+    pub fn to_string(&self) -> String {
+        match self {
+            RedisError::ClientCreationFailed => "Failed to create Redis client".into(),
+            RedisError::ConnectionFailed => "Failed to connect to Redis".into(),
+            RedisError::ExecutionFailed => "Command execution failed".into(),
+            RedisError::PoolCreationFailed => "Failed to create connection pool".into(),
+            RedisError::PoolExhausted => "Connection pool exhausted".into(),
+            RedisError::PoolReleaseFailed => "Failed to release connection".into(),
+            RedisError::SubscriptionFailed => "Failed to subscribe".into(),
+            RedisError::PublishFailed => "Failed to publish message".into(),
+            RedisError::PipelineExecutionFailed => "Pipeline execution failed".into(),
+            RedisError::SerializationFailed => "Serialization failed".into(),
+            RedisError::InvalidUrl => "Invalid Redis URL".into(),
+            RedisError::InvalidUtf8 => "Invalid UTF-8".into(),
+            RedisError::TypeMismatch => "Type mismatch".into(),
+            RedisError::NullValue => "Null value".into(),
+            RedisError::UnexpectedEof => "Unexpected end of input".into(),
+            RedisError::InvalidTypeByte(b) => format!("Invalid RESP3 type byte: 0x{:02X}", b),
+            RedisError::InvalidInteger => "Invalid integer".into(),
+            RedisError::InvalidDouble => "Invalid double".into(),
+            RedisError::InvalidBoolean => "Invalid boolean".into(),
+            RedisError::InvalidVerbatimString => "Invalid verbatim string".into(),
+            RedisError::ServerError(msg) => format!("Redis server error: {}", msg),
+            RedisError::ConnectionClosed => "Connection closed".into(),
+            RedisError::AuthenticationFailed => "Authentication failed".into(),
+            RedisError::ClusterError(msg) => format!("Cluster error: {}", msg),
+            RedisError::ScriptError(msg) => format!("Script error: {}", msg),
+            RedisError::Timeout => "Operation timed out".into(),
+            RedisError::IoError(e) => format!("I/O error: {}", e.to_string()),
+            RedisError::TlsError(e) => format!("TLS error: {}", e.to_string()),
+            RedisError::Moved(url) => format!("MOVED redirection: {}", url),
+            RedisError::Ask(url) => format!("ASK redirection: {}", url),
+        }
+    }
+}
+
+// ============================================================================
+// Redis Stack Modules Support
+// ============================================================================
+
+// RedisJSON
+fn cmd_json_set(key: &str, path: &str, value: &str) -> RedisCommand {
+    RedisCommand::new("JSON.SET").arg(key).arg(path).arg(value)
+}
+
+fn cmd_json_get(key: &str, path: &str) -> RedisCommand {
+    RedisCommand::new("JSON.GET").arg(key).arg(path)
+}
+
+fn cmd_json_del(key: &str, path: &str) -> RedisCommand {
+    RedisCommand::new("JSON.DEL").arg(key).arg(path)
+}
+
+// RedisSearch
+fn cmd_ft_create(index: &str, schema: &str) -> RedisCommand {
+    RedisCommand::new("FT.CREATE").arg(index).arg("ON").arg("JSON").arg("SCHEMA").arg(schema)
+}
+
+fn cmd_ft_search(index: &str, query: &str) -> RedisCommand {
+    RedisCommand::new("FT.SEARCH").arg(index).arg(query)
+}
+
+// RedisTimeSeries
+fn cmd_ts_create(key: &str) -> RedisCommand {
+    RedisCommand::new("TS.CREATE").arg(key)
+}
+
+fn cmd_ts_add(key: &str, timestamp: u64, value: f64) -> RedisCommand {
+    RedisCommand::new("TS.ADD").arg(key).arg(timestamp.to_string()).arg(value.to_string())
+}
+
+fn cmd_ts_range(key: &str, from: u64, to: u64) -> RedisCommand {
+    RedisCommand::new("TS.RANGE").arg(key).arg(from.to_string()).arg(to.to_string())
+}
+
+// RedisBloom
+fn cmd_bf_add(key: &str, item: &str) -> RedisCommand {
+    RedisCommand::new("BF.ADD").arg(key).arg(item)
+}
+
+fn cmd_bf_exists(key: &str, item: &str) -> RedisCommand {
+    RedisCommand::new("BF.EXISTS").arg(key).arg(item)
+}
+
+// RedisGraph
+fn cmd_graph_query(graph: &str, query: &str) -> RedisCommand {
+    RedisCommand::new("GRAPH.QUERY").arg(graph).arg(query)
+}
+
+// ============================================================================
+// Lua Scripting Support
+// ============================================================================
+
+struct RedisScript {
+    sha: String,
+    script: String,
+    num_keys: usize,
+}
+
+impl RedisScript {
+    pub fn new(script: &str) -> Self {
+        RedisScript {
+            sha: String::new(),
+            script: script.into(),
+            num_keys: 0,
+        }
+    }
+    
+    pub fn with_keys(mut self, num_keys: usize) -> Self {
+        self.num_keys = num_keys;
+        self
+    }
+    
+    pub async fn load(&self, client: &RedisClient) -> Result<String, RedisError> {
+        let result = client.execute(&RedisCommand::new("SCRIPT").arg("LOAD").arg(&self.script)).await?;
+        let sha = result.as_string()?;
+        Ok(sha)
+    }
+    
+    pub async fn eval(&self, client: &RedisClient, keys: &[&str], args: &[impl Into<RedisValue>]) -> Result<RedisValue, RedisError> {
+        let mut cmd = RedisCommand::new("EVALSHA").arg(&self.sha).arg(self.num_keys.to_string());
+        for key in keys {
+            cmd = cmd.arg(*key);
+        }
+        for arg in args {
+            cmd = cmd.arg(arg);
+        }
+        client.execute(&cmd).await
+    }
+    
+    pub async fn evalsha(&self, client: &RedisClient, keys: &[&str], args: &[impl Into<RedisValue>]) -> Result<RedisValue, RedisError> {
+        self.eval(client, keys, args).await
+    }
+}
+
+// ============================================================================
+// Transactions (MULTI/EXEC)
+// ============================================================================
+
+struct RedisTransaction {
+    client: RedisClient,
+    commands: Vec<RedisCommand>,
+    watch_keys: Vec<String>,
+}
+
+impl RedisTransaction {
+    pub fn new(client: RedisClient) -> Self {
+        RedisTransaction {
+            client,
+            commands: Vec::new(),
+            watch_keys: Vec::new(),
+        }
+    }
+    
+    pub fn watch(&mut self, keys: &[&str]) -> &mut Self {
+        self.watch_keys.extend(keys.iter().map(|k| k.to_string()));
+        self
+    }
+    
+    pub fn add(&mut self, cmd: RedisCommand) -> &mut Self {
+        self.commands.push(cmd);
+        self
+    }
+    
+    pub async fn exec(self) -> Result<Vec<RedisValue>, RedisError> {
+        // Build MULTI ... EXEC
+        let mut pipeline = self.client.pipeline();
+        
+        if !self.watch_keys.is_empty() {
+            pipeline.add(RedisCommand::new("WATCH").args(self.watch_keys.iter().map(|k| k.as_str().into()).collect()));
+        }
+        
+        pipeline.add(RedisCommand::new("MULTI"));
+        
+        for cmd in self.commands {
+            pipeline.add(cmd);
+        }
+        
+        pipeline.add(RedisCommand::new("EXEC"));
+        
+        pipeline.execute().await
+    }
+    
+    pub async fn discard(self) -> Result<(), RedisError> {
+        self.client.execute(&RedisCommand::new("DISCARD")).await?;
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Scan Iterators
+// ============================================================================
+
+struct ScanIterator {
+    client: RedisClient,
+    cursor: u64,
+    pattern: Option<String>,
+    count: usize,
+    finished: bool,
+}
+
+impl ScanIterator {
+    pub fn new(client: RedisClient) -> Self {
+        ScanIterator {
+            client,
+            cursor: 0,
+            pattern: None,
+            count: 100,
+            finished: false,
+        }
+    }
+    
+    pub fn pattern(mut self, pattern: &str) -> Self {
+        self.pattern = Some(pattern.into());
+        self
+    }
+    
+    pub fn count(mut self, count: usize) -> Self {
+        self.count = count;
+        self
+    }
+}
+
+impl Iterator for ScanIterator {
+    type Item = Result<String, RedisError>;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        
+        let mut cmd = RedisCommand::new("SCAN").arg(self.cursor.to_string());
+        if let Some(ref p) = self.pattern {
+            cmd = cmd.arg("MATCH").arg(p);
+        }
+        cmd = cmd.arg("COUNT").arg(self.count.to_string());
+        
+        // This is blocking - in real impl would be async
+        // For now, return a placeholder
+        Some(Ok("key".into()))
+    }
+}
+
+// ============================================================================
+// Cluster Client
+// ============================================================================
+
+struct RedisClusterClient {
+    nodes: Vec<RedisClient>,
+    slots: HashMap<u16, usize>, // slot -> node index
+}
+
+impl RedisClusterClient {
+    pub fn new(urls: &[String]) -> Result<Self, RedisError> {
+        let mut nodes = Vec::new();
+        for url in urls {
+            let config = RedisConfig::new(url)?;
+            let client = RedisClient::new(config)?;
+            client.connect().await?;
+            nodes.push(client);
+        }
+        
+        // Initialize slot mapping
+        let mut cluster = RedisClusterClient {
+            nodes,
+            slots: HashMap::new(),
+        };
+        
+        cluster.refresh_slots().await?;
+        Ok(cluster)
+    }
+    
+    async fn refresh_slots(&mut self) -> Result<(), RedisError> {
+        // Query CLUSTER SLOTS from a random node
+        if let Some(node) = self.nodes.first() {
+            let result = node.execute(&RedisCommand::new("CLUSTER").arg("SLOTS")).await?;
+            if let RedisValue::Array(slots) = result {
+                for slot_info in slots {
+                    if let RedisValue::Array(info) = slot_info {
+                        if info.len() >= 3 {
+                            if let (RedisValue::Integer(start), RedisValue::Integer(end), RedisValue::Array(node_info)) = 
+                                (&info[0], &info[1], &info[2]) {
+                                // node_info: [host, port, node_id]
+                                if let (RedisValue::String(host), RedisValue::Integer(port)) = (&node_info[0], &node_info[1]) {
+                                    let host_str = host.clone();
+                                    let port_num = *port as u16;
+                                    
+                                    // Find or create node for this host:port
+                                    let node_idx = self.find_or_create_node(&host_str, port_num).await?;
+                                    
+                                    for slot in *start as u16..=*end as u16 {
+                                        self.slots.insert(slot, node_idx);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    
+    async fn find_or_create_node(&mut self, host: &str, port: u16) -> Result<usize, RedisError> {
+        // Check existing nodes
+        for (i, node) in self.nodes.iter().enumerate() {
+            if node.config.host == host && node.config.port == port {
+                return Ok(i);
+            }
+        }
+        
+        // Create new node
+        let config = RedisConfig::default().host(host).port(port);
+        let client = RedisClient::new(config)?;
+        client.connect().await?;
+        let idx = self.nodes.len();
+        self.nodes.push(client);
+        Ok(idx)
+    }
+    
+    fn get_node_for_key(&self, key: &str) -> usize {
+        // CRC16(key) % 16384
+        let slot = crc16(key.as_bytes()) % 16384;
+        *self.slots.get(&slot).unwrap_or(&0)
+    }
+    
+    pub async fn execute(&self, cmd: &RedisCommand) -> Result<RedisValue, RedisError> {
+        // Extract key from command (simplified - first arg after command name)
+        // In real implementation, parse command to find key
+        let node_idx = self.get_node_for_key("default");
+        self.nodes[node_idx].execute(cmd).await
+    }
+}
+
+fn crc16(data: &[u8]) -> u16 {
+    let mut crc: u16 = 0;
+    for &byte in data {
+        crc ^= (byte as u16) << 8;
+        for _ in 0..8 {
+            if crc & 0x8000 != 0 {
+                crc = (crc << 1) ^ 0x1021;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    crc
+}

@@ -1,0 +1,1865 @@
+// ============================================================================
+// Naso HAL (Hardware Abstraction Layer) - Phase 19.8
+// ============================================================================
+// Cross-platform hardware abstraction for embedded and systems programming
+// GPIO, I2C, SPI, UART, PWM, ADC, DMA, interrupts, timers, watchdog
+// ============================================================================
+
+extern "C" {
+    // GPIO
+    fn naso_hal_gpio_open(port: u8, pin: u8, config_ptr: *const u8, config_len: usize) -> u64;
+    fn naso_hal_gpio_close(handle: u64) -> u64;
+    fn naso_hal_gpio_read(handle: u64) -> u64;
+    fn naso_hal_gpio_write(handle: u64, value: u8) -> u64;
+    fn naso_hal_gpio_toggle(handle: u64) -> u64;
+    fn naso_hal_gpio_set_mode(handle: u64, mode: u8) -> u64;
+    fn naso_hal_gpio_set_pull(handle: u64, pull: u8) -> u64;
+    fn naso_hal_gpio_set_drive(handle: u64, drive: u8) -> u64;
+    fn naso_hal_gpio_enable_interrupt(handle: u64, trigger: u8, callback: u64) -> u64;
+    fn naso_hal_gpio_disable_interrupt(handle: u64) -> u64;
+    
+    // I2C
+    fn naso_hal_i2c_open(bus: u8, config_ptr: *const u8, config_len: usize) -> u64;
+    fn naso_hal_i2c_close(handle: u64) -> u64;
+    fn naso_hal_i2c_write(handle: u64, addr: u16, data_ptr: *const u8, data_len: usize) -> u64;
+    fn naso_hal_i2c_read(handle: u64, addr: u16, buffer_ptr: *mut u8, buffer_len: usize) -> u64;
+    fn naso_hal_i2c_write_read(handle: u64, addr: u16, write_ptr: *const u8, write_len: usize, read_ptr: *mut u8, read_len: usize) -> u64;
+    fn naso_hal_i2c_scan(handle: u64, result_ptr: *mut u8, result_max_len: usize) -> u64;
+    fn naso_hal_i2c_set_frequency(handle: u64, frequency: u32) -> u64;
+    
+    // SPI
+    fn naso_hal_spi_open(bus: u8, config_ptr: *const u8, config_len: usize) -> u64;
+    fn naso_hal_spi_close(handle: u64) -> u64;
+    fn naso_hal_spi_transfer(handle: u64, tx_ptr: *const u8, rx_ptr: *mut u8, len: usize) -> u64;
+    fn naso_hal_spi_write(handle: u64, data_ptr: *const u8, data_len: usize) -> u64;
+    fn naso_hal_spi_read(handle: u64, buffer_ptr: *mut u8, buffer_len: usize) -> u64;
+    fn naso_hal_spi_set_frequency(handle: u64, frequency: u32) -> u64;
+    fn naso_hal_spi_set_mode(handle: u64, mode: u8) -> u64;
+    fn naso_hal_spi_set_bit_order(handle: u64, order: u8) -> u64;
+    
+    // UART
+    fn naso_hal_uart_open(port: u8, config_ptr: *const u8, config_len: usize) -> u64;
+    fn naso_hal_uart_close(handle: u64) -> u64;
+    fn naso_hal_uart_write(handle: u64, data_ptr: *const u8, data_len: usize) -> u64;
+    fn naso_hal_uart_read(handle: u64, buffer_ptr: *mut u8, buffer_len: usize) -> u64;
+    fn naso_hal_uart_flush(handle: u64) -> u64;
+    fn naso_hal_uart_set_baudrate(handle: u64, baudrate: u32) -> u64;
+    fn naso_hal_uart_set_config(handle: u64, config_ptr: *const u8, config_len: usize) -> u64;
+    fn naso_hal_uart_enable_rx_interrupt(handle: u64, callback: u64) -> u64;
+    fn naso_hal_uart_disable_rx_interrupt(handle: u64) -> u64;
+    
+    // PWM
+    fn naso_hal_pwm_open(channel: u8, config_ptr: *const u8, config_len: usize) -> u64;
+    fn naso_hal_pwm_close(handle: u64) -> u64;
+    fn naso_hal_pwm_set_duty(handle: u64, duty: u32) -> u64;
+    fn naso_hal_pwm_set_period(handle: u64, period: u32) -> u64;
+    fn naso_hal_pwm_set_frequency(handle: u64, frequency: u32) -> u64;
+    fn naso_hal_pwm_enable(handle: u64) -> u64;
+    fn naso_hal_pwm_disable(handle: u64) -> u64;
+    fn naso_hal_pwm_get_max_duty(handle: u64) -> u64;
+    
+    // ADC
+    fn naso_hal_adc_open(channel: u8, config_ptr: *const u8, config_len: usize) -> u64;
+    fn naso_hal_adc_close(handle: u64) -> u64;
+    fn naso_hal_adc_read(handle: u64) -> u64;
+    fn naso_hal_adc_read_voltage(handle: u64) -> u64;
+    fn naso_hal_adc_set_resolution(handle: u64, bits: u8) -> u64;
+    fn naso_hal_adc_set_reference(handle: u64, reference: u8) -> u64;
+    fn naso_hal_adc_enable_continuous(handle: u64, callback: u64) -> u64;
+    fn naso_hal_adc_disable_continuous(handle: u64) -> u64;
+    
+    // DMA
+    fn naso_hal_dma_alloc(channel: u8, size: usize, alignment: usize) -> u64;
+    fn naso_hal_dma_free(handle: u64) -> u64;
+    fn naso_hal_dma_start(handle: u64, src_ptr: *const u8, dst_ptr: *mut u8, len: usize, config_ptr: *const u8, config_len: usize) -> u64;
+    fn naso_hal_dma_wait(handle: u64, timeout_ms: u32) -> u64;
+    fn naso_hal_dma_abort(handle: u64) -> u64;
+    fn naso_hal_dma_set_callback(handle: u64, callback: u64) -> u64;
+    
+    // Timer
+    fn naso_hal_timer_open(timer_id: u8, config_ptr: *const u8, config_len: usize) -> u64;
+    fn naso_hal_timer_close(handle: u64) -> u64;
+    fn naso_hal_timer_start(handle: u64) -> u64;
+    fn naso_hal_timer_stop(handle: u64) -> u64;
+    fn naso_hal_timer_set_period(handle: u64, period_us: u64) -> u64;
+    fn naso_hal_timer_get_counter(handle: u64) -> u64;
+    fn naso_hal_timer_set_callback(handle: u64, callback: u64) -> u64;
+    fn naso_hal_timer_enable_interrupt(handle: u64) -> u64;
+    fn naso_hal_timer_disable_interrupt(handle: u64) -> u64;
+    
+    // Watchdog
+    fn naso_hal_wdt_open(config_ptr: *const u8, config_len: usize) -> u64;
+    fn naso_hal_wdt_close(handle: u64) -> u64;
+    fn naso_hal_wdt_feed(handle: u64) -> u64;
+    fn naso_hal_wdt_set_timeout(handle: u64, timeout_ms: u32) -> u64;
+    fn naso_hal_wdt_get_remaining(handle: u64) -> u64;
+    
+    // RTC
+    fn naso_hal_rtc_open() -> u64;
+    fn naso_hal_rtc_close(handle: u64) -> u64;
+    fn naso_hal_rtc_get_time(handle: u64, time_ptr: *mut u8, time_max_len: usize) -> u64;
+    fn naso_hal_rtc_set_time(handle: u64, time_ptr: *const u8, time_len: usize) -> u64;
+    fn naso_hal_rtc_set_alarm(handle: u64, time_ptr: *const u8, time_len: usize, callback: u64) -> u64;
+    fn naso_hal_rtc_disable_alarm(handle: u64) -> u64;
+    
+    // Power Management
+    fn naso_hal_pm_sleep(mode: u8) -> u64;
+    fn naso_hal_pm_deep_sleep(mode: u8, wakeup_ptr: *const u8, wakeup_len: usize) -> u64;
+    fn naso_hal_pm_get_wakeup_reason(reason_ptr: *mut u8, reason_max_len: usize) -> u64;
+    
+    // Random
+    fn naso_hal_random_bytes(buffer_ptr: *mut u8, len: usize) -> u64;
+    fn naso_hal_random_u32() -> u64;
+    fn naso_hal_random_u64() -> u64;
+    
+    // System Info
+    fn naso_hal_get_chip_id(id_ptr: *mut u8, id_max_len: usize) -> u64;
+    fn naso_hal_get_chip_revision() -> u64;
+    fn naso_hal_get_flash_size() -> u64;
+    fn naso_hal_get_ram_size() -> u64;
+    fn naso_hal_get_cpu_frequency() -> u64;
+    fn naso_hal_get_unique_id(id_ptr: *mut u8, id_max_len: usize) -> u64;
+    fn naso_hal_get_reset_reason(reason_ptr: *mut u8, reason_max_len: usize) -> u64;
+    
+    // Interrupts
+    fn naso_hal_interrupt_enable(irq: u32) -> u64;
+    fn naso_hal_interrupt_disable(irq: u32) -> u64;
+    fn naso_hal_interrupt_set_priority(irq: u32, priority: u8) -> u64;
+    fn naso_hal_interrupt_set_handler(irq: u32, handler: u64) -> u64;
+    fn naso_hal_interrupt_pending(irq: u32) -> u64;
+    
+    // Board Support
+    fn naso_hal_board_init() -> u64;
+    fn naso_hal_board_get_led_pins(leds_ptr: *mut u8, leds_max_len: usize) -> u64;
+    fn naso_hal_board_get_button_pins(buttons_ptr: *mut u8, buttons_max_len: usize) -> u64;
+}
+
+// ============================================================================
+// GPIO
+// ============================================================================
+
+enum GpioMode {
+    Input = 0,
+    Output = 1,
+    Alternate = 2,
+    Analog = 3,
+}
+
+enum GpioPull {
+    None = 0,
+    Up = 1,
+    Down = 2,
+}
+
+enum GpioDrive {
+    Low = 0,
+    Medium = 1,
+    High = 2,
+    VeryHigh = 3,
+}
+
+enum GpioInterruptTrigger {
+    Rising = 0,
+    Falling = 1,
+    Both = 2,
+    LowLevel = 3,
+    HighLevel = 4,
+}
+
+struct GpioConfig {
+    mode: GpioMode,
+    pull: GpioPull,
+    drive: GpioDrive,
+    initial_value: Option<bool>,
+}
+
+impl Default for GpioConfig {
+    fn default() -> Self {
+        GpioConfig {
+            mode: GpioMode::Input,
+            pull: GpioPull::None,
+            drive: GpioDrive::Medium,
+            initial_value: None,
+        }
+    }
+}
+
+struct GpioPin {
+    handle: u64,
+    port: u8,
+    pin: u8,
+}
+
+impl GpioPin {
+    pub fn new(port: u8, pin: u8, config: GpioConfig) -> Result<Self, HalError> {
+        let config_json = gpio_config_to_json(&config);
+        let handle = naso_hal_gpio_open(port, pin, config_json.as_ptr(), config_json.len());
+        if handle == 0 {
+            return Err(HalError::GpioOpenFailed);
+        }
+        Ok(GpioPin { handle, port, pin })
+    }
+    
+    pub fn input(port: u8, pin: u8, pull: GpioPull) -> Result<Self, HalError> {
+        let config = GpioConfig { mode: GpioMode::Input, pull, ..Default::default() };
+        Self::new(port, pin, config)
+    }
+    
+    pub fn output(port: u8, pin: u8, initial: bool) -> Result<Self, HalError> {
+        let config = GpioConfig { mode: GpioMode::Output, initial_value: Some(initial), ..Default::default() };
+        Self::new(port, pin, config)
+    }
+    
+    pub fn read(&self) -> Result<bool, HalError> {
+        let result = naso_hal_gpio_read(self.handle);
+        if result == u64::MAX {
+            return Err(HalError::GpioReadFailed);
+        }
+        Ok(result != 0)
+    }
+    
+    pub fn write(&mut self, value: bool) -> Result<(), HalError> {
+        let result = naso_hal_gpio_write(self.handle, if value { 1 } else { 0 });
+        if result == 0 {
+            return Err(HalError::GpioWriteFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn toggle(&mut self) -> Result<(), HalError> {
+        let result = naso_hal_gpio_toggle(self.handle);
+        if result == 0 {
+            return Err(HalError::GpioWriteFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn set_mode(&mut self, mode: GpioMode) -> Result<(), HalError> {
+        let result = naso_hal_gpio_set_mode(self.handle, mode as u8);
+        if result == 0 {
+            return Err(HalError::GpioConfigFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn set_pull(&mut self, pull: GpioPull) -> Result<(), HalError> {
+        let result = naso_hal_gpio_set_pull(self.handle, pull as u8);
+        if result == 0 {
+            return Err(HalError::GpioConfigFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn set_drive(&mut self, drive: GpioDrive) -> Result<(), HalError> {
+        let result = naso_hal_gpio_set_drive(self.handle, drive as u8);
+        if result == 0 {
+            return Err(HalError::GpioConfigFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn enable_interrupt(&mut self, trigger: GpioInterruptTrigger, callback: impl FnMut(bool) + Send + 'static) -> Result<(), HalError> {
+        // Would register callback in runtime
+        let cb_ptr = register_callback(Box::new(callback));
+        let result = naso_hal_gpio_enable_interrupt(self.handle, trigger as u8, cb_ptr);
+        if result == 0 {
+            return Err(HalError::InterruptSetupFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn disable_interrupt(&mut self) -> Result<(), HalError> {
+        let result = naso_hal_gpio_disable_interrupt(self.handle);
+        if result == 0 {
+            return Err(HalError::InterruptSetupFailed);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for GpioPin {
+    fn drop(&mut self) {
+        naso_hal_gpio_close(self.handle);
+    }
+}
+
+fn gpio_config_to_json(config: &GpioConfig) -> String {
+    format!(
+        "{{\"mode\":{},\"pull\":{},\"drive\":{},\"initial_value\":{}}}",
+        config.mode as u8,
+        config.pull as u8,
+        config.drive as u8,
+        config.initial_value.map(|v| if v { "true" } else { "false" }).unwrap_or("null")
+    )
+}
+
+// ============================================================================
+// I2C
+// ============================================================================
+
+struct I2cConfig {
+    frequency: u32,
+    timeout_ms: u32,
+    addressing_mode: I2cAddressingMode,
+}
+
+enum I2cAddressingMode {
+    SevenBit = 0,
+    TenBit = 1,
+}
+
+impl Default for I2cConfig {
+    fn default() -> Self {
+        I2cConfig {
+            frequency: 100_000,
+            timeout_ms: 1000,
+            addressing_mode: I2cAddressingMode::SevenBit,
+        }
+    }
+}
+
+struct I2c {
+    handle: u64,
+    bus: u8,
+}
+
+impl I2c {
+    pub fn new(bus: u8, config: I2cConfig) -> Result<Self, HalError> {
+        let config_json = i2c_config_to_json(&config);
+        let handle = naso_hal_i2c_open(bus, config_json.as_ptr(), config_json.len());
+        if handle == 0 {
+            return Err(HalError::I2cOpenFailed);
+        }
+        Ok(I2c { handle, bus })
+    }
+    
+    pub fn write(&mut self, addr: u16, data: &[u8]) -> Result<usize, HalError> {
+        let result = naso_hal_i2c_write(self.handle, addr, data.as_ptr(), data.len());
+        if result == u64::MAX {
+            return Err(HalError::I2cWriteFailed);
+        }
+        Ok(result as usize)
+    }
+    
+    pub fn read(&mut self, addr: u16, buffer: &mut [u8]) -> Result<usize, HalError> {
+        let result = naso_hal_i2c_read(self.handle, addr, buffer.as_mut_ptr(), buffer.len());
+        if result == u64::MAX {
+            return Err(HalError::I2cReadFailed);
+        }
+        Ok(result as usize)
+    }
+    
+    pub fn write_read(&mut self, addr: u16, write_data: &[u8], read_buffer: &mut [u8]) -> Result<usize, HalError> {
+        let result = naso_hal_i2c_write_read(self.handle, addr, write_data.as_ptr(), write_data.len(), read_buffer.as_mut_ptr(), read_buffer.len());
+        if result == u64::MAX {
+            return Err(HalError::I2cWriteReadFailed);
+        }
+        Ok(result as usize)
+    }
+    
+    pub fn scan(&mut self) -> Result<Vec<u16>, HalError> {
+        let mut result = vec![0u8; 1024];
+        let len = naso_hal_i2c_scan(self.handle, result.as_mut_ptr(), result.len());
+        if len == u64::MAX {
+            return Err(HalError::I2cScanFailed);
+        }
+        result.truncate(len as usize);
+        // Parse addresses from result
+        let mut addresses = Vec::new();
+        for i in (0..result.len()).step_by(2) {
+            if i + 1 < result.len() {
+                addresses.push(u16::from_le_bytes([result[i], result[i+1]]));
+            }
+        }
+        Ok(addresses)
+    }
+    
+    pub fn set_frequency(&mut self, frequency: u32) -> Result<(), HalError> {
+        let result = naso_hal_i2c_set_frequency(self.handle, frequency);
+        if result == 0 {
+            return Err(HalError::I2cConfigFailed);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for I2c {
+    fn drop(&mut self) {
+        naso_hal_i2c_close(self.handle);
+    }
+}
+
+fn i2c_config_to_json(config: &I2cConfig) -> String {
+    format!(
+        "{{\"frequency\":{},\"timeout_ms\":{},\"addressing_mode\":{}}}",
+        config.frequency,
+        config.timeout_ms,
+        config.addressing_mode as u8
+    )
+}
+
+// ============================================================================
+// SPI
+// ============================================================================
+
+enum SpiMode {
+    Mode0 = 0, // CPOL=0, CPHA=0
+    Mode1 = 1, // CPOL=0, CPHA=1
+    Mode2 = 2, // CPOL=1, CPHA=0
+    Mode3 = 3, // CPOL=1, CPHA=1
+}
+
+enum SpiBitOrder {
+    MsbFirst = 0,
+    LsbFirst = 1,
+}
+
+struct SpiConfig {
+    frequency: u32,
+    mode: SpiMode,
+    bit_order: SpiBitOrder,
+    bits_per_word: u8,
+}
+
+impl Default for SpiConfig {
+    fn default() -> Self {
+        SpiConfig {
+            frequency: 1_000_000,
+            mode: SpiMode::Mode0,
+            bit_order: SpiBitOrder::MsbFirst,
+            bits_per_word: 8,
+        }
+    }
+}
+
+struct Spi {
+    handle: u64,
+    bus: u8,
+}
+
+impl Spi {
+    pub fn new(bus: u8, config: SpiConfig) -> Result<Self, HalError> {
+        let config_json = spi_config_to_json(&config);
+        let handle = naso_hal_spi_open(bus, config_json.as_ptr(), config_json.len());
+        if handle == 0 {
+            return Err(HalError::SpiOpenFailed);
+        }
+        Ok(Spi { handle, bus })
+    }
+    
+    pub fn transfer(&mut self, tx: &[u8], rx: &mut [u8]) -> Result<usize, HalError> {
+        if tx.len() != rx.len() {
+            return Err(HalError::InvalidBufferSize);
+        }
+        let result = naso_hal_spi_transfer(self.handle, tx.as_ptr(), rx.as_mut_ptr(), tx.len());
+        if result == u64::MAX {
+            return Err(HalError::SpiTransferFailed);
+        }
+        Ok(result as usize)
+    }
+    
+    pub fn write(&mut self, data: &[u8]) -> Result<usize, HalError> {
+        let result = naso_hal_spi_write(self.handle, data.as_ptr(), data.len());
+        if result == u64::MAX {
+            return Err(HalError::SpiWriteFailed);
+        }
+        Ok(result as usize)
+    }
+    
+    pub fn read(&mut self, buffer: &mut [u8]) -> Result<usize, HalError> {
+        let result = naso_hal_spi_read(self.handle, buffer.as_mut_ptr(), buffer.len());
+        if result == u64::MAX {
+            return Err(HalError::SpiReadFailed);
+        }
+        Ok(result as usize)
+    }
+    
+    pub fn set_frequency(&mut self, frequency: u32) -> Result<(), HalError> {
+        let result = naso_hal_spi_set_frequency(self.handle, frequency);
+        if result == 0 {
+            return Err(HalError::SpiConfigFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn set_mode(&mut self, mode: SpiMode) -> Result<(), HalError> {
+        let result = naso_hal_spi_set_mode(self.handle, mode as u8);
+        if result == 0 {
+            return Err(HalError::SpiConfigFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn set_bit_order(&mut self, order: SpiBitOrder) -> Result<(), HalError> {
+        let result = naso_hal_spi_set_bit_order(self.handle, order as u8);
+        if result == 0 {
+            return Err(HalError::SpiConfigFailed);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Spi {
+    fn drop(&mut self) {
+        naso_hal_spi_close(self.handle);
+    }
+}
+
+fn spi_config_to_json(config: &SpiConfig) -> String {
+    format!(
+        "{{\"frequency\":{},\"mode\":{},\"bit_order\":{},\"bits_per_word\":{}}}",
+        config.frequency,
+        config.mode as u8,
+        config.bit_order as u8,
+        config.bits_per_word
+    )
+}
+
+// ============================================================================
+// UART
+// ============================================================================
+
+enum UartParity {
+    None = 0,
+    Even = 1,
+    Odd = 2,
+}
+
+enum UartStopBits {
+    One = 0,
+    Two = 1,
+}
+
+enum UartFlowControl {
+    None = 0,
+    RtsCts = 1,
+    XonXoff = 2,
+}
+
+struct UartConfig {
+    baudrate: u32,
+    data_bits: u8,
+    parity: UartParity,
+    stop_bits: UartStopBits,
+    flow_control: UartFlowControl,
+    timeout_ms: u32,
+}
+
+impl Default for UartConfig {
+    fn default() -> Self {
+        UartConfig {
+            baudrate: 115_200,
+            data_bits: 8,
+            parity: UartParity::None,
+            stop_bits: UartStopBits::One,
+            flow_control: UartFlowControl::None,
+            timeout_ms: 1000,
+        }
+    }
+}
+
+struct Uart {
+    handle: u64,
+    port: u8,
+}
+
+impl Uart {
+    pub fn new(port: u8, config: UartConfig) -> Result<Self, HalError> {
+        let config_json = uart_config_to_json(&config);
+        let handle = naso_hal_uart_open(port, config_json.as_ptr(), config_json.len());
+        if handle == 0 {
+            return Err(HalError::UartOpenFailed);
+        }
+        Ok(Uart { handle, port })
+    }
+    
+    pub fn write(&mut self, data: &[u8]) -> Result<usize, HalError> {
+        let result = naso_hal_uart_write(self.handle, data.as_ptr(), data.len());
+        if result == u64::MAX {
+            return Err(HalError::UartWriteFailed);
+        }
+        Ok(result as usize)
+    }
+    
+    pub fn read(&mut self, buffer: &mut [u8]) -> Result<usize, HalError> {
+        let result = naso_hal_uart_read(self.handle, buffer.as_mut_ptr(), buffer.len());
+        if result == u64::MAX {
+            return Err(HalError::UartReadFailed);
+        }
+        Ok(result as usize)
+    }
+    
+    pub fn flush(&mut self) -> Result<(), HalError> {
+        let result = naso_hal_uart_flush(self.handle);
+        if result == 0 {
+            return Err(HalError::UartFlushFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn set_baudrate(&mut self, baudrate: u32) -> Result<(), HalError> {
+        let result = naso_hal_uart_set_baudrate(self.handle, baudrate);
+        if result == 0 {
+            return Err(HalError::UartConfigFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn set_config(&mut self, config: UartConfig) -> Result<(), HalError> {
+        let config_json = uart_config_to_json(&config);
+        let result = naso_hal_uart_set_config(self.handle, config_json.as_ptr(), config_json.len());
+        if result == 0 {
+            return Err(HalError::UartConfigFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn enable_rx_interrupt(&mut self, callback: impl FnMut(&[u8]) + Send + 'static) -> Result<(), HalError> {
+        let cb_ptr = register_callback(Box::new(callback));
+        let result = naso_hal_uart_enable_rx_interrupt(self.handle, cb_ptr);
+        if result == 0 {
+            return Err(HalError::InterruptSetupFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn disable_rx_interrupt(&mut self) -> Result<(), HalError> {
+        let result = naso_hal_uart_disable_rx_interrupt(self.handle);
+        if result == 0 {
+            return Err(HalError::InterruptSetupFailed);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Uart {
+    fn drop(&mut self) {
+        naso_hal_uart_close(self.handle);
+    }
+}
+
+fn uart_config_to_json(config: &UartConfig) -> String {
+    format!(
+        "{{\"baudrate\":{},\"data_bits\":{},\"parity\":{},\"stop_bits\":{},\"flow_control\":{},\"timeout_ms\":{}}}",
+        config.baudrate,
+        config.data_bits,
+        config.parity as u8,
+        config.stop_bits as u8,
+        config.flow_control as u8,
+        config.timeout_ms
+    )
+}
+
+// ============================================================================
+// PWM
+// ============================================================================
+
+struct PwmConfig {
+    frequency: u32,
+    duty_cycle: u32, // 0 to max_duty
+    polarity: PwmPolarity,
+}
+
+enum PwmPolarity {
+    Normal = 0,
+    Inverted = 1,
+}
+
+impl Default for PwmConfig {
+    fn default() -> Self {
+        PwmConfig {
+            frequency: 1000,
+            duty_cycle: 0,
+            polarity: PwmPolarity::Normal,
+        }
+    }
+}
+
+struct Pwm {
+    handle: u64,
+    channel: u8,
+    max_duty: u32,
+}
+
+impl Pwm {
+    pub fn new(channel: u8, config: PwmConfig) -> Result<Self, HalError> {
+        let config_json = pwm_config_to_json(&config);
+        let handle = naso_hal_pwm_open(channel, config_json.as_ptr(), config_json.len());
+        if handle == 0 {
+            return Err(HalError::PwmOpenFailed);
+        }
+        
+        let max_duty = naso_hal_pwm_get_max_duty(handle) as u32;
+        
+        Ok(Pwm { handle, channel, max_duty })
+    }
+    
+    pub fn set_duty(&mut self, duty: u32) -> Result<(), HalError> {
+        if duty > self.max_duty {
+            return Err(HalError::InvalidDutyCycle);
+        }
+        let result = naso_hal_pwm_set_duty(self.handle, duty);
+        if result == 0 {
+            return Err(HalError::PwmSetFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn set_duty_percent(&mut self, percent: f32) -> Result<(), HalError> {
+        let duty = ((percent.clamp(0.0, 100.0) / 100.0) * self.max_duty as f32) as u32;
+        self.set_duty(duty)
+    }
+    
+    pub fn set_period(&mut self, period_us: u32) -> Result<(), HalError> {
+        let result = naso_hal_pwm_set_period(self.handle, period_us);
+        if result == 0 {
+            return Err(HalError::PwmSetFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn set_frequency(&mut self, frequency: u32) -> Result<(), HalError> {
+        let result = naso_hal_pwm_set_frequency(self.handle, frequency);
+        if result == 0 {
+            return Err(HalError::PwmSetFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn enable(&mut self) -> Result<(), HalError> {
+        let result = naso_hal_pwm_enable(self.handle);
+        if result == 0 {
+            return Err(HalError::PwmEnableFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn disable(&mut self) -> Result<(), HalError> {
+        let result = naso_hal_pwm_disable(self.handle);
+        if result == 0 {
+            return Err(HalError::PwmDisableFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn get_max_duty(&self) -> u32 {
+        self.max_duty
+    }
+}
+
+impl Drop for Pwm {
+    fn drop(&mut self) {
+        naso_hal_pwm_close(self.handle);
+    }
+}
+
+fn pwm_config_to_json(config: &PwmConfig) -> String {
+    format!(
+        "{{\"frequency\":{},\"duty_cycle\":{},\"polarity\":{}}}",
+        config.frequency,
+        config.duty_cycle,
+        config.polarity as u8
+    )
+}
+
+// ============================================================================
+// ADC
+// ============================================================================
+
+enum AdcReference {
+    Internal = 0,
+    External = 1,
+    Vcc = 2,
+}
+
+struct AdcConfig {
+    resolution_bits: u8,
+    reference: AdcReference,
+    sampling_time: u32, // ADC cycles
+}
+
+impl Default for AdcConfig {
+    fn default() -> Self {
+        AdcConfig {
+            resolution_bits: 12,
+            reference: AdcReference::Vcc,
+            sampling_time: 15,
+        }
+    }
+}
+
+struct Adc {
+    handle: u64,
+    channel: u8,
+    resolution_bits: u8,
+    reference_voltage: f32, // V
+}
+
+impl Adc {
+    pub fn new(channel: u8, config: AdcConfig) -> Result<Self, HalError> {
+        let config_json = adc_config_to_json(&config);
+        let handle = naso_hal_adc_open(channel, config_json.as_ptr(), config_json.len());
+        if handle == 0 {
+            return Err(HalError::AdcOpenFailed);
+        }
+        
+        let reference_voltage = match config.reference {
+            AdcReference::Internal => 1.1,
+            AdcReference::External => 3.3, // Would be configured
+            AdcReference::Vcc => 3.3,
+        };
+        
+        Ok(Adc {
+            handle,
+            channel,
+            resolution_bits: config.resolution_bits,
+            reference_voltage,
+        })
+    }
+    
+    pub fn read(&mut self) -> Result<u32, HalError> {
+        let result = naso_hal_adc_read(self.handle);
+        if result == u64::MAX {
+            return Err(HalError::AdcReadFailed);
+        }
+        Ok(result as u32)
+    }
+    
+    pub fn read_voltage(&mut self) -> Result<f32, HalError> {
+        let result = naso_hal_adc_read_voltage(self.handle);
+        if result == u64::MAX {
+            return Err(HalError::AdcReadFailed);
+        }
+        // Result is in millivolts as u32
+        Ok((result as u32) as f32 / 1000.0)
+    }
+    
+    pub fn set_resolution(&mut self, bits: u8) -> Result<(), HalError> {
+        if bits > 16 {
+            return Err(HalError::InvalidResolution);
+        }
+        let result = naso_hal_adc_set_resolution(self.handle, bits);
+        if result == 0 {
+            return Err(HalError::AdcConfigFailed);
+        }
+        self.resolution_bits = bits;
+        Ok(())
+    }
+    
+    pub fn set_reference(&mut self, reference: AdcReference) -> Result<(), HalError> {
+        let result = naso_hal_adc_set_reference(self.handle, reference as u8);
+        if result == 0 {
+            return Err(HalError::AdcConfigFailed);
+        }
+        self.reference_voltage = match reference {
+            AdcReference::Internal => 1.1,
+            AdcReference::External => 3.3,
+            AdcReference::Vcc => 3.3,
+        };
+        Ok(())
+    }
+    
+    pub fn enable_continuous(&mut self, callback: impl FnMut(u32) + Send + 'static) -> Result<(), HalError> {
+        let cb_ptr = register_callback(Box::new(callback));
+        let result = naso_hal_adc_enable_continuous(self.handle, cb_ptr);
+        if result == 0 {
+            return Err(HalError::InterruptSetupFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn disable_continuous(&mut self) -> Result<(), HalError> {
+        let result = naso_hal_adc_disable_continuous(self.handle);
+        if result == 0 {
+            return Err(HalError::InterruptSetupFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn max_value(&self) -> u32 {
+        (1u32 << self.resolution_bits) - 1
+    }
+}
+
+impl Drop for Adc {
+    fn drop(&mut self) {
+        naso_hal_adc_close(self.handle);
+    }
+}
+
+fn adc_config_to_json(config: &AdcConfig) -> String {
+    format!(
+        "{{\"resolution_bits\":{},\"reference\":{},\"sampling_time\":{}}}",
+        config.resolution_bits,
+        config.reference as u8,
+        config.sampling_time
+    )
+}
+
+// ============================================================================
+// DMA
+// ============================================================================
+
+enum DmaDirection {
+    PeripheralToMemory = 0,
+    MemoryToPeripheral = 1,
+    MemoryToMemory = 2,
+}
+
+enum DmaDataSize {
+    Byte = 0,
+    HalfWord = 1,
+    Word = 2,
+}
+
+enum DmaPriority {
+    Low = 0,
+    Medium = 1,
+    High = 2,
+    VeryHigh = 3,
+}
+
+struct DmaConfig {
+    direction: DmaDirection,
+    peripheral_addr: u32,
+    memory_increment: bool,
+    peripheral_increment: bool,
+    data_size: DmaDataSize,
+    priority: DmaPriority,
+    circular: bool,
+}
+
+struct Dma {
+    handle: u64,
+    channel: u8,
+}
+
+impl Dma {
+    pub fn new(channel: u8, buffer_size: usize, alignment: usize) -> Result<Self, HalError> {
+        let handle = naso_hal_dma_alloc(channel, buffer_size, alignment);
+        if handle == 0 {
+            return Err(HalError::DmaAllocFailed);
+        }
+        Ok(Dma { handle, channel })
+    }
+    
+    pub fn start(&mut self, src: &[u8], dst: &mut [u8], config: DmaConfig) -> Result<(), HalError> {
+        if src.len() != dst.len() {
+            return Err(HalError::InvalidBufferSize);
+        }
+        let config_json = dma_config_to_json(&config);
+        let result = naso_hal_dma_start(self.handle, src.as_ptr(), dst.as_mut_ptr(), src.len(), config_json.as_ptr(), config_json.len());
+        if result == 0 {
+            return Err(HalError::DmaStartFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn wait(&mut self, timeout_ms: u32) -> Result<bool, HalError> {
+        let result = naso_hal_dma_wait(self.handle, timeout_ms);
+        if result == u64::MAX {
+            return Err(HalError::DmaWaitFailed);
+        }
+        Ok(result != 0)
+    }
+    
+    pub fn abort(&mut self) -> Result<(), HalError> {
+        let result = naso_hal_dma_abort(self.handle);
+        if result == 0 {
+            return Err(HalError::DmaAbortFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn set_callback(&mut self, callback: impl FnMut() + Send + 'static) -> Result<(), HalError> {
+        let cb_ptr = register_callback(Box::new(callback));
+        let result = naso_hal_dma_set_callback(self.handle, cb_ptr);
+        if result == 0 {
+            return Err(HalError::InterruptSetupFailed);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Dma {
+    fn drop(&mut self) {
+        naso_hal_dma_free(self.handle);
+    }
+}
+
+fn dma_config_to_json(config: &DmaConfig) -> String {
+    format!(
+        "{{\"direction\":{},\"peripheral_addr\":{},\"memory_increment\":{},\"peripheral_increment\":{},\"data_size\":{},\"priority\":{},\"circular\":{}}}",
+        config.direction as u8,
+        config.peripheral_addr,
+        config.memory_increment as u8,
+        config.peripheral_increment as u8,
+        config.data_size as u8,
+        config.priority as u8,
+        config.circular as u8
+    )
+}
+
+// ============================================================================
+// Timer
+// ============================================================================
+
+enum TimerMode {
+    OneShot = 0,
+    Periodic = 1,
+    Pwm = 2,
+    Capture = 3,
+}
+
+struct TimerConfig {
+    frequency_hz: u32,
+    mode: TimerMode,
+    auto_reload: bool,
+}
+
+impl Default for TimerConfig {
+    fn default() -> Self {
+        TimerConfig {
+            frequency_hz: 1_000_000, // 1 MHz
+            mode: TimerMode::Periodic,
+            auto_reload: true,
+        }
+    }
+}
+
+struct Timer {
+    handle: u64,
+    timer_id: u8,
+}
+
+impl Timer {
+    pub fn new(timer_id: u8, config: TimerConfig) -> Result<Self, HalError> {
+        let config_json = timer_config_to_json(&config);
+        let handle = naso_hal_timer_open(timer_id, config_json.as_ptr(), config_json.len());
+        if handle == 0 {
+            return Err(HalError::TimerOpenFailed);
+        }
+        Ok(Timer { handle, timer_id })
+    }
+    
+    pub fn start(&mut self) -> Result<(), HalError> {
+        let result = naso_hal_timer_start(self.handle);
+        if result == 0 {
+            return Err(HalError::TimerStartFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn stop(&mut self) -> Result<(), HalError> {
+        let result = naso_hal_timer_stop(self.handle);
+        if result == 0 {
+            return Err(HalError::TimerStopFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn set_period_us(&mut self, period_us: u64) -> Result<(), HalError> {
+        let result = naso_hal_timer_set_period(self.handle, period_us);
+        if result == 0 {
+            return Err(HalError::TimerConfigFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn get_counter(&mut self) -> Result<u64, HalError> {
+        let result = naso_hal_timer_get_counter(self.handle);
+        if result == u64::MAX {
+            return Err(HalError::TimerReadFailed);
+        }
+        Ok(result)
+    }
+    
+    pub fn set_callback(&mut self, callback: impl FnMut() + Send + 'static) -> Result<(), HalError> {
+        let cb_ptr = register_callback(Box::new(callback));
+        let result = naso_hal_timer_set_callback(self.handle, cb_ptr);
+        if result == 0 {
+            return Err(HalError::InterruptSetupFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn enable_interrupt(&mut self) -> Result<(), HalError> {
+        let result = naso_hal_timer_enable_interrupt(self.handle);
+        if result == 0 {
+            return Err(HalError::InterruptSetupFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn disable_interrupt(&mut self) -> Result<(), HalError> {
+        let result = naso_hal_timer_disable_interrupt(self.handle);
+        if result == 0 {
+            return Err(HalError::InterruptSetupFailed);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Timer {
+    fn drop(&mut self) {
+        naso_hal_timer_close(self.handle);
+    }
+}
+
+fn timer_config_to_json(config: &TimerConfig) -> String {
+    format!(
+        "{{\"frequency_hz\":{},\"mode\":{},\"auto_reload\":{}}}",
+        config.frequency_hz,
+        config.mode as u8,
+        config.auto_reload as u8
+    )
+}
+
+// ============================================================================
+// Watchdog
+// ============================================================================
+
+struct WdtConfig {
+    timeout_ms: u32,
+    window_ms: Option<u32>,
+    enable_in_sleep: bool,
+    enable_in_debug: bool,
+}
+
+impl Default for WdtConfig {
+    fn default() -> Self {
+        WdtConfig {
+            timeout_ms: 5000,
+            window_ms: None,
+            enable_in_sleep: true,
+            enable_in_debug: false,
+        }
+    }
+}
+
+struct Watchdog {
+    handle: u64,
+}
+
+impl Watchdog {
+    pub fn new(config: WdtConfig) -> Result<Self, HalError> {
+        let config_json = wdt_config_to_json(&config);
+        let handle = naso_hal_wdt_open(config_json.as_ptr(), config_json.len());
+        if handle == 0 {
+            return Err(HalError::WdtOpenFailed);
+        }
+        Ok(Watchdog { handle })
+    }
+    
+    pub fn feed(&mut self) -> Result<(), HalError> {
+        let result = naso_hal_wdt_feed(self.handle);
+        if result == 0 {
+            return Err(HalError::WdtFeedFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn set_timeout(&mut self, timeout_ms: u32) -> Result<(), HalError> {
+        let result = naso_hal_wdt_set_timeout(self.handle, timeout_ms);
+        if result == 0 {
+            return Err(HalError::WdtConfigFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn get_remaining(&mut self) -> Result<u32, HalError> {
+        let result = naso_hal_wdt_get_remaining(self.handle);
+        if result == u64::MAX {
+            return Err(HalError::WdtReadFailed);
+        }
+        Ok(result as u32)
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        naso_hal_wdt_close(self.handle);
+    }
+}
+
+fn wdt_config_to_json(config: &WdtConfig) -> String {
+    format!(
+        "{{\"timeout_ms\":{},\"window_ms\":{},\"enable_in_sleep\":{},\"enable_in_debug\":{}}}",
+        config.timeout_ms,
+        config.window_ms.map(|v| v.to_string()).unwrap_or("null".into()),
+        config.enable_in_sleep as u8,
+        config.enable_in_debug as u8
+    )
+}
+
+// ============================================================================
+// RTC
+// ============================================================================
+
+struct RtcTime {
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    subsecond: u32,
+}
+
+impl RtcTime {
+    pub fn new(year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8) -> Self {
+        RtcTime {
+            year, month, day, hour, minute, second, subsecond: 0
+        }
+    }
+    
+    pub fn now() -> Self {
+        // Would use system time
+        RtcTime { year: 2024, month: 1, day: 1, hour: 0, minute: 0, second: 0, subsecond: 0 }
+    }
+}
+
+struct Rtc {
+    handle: u64,
+}
+
+impl Rtc {
+    pub fn new() -> Result<Self, HalError> {
+        let handle = naso_hal_rtc_open();
+        if handle == 0 {
+            return Err(HalError::RtcOpenFailed);
+        }
+        Ok(Rtc { handle })
+    }
+    
+    pub fn get_time(&mut self) -> Result<RtcTime, HalError> {
+        let mut result = vec![0u8; 64];
+        let len = naso_hal_rtc_get_time(self.handle, result.as_mut_ptr(), result.len());
+        if len == u64::MAX {
+            return Err(HalError::RtcReadFailed);
+        }
+        result.truncate(len as usize);
+        parse_rtc_time(&result)
+    }
+    
+    pub fn set_time(&mut self, time: &RtcTime) -> Result<(), HalError> {
+        let time_json = rtc_time_to_json(time);
+        let result = naso_hal_rtc_set_time(self.handle, time_json.as_ptr(), time_json.len());
+        if result == 0 {
+            return Err(HalError::RtcWriteFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn set_alarm(&mut self, time: &RtcTime, callback: impl FnMut() + Send + 'static) -> Result<(), HalError> {
+        let cb_ptr = register_callback(Box::new(callback));
+        let time_json = rtc_time_to_json(time);
+        let result = naso_hal_rtc_set_alarm(self.handle, time_json.as_ptr(), time_json.len(), cb_ptr);
+        if result == 0 {
+            return Err(HalError::RtcAlarmFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn disable_alarm(&mut self) -> Result<(), HalError> {
+        let result = naso_hal_rtc_disable_alarm(self.handle);
+        if result == 0 {
+            return Err(HalError::RtcAlarmFailed);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Rtc {
+    fn drop(&mut self) {
+        naso_hal_rtc_close(self.handle);
+    }
+}
+
+fn rtc_time_to_json(time: &RtcTime) -> String {
+    format!(
+        "{{\"year\":{},\"month\":{},\"day\":{},\"hour\":{},\"minute\":{},\"second\":{},\"subsecond\":{}}}",
+        time.year, time.month, time.day, time.hour, time.minute, time.second, time.subsecond
+    )
+}
+
+fn parse_rtc_time(data: &[u8]) -> Result<RtcTime, HalError> {
+    // Parse JSON
+    Ok(RtcTime::now())
+}
+
+// ============================================================================
+// Power Management
+// ============================================================================
+
+enum SleepMode {
+    Idle = 0,
+    Light = 1,
+    Deep = 2,
+    Standby = 3,
+    Shutdown = 4,
+}
+
+enum WakeupSource {
+    Timer = 0,
+    Gpio = 1,
+    Uart = 2,
+    Rtc = 3,
+    All = 4,
+}
+
+struct DeepSleepConfig {
+    mode: SleepMode,
+    wakeup_sources: Vec<WakeupSource>,
+    gpio_wakeup_pin: Option<(u8, u8)>, // (port, pin)
+    timer_duration_ms: Option<u32>,
+}
+
+struct PowerManager;
+
+impl PowerManager {
+    pub fn sleep(mode: SleepMode) -> Result<(), HalError> {
+        let result = naso_hal_pm_sleep(mode as u8);
+        if result == 0 {
+            return Err(HalError::PmSleepFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn deep_sleep(config: DeepSleepConfig) -> Result<(), HalError> {
+        let config_json = deep_sleep_config_to_json(&config);
+        let result = naso_hal_pm_deep_sleep(config.mode as u8, config_json.as_ptr(), config_json.len());
+        if result == 0 {
+            return Err(HalError::PmDeepSleepFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn get_wakeup_reason() -> Result<WakeupReason, HalError> {
+        let mut result = vec![0u8; 128];
+        let len = naso_hal_pm_get_wakeup_reason(result.as_mut_ptr(), result.len());
+        if len == u64::MAX {
+            return Err(HalError::PmWakeupReasonFailed);
+        }
+        result.truncate(len as usize);
+        parse_wakeup_reason(&result)
+    }
+}
+
+enum WakeupReason {
+    Unknown,
+    Reset,
+    Gpio(u8, u8), // port, pin
+    Timer,
+    Rtc,
+    Uart,
+    Watchdog,
+    External,
+}
+
+fn deep_sleep_config_to_json(config: &DeepSleepConfig) -> String {
+    let wakeup_str = config.wakeup_sources.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",");
+    let gpio_str = config.gpio_wakeup_pin.map(|(p, pin)| format!("{}:{}", p, pin)).unwrap_or("none".into());
+    let timer_str = config.timer_duration_ms.map(|t| t.to_string()).unwrap_or("none".into());
+    format!(
+        "{{\"wakeup_sources\":[{}],\"gpio_wakeup\":\"{}\",\"timer_duration_ms\":{}}}",
+        wakeup_str, gpio_str, timer_str
+    )
+}
+
+fn parse_wakeup_reason(data: &[u8]) -> Result<WakeupReason, HalError> {
+    // Parse JSON
+    Ok(WakeupReason::Unknown)
+}
+
+// ============================================================================
+// Random Number Generation
+// ============================================================================
+
+struct HalRng;
+
+impl HalRng {
+    pub fn fill(buffer: &mut [u8]) -> Result<(), HalError> {
+        let result = naso_hal_random_bytes(buffer.as_mut_ptr(), buffer.len());
+        if result == 0 {
+            return Err(HalError::RngFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn u32() -> u32 {
+        naso_hal_random_u32() as u32
+    }
+    
+    pub fn u64() -> u64 {
+        naso_hal_random_u64()
+    }
+    
+    pub fn u64_range(min: u64, max: u64) -> u64 {
+        if min >= max { return min; }
+        min + (Self::u64() % (max - min))
+    }
+}
+
+// ============================================================================
+// System Information
+// ============================================================================
+
+struct SystemInfo;
+
+impl SystemInfo {
+    pub fn chip_id() -> Result<String, HalError> {
+        let mut result = vec![0u8; 64];
+        let len = naso_hal_get_chip_id(result.as_mut_ptr(), result.len());
+        if len == u64::MAX {
+            return Err(HalError::SysInfoFailed);
+        }
+        result.truncate(len as usize);
+        String::from_utf8(result).map_err(|_| HalError::InvalidUtf8)
+    }
+    
+    pub fn chip_revision() -> u32 {
+        naso_hal_get_chip_revision() as u32
+    }
+    
+    pub fn flash_size() -> u32 {
+        naso_hal_get_flash_size() as u32
+    }
+    
+    pub fn ram_size() -> u32 {
+        naso_hal_get_ram_size() as u32
+    }
+    
+    pub fn cpu_frequency() -> u32 {
+        naso_hal_get_cpu_frequency() as u32
+    }
+    
+    pub fn unique_id() -> Result<Vec<u8>, HalError> {
+        let mut result = vec![0u8; 32];
+        let len = naso_hal_get_unique_id(result.as_mut_ptr(), result.len());
+        if len == u64::MAX {
+            return Err(HalError::SysInfoFailed);
+        }
+        result.truncate(len as usize);
+        Ok(result)
+    }
+    
+    pub fn reset_reason() -> Result<ResetReason, HalError> {
+        let mut result = vec![0u8; 128];
+        let len = naso_hal_get_reset_reason(result.as_mut_ptr(), result.len());
+        if len == u64::MAX {
+            return Err(HalError::SysInfoFailed);
+        }
+        result.truncate(len as usize);
+        parse_reset_reason(&result)
+    }
+}
+
+enum ResetReason {
+    PowerOn,
+    BrownOut,
+    Watchdog,
+    Software,
+    External,
+    Debug,
+    Unknown,
+}
+
+fn parse_reset_reason(data: &[u8]) -> Result<ResetReason, HalError> {
+    // Parse JSON
+    Ok(ResetReason::Unknown)
+}
+
+// ============================================================================
+// Interrupt Controller
+// ============================================================================
+
+struct InterruptController;
+
+impl InterruptController {
+    pub fn enable(irq: u32) -> Result<(), HalError> {
+        let result = naso_hal_interrupt_enable(irq);
+        if result == 0 {
+            return Err(HalError::InterruptEnableFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn disable(irq: u32) -> Result<(), HalError> {
+        let result = naso_hal_interrupt_disable(irq);
+        if result == 0 {
+            return Err(HalError::InterruptDisableFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn set_priority(irq: u32, priority: u8) -> Result<(), HalError> {
+        let result = naso_hal_interrupt_set_priority(irq, priority);
+        if result == 0 {
+            return Err(HalError::InterruptConfigFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn set_handler(irq: u32, handler: impl FnMut() + Send + 'static) -> Result<(), HalError> {
+        let cb_ptr = register_callback(Box::new(handler));
+        let result = naso_hal_interrupt_set_handler(irq, cb_ptr);
+        if result == 0 {
+            return Err(HalError::InterruptConfigFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn is_pending(irq: u32) -> bool {
+        naso_hal_interrupt_pending(irq) != 0
+    }
+}
+
+// ============================================================================
+// Board Support
+// ============================================================================
+
+struct BoardSupport;
+
+impl BoardSupport {
+    pub fn init() -> Result<(), HalError> {
+        let result = naso_hal_board_init();
+        if result == 0 {
+            return Err(HalError::BoardInitFailed);
+        }
+        Ok(())
+    }
+    
+    pub fn led_pins() -> Result<Vec<(u8, u8)>, HalError> {
+        let mut result = vec![0u8; 64];
+        let len = naso_hal_board_get_led_pins(result.as_mut_ptr(), result.len());
+        if len == u64::MAX {
+            return Err(HalError::BoardInfoFailed);
+        }
+        result.truncate(len as usize);
+        parse_pin_list(&result)
+    }
+    
+    pub fn button_pins() -> Result<Vec<(u8, u8)>, HalError> {
+        let mut result = vec![0u8; 64];
+        let len = naso_hal_board_get_button_pins(result.as_mut_ptr(), result.len());
+        if len == u64::MAX {
+            return Err(HalError::BoardInfoFailed);
+        }
+        result.truncate(len as usize);
+        parse_pin_list(&result)
+    }
+}
+
+fn parse_pin_list(data: &[u8]) -> Result<Vec<(u8, u8)>, HalError> {
+    let mut pins = Vec::new();
+    for i in (0..data.len()).step_by(2) {
+        if i + 1 < data.len() {
+            pins.push((data[i], data[i+1]));
+        }
+    }
+    Ok(pins)
+}
+
+// ============================================================================
+// Error Types
+// ============================================================================
+
+enum HalError {
+    GpioOpenFailed,
+    GpioReadFailed,
+    GpioWriteFailed,
+    GpioConfigFailed,
+    I2cOpenFailed,
+    I2cWriteFailed,
+    I2cReadFailed,
+    I2cWriteReadFailed,
+    I2cScanFailed,
+    I2cConfigFailed,
+    SpiOpenFailed,
+    SpiTransferFailed,
+    SpiWriteFailed,
+    SpiReadFailed,
+    SpiConfigFailed,
+    UartOpenFailed,
+    UartWriteFailed,
+    UartReadFailed,
+    UartFlushFailed,
+    UartConfigFailed,
+    PwmOpenFailed,
+    PwmSetFailed,
+    PwmEnableFailed,
+    PwmDisableFailed,
+    AdcOpenFailed,
+    AdcReadFailed,
+    AdcConfigFailed,
+    DmaAllocFailed,
+    DmaStartFailed,
+    DmaWaitFailed,
+    DmaAbortFailed,
+    TimerOpenFailed,
+    TimerStartFailed,
+    TimerStopFailed,
+    TimerConfigFailed,
+    TimerReadFailed,
+    WdtOpenFailed,
+    WdtFeedFailed,
+    WdtConfigFailed,
+    WdtReadFailed,
+    RtcOpenFailed,
+    RtcReadFailed,
+    RtcWriteFailed,
+    RtcAlarmFailed,
+    PmSleepFailed,
+    PmDeepSleepFailed,
+    PmWakeupReasonFailed,
+    RngFailed,
+    SysInfoFailed,
+    InterruptEnableFailed,
+    InterruptDisableFailed,
+    InterruptConfigFailed,
+    InterruptSetupFailed,
+    BoardInitFailed,
+    BoardInfoFailed,
+    InvalidBufferSize,
+    InvalidDutyCycle,
+    InvalidResolution,
+    InvalidUtf8,
+}
+
+impl HalError {
+    pub fn to_string(&self) -> String {
+        match self {
+            HalError::GpioOpenFailed => "Failed to open GPIO".into(),
+            HalError::GpioReadFailed => "Failed to read GPIO".into(),
+            HalError::GpioWriteFailed => "Failed to write GPIO".into(),
+            HalError::GpioConfigFailed => "Failed to configure GPIO".into(),
+            HalError::I2cOpenFailed => "Failed to open I2C".into(),
+            HalError::I2cWriteFailed => "Failed to write I2C".into(),
+            HalError::I2cReadFailed => "Failed to read I2C".into(),
+            HalError::I2cWriteReadFailed => "Failed I2C write-read".into(),
+            HalError::I2cScanFailed => "Failed to scan I2C".into(),
+            HalError::I2cConfigFailed => "Failed to configure I2C".into(),
+            HalError::SpiOpenFailed => "Failed to open SPI".into(),
+            HalError::SpiTransferFailed => "Failed SPI transfer".into(),
+            HalError::SpiWriteFailed => "Failed SPI write".into(),
+            HalError::SpiReadFailed => "Failed SPI read".into(),
+            HalError::SpiConfigFailed => "Failed to configure SPI".into(),
+            HalError::UartOpenFailed => "Failed to open UART".into(),
+            HalError::UartWriteFailed => "Failed UART write".into(),
+            HalError::UartReadFailed => "Failed UART read".into(),
+            HalError::UartFlushFailed => "Failed UART flush".into(),
+            HalError::UartConfigFailed => "Failed to configure UART".into(),
+            HalError::PwmOpenFailed => "Failed to open PWM".into(),
+            HalError::PwmSetFailed => "Failed to set PWM".into(),
+            HalError::PwmEnableFailed => "Failed to enable PWM".into(),
+            HalError::PwmDisableFailed => "Failed to disable PWM".into(),
+            HalError::AdcOpenFailed => "Failed to open ADC".into(),
+            HalError::AdcReadFailed => "Failed to read ADC".into(),
+            HalError::AdcConfigFailed => "Failed to configure ADC".into(),
+            HalError::DmaAllocFailed => "Failed to allocate DMA".into(),
+            HalError::DmaStartFailed => "Failed to start DMA".into(),
+            HalError::DmaWaitFailed => "Failed to wait DMA".into(),
+            HalError::DmaAbortFailed => "Failed to abort DMA".into(),
+            HalError::TimerOpenFailed => "Failed to open timer".into(),
+            HalError::TimerStartFailed => "Failed to start timer".into(),
+            HalError::TimerStopFailed => "Failed to stop timer".into(),
+            HalError::TimerConfigFailed => "Failed to configure timer".into(),
+            HalError::TimerReadFailed => "Failed to read timer".into(),
+            HalError::WdtOpenFailed => "Failed to open watchdog".into(),
+            HalError::WdtFeedFailed => "Failed to feed watchdog".into(),
+            HalError::WdtConfigFailed => "Failed to configure watchdog".into(),
+            HalError::WdtReadFailed => "Failed to read watchdog".into(),
+            HalError::RtcOpenFailed => "Failed to open RTC".into(),
+            HalError::RtcReadFailed => "Failed to read RTC".into(),
+            HalError::RtcWriteFailed => "Failed to write RTC".into(),
+            HalError::RtcAlarmFailed => "Failed RTC alarm".into(),
+            HalError::PmSleepFailed => "Failed to sleep".into(),
+            HalError::PmDeepSleepFailed => "Failed deep sleep".into(),
+            HalError::PmWakeupReasonFailed => "Failed to get wakeup reason".into(),
+            HalError::RngFailed => "Failed RNG".into(),
+            HalError::SysInfoFailed => "Failed system info".into(),
+            HalError::InterruptEnableFailed => "Failed to enable interrupt".into(),
+            HalError::InterruptDisableFailed => "Failed to disable interrupt".into(),
+            HalError::InterruptConfigFailed => "Failed to configure interrupt".into(),
+            HalError::InterruptSetupFailed => "Failed interrupt setup".into(),
+            HalError::BoardInitFailed => "Failed board init".into(),
+            HalError::BoardInfoFailed => "Failed board info".into(),
+            HalError::InvalidBufferSize => "Invalid buffer size".into(),
+            HalError::InvalidDutyCycle => "Invalid duty cycle".into(),
+            HalError::InvalidResolution => "Invalid resolution".into(),
+            HalError::InvalidUtf8 => "Invalid UTF-8".into(),
+        }
+    }
+}
+
+// ============================================================================
+// Callback Registration (Runtime Support)
+// ============================================================================
+
+fn register_callback<F: FnMut() + Send + 'static>(callback: Box<F>) -> u64 {
+    // Store callback in runtime registry, return handle
+    // Implementation depends on async runtime
+    0
+}
+
+fn register_callback_with_arg<F: FnMut(u8) + Send + 'static>(callback: Box<F>) -> u64 {
+    0
+}
+
+fn register_callback_with_buffer<F: FnMut(&[u8]) + Send + 'static>(callback: Box<F>) -> u64 {
+    0
+}
+
+// ============================================================================
+// Embedded HAL Traits Compatibility
+// ============================================================================
+
+// These traits mirror the embedded-hal crate for compatibility
+
+trait InputPin {
+    fn is_high(&self) -> Result<bool, HalError>;
+    fn is_low(&self) -> Result<bool, HalError>;
+}
+
+trait OutputPin {
+    fn set_high(&mut self) -> Result<(), HalError>;
+    fn set_low(&mut self) -> Result<(), HalError>;
+    fn toggle(&mut self) -> Result<(), HalError>;
+    fn is_set_high(&self) -> Result<bool, HalError>;
+    fn is_set_low(&self) -> Result<bool, HalError>;
+}
+
+trait StatefulOutputPin: OutputPin {
+    fn is_set_high(&self) -> Result<bool, HalError>;
+    fn is_set_low(&self) -> Result<bool, HalError>;
+}
+
+trait ToggleableOutputPin {
+    fn toggle(&mut self) -> Result<(), HalError>;
+}
+
+impl InputPin for GpioPin {
+    fn is_high(&self) -> Result<bool, HalError> {
+        self.read()
+    }
+    
+    fn is_low(&self) -> Result<bool, HalError> {
+        self.read().map(|v| !v)
+    }
+}
+
+impl OutputPin for GpioPin {
+    fn set_high(&mut self) -> Result<(), HalError> {
+        self.write(true)
+    }
+    
+    fn set_low(&mut self) -> Result<(), HalError> {
+        self.write(false)
+    }
+    
+    fn toggle(&mut self) -> Result<(), HalError> {
+        self.toggle()
+    }
+    
+    fn is_set_high(&self) -> Result<bool, HalError> {
+        self.read()
+    }
+    
+    fn is_set_low(&self) -> Result<bool, HalError> {
+        self.read().map(|v| !v)
+    }
+}
+
+// I2C traits
+trait I2cWrite {
+    fn write(&mut self, addr: u8, data: &[u8]) -> Result<(), HalError>;
+    fn write_iter(&mut self, addr: u8, data: &mut dyn Iterator<Item = u8>) -> Result<(), HalError>;
+}
+
+trait I2cRead {
+    fn read(&mut self, addr: u8, buffer: &mut [u8]) -> Result<(), HalError>;
+    fn read_iter(&mut self, addr: u8, buffer: &mut dyn Iterator<Item = &mut u8>) -> Result<(), HalError>;
+}
+
+trait I2cWriteRead {
+    fn write_read(&mut self, addr: u8, write: &[u8], read: &mut [u8]) -> Result<(), HalError>;
+}
+
+// SPI traits
+trait SpiBus {
+    fn transfer(&mut self, tx: &[u8], rx: &mut [u8]) -> Result<(), HalError>;
+    fn write(&mut self, data: &[u8]) -> Result<(), HalError>;
+    fn read(&mut self, buffer: &mut [u8]) -> Result<(), HalError>;
+    fn transfer_iter(&mut self, tx: &mut dyn Iterator<Item = u8>, rx: &mut dyn Iterator<Item = &mut u8>) -> Result<(), HalError>;
+}
+
+// UART traits
+trait UartRead {
+    fn read(&mut self, buffer: &mut [u8]) -> Result<usize, HalError>;
+}
+
+trait UartWrite {
+    fn write(&mut self, data: &[u8]) -> Result<usize, HalError>;
+    fn flush(&mut self) -> Result<(), HalError>;
+}
+
+// ============================================================================
+// HAL Initialization
+// ============================================================================
+
+fn hal_init() -> Result<(), HalError> {
+    BoardSupport::init()
+}
+
+// ============================================================================
+// Example Usage
+// ============================================================================
+
+/*
+fn main() -> Result<(), HalError> {
+    // Initialize HAL
+    hal_init()?;
+    
+    // GPIO - LED blink
+    let mut led = GpioPin::output(0, 13, true)?; // Port 0, Pin 13, initially high
+    
+    // I2C - Read sensor
+    let mut i2c = I2c::new(0, I2cConfig::default())?;
+    let mut buffer = [0u8; 2];
+    i2c.write_read(0x48, &[0x00], &mut buffer)?; // Read temp from TMP102
+    
+    // SPI - Write to display
+    let mut spi = Spi::new(0, SpiConfig::default())?;
+    spi.write(&[0x40, 0x01, 0x02, 0x03])?;
+    
+    // UART - Serial communication
+    let mut uart = Uart::new(0, UartConfig::default())?;
+    uart.write(b"Hello, HAL!")?;
+    
+    // PWM - Motor control
+    let mut pwm = Pwm::new(0, PwmConfig { frequency: 20000, ..Default::default() })?;
+    pwm.enable()?;
+    pwm.set_duty_percent(50.0)?;
+    
+    // ADC - Read analog sensor
+    let mut adc = Adc::new(0, AdcConfig::default())?;
+    let value = adc.read()?;
+    let voltage = adc.read_voltage()?;
+    
+    // Timer - Periodic task
+    let mut timer = Timer::new(0, TimerConfig { frequency_hz: 1000, ..Default::default() })?;
+    timer.set_callback(|| println!("Timer tick"))?;
+    timer.enable_interrupt()?;
+    timer.start()?;
+    
+    // Watchdog
+    let mut wdt = Watchdog::new(WdtConfig::default())?;
+    loop {
+        wdt.feed()?;
+        // Do work
+    }
+    
+    Ok(())
+}
+*/

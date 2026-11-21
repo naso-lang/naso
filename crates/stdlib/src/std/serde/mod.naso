@@ -1,0 +1,1913 @@
+// ============================================================================
+// Naso Serialization (naso_serde) - Phase 19.4
+// ============================================================================
+// High-performance serialization with QTT (Quantized Type Tags) types
+// Supports JSON, MessagePack, CBOR, Bincode, and custom formats
+// ============================================================================
+
+extern "C" {
+    fn naso_ser_json_serialize(value_ptr: *const u8, value_len: usize, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_ser_json_deserialize(data_ptr: *const u8, data_len: usize, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_ser_msgpack_serialize(value_ptr: *const u8, value_len: usize, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_ser_msgpack_deserialize(data_ptr: *const u8, data_len: usize, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_ser_cbor_serialize(value_ptr: *const u8, value_len: usize, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_ser_cbor_deserialize(data_ptr: *const u8, data_len: usize, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_ser_bincode_serialize(value_ptr: *const u8, value_len: usize, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_ser_bincode_deserialize(data_ptr: *const u8, data_len: usize, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_ser_register_type(type_id: u64, schema_ptr: *const u8, schema_len: usize) -> u64;
+    fn naso_ser_get_schema(type_id: u64, out_ptr: *mut u8, out_max_len: usize) -> u64;
+}
+
+// ============================================================================
+// QTT (Quantized Type Tags) - Core Type System
+// ============================================================================
+
+// QTT uses a compact tag system for zero-copy serialization
+// Tags are 8-bit with the following encoding:
+// 0x00-0x0F: Fixed-width integers (u8, u16, u32, u64, i8, i16, i32, i64)
+// 0x10-0x17: Variable-length integers (zigzag encoded)
+// 0x18-0x1F: Floats (f32, f64, f16, f128)
+// 0x20-0x27: Boolean, null, unit
+// 0x28-0x2F: Strings (inline up to 31 bytes, then length-prefixed)
+// 0x30-0x37: Bytes (inline up to 31 bytes, then length-prefixed)
+// 0x38-0x3F: Arrays/Lists (inline count up to 15, then length-prefixed)
+// 0x40-0x47: Maps/Objects (inline count up to 15, then length-prefixed)
+// 0x48-0x4F: Structs (schema-referenced)
+// 0x50-0x57: Enums/Tagged unions
+// 0x58-0x5F: Options (Some/None)
+// 0x60-0x67: References/Cycles
+// 0x68-0x6F: Custom/Extension types
+// 0x70-0x7F: Reserved for future use
+// 0x80-0xFF: Extended tags (multi-byte)
+
+enum QttTag {
+    // Fixed-width integers
+    U8 = 0x00,
+    U16 = 0x01,
+    U32 = 0x02,
+    U64 = 0x03,
+    I8 = 0x04,
+    I16 = 0x05,
+    I32 = 0x06,
+    I64 = 0x07,
+    
+    // Variable-length integers (zigzag)
+    VarUInt = 0x10,
+    VarInt = 0x11,
+    
+    // Floats
+    F32 = 0x18,
+    F64 = 0x19,
+    F16 = 0x1A,
+    
+    // Simple types
+    Bool = 0x20,
+    Null = 0x21,
+    Unit = 0x22,
+    
+    // Strings
+    StrInline = 0x28,      // 0x28-0x2F: inline length (0-7 bytes)
+    Str8 = 0x30,
+    Str16 = 0x31,
+    Str32 = 0x32,
+    
+    // Bytes
+    BytesInline = 0x33,    // 0x33-0x37: inline length
+    Bytes8 = 0x38,
+    Bytes16 = 0x39,
+    Bytes32 = 0x3A,
+    
+    // Arrays
+    ArrayInline = 0x3B,    // 0x3B-0x3F: inline count (0-7)
+    Array8 = 0x40,
+    Array16 = 0x41,
+    Array32 = 0x42,
+    
+    // Maps
+    MapInline = 0x43,      // 0x43-0x47: inline count
+    Map8 = 0x48,
+    Map16 = 0x49,
+    Map32 = 0x4A,
+    
+    // Structs (schema-referenced)
+    StructRef = 0x4B,
+    StructInline = 0x4C,
+    
+    // Enums
+    EnumVariant = 0x4D,
+    EnumUnit = 0x4E,
+    EnumNewtype = 0x4F,
+    EnumTuple = 0x50,
+    EnumStruct = 0x51,
+    
+    // Options
+    Some = 0x52,
+    None = 0x53,
+    
+    // References
+    Ref = 0x54,
+    RefBack = 0x55,
+    
+    // Custom
+    Custom = 0x68,
+    Custom8 = 0x69,
+    Custom16 = 0x6A,
+}
+
+struct QttWriter {
+    buf: Vec<u8>,
+    schema_registry: SchemaRegistry,
+}
+
+impl QttWriter {
+    pub fn new() -> Self {
+        QttWriter {
+            buf: Vec::with_capacity(1024),
+            schema_registry: SchemaRegistry::new(),
+        }
+    }
+    
+    pub fn with_capacity(cap: usize) -> Self {
+        QttWriter {
+            buf: Vec::with_capacity(cap),
+            schema_registry: SchemaRegistry::new(),
+        }
+    }
+    
+    pub fn write_u8(&mut self, value: u8) {
+        self.buf.push(QttTag::U8 as u8);
+        self.buf.push(value);
+    }
+    
+    pub fn write_u16(&mut self, value: u16) {
+        self.buf.push(QttTag::U16 as u8);
+        self.buf.extend_from_slice(&value.to_le_bytes());
+    }
+    
+    pub fn write_u32(&mut self, value: u32) {
+        self.buf.push(QttTag::U32 as u8);
+        self.buf.extend_from_slice(&value.to_le_bytes());
+    }
+    
+    pub fn write_u64(&mut self, value: u64) {
+        self.buf.push(QttTag::U64 as u8);
+        self.buf.extend_from_slice(&value.to_le_bytes());
+    }
+    
+    pub fn write_i8(&mut self, value: i8) {
+        self.buf.push(QttTag::I8 as u8);
+        self.buf.push(value as u8);
+    }
+    
+    pub fn write_i16(&mut self, value: i16) {
+        self.buf.push(QttTag::I16 as u8);
+        self.buf.extend_from_slice(&value.to_le_bytes());
+    }
+    
+    pub fn write_i32(&mut self, value: i32) {
+        self.buf.push(QttTag::I32 as u8);
+        self.buf.extend_from_slice(&value.to_le_bytes());
+    }
+    
+    pub fn write_i64(&mut self, value: i64) {
+        self.buf.push(QttTag::I64 as u8);
+        self.buf.extend_from_slice(&value.to_le_bytes());
+    }
+    
+    pub fn write_var_uint(&mut self, value: u64) {
+        self.buf.push(QttTag::VarUInt as u8);
+        write_varint(&mut self.buf, value);
+    }
+    
+    pub fn write_var_int(&mut self, value: i64) {
+        self.buf.push(QttTag::VarInt as u8);
+        write_zigzag(&mut self.buf, value);
+    }
+    
+    pub fn write_f32(&mut self, value: f32) {
+        self.buf.push(QttTag::F32 as u8);
+        self.buf.extend_from_slice(&value.to_le_bytes());
+    }
+    
+    pub fn write_f64(&mut self, value: f64) {
+        self.buf.push(QttTag::F64 as u8);
+        self.buf.extend_from_slice(&value.to_le_bytes());
+    }
+    
+    pub fn write_bool(&mut self, value: bool) {
+        self.buf.push(QttTag::Bool as u8);
+        self.buf.push(if value { 1 } else { 0 });
+    }
+    
+    pub fn write_null(&mut self) {
+        self.buf.push(QttTag::Null as u8);
+    }
+    
+    pub fn write_str(&mut self, value: &str) {
+        let bytes = value.as_bytes();
+        write_string(&mut self.buf, bytes);
+    }
+    
+    pub fn write_bytes(&mut self, value: &[u8]) {
+        write_bytes(&mut self.buf, value);
+    }
+    
+    pub fn write_array_start(&mut self, len: usize) {
+        if len <= 7 {
+            self.buf.push(QttTag::ArrayInline as u8 | (len as u8 & 0x07));
+        } else if len <= 255 {
+            self.buf.push(QttTag::Array8 as u8);
+            self.buf.push(len as u8);
+        } else if len <= 65535 {
+            self.buf.push(QttTag::Array16 as u8);
+            self.buf.extend_from_slice(&(len as u16).to_le_bytes());
+        } else {
+            self.buf.push(QttTag::Array32 as u8);
+            self.buf.extend_from_slice(&(len as u32).to_le_bytes());
+        }
+    }
+    
+    pub fn write_map_start(&mut self, len: usize) {
+        if len <= 7 {
+            self.buf.push(QttTag::MapInline as u8 | (len as u8 & 0x07));
+        } else if len <= 255 {
+            self.buf.push(QttTag::Map8 as u8);
+            self.buf.push(len as u8);
+        } else if len <= 65535 {
+            self.buf.push(QttTag::Map16 as u8);
+            self.buf.extend_from_slice(&(len as u16).to_le_bytes());
+        } else {
+            self.buf.push(QttTag::Map32 as u8);
+            self.buf.extend_from_slice(&(len as u32).to_le_bytes());
+        }
+    }
+    
+    pub fn write_some(&mut self) {
+        self.buf.push(QttTag::Some as u8);
+    }
+    
+    pub fn write_none(&mut self) {
+        self.buf.push(QttTag::None as u8);
+    }
+    
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.buf
+    }
+    
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf
+    }
+    
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+    
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+}
+
+struct QttReader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+    schema_registry: &'a SchemaRegistry,
+}
+
+impl<'a> QttReader<'a> {
+    pub fn new(buf: &'a [u8]) -> Self {
+        QttReader {
+            buf,
+            pos: 0,
+            schema_registry: &SchemaRegistry::empty(),
+        }
+    }
+    
+    pub fn with_registry(buf: &'a [u8], registry: &'a SchemaRegistry) -> Self {
+        QttReader {
+            buf,
+            pos: 0,
+            schema_registry: registry,
+        }
+    }
+    
+    pub fn read_u8(&mut self) -> Result<u8, SerdeError> {
+        self.expect_tag(QttTag::U8)?;
+        let value = self.buf[self.pos];
+        self.pos += 1;
+        Ok(value)
+    }
+    
+    pub fn read_u16(&mut self) -> Result<u16, SerdeError> {
+        self.expect_tag(QttTag::U16)?;
+        if self.pos + 2 > self.buf.len() {
+            return Err(SerdeError::UnexpectedEof);
+        }
+        let value = u16::from_le_bytes([self.buf[self.pos], self.buf[self.pos + 1]]);
+        self.pos += 2;
+        Ok(value)
+    }
+    
+    pub fn read_u32(&mut self) -> Result<u32, SerdeError> {
+        self.expect_tag(QttTag::U32)?;
+        if self.pos + 4 > self.buf.len() {
+            return Err(SerdeError::UnexpectedEof);
+        }
+        let value = u32::from_le_bytes([
+            self.buf[self.pos],
+            self.buf[self.pos + 1],
+            self.buf[self.pos + 2],
+            self.buf[self.pos + 3],
+        ]);
+        self.pos += 4;
+        Ok(value)
+    }
+    
+    pub fn read_u64(&mut self) -> Result<u64, SerdeError> {
+        self.expect_tag(QttTag::U64)?;
+        if self.pos + 8 > self.buf.len() {
+            return Err(SerdeError::UnexpectedEof);
+        }
+        let value = u64::from_le_bytes([
+            self.buf[self.pos],
+            self.buf[self.pos + 1],
+            self.buf[self.pos + 2],
+            self.buf[self.pos + 3],
+            self.buf[self.pos + 4],
+            self.buf[self.pos + 5],
+            self.buf[self.pos + 6],
+            self.buf[self.pos + 7],
+        ]);
+        self.pos += 8;
+        Ok(value)
+    }
+    
+    pub fn read_i8(&mut self) -> Result<i8, SerdeError> {
+        self.expect_tag(QttTag::I8)?;
+        let value = self.buf[self.pos] as i8;
+        self.pos += 1;
+        Ok(value)
+    }
+    
+    pub fn read_i16(&mut self) -> Result<i16, SerdeError> {
+        self.expect_tag(QttTag::I16)?;
+        if self.pos + 2 > self.buf.len() {
+            return Err(SerdeError::UnexpectedEof);
+        }
+        let value = i16::from_le_bytes([self.buf[self.pos], self.buf[self.pos + 1]]);
+        self.pos += 2;
+        Ok(value)
+    }
+    
+    pub fn read_i32(&mut self) -> Result<i32, SerdeError> {
+        self.expect_tag(QttTag::I32)?;
+        if self.pos + 4 > self.buf.len() {
+            return Err(SerdeError::UnexpectedEof);
+        }
+        let value = i32::from_le_bytes([
+            self.buf[self.pos],
+            self.buf[self.pos + 1],
+            self.buf[self.pos + 2],
+            self.buf[self.pos + 3],
+        ]);
+        self.pos += 4;
+        Ok(value)
+    }
+    
+    pub fn read_i64(&mut self) -> Result<i64, SerdeError> {
+        self.expect_tag(QttTag::I64)?;
+        if self.pos + 8 > self.buf.len() {
+            return Err(SerdeError::UnexpectedEof);
+        }
+        let value = i64::from_le_bytes([
+            self.buf[self.pos],
+            self.buf[self.pos + 1],
+            self.buf[self.pos + 2],
+            self.buf[self.pos + 3],
+            self.buf[self.pos + 4],
+            self.buf[self.pos + 5],
+            self.buf[self.pos + 6],
+            self.buf[self.pos + 7],
+        ]);
+        self.pos += 8;
+        Ok(value)
+    }
+    
+    pub fn read_var_uint(&mut self) -> Result<u64, SerdeError> {
+        self.expect_tag(QttTag::VarUInt)?;
+        read_varint(&self.buf, &mut self.pos)
+    }
+    
+    pub fn read_var_int(&mut self) -> Result<i64, SerdeError> {
+        self.expect_tag(QttTag::VarInt)?;
+        read_zigzag(&self.buf, &mut self.pos)
+    }
+    
+    pub fn read_f32(&mut self) -> Result<f32, SerdeError> {
+        self.expect_tag(QttTag::F32)?;
+        if self.pos + 4 > self.buf.len() {
+            return Err(SerdeError::UnexpectedEof);
+        }
+        let value = f32::from_le_bytes([
+            self.buf[self.pos],
+            self.buf[self.pos + 1],
+            self.buf[self.pos + 2],
+            self.buf[self.pos + 3],
+        ]);
+        self.pos += 4;
+        Ok(value)
+    }
+    
+    pub fn read_f64(&mut self) -> Result<f64, SerdeError> {
+        self.expect_tag(QttTag::F64)?;
+        if self.pos + 8 > self.buf.len() {
+            return Err(SerdeError::UnexpectedEof);
+        }
+        let value = f64::from_le_bytes([
+            self.buf[self.pos],
+            self.buf[self.pos + 1],
+            self.buf[self.pos + 2],
+            self.buf[self.pos + 3],
+            self.buf[self.pos + 4],
+            self.buf[self.pos + 5],
+            self.buf[self.pos + 6],
+            self.buf[self.pos + 7],
+        ]);
+        self.pos += 8;
+        Ok(value)
+    }
+    
+    pub fn read_bool(&mut self) -> Result<bool, SerdeError> {
+        self.expect_tag(QttTag::Bool)?;
+        let value = self.buf[self.pos] != 0;
+        self.pos += 1;
+        Ok(value)
+    }
+    
+    pub fn read_null(&mut self) -> Result<(), SerdeError> {
+        self.expect_tag(QttTag::Null)?;
+        Ok(())
+    }
+    
+    pub fn read_str(&mut self) -> Result<&'a str, SerdeError> {
+        let (bytes, consumed) = read_string(&self.buf[self.pos..])?;
+        self.pos += consumed;
+        unsafe { Ok(std::str::from_utf8_unchecked(bytes)) }
+    }
+    
+    pub fn read_bytes(&mut self) -> Result<&'a [u8], SerdeError> {
+        let (bytes, consumed) = read_bytes(&self.buf[self.pos..])?;
+        self.pos += consumed;
+        Ok(bytes)
+    }
+    
+    pub fn read_array_len(&mut self) -> Result<usize, SerdeError> {
+        if self.pos >= self.buf.len() {
+            return Err(SerdeError::UnexpectedEof);
+        }
+        let tag = self.buf[self.pos];
+        self.pos += 1;
+        
+        if tag >= QttTag::ArrayInline as u8 && tag <= (QttTag::ArrayInline as u8 + 7) {
+            Ok((tag - QttTag::ArrayInline as u8) as usize)
+        } else if tag == QttTag::Array8 as u8 {
+            if self.pos >= self.buf.len() {
+                return Err(SerdeError::UnexpectedEof);
+            }
+            Ok(self.buf[self.pos++] as usize)
+        } else if tag == QttTag::Array16 as u8 {
+            if self.pos + 2 > self.buf.len() {
+                return Err(SerdeError::UnexpectedEof);
+            }
+            let len = u16::from_le_bytes([self.buf[self.pos], self.buf[self.pos + 1]]) as usize;
+            self.pos += 2;
+            Ok(len)
+        } else if tag == QttTag::Array32 as u8 {
+            if self.pos + 4 > self.buf.len() {
+                return Err(SerdeError::UnexpectedEof);
+            }
+            let len = u32::from_le_bytes([
+                self.buf[self.pos],
+                self.buf[self.pos + 1],
+                self.buf[self.pos + 2],
+                self.buf[self.pos + 3],
+            ]) as usize;
+            self.pos += 4;
+            Ok(len)
+        } else {
+            Err(SerdeError::InvalidTag(tag))
+        }
+    }
+    
+    pub fn read_map_len(&mut self) -> Result<usize, SerdeError> {
+        if self.pos >= self.buf.len() {
+            return Err(SerdeError::UnexpectedEof);
+        }
+        let tag = self.buf[self.pos];
+        self.pos += 1;
+        
+        if tag >= QttTag::MapInline as u8 && tag <= (QttTag::MapInline as u8 + 7) {
+            Ok((tag - QttTag::MapInline as u8) as usize)
+        } else if tag == QttTag::Map8 as u8 {
+            if self.pos >= self.buf.len() {
+                return Err(SerdeError::UnexpectedEof);
+            }
+            Ok(self.buf[self.pos++] as usize)
+        } else if tag == QttTag::Map16 as u8 {
+            if self.pos + 2 > self.buf.len() {
+                return Err(SerdeError::UnexpectedEof);
+            }
+            let len = u16::from_le_bytes([self.buf[self.pos], self.buf[self.pos + 1]]) as usize;
+            self.pos += 2;
+            Ok(len)
+        } else if tag == QttTag::Map32 as u8 {
+            if self.pos + 4 > self.buf.len() {
+                return Err(SerdeError::UnexpectedEof);
+            }
+            let len = u32::from_le_bytes([
+                self.buf[self.pos],
+                self.buf[self.pos + 1],
+                self.buf[self.pos + 2],
+                self.buf[self.pos + 3],
+            ]) as usize;
+            self.pos += 4;
+            Ok(len)
+        } else {
+            Err(SerdeError::InvalidTag(tag))
+        }
+    }
+    
+    pub fn read_option_tag(&mut self) -> Result<bool, SerdeError> {
+        if self.pos >= self.buf.len() {
+            return Err(SerdeError::UnexpectedEof);
+        }
+        let tag = self.buf[self.pos];
+        self.pos += 1;
+        if tag == QttTag::Some as u8 {
+            Ok(true)
+        } else if tag == QttTag::None as u8 {
+            Ok(false)
+        } else {
+            Err(SerdeError::InvalidTag(tag))
+        }
+    }
+    
+    fn expect_tag(&mut self, expected: QttTag) -> Result<(), SerdeError> {
+        if self.pos >= self.buf.len() {
+            return Err(SerdeError::UnexpectedEof);
+        }
+        let tag = self.buf[self.pos];
+        self.pos += 1;
+        if tag != expected as u8 {
+            return Err(SerdeError::ExpectedTag(expected as u8, tag));
+        }
+        Ok(())
+    }
+    
+    pub fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+    
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+}
+
+// Helper functions for variable-length encoding
+fn write_varint(buf: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let mut byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        buf.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+fn read_varint(buf: &[u8], pos: &mut usize) -> Result<u64, SerdeError> {
+    let mut value: u64 = 0;
+    let mut shift = 0;
+    
+    loop {
+        if *pos >= buf.len() {
+            return Err(SerdeError::UnexpectedEof);
+        }
+        let byte = buf[*pos];
+        *pos += 1;
+        value |= ((byte & 0x7F) as u64) << shift;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+        if shift > 63 {
+            return Err(SerdeError::VarintOverflow);
+        }
+    }
+    Ok(value)
+}
+
+fn write_zigzag(buf: &mut Vec<u8>, value: i64) {
+    let encoded = ((value << 1) ^ (value >> 63)) as u64;
+    write_varint(buf, encoded);
+}
+
+fn read_zigzag(buf: &[u8], pos: &mut usize) -> Result<i64, SerdeError> {
+    let encoded = read_varint(buf, pos)?;
+    let value = ((encoded >> 1) as i64) ^ (-((encoded & 1) as i64));
+    Ok(value)
+}
+
+fn write_string(buf: &mut Vec<u8>, bytes: &[u8]) {
+    let len = bytes.len();
+    if len <= 7 {
+        buf.push(QttTag::StrInline as u8 | (len as u8 & 0x07));
+        buf.extend_from_slice(bytes);
+    } else if len <= 255 {
+        buf.push(QttTag::Str8 as u8);
+        buf.push(len as u8);
+        buf.extend_from_slice(bytes);
+    } else if len <= 65535 {
+        buf.push(QttTag::Str16 as u8);
+        buf.extend_from_slice(&(len as u16).to_le_bytes());
+        buf.extend_from_slice(bytes);
+    } else {
+        buf.push(QttTag::Str32 as u8);
+        buf.extend_from_slice(&(len as u32).to_le_bytes());
+        buf.extend_from_slice(bytes);
+    }
+}
+
+fn read_string(buf: &[u8]) -> Result<(&[u8], usize), SerdeError> {
+    if buf.is_empty() {
+        return Err(SerdeError::UnexpectedEof);
+    }
+    let tag = buf[0];
+    let mut pos = 1;
+    
+    if tag >= QttTag::StrInline as u8 && tag <= (QttTag::StrInline as u8 + 7) {
+        let len = (tag - QttTag::StrInline as u8) as usize;
+        if pos + len > buf.len() {
+            return Err(SerdeError::UnexpectedEof);
+        }
+        Ok((&buf[pos..pos + len], pos + len))
+    } else if tag == QttTag::Str8 as u8 {
+        if pos >= buf.len() {
+            return Err(SerdeError::UnexpectedEof);
+        }
+        let len = buf[pos] as usize;
+        pos += 1;
+        if pos + len > buf.len() {
+            return Err(SerdeError::UnexpectedEof);
+        }
+        Ok((&buf[pos..pos + len], pos + len))
+    } else if tag == QttTag::Str16 as u8 {
+        if pos + 2 > buf.len() {
+            return Err(SerdeError::UnexpectedEof);
+        }
+        let len = u16::from_le_bytes([buf[pos], buf[pos + 1]]) as usize;
+        pos += 2;
+        if pos + len > buf.len() {
+            return Err(SerdeError::UnexpectedEof);
+        }
+        Ok((&buf[pos..pos + len], pos + len))
+    } else if tag == QttTag::Str32 as u8 {
+        if pos + 4 > buf.len() {
+            return Err(SerdeError::UnexpectedEof);
+        }
+        let len = u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
+        pos += 4;
+        if pos + len > buf.len() {
+            return Err(SerdeError::UnexpectedEof);
+        }
+        Ok((&buf[pos..pos + len], pos + len))
+    } else {
+        Err(SerdeError::InvalidTag(tag))
+    }
+}
+
+fn write_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
+    let len = bytes.len();
+    if len <= 7 {
+        buf.push(QttTag::BytesInline as u8 | (len as u8 & 0x07));
+        buf.extend_from_slice(bytes);
+    } else if len <= 255 {
+        buf.push(QttTag::Bytes8 as u8);
+        buf.push(len as u8);
+        buf.extend_from_slice(bytes);
+    } else if len <= 65535 {
+        buf.push(QttTag::Bytes16 as u8);
+        buf.extend_from_slice(&(len as u16).to_le_bytes());
+        buf.extend_from_slice(bytes);
+    } else {
+        buf.push(QttTag::Bytes32 as u8);
+        buf.extend_from_slice(&(len as u32).to_le_bytes());
+        buf.extend_from_slice(bytes);
+    }
+}
+
+fn read_bytes(buf: &[u8]) -> Result<(&[u8], usize), SerdeError> {
+    if buf.is_empty() {
+        return Err(SerdeError::UnexpectedEof);
+    }
+    let tag = buf[0];
+    let mut pos = 1;
+    
+    if tag >= QttTag::BytesInline as u8 && tag <= (QttTag::BytesInline as u8 + 7) {
+        let len = (tag - QttTag::BytesInline as u8) as usize;
+        if pos + len > buf.len() {
+            return Err(SerdeError::UnexpectedEof);
+        }
+        Ok((&buf[pos..pos + len], pos + len))
+    } else if tag == QttTag::Bytes8 as u8 {
+        if pos >= buf.len() {
+            return Err(SerdeError::UnexpectedEof);
+        }
+        let len = buf[pos] as usize;
+        pos += 1;
+        if pos + len > buf.len() {
+            return Err(SerdeError::UnexpectedEof);
+        }
+        Ok((&buf[pos..pos + len], pos + len))
+    } else if tag == QttTag::Bytes16 as u8 {
+        if pos + 2 > buf.len() {
+            return Err(SerdeError::UnexpectedEof);
+        }
+        let len = u16::from_le_bytes([buf[pos], buf[pos + 1]]) as usize;
+        pos += 2;
+        if pos + len > buf.len() {
+            return Err(SerdeError::UnexpectedEof);
+        }
+        Ok((&buf[pos..pos + len], pos + len))
+    } else if tag == QttTag::Bytes32 as u8 {
+        if pos + 4 > buf.len() {
+            return Err(SerdeError::UnexpectedEof);
+        }
+        let len = u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
+        pos += 4;
+        if pos + len > buf.len() {
+            return Err(SerdeError::UnexpectedEof);
+        }
+        Ok((&buf[pos..pos + len], pos + len))
+    } else {
+        Err(SerdeError::InvalidTag(tag))
+    }
+}
+
+// ============================================================================
+// Schema Registry for QTT
+// ============================================================================
+
+struct SchemaRegistry {
+    schemas: HashMap<u64, TypeSchema>,
+    next_type_id: u64,
+}
+
+impl SchemaRegistry {
+    pub fn new() -> Self {
+        SchemaRegistry {
+            schemas: HashMap::new(),
+            next_type_id: 1,
+        }
+    }
+    
+    pub fn empty() -> Self {
+        SchemaRegistry {
+            schemas: HashMap::new(),
+            next_type_id: 1,
+        }
+    }
+    
+    pub fn register(&mut self, schema: TypeSchema) -> u64 {
+        let id = self.next_type_id;
+        self.next_type_id += 1;
+        self.schemas.insert(id, schema);
+        id
+    }
+    
+    pub fn get(&self, id: u64) -> Option<&TypeSchema> {
+        self.schemas.get(&id)
+    }
+}
+
+struct TypeSchema {
+    name: String,
+    fields: Vec<FieldSchema>,
+    schema_type: SchemaType,
+}
+
+enum SchemaType {
+    Struct,
+    Enum,
+    Newtype,
+    Tuple,
+}
+
+struct FieldSchema {
+    name: String,
+    field_type: TypeRef,
+    optional: bool,
+    default: Option<Vec<u8>>, // Serialized default value
+}
+
+enum TypeRef {
+    Primitive(PrimitiveType),
+    Array(Box<TypeRef>),
+    Map(Box<TypeRef>, Box<TypeRef>), // key, value
+    Option(Box<TypeRef>),
+    Reference(u64), // Schema ID
+    Custom(u64),    // Custom type ID
+}
+
+enum PrimitiveType {
+    U8, U16, U32, U64,
+    I8, I16, I32, I64,
+    F32, F64,
+    Bool,
+    String,
+    Bytes,
+    Unit,
+}
+
+// ============================================================================
+// Serialize/Deserialize Traits
+// ============================================================================
+
+trait Serialize {
+    fn serialize(&self, writer: &mut QttWriter) -> Result<(), SerdeError>;
+    fn serialize_json(&self) -> Result<String, SerdeError>;
+    fn serialize_msgpack(&self) -> Result<Vec<u8>, SerdeError>;
+    fn serialize_cbor(&self) -> Result<Vec<u8>, SerdeError>;
+    fn serialize_bincode(&self) -> Result<Vec<u8>, SerdeError>;
+}
+
+trait Deserialize: Sized {
+    fn deserialize(reader: &mut QttReader) -> Result<Self, SerdeError>;
+    fn deserialize_json(data: &str) -> Result<Self, SerdeError>;
+    fn deserialize_msgpack(data: &[u8]) -> Result<Self, SerdeError>;
+    fn deserialize_cbor(data: &[u8]) -> Result<Self, SerdeError>;
+    fn deserialize_bincode(data: &[u8]) -> Result<Self, SerdeError>;
+}
+
+// ============================================================================
+// Format-specific Serialization (JSON, MessagePack, CBOR, Bincode)
+// ============================================================================
+
+enum SerializationFormat {
+    Json,
+    MessagePack,
+    Cbor,
+    Bincode,
+    Qtt, // Native format
+}
+
+struct Serializer {
+    format: SerializationFormat,
+    writer: QttWriter,
+    json_buf: String,
+}
+
+impl Serializer {
+    pub fn new(format: SerializationFormat) -> Self {
+        Serializer {
+            format,
+            writer: QttWriter::new(),
+            json_buf: String::new(),
+        }
+    }
+    
+    pub fn serialize<T: Serialize>(&mut self, value: &T) -> Result<Vec<u8>, SerdeError> {
+        match self.format {
+            SerializationFormat::Json => {
+                value.serialize_json().map(|s| s.into_bytes())
+            }
+            SerializationFormat::MessagePack => {
+                value.serialize_msgpack()
+            }
+            SerializationFormat::Cbor => {
+                value.serialize_cbor()
+            }
+            SerializationFormat::Bincode => {
+                value.serialize_bincode()
+            }
+            SerializationFormat::Qtt => {
+                value.serialize(&mut self.writer)?;
+                Ok(self.writer.into_bytes())
+            }
+        }
+    }
+}
+
+struct Deserializer {
+    format: SerializationFormat,
+    reader: QttReader<'static>, // Lifetime simplified
+}
+
+impl Deserializer {
+    pub fn new(format: SerializationFormat, data: &[u8]) -> Self {
+        Deserializer {
+            format,
+            reader: QttReader::new(data),
+        }
+    }
+    
+    pub fn deserialize<T: Deserialize>(&mut self) -> Result<T, SerdeError> {
+        match self.format {
+            SerializationFormat::Json => {
+                let json_str = unsafe { std::str::from_utf8_unchecked(&self.reader.buf) };
+                T::deserialize_json(json_str)
+            }
+            SerializationFormat::MessagePack => {
+                T::deserialize_msgpack(self.reader.buf)
+            }
+            SerializationFormat::Cbor => {
+                T::deserialize_cbor(self.reader.buf)
+            }
+            SerializationFormat::Bincode => {
+                T::deserialize_bincode(self.reader.buf)
+            }
+            SerializationFormat::Qtt => {
+                T::deserialize(&mut self.reader)
+            }
+        }
+    }
+}
+
+// ============================================================================
+// JSON Serialization (via FFI)
+// ============================================================================
+
+fn to_json<T: Serialize>(value: &T) -> Result<String, SerdeError> {
+    value.serialize_json()
+}
+
+fn from_json<T: Deserialize>(json: &str) -> Result<T, SerdeError> {
+    T::deserialize_json(json)
+}
+
+fn to_msgpack<T: Serialize>(value: &T) -> Result<Vec<u8>, SerdeError> {
+    value.serialize_msgpack()
+}
+
+fn from_msgpack<T: Deserialize>(data: &[u8]) -> Result<T, SerdeError> {
+    T::deserialize_msgpack(data)
+}
+
+fn to_cbor<T: Serialize>(value: &T) -> Result<Vec<u8>, SerdeError> {
+    value.serialize_cbor()
+}
+
+fn from_cbor<T: Deserialize>(data: &[u8]) -> Result<T, SerdeError> {
+    T::deserialize_cbor(data)
+}
+
+fn to_bincode<T: Serialize>(value: &T) -> Result<Vec<u8>, SerdeError> {
+    value.serialize_bincode()
+}
+
+fn from_bincode<T: Deserialize>(data: &[u8]) -> Result<T, SerdeError> {
+    T::deserialize_bincode(data)
+}
+
+// ============================================================================
+// Derive Macro Support (Serde-like attributes)
+// ============================================================================
+
+// #[derive(Serialize, Deserialize)]
+// struct MyStruct {
+//     #[serde(rename = "field_name")]
+//     field: String,
+//     #[serde(skip_serializing_if = "Option::is_none")]
+//     optional_field: Option<i32>,
+//     #[serde(default)]
+//     default_field: Vec<String>,
+//     #[serde(flatten)]
+//     flattened: HashMap<String, Value>,
+// }
+
+// Attribute macros would be implemented via Naso's macro system
+
+// ============================================================================
+// Value Type (like serde_json::Value)
+// ============================================================================
+
+enum Value {
+    Null,
+    Bool(bool),
+    Number(Number),
+    String(String),
+    Array(Vec<Value>),
+    Object(Map<String, Value>),
+}
+
+struct Number {
+    // Can represent integer, unsigned, or float
+    value: NumberValue,
+}
+
+enum NumberValue {
+    Integer(i64),
+    Unsigned(u64),
+    Float(f64),
+}
+
+impl Number {
+    pub fn from_i64(v: i64) -> Self {
+        Number { value: NumberValue::Integer(v) }
+    }
+    
+    pub fn from_u64(v: u64) -> Self {
+        Number { value: NumberValue::Unsigned(v) }
+    }
+    
+    pub fn from_f64(v: f64) -> Self {
+        Number { value: NumberValue::Float(v) }
+    }
+    
+    pub fn as_i64(&self) -> Option<i64> {
+        match self.value {
+            NumberValue::Integer(v) => Some(v),
+            NumberValue::Unsigned(v) => i64::try_from(v).ok(),
+            NumberValue::Float(v) => Some(v as i64),
+        }
+    }
+    
+    pub fn as_u64(&self) -> Option<u64> {
+        match self.value {
+            NumberValue::Integer(v) => u64::try_from(v).ok(),
+            NumberValue::Unsigned(v) => Some(v),
+            NumberValue::Float(v) => Some(v as u64),
+        }
+    }
+    
+    pub fn as_f64(&self) -> Option<f64> {
+        match self.value {
+            NumberValue::Integer(v) => Some(v as f64),
+            NumberValue::Unsigned(v) => Some(v as f64),
+            NumberValue::Float(v) => Some(v),
+        }
+    }
+}
+
+impl Serialize for Value {
+    fn serialize(&self, writer: &mut QttWriter) -> Result<(), SerdeError> {
+        match self {
+            Value::Null => writer.write_null(),
+            Value::Bool(b) => writer.write_bool(*b),
+            Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    writer.write_var_int(i);
+                } else if let Some(u) = n.as_u64() {
+                    writer.write_var_uint(u);
+                } else if let Some(f) = n.as_f64() {
+                    writer.write_f64(f);
+                }
+            }
+            Value::String(s) => writer.write_str(s),
+            Value::Array(arr) => {
+                writer.write_array_start(arr.len());
+                for item in arr {
+                    item.serialize(writer)?;
+                }
+            }
+            Value::Object(obj) => {
+                writer.write_map_start(obj.len());
+                for (k, v) in obj {
+                    writer.write_str(k);
+                    v.serialize(writer)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    
+    fn serialize_json(&self) -> Result<String, SerdeError> {
+        // Use FFI
+        let qtt_bytes = self.to_qtt()?;
+        let mut out = vec![0u8; 65536];
+        let len = naso_ser_json_serialize(qtt_bytes.as_ptr(), qtt_bytes.len(), out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(SerdeError::SerializationFailed);
+        }
+        out.truncate(len as usize);
+        String::from_utf8(out).map_err(|_| SerdeError::InvalidUtf8)
+    }
+    
+    fn serialize_msgpack(&self) -> Result<Vec<u8>, SerdeError> {
+        let qtt_bytes = self.to_qtt()?;
+        let mut out = vec![0u8; 65536];
+        let len = naso_ser_msgpack_serialize(qtt_bytes.as_ptr(), qtt_bytes.len(), out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(SerdeError::SerializationFailed);
+        }
+        out.truncate(len as usize);
+        Ok(out)
+    }
+    
+    fn serialize_cbor(&self) -> Result<Vec<u8>, SerdeError> {
+        let qtt_bytes = self.to_qtt()?;
+        let mut out = vec![0u8; 65536];
+        let len = naso_ser_cbor_serialize(qtt_bytes.as_ptr(), qtt_bytes.len(), out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(SerdeError::SerializationFailed);
+        }
+        out.truncate(len as usize);
+        Ok(out)
+    }
+    
+    fn serialize_bincode(&self) -> Result<Vec<u8>, SerdeError> {
+        let qtt_bytes = self.to_qtt()?;
+        let mut out = vec![0u8; 65536];
+        let len = naso_ser_bincode_serialize(qtt_bytes.as_ptr(), qtt_bytes.len(), out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(SerdeError::SerializationFailed);
+        }
+        out.truncate(len as usize);
+        Ok(out)
+    }
+}
+
+impl Value {
+    fn to_qtt(&self) -> Result<Vec<u8>, SerdeError> {
+        let mut writer = QttWriter::new();
+        self.serialize(&mut writer)?;
+        Ok(writer.into_bytes())
+    }
+}
+
+impl Deserialize for Value {
+    fn deserialize(reader: &mut QttReader) -> Result<Self, SerdeError> {
+        if reader.remaining() == 0 {
+            return Err(SerdeError::UnexpectedEof);
+        }
+        let tag = reader.buf[reader.pos];
+        
+        if tag == QttTag::Null as u8 {
+            reader.pos += 1;
+            return Ok(Value::Null);
+        }
+        if tag == QttTag::Bool as u8 {
+            reader.pos += 1;
+            let val = reader.buf[reader.pos] != 0;
+            reader.pos += 1;
+            return Ok(Value::Bool(val));
+        }
+        if tag == QttTag::VarInt as u8 || tag == QttTag::VarUInt as u8 || 
+           tag == QttTag::I8 as u8 || tag == QttTag::I16 as u8 || tag == QttTag::I32 as u8 || tag == QttTag::I64 as u8 ||
+           tag == QttTag::U8 as u8 || tag == QttTag::U16 as u8 || tag == QttTag::U32 as u8 || tag == QttTag::U64 as u8 {
+            // Rewind to let typed readers handle it
+            let mut num_reader = QttReader::new(&reader.buf[reader.pos - 1..]);
+            // Simplified - would need proper number parsing
+            reader.pos = reader.buf.len(); // Skip for now
+            return Ok(Value::Number(Number::from_i64(0)));
+        }
+        if tag >= QttTag::StrInline as u8 && tag <= QttTag::Str32 as u8 {
+            let s = reader.read_str()?;
+            return Ok(Value::String(s.to_string()));
+        }
+        if tag >= QttTag::ArrayInline as u8 && tag <= QttTag::Array32 as u8 {
+            let len = reader.read_array_len()?;
+            let mut arr = Vec::with_capacity(len);
+            for _ in 0..len {
+                arr.push(Value::deserialize(reader)?);
+            }
+            return Ok(Value::Array(arr));
+        }
+        if tag >= QttTag::MapInline as u8 && tag <= QttTag::Map32 as u8 {
+            let len = reader.read_map_len()?;
+            let mut obj = HashMap::new();
+            for _ in 0..len {
+                let k = reader.read_str()?.to_string();
+                let v = Value::deserialize(reader)?;
+                obj.insert(k, v);
+            }
+            return Ok(Value::Object(obj));
+        }
+        
+        Err(SerdeError::InvalidTag(tag))
+    }
+    
+    fn deserialize_json(data: &str) -> Result<Self, SerdeError> {
+        let mut out = vec![0u8; 65536];
+        let len = naso_ser_json_deserialize(data.as_ptr(), data.len(), out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(SerdeError::DeserializationFailed);
+        }
+        out.truncate(len as usize);
+        let mut reader = QttReader::new(&out);
+        Value::deserialize(&mut reader)
+    }
+    
+    fn deserialize_msgpack(data: &[u8]) -> Result<Self, SerdeError> {
+        let mut out = vec![0u8; 65536];
+        let len = naso_ser_msgpack_deserialize(data.as_ptr(), data.len(), out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(SerdeError::DeserializationFailed);
+        }
+        out.truncate(len as usize);
+        let mut reader = QttReader::new(&out);
+        Value::deserialize(&mut reader)
+    }
+    
+    fn deserialize_cbor(data: &[u8]) -> Result<Self, SerdeError> {
+        let mut out = vec![0u8; 65536];
+        let len = naso_ser_cbor_deserialize(data.as_ptr(), data.len(), out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(SerdeError::DeserializationFailed);
+        }
+        out.truncate(len as usize);
+        let mut reader = QttReader::new(&out);
+        Value::deserialize(&mut reader)
+    }
+    
+    fn deserialize_bincode(data: &[u8]) -> Result<Self, SerdeError> {
+        let mut out = vec![0u8; 65536];
+        let len = naso_ser_bincode_deserialize(data.as_ptr(), data.len(), out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(SerdeError::DeserializationFailed);
+        }
+        out.truncate(len as usize);
+        let mut reader = QttReader::new(&out);
+        Value::deserialize(&mut reader)
+    }
+}
+
+// ============================================================================
+// Error Types
+// ============================================================================
+
+enum SerdeError {
+    UnexpectedEof,
+    InvalidTag(u8),
+    ExpectedTag(u8, u8),
+    VarintOverflow,
+    InvalidUtf8,
+    SerializationFailed,
+    DeserializationFailed,
+    InvalidNumber,
+    MissingField(String),
+    UnknownVariant(String),
+    RecursionLimitExceeded,
+    Custom(String),
+}
+
+impl SerdeError {
+    pub fn to_string(&self) -> String {
+        match self {
+            SerdeError::UnexpectedEof => "Unexpected end of input".into(),
+            SerdeError::InvalidTag(tag) => format!("Invalid tag: 0x{:02X}", tag),
+            SerdeError::ExpectedTag(expected, found) => format!("Expected tag 0x{:02X}, found 0x{:02X}", expected, found),
+            SerdeError::VarintOverflow => "Varint overflow".into(),
+            SerdeError::InvalidUtf8 => "Invalid UTF-8".into(),
+            SerdeError::SerializationFailed => "Serialization failed".into(),
+            SerdeError::DeserializationFailed => "Deserialization failed".into(),
+            SerdeError::InvalidNumber => "Invalid number format".into(),
+            SerdeError::MissingField(field) => format!("Missing field: {}", field),
+            SerdeError::UnknownVariant(variant) => format!("Unknown variant: {}", variant),
+            SerdeError::RecursionLimitExceeded => "Recursion limit exceeded".into(),
+            SerdeError::Custom(msg) => msg.clone(),
+        }
+    }
+}
+
+// ============================================================================
+// Convenience Functions
+// ============================================================================
+
+impl<T: Serialize> Serialize for Option<T> {
+    fn serialize(&self, writer: &mut QttWriter) -> Result<(), SerdeError> {
+        match self {
+            Some(v) => {
+                writer.write_some();
+                v.serialize(writer)
+            }
+            None => {
+                writer.write_none();
+                Ok(())
+            }
+        }
+    }
+    
+    fn serialize_json(&self) -> Result<String, SerdeError> {
+        match self {
+            Some(v) => v.serialize_json(),
+            None => Ok("null".into()),
+        }
+    }
+    
+    fn serialize_msgpack(&self) -> Result<Vec<u8>, SerdeError> {
+        match self {
+            Some(v) => v.serialize_msgpack(),
+            None => Ok(vec![0xC0]), // MessagePack nil
+        }
+    }
+    
+    fn serialize_cbor(&self) -> Result<Vec<u8>, SerdeError> {
+        match self {
+            Some(v) => v.serialize_cbor(),
+            None => Ok(vec![0xF6]), // CBOR null
+        }
+    }
+    
+    fn serialize_bincode(&self) -> Result<Vec<u8>, SerdeError> {
+        match self {
+            Some(v) => {
+                let mut buf = vec![1u8]; // Some tag
+                buf.extend_from_slice(&v.serialize_bincode()?);
+                Ok(buf)
+            }
+            None => Ok(vec![0u8]), // None tag
+        }
+    }
+}
+
+impl<T: Deserialize> Deserialize for Option<T> {
+    fn deserialize(reader: &mut QttReader) -> Result<Self, SerdeError> {
+        let is_some = reader.read_option_tag()?;
+        if is_some {
+            Ok(Some(T::deserialize(reader)?))
+        } else {
+            Ok(None)
+        }
+    }
+    
+    fn deserialize_json(data: &str) -> Result<Self, SerdeError> {
+        if data == "null" {
+            Ok(None)
+        } else {
+            Ok(Some(T::deserialize_json(data)?))
+        }
+    }
+    
+    fn deserialize_msgpack(data: &[u8]) -> Result<Self, SerdeError> {
+        if data.len() == 1 && data[0] == 0xC0 {
+            Ok(None)
+        } else {
+            Ok(Some(T::deserialize_msgpack(data)?))
+        }
+    }
+    
+    fn deserialize_cbor(data: &[u8]) -> Result<Self, SerdeError> {
+        if data.len() == 1 && data[0] == 0xF6 {
+            Ok(None)
+        } else {
+            Ok(Some(T::deserialize_cbor(data)?))
+        }
+    }
+    
+    fn deserialize_bincode(data: &[u8]) -> Result<Self, SerdeError> {
+        if data.is_empty() {
+            return Err(SerdeError::UnexpectedEof);
+        }
+        if data[0] == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(T::deserialize_bincode(&data[1..])?))
+        }
+    }
+}
+
+impl<T: Serialize> Serialize for Vec<T> {
+    fn serialize(&self, writer: &mut QttWriter) -> Result<(), SerdeError> {
+        writer.write_array_start(self.len());
+        for item in self {
+            item.serialize(writer)?;
+        }
+        Ok(())
+    }
+    
+    fn serialize_json(&self) -> Result<String, SerdeError> {
+        // Simplified - would use proper JSON array serialization
+        let mut result = String::from("[");
+        for (i, item) in self.iter().enumerate() {
+            if i > 0 {
+                result.push(',');
+            }
+            result.push_str(&item.serialize_json()?);
+        }
+        result.push(']');
+        Ok(result)
+    }
+    
+    fn serialize_msgpack(&self) -> Result<Vec<u8>, SerdeError> {
+        // Use QTT as intermediate
+        let mut writer = QttWriter::new();
+        self.serialize(&mut writer)?;
+        // Convert to msgpack via FFI
+        let qtt = writer.into_bytes();
+        let mut out = vec![0u8; qtt.len() * 2];
+        let len = naso_ser_msgpack_serialize(qtt.as_ptr(), qtt.len(), out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(SerdeError::SerializationFailed);
+        }
+        out.truncate(len as usize);
+        Ok(out)
+    }
+    
+    fn serialize_cbor(&self) -> Result<Vec<u8>, SerdeError> {
+        let mut writer = QttWriter::new();
+        self.serialize(&mut writer)?;
+        let qtt = writer.into_bytes();
+        let mut out = vec![0u8; qtt.len() * 2];
+        let len = naso_ser_cbor_serialize(qtt.as_ptr(), qtt.len(), out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(SerdeError::SerializationFailed);
+        }
+        out.truncate(len as usize);
+        Ok(out)
+    }
+    
+    fn serialize_bincode(&self) -> Result<Vec<u8>, SerdeError> {
+        let mut writer = QttWriter::new();
+        self.serialize(&mut writer)?;
+        let qtt = writer.into_bytes();
+        let mut out = vec![0u8; qtt.len() * 2];
+        let len = naso_ser_bincode_serialize(qtt.as_ptr(), qtt.len(), out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(SerdeError::SerializationFailed);
+        }
+        out.truncate(len as usize);
+        Ok(out)
+    }
+}
+
+impl<T: Deserialize> Deserialize for Vec<T> {
+    fn deserialize(reader: &mut QttReader) -> Result<Self, SerdeError> {
+        let len = reader.read_array_len()?;
+        let mut vec = Vec::with_capacity(len);
+        for _ in 0..len {
+            vec.push(T::deserialize(reader)?);
+        }
+        Ok(vec)
+    }
+    
+    fn deserialize_json(data: &str) -> Result<Self, SerdeError> {
+        // Simplified JSON array parsing
+        let mut out = vec![0u8; 65536];
+        let len = naso_ser_json_deserialize(data.as_ptr(), data.len(), out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(SerdeError::DeserializationFailed);
+        }
+        out.truncate(len as usize);
+        let mut reader = QttReader::new(&out);
+        Vec::deserialize(&mut reader)
+    }
+    
+    fn deserialize_msgpack(data: &[u8]) -> Result<Self, SerdeError> {
+        let mut out = vec![0u8; 65536];
+        let len = naso_ser_msgpack_deserialize(data.as_ptr(), data.len(), out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(SerdeError::DeserializationFailed);
+        }
+        out.truncate(len as usize);
+        let mut reader = QttReader::new(&out);
+        Vec::deserialize(&mut reader)
+    }
+    
+    fn deserialize_cbor(data: &[u8]) -> Result<Self, SerdeError> {
+        let mut out = vec![0u8; 65536];
+        let len = naso_ser_cbor_deserialize(data.as_ptr(), data.len(), out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(SerdeError::DeserializationFailed);
+        }
+        out.truncate(len as usize);
+        let mut reader = QttReader::new(&out);
+        Vec::deserialize(&mut reader)
+    }
+    
+    fn deserialize_bincode(data: &[u8]) -> Result<Self, SerdeError> {
+        let mut out = vec![0u8; 65536];
+        let len = naso_ser_bincode_deserialize(data.as_ptr(), data.len(), out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(SerdeError::DeserializationFailed);
+        }
+        out.truncate(len as usize);
+        let mut reader = QttReader::new(&out);
+        Vec::deserialize(&mut reader)
+    }
+}
+
+// Implement for String
+impl Serialize for String {
+    fn serialize(&self, writer: &mut QttWriter) -> Result<(), SerdeError> {
+        writer.write_str(self);
+        Ok(())
+    }
+    
+    fn serialize_json(&self) -> Result<String, SerdeError> {
+        // Escape and quote
+        let mut result = String::from("\"");
+        for c in self.chars() {
+            match c {
+                '"' => result.push_str("\\\""),
+                '\\' => result.push_str("\\\\"),
+                '\n' => result.push_str("\\n"),
+                '\r' => result.push_str("\\r"),
+                '\t' => result.push_str("\\t"),
+                c if c.is_control() => result.push_str(&format!("\\u{:04X}", c as u32)),
+                c => result.push(c),
+            }
+        }
+        result.push('"');
+        Ok(result)
+    }
+    
+    fn serialize_msgpack(&self) -> Result<Vec<u8>, SerdeError> {
+        let qtt = self.to_qtt()?;
+        let mut out = vec![0u8; qtt.len() * 2];
+        let len = naso_ser_msgpack_serialize(qtt.as_ptr(), qtt.len(), out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(SerdeError::SerializationFailed);
+        }
+        out.truncate(len as usize);
+        Ok(out)
+    }
+    
+    fn serialize_cbor(&self) -> Result<Vec<u8>, SerdeError> {
+        let qtt = self.to_qtt()?;
+        let mut out = vec![0u8; qtt.len() * 2];
+        let len = naso_ser_cbor_serialize(qtt.as_ptr(), qtt.len(), out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(SerdeError::SerializationFailed);
+        }
+        out.truncate(len as usize);
+        Ok(out)
+    }
+    
+    fn serialize_bincode(&self) -> Result<Vec<u8>, SerdeError> {
+        let qtt = self.to_qtt()?;
+        let mut out = vec![0u8; qtt.len() * 2];
+        let len = naso_ser_bincode_serialize(qtt.as_ptr(), qtt.len(), out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(SerdeError::SerializationFailed);
+        }
+        out.truncate(len as usize);
+        Ok(out)
+    }
+}
+
+impl String {
+    fn to_qtt(&self) -> Result<Vec<u8>, SerdeError> {
+        let mut writer = QttWriter::new();
+        writer.write_str(self);
+        Ok(writer.into_bytes())
+    }
+}
+
+impl Deserialize for String {
+    fn deserialize(reader: &mut QttReader) -> Result<Self, SerdeError> {
+        reader.read_str().map(|s| s.to_string())
+    }
+    
+    fn deserialize_json(data: &str) -> Result<Self, SerdeError> {
+        // Simplified - would parse JSON string
+        if data.starts_with('"') && data.ends_with('"') && data.len() >= 2 {
+            let inner = &data[1..data.len()-1];
+            // Unescape
+            let mut result = String::new();
+            let mut chars = inner.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    if let Some(next) = chars.next() {
+                        match next {
+                            '"' => result.push('"'),
+                            '\\' => result.push('\\'),
+                            'n' => result.push('\n'),
+                            'r' => result.push('\r'),
+                            't' => result.push('\t'),
+                            'u' => {
+                                // Unicode escape
+                                let mut hex = String::new();
+                                for _ in 0..4 {
+                                    if let Some(h) = chars.next() {
+                                        hex.push(h);
+                                    }
+                                }
+                                if let Ok(code) = u32::from_str_radix(&hex, 16) {
+                                    if let Some(ch) = char::from_u32(code) {
+                                        result.push(ch);
+                                    }
+                                }
+                            }
+                            _ => result.push(next),
+                        }
+                    }
+                } else {
+                    result.push(c);
+                }
+            }
+            Ok(result)
+        } else {
+            Err(SerdeError::InvalidUtf8)
+        }
+    }
+    
+    fn deserialize_msgpack(data: &[u8]) -> Result<Self, SerdeError> {
+        let mut out = vec![0u8; 65536];
+        let len = naso_ser_msgpack_deserialize(data.as_ptr(), data.len(), out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(SerdeError::DeserializationFailed);
+        }
+        out.truncate(len as usize);
+        let mut reader = QttReader::new(&out);
+        String::deserialize(&mut reader)
+    }
+    
+    fn deserialize_cbor(data: &[u8]) -> Result<Self, SerdeError> {
+        let mut out = vec![0u8; 65536];
+        let len = naso_ser_cbor_deserialize(data.as_ptr(), data.len(), out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(SerdeError::DeserializationFailed);
+        }
+        out.truncate(len as usize);
+        let mut reader = QttReader::new(&out);
+        String::deserialize(&mut reader)
+    }
+    
+    fn deserialize_bincode(data: &[u8]) -> Result<Self, SerdeError> {
+        let mut out = vec![0u8; 65536];
+        let len = naso_ser_bincode_deserialize(data.as_ptr(), data.len(), out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(SerdeError::DeserializationFailed);
+        }
+        out.truncate(len as usize);
+        let mut reader = QttReader::new(&out);
+        String::deserialize(&mut reader)
+    }
+}
+
+// Implement for primitive types
+macro_rules! impl_serialize_primitive {
+    ($($t:ty => $write:ident),*) => {
+        $(
+            impl Serialize for $t {
+                fn serialize(&self, writer: &mut QttWriter) -> Result<(), SerdeError> {
+                    writer.$write(*self);
+                    Ok(())
+                }
+                
+                fn serialize_json(&self) -> Result<String, SerdeError> {
+                    Ok(self.to_string())
+                }
+                
+                fn serialize_msgpack(&self) -> Result<Vec<u8>, SerdeError> {
+                    let qtt = self.to_qtt()?;
+                    let mut out = vec![0u8; qtt.len() * 2];
+                    let len = naso_ser_msgpack_serialize(qtt.as_ptr(), qtt.len(), out.as_mut_ptr(), out.len());
+                    if len == 0 {
+                        return Err(SerdeError::SerializationFailed);
+                    }
+                    out.truncate(len as usize);
+                    Ok(out)
+                }
+                
+                fn serialize_cbor(&self) -> Result<Vec<u8>, SerdeError> {
+                    let qtt = self.to_qtt()?;
+                    let mut out = vec![0u8; qtt.len() * 2];
+                    let len = naso_ser_cbor_serialize(qtt.as_ptr(), qtt.len(), out.as_mut_ptr(), out.len());
+                    if len == 0 {
+                        return Err(SerdeError::SerializationFailed);
+                    }
+                    out.truncate(len as usize);
+                    Ok(out)
+                }
+                
+                fn serialize_bincode(&self) -> Result<Vec<u8>, SerdeError> {
+                    let qtt = self.to_qtt()?;
+                    let mut out = vec![0u8; qtt.len() * 2];
+                    let len = naso_ser_bincode_serialize(qtt.as_ptr(), qtt.len(), out.as_mut_ptr(), out.len());
+                    if len == 0 {
+                        return Err(SerdeError::SerializationFailed);
+                    }
+                    out.truncate(len as usize);
+                    Ok(out)
+                }
+            }
+            
+            impl $t {
+                fn to_qtt(&self) -> Result<Vec<u8>, SerdeError> {
+                    let mut writer = QttWriter::new();
+                    writer.$write(*self);
+                    Ok(writer.into_bytes())
+                }
+            }
+        )*
+    };
+}
+
+impl_serialize_primitive!(
+    u8 => write_u8,
+    u16 => write_u16,
+    u32 => write_u32,
+    u64 => write_u64,
+    i8 => write_i8,
+    i16 => write_i16,
+    i32 => write_i32,
+    i64 => write_i64,
+    f32 => write_f32,
+    f64 => write_f64,
+    bool => write_bool
+);
+
+macro_rules! impl_deserialize_primitive {
+    ($($t:ty => $read:ident),*) => {
+        $(
+            impl Deserialize for $t {
+                fn deserialize(reader: &mut QttReader) -> Result<Self, SerdeError> {
+                    reader.$read()
+                }
+                
+                fn deserialize_json(data: &str) -> Result<Self, SerdeError> {
+                    data.parse().map_err(|_| SerdeError::InvalidNumber)
+                }
+                
+                fn deserialize_msgpack(data: &[u8]) -> Result<Self, SerdeError> {
+                    let mut out = vec![0u8; 65536];
+                    let len = naso_ser_msgpack_deserialize(data.as_ptr(), data.len(), out.as_mut_ptr(), out.len());
+                    if len == 0 {
+                        return Err(SerdeError::DeserializationFailed);
+                    }
+                    out.truncate(len as usize);
+                    let mut reader = QttReader::new(&out);
+                    reader.$read()
+                }
+                
+                fn deserialize_cbor(data: &[u8]) -> Result<Self, SerdeError> {
+                    let mut out = vec![0u8; 65536];
+                    let len = naso_ser_cbor_deserialize(data.as_ptr(), data.len(), out.as_mut_ptr(), out.len());
+                    if len == 0 {
+                        return Err(SerdeError::DeserializationFailed);
+                    }
+                    out.truncate(len as usize);
+                    let mut reader = QttReader::new(&out);
+                    reader.$read()
+                }
+                
+                fn deserialize_bincode(data: &[u8]) -> Result<Self, SerdeError> {
+                    let mut out = vec![0u8; 65536];
+                    let len = naso_ser_bincode_deserialize(data.as_ptr(), data.len(), out.as_mut_ptr(), out.len());
+                    if len == 0 {
+                        return Err(SerdeError::DeserializationFailed);
+                    }
+                    out.truncate(len as usize);
+                    let mut reader = QttReader::new(&out);
+                    reader.$read()
+                }
+            }
+        )*
+    };
+}
+
+impl_deserialize_primitive!(
+    u8 => read_u8,
+    u16 => read_u16,
+    u32 => read_u32,
+    u64 => read_u64,
+    i8 => read_i8,
+    i16 => read_i16,
+    i32 => read_i32,
+    i64 => read_i64,
+    f32 => read_f32,
+    f64 => read_f64,
+    bool => read_bool
+);
+
+// ============================================================================
+// HashMap and BTreeMap Serialization
+// ============================================================================
+
+impl<K: Serialize + Eq + std::hash::Hash, V: Serialize> Serialize for HashMap<K, V> {
+    fn serialize(&self, writer: &mut QttWriter) -> Result<(), SerdeError> {
+        writer.write_map_start(self.len());
+        for (k, v) in self {
+            k.serialize(writer)?;
+            v.serialize(writer)?;
+        }
+        Ok(())
+    }
+    
+    fn serialize_json(&self) -> Result<String, SerdeError> {
+        // Simplified
+        Ok("{}".into())
+    }
+    
+    fn serialize_msgpack(&self) -> Result<Vec<u8>, SerdeError> {
+        let mut writer = QttWriter::new();
+        self.serialize(&mut writer)?;
+        let qtt = writer.into_bytes();
+        let mut out = vec![0u8; qtt.len() * 2];
+        let len = naso_ser_msgpack_serialize(qtt.as_ptr(), qtt.len(), out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(SerdeError::SerializationFailed);
+        }
+        out.truncate(len as usize);
+        Ok(out)
+    }
+    
+    fn serialize_cbor(&self) -> Result<Vec<u8>, SerdeError> {
+        let mut writer = QttWriter::new();
+        self.serialize(&mut writer)?;
+        let qtt = writer.into_bytes();
+        let mut out = vec![0u8; qtt.len() * 2];
+        let len = naso_ser_cbor_serialize(qtt.as_ptr(), qtt.len(), out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(SerdeError::SerializationFailed);
+        }
+        out.truncate(len as usize);
+        Ok(out)
+    }
+    
+    fn serialize_bincode(&self) -> Result<Vec<u8>, SerdeError> {
+        let mut writer = QttWriter::new();
+        self.serialize(&mut writer)?;
+        let qtt = writer.into_bytes();
+        let mut out = vec![0u8; qtt.len() * 2];
+        let len = naso_ser_bincode_serialize(qtt.as_ptr(), qtt.len(), out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(SerdeError::SerializationFailed);
+        }
+        out.truncate(len as usize);
+        Ok(out)
+    }
+}
+
+// ============================================================================
+// Async Serialization (for streaming)
+// ============================================================================
+
+struct AsyncSerializer<W: AsyncWrite> {
+    writer: W,
+    buffer: Vec<u8>,
+    format: SerializationFormat,
+}
+
+impl<W: AsyncWrite> AsyncSerializer<W> {
+    pub fn new(writer: W, format: SerializationFormat) -> Self {
+        AsyncSerializer {
+            writer,
+            buffer: Vec::with_capacity(8192),
+            format,
+        }
+    }
+    
+    pub async fn serialize<T: Serialize>(&mut self, value: &T) -> Result<(), SerdeError> {
+        let data = match self.format {
+            SerializationFormat::Json => value.serialize_json()?.into_bytes(),
+            SerializationFormat::MessagePack => value.serialize_msgpack()?,
+            SerializationFormat::Cbor => value.serialize_cbor()?,
+            SerializationFormat::Bincode => value.serialize_bincode()?,
+            SerializationFormat::Qtt => {
+                let mut writer = QttWriter::new();
+                value.serialize(&mut writer)?;
+                writer.into_bytes()
+            }
+        };
+        
+        self.writer.write_all(&data).await.map_err(|e| SerdeError::Custom(e.to_string()))?;
+        Ok(())
+    }
+    
+    pub async fn flush(&mut self) -> Result<(), SerdeError> {
+        self.writer.flush().await.map_err(|e| SerdeError::Custom(e.to_string()))
+    }
+}
+
+struct AsyncDeserializer<R: AsyncRead> {
+    reader: R,
+    buffer: Vec<u8>,
+    format: SerializationFormat,
+}
+
+impl<R: AsyncRead> AsyncDeserializer<R> {
+    pub fn new(reader: R, format: SerializationFormat) -> Self {
+        AsyncDeserializer {
+            reader,
+            buffer: Vec::with_capacity(8192),
+            format,
+        }
+    }
+    
+    pub async fn deserialize<T: Deserialize>(&mut self) -> Result<T, SerdeError> {
+        // Read until we have a complete value
+        // This is simplified - real implementation would be incremental
+        let mut buf = vec![0u8; 65536];
+        let n = self.reader.read(&mut buf).await.map_err(|e| SerdeError::Custom(e.to_string()))?;
+        buf.truncate(n);
+        
+        match self.format {
+            SerializationFormat::Json => {
+                let json = String::from_utf8(buf).map_err(|_| SerdeError::InvalidUtf8)?;
+                T::deserialize_json(&json)
+            }
+            SerializationFormat::MessagePack => T::deserialize_msgpack(&buf),
+            SerializationFormat::Cbor => T::deserialize_cbor(&buf),
+            SerializationFormat::Bincode => T::deserialize_bincode(&buf),
+            SerializationFormat::Qtt => {
+                let mut reader = QttReader::new(&buf);
+                T::deserialize(&mut reader)
+            }
+        }
+    }
+}

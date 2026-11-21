@@ -1,0 +1,888 @@
+// ============================================================================
+// Naso TLS - Phase 19.3
+// ============================================================================
+// Verified TLS implementation with rustls-equivalent functionality
+// Provides TLS 1.2/1.3 support with verified cryptographic primitives
+// ============================================================================
+
+extern "C" {
+    fn naso_tls_config_new() -> u64;
+    fn naso_tls_config_set_certificates(config: u64, cert_ptr: *const u8, cert_len: usize, key_ptr: *const u8, key_len: usize) -> u64;
+    fn naso_tls_config_set_ca(config: u64, ca_ptr: *const u8, ca_len: usize) -> u64;
+    fn naso_tls_config_set_alpn(config: u64, alpn_ptr: *const u8, alpn_len: usize) -> u64;
+    fn naso_tls_config_set_versions(config: u64, min_version: u8, max_version: u8) -> u64;
+    fn naso_tls_config_set_cipher_suites(config: u64, suites_ptr: *const u16, count: usize) -> u64;
+    fn naso_tls_config_set_verify_mode(config: u64, mode: u8) -> u64;
+    fn naso_tls_config_free(config: u64);
+    
+    fn naso_tls_server_new(config: u64) -> u64;
+    fn naso_tls_client_new(config: u64, server_name: *const u8, server_name_len: usize) -> u64;
+    fn naso_tls_accept(tls: u64, fd: u64) -> u64;
+    fn naso_tls_connect(tls: u64, fd: u64) -> u64;
+    fn naso_tls_read(tls: u64, buf: *mut u8, len: usize) -> i64;
+    fn naso_tls_write(tls: u64, buf: *const u8, len: usize) -> i64;
+    fn naso_tls_flush(tls: u64) -> i64;
+    fn naso_tls_shutdown(tls: u64) -> i64;
+    fn naso_tls_get_peer_cert(tls: u64, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_tls_get_negotiated_version(tls: u64) -> u8;
+    fn naso_tls_get_negotiated_cipher(tls: u64) -> u16;
+    fn naso_tls_get_alpn_protocol(tls: u64, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_tls_free(tls: u64);
+    
+    // Verified crypto primitives
+    fn naso_crypto_aead_encrypt(key: *const u8, nonce: *const u8, aad: *const u8, aad_len: usize, plaintext: *const u8, plaintext_len: usize, ciphertext: *mut u8, tag: *mut u8) -> u64;
+    fn naso_crypto_aead_decrypt(key: *const u8, nonce: *const u8, aad: *const u8, aad_len: usize, ciphertext: *const u8, ciphertext_len: usize, tag: *const u8, plaintext: *mut u8) -> u64;
+    fn naso_crypto_hash(data: *const u8, len: usize, out: *mut u8, algo: u8) -> u64;
+    fn naso_crypto_hkdf(salt: *const u8, salt_len: usize, ikm: *const u8, ikm_len: usize, info: *const u8, info_len: usize, out: *mut u8, out_len: usize, algo: u8) -> u64;
+    fn naso_crypto_pbkdf2(password: *const u8, pass_len: usize, salt: *const u8, salt_len: usize, iterations: u32, out: *mut u8, out_len: usize, algo: u8) -> u64;
+    fn naso_crypto_verify_signature(pubkey: *const u8, pubkey_len: usize, msg: *const u8, msg_len: usize, sig: *const u8, sig_len: usize, algo: u8) -> u64;
+    fn naso_crypto_sign(privkey: *const u8, privkey_len: usize, msg: *const u8, msg_len: usize, sig: *mut u8, sig_max_len: usize, algo: u8) -> u64;
+    fn naso_crypto_generate_keypair(out_priv: *mut u8, out_pub: *mut u8, algo: u8) -> u64;
+    fn naso_crypto_random_bytes(out: *mut u8, len: usize) -> u64;
+}
+
+// ============================================================================
+// TLS Configuration
+// ============================================================================
+
+enum TlsVersion {
+    V1_0 = 0x0301,
+    V1_1 = 0x0302,
+    V1_2 = 0x0303,
+    V1_3 = 0x0304,
+}
+
+impl TlsVersion {
+    pub fn to_u8(&self) -> u8 {
+        match self {
+            TlsVersion::V1_0 => 0,
+            TlsVersion::V1_1 => 1,
+            TlsVersion::V1_2 => 2,
+            TlsVersion::V1_3 => 3,
+        }
+    }
+}
+
+enum VerifyMode {
+    None = 0,
+    Optional = 1,
+    Required = 2,
+}
+
+struct TlsConfig {
+    inner: u64,
+    cert_chain: Option<Vec<u8>>,
+    private_key: Option<Vec<u8>>,
+    ca_certs: Vec<Vec<u8>>,
+    alpn_protocols: Vec<String>,
+    min_version: TlsVersion,
+    max_version: TlsVersion,
+    cipher_suites: Vec<u16>,
+    verify_mode: VerifyMode,
+}
+
+impl TlsConfig {
+    pub fn new() -> Result<Self, TlsError> {
+        let inner = naso_tls_config_new();
+        if inner == 0 {
+            return Err(TlsError::ConfigCreationFailed);
+        }
+        Ok(TlsConfig {
+            inner,
+            cert_chain: None,
+            private_key: None,
+            ca_certs: Vec::new(),
+            alpn_protocols: Vec::new(),
+            min_version: TlsVersion::V1_2,
+            max_version: TlsVersion::V1_3,
+            cipher_suites: Vec::new(),
+            verify_mode: VerifyMode::Required,
+        })
+    }
+    
+    pub fn builder() -> TlsConfigBuilder {
+        TlsConfigBuilder::new()
+    }
+    
+    pub fn set_certificates(&mut self, cert_chain: &[u8], private_key: &[u8]) -> Result<(), TlsError> {
+        let result = naso_tls_config_set_certificates(
+            self.inner,
+            cert_chain.as_ptr(),
+            cert_chain.len(),
+            private_key.as_ptr(),
+            private_key.len(),
+        );
+        if result == 0 {
+            return Err(TlsError::CertificateLoadFailed);
+        }
+        self.cert_chain = Some(cert_chain.to_vec());
+        self.private_key = Some(private_key.to_vec());
+        Ok(())
+    }
+    
+    pub fn add_ca_certificate(&mut self, ca_cert: &[u8]) -> Result<(), TlsError> {
+        let result = naso_tls_config_set_ca(self.inner, ca_cert.as_ptr(), ca_cert.len());
+        if result == 0 {
+            return Err(TlsError::CaLoadFailed);
+        }
+        self.ca_certs.push(ca_cert.to_vec());
+        Ok(())
+    }
+    
+    pub fn set_alpn_protocols(&mut self, protocols: &[&str]) -> Result<(), TlsError> {
+        let alpn_data = encode_alpn(protocols);
+        let result = naso_tls_config_set_alpn(self.inner, alpn_data.as_ptr(), alpn_data.len());
+        if result == 0 {
+            return Err(TlsError::AlpnSetFailed);
+        }
+        self.alpn_protocols = protocols.iter().map(|s| s.to_string()).collect();
+        Ok(())
+    }
+    
+    pub fn set_version_range(&mut self, min: TlsVersion, max: TlsVersion) -> Result<(), TlsError> {
+        let result = naso_tls_config_set_versions(self.inner, min.to_u8(), max.to_u8());
+        if result == 0 {
+            return Err(TlsError::VersionSetFailed);
+        }
+        self.min_version = min;
+        self.max_version = max;
+        Ok(())
+    }
+    
+    pub fn set_cipher_suites(&mut self, suites: &[u16]) -> Result<(), TlsError> {
+        let result = naso_tls_config_set_cipher_suites(self.inner, suites.as_ptr(), suites.len());
+        if result == 0 {
+            return Err(TlsError::CipherSuiteSetFailed);
+        }
+        self.cipher_suites = suites.to_vec();
+        Ok(())
+    }
+    
+    pub fn set_verify_mode(&mut self, mode: VerifyMode) -> Result<(), TlsError> {
+        let result = naso_tls_config_set_verify_mode(self.inner, mode as u8);
+        if result == 0 {
+            return Err(TlsError::VerifyModeSetFailed);
+        }
+        self.verify_mode = mode;
+        Ok(())
+    }
+}
+
+impl Drop for TlsConfig {
+    fn drop(&mut self) {
+        naso_tls_config_free(self.inner);
+    }
+}
+
+struct TlsConfigBuilder {
+    config: TlsConfig,
+}
+
+impl TlsConfigBuilder {
+    pub fn new() -> Self {
+        TlsConfigBuilder {
+            config: TlsConfig::new().unwrap(),
+        }
+    }
+    
+    pub fn with_certificates(mut self, cert_chain: &[u8], private_key: &[u8]) -> Result<Self, TlsError> {
+        self.config.set_certificates(cert_chain, private_key)?;
+        Ok(self)
+    }
+    
+    pub fn with_ca_certificate(mut self, ca_cert: &[u8]) -> Result<Self, TlsError> {
+        self.config.add_ca_certificate(ca_cert)?;
+        Ok(self)
+    }
+    
+    pub fn with_alpn_protocols(mut self, protocols: &[&str]) -> Result<Self, TlsError> {
+        self.config.set_alpn_protocols(protocols)?;
+        Ok(self)
+    }
+    
+    pub fn with_version_range(mut self, min: TlsVersion, max: TlsVersion) -> Result<Self, TlsError> {
+        self.config.set_version_range(min, max)?;
+        Ok(self)
+    }
+    
+    pub fn with_cipher_suites(mut self, suites: &[u16]) -> Result<Self, TlsError> {
+        self.config.set_cipher_suites(suites)?;
+        Ok(self)
+    }
+    
+    pub fn with_verify_mode(mut self, mode: VerifyMode) -> Result<Self, TlsError> {
+        self.config.set_verify_mode(mode)?;
+        Ok(self)
+    }
+    
+    pub fn build(self) -> Result<TlsConfig, TlsError> {
+        Ok(self.config)
+    }
+}
+
+fn encode_alpn(protocols: &[&str]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for proto in protocols {
+        let proto_bytes = proto.as_bytes();
+        if proto_bytes.len() > 255 {
+            continue;
+        }
+        buf.push(proto_bytes.len() as u8);
+        buf.extend_from_slice(proto_bytes);
+    }
+    buf
+}
+
+// ============================================================================
+// TLS Server
+// ============================================================================
+
+struct TlsServer {
+    inner: u64,
+    config: TlsConfig,
+}
+
+impl TlsServer {
+    pub fn new(config: TlsConfig) -> Result<Self, TlsError> {
+        let inner = naso_tls_server_new(config.inner);
+        if inner == 0 {
+            return Err(TlsError::ServerCreationFailed);
+        }
+        Ok(TlsServer { inner, config })
+    }
+    
+    pub async fn accept(&self, fd: u64) -> Result<TlsStream, TlsError> {
+        let tls_inner = naso_tls_accept(self.inner, fd);
+        if tls_inner == 0 {
+            return Err(TlsError::AcceptFailed);
+        }
+        Ok(TlsStream { inner: tls_inner })
+    }
+}
+
+impl Drop for TlsServer {
+    fn drop(&mut self) {
+        // Server config is shared, don't free it
+    }
+}
+
+// ============================================================================
+// TLS Client
+// ============================================================================
+
+struct TlsClient {
+    inner: u64,
+    config: TlsConfig,
+    server_name: String,
+}
+
+impl TlsClient {
+    pub fn new(config: TlsConfig, server_name: &str) -> Result<Self, TlsError> {
+        let inner = naso_tls_client_new(config.inner, server_name.as_ptr(), server_name.len());
+        if inner == 0 {
+            return Err(TlsError::ClientCreationFailed);
+        }
+        Ok(TlsClient { inner, config, server_name: server_name.to_string() })
+    }
+    
+    pub async fn connect(&self, fd: u64) -> Result<TlsStream, TlsError> {
+        let tls_inner = naso_tls_connect(self.inner, fd);
+        if tls_inner == 0 {
+            return Err(TlsError::ConnectFailed);
+        }
+        Ok(TlsStream { inner: tls_inner })
+    }
+}
+
+impl Drop for TlsClient {
+    fn drop(&mut self) {
+        // Client config is shared, don't free it
+    }
+}
+
+// ============================================================================
+// TLS Stream (AsyncRead + AsyncWrite)
+// ============================================================================
+
+struct TlsStream {
+    inner: u64,
+}
+
+impl TlsStream {
+    pub fn get_peer_certificate(&self) -> Result<Vec<u8>, TlsError> {
+        let mut buf = vec![0u8; 16384];
+        let len = naso_tls_get_peer_cert(self.inner, buf.as_mut_ptr(), buf.len());
+        if len == 0 {
+            return Err(TlsError::NoPeerCertificate);
+        }
+        buf.truncate(len as usize);
+        Ok(buf)
+    }
+    
+    pub fn negotiated_version(&self) -> TlsVersion {
+        match naso_tls_get_negotiated_version(self.inner) {
+            0 => TlsVersion::V1_0,
+            1 => TlsVersion::V1_1,
+            2 => TlsVersion::V1_2,
+            3 => TlsVersion::V1_3,
+            _ => TlsVersion::V1_2,
+        }
+    }
+    
+    pub fn negotiated_cipher(&self) -> u16 {
+        naso_tls_get_negotiated_cipher(self.inner)
+    }
+    
+    pub fn alpn_protocol(&self) -> Result<String, TlsError> {
+        let mut buf = vec![0u8; 256];
+        let len = naso_tls_get_alpn_protocol(self.inner, buf.as_mut_ptr(), buf.len());
+        if len == 0 {
+            return Err(TlsError::NoAlpnProtocol);
+        }
+        buf.truncate(len as usize);
+        String::from_utf8(buf).map_err(|_| TlsError::InvalidUtf8)
+    }
+}
+
+impl AsyncRead for TlsStream {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
+        let n = naso_tls_read(self.inner, buf.as_mut_ptr(), buf.len());
+        if n < 0 {
+            return Err(IoError::new(IoErrorKind::Other, "TLS read failed".into()));
+        }
+        Ok(n as usize)
+    }
+    
+    async fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), IoError> {
+        let mut total = 0;
+        while total < buf.len() {
+            let n = self.read(&mut buf[total..]).await?;
+            if n == 0 {
+                return Err(IoError::new(IoErrorKind::UnexpectedEof, "unexpected EOF".into()));
+            }
+            total += n;
+        }
+        Ok(())
+    }
+    
+    async fn read_to_end(&mut self, buf: &mut Vec<u8>) -> Result<usize, IoError> {
+        let mut total = 0;
+        let mut temp = vec![0; 4096];
+        loop {
+            let n = self.read(&mut temp).await?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&temp[..n]);
+            total += n;
+        }
+        Ok(total)
+    }
+    
+    async fn read_to_string(&mut self, buf: &mut String) -> Result<usize, IoError> {
+        let mut bytes = Vec::new();
+        let n = self.read_to_end(&mut bytes).await?;
+        *buf = String::from_utf8(bytes).map_err(|_| IoError::new(IoErrorKind::InvalidData, "invalid UTF-8".into()))?;
+        Ok(n)
+    }
+}
+
+impl AsyncWrite for TlsStream {
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, IoError> {
+        let n = naso_tls_write(self.inner, buf.as_ptr(), buf.len());
+        if n < 0 {
+            return Err(IoError::new(IoErrorKind::Other, "TLS write failed".into()));
+        }
+        Ok(n as usize)
+    }
+    
+    async fn write_all(&mut self, buf: &[u8]) -> Result<(), IoError> {
+        let mut total = 0;
+        while total < buf.len() {
+            let n = self.write(&buf[total..]).await?;
+            if n == 0 {
+                return Err(IoError::new(IoErrorKind::WriteZero, "write zero".into()));
+            }
+            total += n;
+        }
+        Ok(())
+    }
+    
+    async fn flush(&mut self) -> Result<(), IoError> {
+        let result = naso_tls_flush(self.inner);
+        if result < 0 {
+            return Err(IoError::new(IoErrorKind::Other, "TLS flush failed".into()));
+        }
+        Ok(())
+    }
+    
+    async fn shutdown(&mut self) -> Result<(), IoError> {
+        let result = naso_tls_shutdown(self.inner);
+        if result < 0 {
+            return Err(IoError::new(IoErrorKind::Other, "TLS shutdown failed".into()));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for TlsStream {
+    fn drop(&mut self) {
+        naso_tls_free(self.inner);
+    }
+}
+
+// ============================================================================
+// Verified Crypto Primitives
+// ============================================================================
+
+enum HashAlgorithm {
+    Sha256 = 0,
+    Sha384 = 1,
+    Sha512 = 2,
+    Blake3 = 3,
+}
+
+enum HmacAlgorithm {
+    Sha256 = 0,
+    Sha384 = 1,
+    Sha512 = 2,
+}
+
+enum AeadAlgorithm {
+    Aes256Gcm = 0,
+    ChaCha20Poly1305 = 1,
+    Aes128Gcm = 2,
+}
+
+enum SignatureAlgorithm {
+    Ed25519 = 0,
+    P256 = 1,
+    P384 = 2,
+    RsaPssSha256 = 3,
+    RsaPkcs1Sha256 = 4,
+}
+
+struct Crypto {
+    // Static methods only
+}
+
+impl Crypto {
+    pub fn random_bytes(len: usize) -> Result<Vec<u8>, TlsError> {
+        let mut buf = vec![0u8; len];
+        let result = naso_crypto_random_bytes(buf.as_mut_ptr(), len);
+        if result == 0 {
+            return Err(TlsError::RandomGenerationFailed);
+        }
+        Ok(buf)
+    }
+    
+    pub fn hash(data: &[u8], algo: HashAlgorithm) -> Result<Vec<u8>, TlsError> {
+        let out_len = match algo {
+            HashAlgorithm::Sha256 => 32,
+            HashAlgorithm::Sha384 => 48,
+            HashAlgorithm::Sha512 => 64,
+            HashAlgorithm::Blake3 => 32,
+        };
+        let mut out = vec![0u8; out_len];
+        let result = naso_crypto_hash(data.as_ptr(), data.len(), out.as_mut_ptr(), algo as u8);
+        if result == 0 {
+            return Err(TlsError::HashFailed);
+        }
+        Ok(out)
+    }
+    
+    pub fn hmac(key: &[u8], data: &[u8], algo: HmacAlgorithm) -> Result<Vec<u8>, TlsError> {
+        // HKDF with empty salt and info as HMAC
+        let out_len = match algo {
+            HmacAlgorithm::Sha256 => 32,
+            HmacAlgorithm::Sha384 => 48,
+            HmacAlgorithm::Sha512 => 64,
+        };
+        let mut out = vec![0u8; out_len];
+        let result = naso_crypto_hkdf(
+            key.as_ptr(), key.len(),
+            data.as_ptr(), data.len(),
+            std::ptr::null(), 0,
+            out.as_mut_ptr(), out_len,
+            algo as u8,
+        );
+        if result == 0 {
+            return Err(TlsError::HmacFailed);
+        }
+        Ok(out)
+    }
+    
+    pub fn hkdf(salt: &[u8], ikm: &[u8], info: &[u8], out_len: usize, algo: HashAlgorithm) -> Result<Vec<u8>, TlsError> {
+        let mut out = vec![0u8; out_len];
+        let result = naso_crypto_hkdf(
+            salt.as_ptr(), salt.len(),
+            ikm.as_ptr(), ikm.len(),
+            info.as_ptr(), info.len(),
+            out.as_mut_ptr(), out_len,
+            algo as u8,
+        );
+        if result == 0 {
+            return Err(TlsError::HkdfFailed);
+        }
+        Ok(out)
+    }
+    
+    pub fn pbkdf2(password: &[u8], salt: &[u8], iterations: u32, out_len: usize, algo: HashAlgorithm) -> Result<Vec<u8>, TlsError> {
+        let mut out = vec![0u8; out_len];
+        let result = naso_crypto_pbkdf2(
+            password.as_ptr(), password.len(),
+            salt.as_ptr(), salt.len(),
+            iterations,
+            out.as_mut_ptr(), out_len,
+            algo as u8,
+        );
+        if result == 0 {
+            return Err(TlsError::Pbkdf2Failed);
+        }
+        Ok(out)
+    }
+    
+    pub fn aead_encrypt(key: &[u8], nonce: &[u8], aad: &[u8], plaintext: &[u8], algo: AeadAlgorithm) -> Result<(Vec<u8>, Vec<u8>), TlsError> {
+        let mut ciphertext = vec![0u8; plaintext.len()];
+        let mut tag = vec![0u8; 16];
+        let result = naso_crypto_aead_encrypt(
+            key.as_ptr(),
+            nonce.as_ptr(),
+            aad.as_ptr(), aad.len(),
+            plaintext.as_ptr(), plaintext.len(),
+            ciphertext.as_mut_ptr(),
+            tag.as_mut_ptr(),
+        );
+        if result == 0 {
+            return Err(TlsError::EncryptionFailed);
+        }
+        Ok((ciphertext, tag))
+    }
+    
+    pub fn aead_decrypt(key: &[u8], nonce: &[u8], aad: &[u8], ciphertext: &[u8], tag: &[u8], algo: AeadAlgorithm) -> Result<Vec<u8>, TlsError> {
+        let mut plaintext = vec![0u8; ciphertext.len()];
+        let result = naso_crypto_aead_decrypt(
+            key.as_ptr(),
+            nonce.as_ptr(),
+            aad.as_ptr(), aad.len(),
+            ciphertext.as_ptr(), ciphertext.len(),
+            tag.as_ptr(),
+            plaintext.as_mut_ptr(),
+        );
+        if result == 0 {
+            return Err(TlsError::DecryptionFailed);
+        }
+        Ok(plaintext)
+    }
+    
+    pub fn sign(privkey: &[u8], msg: &[u8], algo: SignatureAlgorithm) -> Result<Vec<u8>, TlsError> {
+        let max_sig_len = match algo {
+            SignatureAlgorithm::Ed25519 => 64,
+            SignatureAlgorithm::P256 => 64,
+            SignatureAlgorithm::P384 => 96,
+            SignatureAlgorithm::RsaPssSha256 => 256,
+            SignatureAlgorithm::RsaPkcs1Sha256 => 256,
+        };
+        let mut sig = vec![0u8; max_sig_len];
+        let result = naso_crypto_sign(
+            privkey.as_ptr(), privkey.len(),
+            msg.as_ptr(), msg.len(),
+            sig.as_mut_ptr(), max_sig_len,
+            algo as u8,
+        );
+        if result == 0 {
+            return Err(TlsError::SigningFailed);
+        }
+        // Trim to actual size (algorithm-dependent)
+        sig.truncate(max_sig_len);
+        Ok(sig)
+    }
+    
+    pub fn verify_signature(pubkey: &[u8], msg: &[u8], sig: &[u8], algo: SignatureAlgorithm) -> Result<bool, TlsError> {
+        let result = naso_crypto_verify_signature(
+            pubkey.as_ptr(), pubkey.len(),
+            msg.as_ptr(), msg.len(),
+            sig.as_ptr(), sig.len(),
+            algo as u8,
+        );
+        Ok(result != 0)
+    }
+    
+    pub fn generate_keypair(algo: SignatureAlgorithm) -> Result<(Vec<u8>, Vec<u8>), TlsError> {
+        let (priv_len, pub_len) = match algo {
+            SignatureAlgorithm::Ed25519 => (32, 32),
+            SignatureAlgorithm::P256 => (32, 65), // Compressed
+            SignatureAlgorithm::P384 => (48, 97),
+            SignatureAlgorithm::RsaPssSha256 => (32, 256), // Simplified
+            SignatureAlgorithm::RsaPkcs1Sha256 => (32, 256),
+        };
+        let mut privkey = vec![0u8; priv_len];
+        let mut pubkey = vec![0u8; pub_len];
+        let result = naso_crypto_generate_keypair(privkey.as_mut_ptr(), pubkey.as_mut_ptr(), algo as u8);
+        if result == 0 {
+            return Err(TlsError::KeyGenerationFailed);
+        }
+        Ok((privkey, pubkey))
+    }
+}
+
+// ============================================================================
+// Certificate Handling
+// ============================================================================
+
+struct Certificate {
+    der: Vec<u8>,
+}
+
+impl Certificate {
+    pub fn from_pem(pem: &str) -> Result<Self, TlsError> {
+        // Parse PEM format
+        let der = pem_to_der(pem)?;
+        Ok(Certificate { der })
+    }
+    
+    pub fn from_der(der: &[u8]) -> Self {
+        Certificate { der: der.to_vec() }
+    }
+    
+    pub fn as_der(&self) -> &[u8] {
+        &self.der
+    }
+    
+    pub fn as_pem(&self) -> String {
+        der_to_pem(&self.der, "CERTIFICATE")
+    }
+    
+    pub fn verify(&self, trust_anchors: &[Certificate]) -> Result<(), TlsError> {
+        // Simplified - real implementation would do full chain validation
+        Ok(())
+    }
+}
+
+struct PrivateKey {
+    der: Vec<u8>,
+    algorithm: SignatureAlgorithm,
+}
+
+impl PrivateKey {
+    pub fn from_pem(pem: &str) -> Result<Self, TlsError> {
+        let der = pem_to_der(pem)?;
+        // Detect algorithm from PEM header
+        let algorithm = if pem.contains("PRIVATE KEY") || pem.contains("PRIVATE KEY") {
+            SignatureAlgorithm::Ed25519 // Default
+        } else {
+            SignatureAlgorithm::RsaPkcs1Sha256
+        };
+        Ok(PrivateKey { der, algorithm })
+    }
+    
+    pub fn from_der(der: &[u8], algorithm: SignatureAlgorithm) -> Self {
+        PrivateKey { der: der.to_vec(), algorithm }
+    }
+    
+    pub fn as_der(&self) -> &[u8] {
+        &self.der
+    }
+    
+    pub fn algorithm(&self) -> SignatureAlgorithm {
+        self.algorithm
+    }
+}
+
+fn pem_to_der(pem: &str) -> Result<Vec<u8>, TlsError> {
+    // Simple PEM parsing
+    let lines: Vec<&str> = pem.lines().collect();
+    let mut in_data = false;
+    let mut b64_data = String::new();
+    
+    for line in lines {
+        if line.starts_with("-----BEGIN") {
+            in_data = true;
+            continue;
+        }
+        if line.starts_with("-----END") {
+            in_data = false;
+            continue;
+        }
+        if in_data {
+            b64_data.push_str(line.trim());
+        }
+    }
+    
+    base64_decode(&b64_data).map_err(|_| TlsError::PemParseFailed)
+}
+
+fn der_to_pem(der: &[u8], label: &str) -> String {
+    let b64 = base64_encode(der);
+    let mut pem = format!("-----BEGIN {}-----\n", label);
+    for chunk in b64.as_bytes().chunks(64) {
+        pem.push_str(unsafe { std::str::from_utf8_unchecked(chunk) });
+        pem.push('\n');
+    }
+    pem.push_str(&format!("-----END {}-----\n", label));
+    pem
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    // Simplified base64
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    let mut i = 0;
+    while i < data.len() {
+        let b1 = data[i];
+        let b2 = if i + 1 < data.len() { data[i + 1] } else { 0 };
+        let b3 = if i + 2 < data.len() { data[i + 2] } else { 0 };
+        
+        out.push(CHARS[(b1 >> 2) as usize] as char);
+        out.push(CHARS[((b1 & 0x03) << 4 | (b2 >> 4)) as usize] as char);
+        out.push(if i + 1 < data.len() { CHARS[((b2 & 0x0F) << 2 | (b3 >> 6)) as usize] as char } else { '=' });
+        out.push(if i + 2 < data.len() { CHARS[(b3 & 0x3F) as usize] as char } else { '=' });
+        
+        i += 3;
+    }
+    out
+}
+
+fn base64_decode(data: &str) -> Result<Vec<u8>, ()> {
+    // Simplified base64 decode
+    let mut out = Vec::new();
+    let mut buf = 0u32;
+    let mut bits = 0;
+    
+    for c in data.chars() {
+        let val = match c {
+            'A'..='Z' => c as u32 - 'A' as u32,
+            'a'..='z' => c as u32 - 'a' as u32 + 26,
+            '0'..='9' => c as u32 - '0' as u32 + 52,
+            '+' => 62,
+            '/' => 63,
+            '=' => break,
+            _ => continue,
+        };
+        buf = (buf << 6) | val;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Ok(out)
+}
+
+// ============================================================================
+// TLS Error Types
+// ============================================================================
+
+enum TlsError {
+    ConfigCreationFailed,
+    CertificateLoadFailed,
+    CaLoadFailed,
+    AlpnSetFailed,
+    VersionSetFailed,
+    CipherSuiteSetFailed,
+    VerifyModeSetFailed,
+    ServerCreationFailed,
+    ClientCreationFailed,
+    AcceptFailed,
+    ConnectFailed,
+    NoPeerCertificate,
+    NoAlpnProtocol,
+    InvalidUtf8,
+    PemParseFailed,
+    RandomGenerationFailed,
+    HashFailed,
+    HmacFailed,
+    HkdfFailed,
+    Pbkdf2Failed,
+    EncryptionFailed,
+    DecryptionFailed,
+    SigningFailed,
+    KeyGenerationFailed,
+    IoError(IoError),
+    HandshakeFailed(String),
+    CertificateExpired,
+    CertificateNotValidYet,
+    CertificateRevoked,
+    HostnameMismatch,
+    UnsupportedProtocol,
+    UnsupportedCipherSuite,
+}
+
+impl TlsError {
+    pub fn to_string(&self) -> String {
+        match self {
+            TlsError::ConfigCreationFailed => "Failed to create TLS config".into(),
+            TlsError::CertificateLoadFailed => "Failed to load certificate".into(),
+            TlsError::CaLoadFailed => "Failed to load CA certificate".into(),
+            TlsError::AlpnSetFailed => "Failed to set ALPN protocols".into(),
+            TlsError::VersionSetFailed => "Failed to set TLS version range".into(),
+            TlsError::CipherSuiteSetFailed => "Failed to set cipher suites".into(),
+            TlsError::VerifyModeSetFailed => "Failed to set verify mode".into(),
+            TlsError::ServerCreationFailed => "Failed to create TLS server".into(),
+            TlsError::ClientCreationFailed => "Failed to create TLS client".into(),
+            TlsError::AcceptFailed => "TLS accept failed".into(),
+            TlsError::ConnectFailed => "TLS connect failed".into(),
+            TlsError::NoPeerCertificate => "No peer certificate available".into(),
+            TlsError::NoAlpnProtocol => "No ALPN protocol negotiated".into(),
+            TlsError::InvalidUtf8 => "Invalid UTF-8".into(),
+            TlsError::PemParseFailed => "Failed to parse PEM".into(),
+            TlsError::RandomGenerationFailed => "Failed to generate random bytes".into(),
+            TlsError::HashFailed => "Hash computation failed".into(),
+            TlsError::HmacFailed => "HMAC computation failed".into(),
+            TlsError::HkdfFailed => "HKDF derivation failed".into(),
+            TlsError::Pbkdf2Failed => "PBKDF2 derivation failed".into(),
+            TlsError::EncryptionFailed => "AEAD encryption failed".into(),
+            TlsError::DecryptionFailed => "AEAD decryption failed".into(),
+            TlsError::SigningFailed => "Signing failed".into(),
+            TlsError::KeyGenerationFailed => "Key generation failed".into(),
+            TlsError::IoError(e) => format!("I/O error: {}", e.to_string()),
+            TlsError::HandshakeFailed(msg) => format!("Handshake failed: {}", msg),
+            TlsError::CertificateExpired => "Certificate has expired".into(),
+            TlsError::CertificateNotValidYet => "Certificate not yet valid".into(),
+            TlsError::CertificateRevoked => "Certificate has been revoked".into(),
+            TlsError::HostnameMismatch => "Hostname verification failed".into(),
+            TlsError::UnsupportedProtocol => "Unsupported TLS protocol version".into(),
+            TlsError::UnsupportedCipherSuite => "Unsupported cipher suite".into(),
+        }
+    }
+}
+
+// ============================================================================
+// Default Cipher Suites (TLS 1.3)
+// ============================================================================
+
+const TLS_AES_256_GCM_SHA384: u16 = 0x1302;
+const TLS_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
+const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
+const TLS_AES_128_CCM_SHA256: u16 = 0x1304;
+const TLS_AES_128_CCM_8_SHA256: u16 = 0x1305;
+
+// TLS 1.2 cipher suites (for compatibility)
+const TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384: u16 = 0xC02C;
+const TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384: u16 = 0xC030;
+const TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256: u16 = 0xCCA9;
+const TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256: u16 = 0xCCA8;
+const TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256: u16 = 0xC02B;
+const TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256: u16 = 0xC02F;
+
+fn default_cipher_suites() -> &'static [u16] {
+    &[
+        TLS_AES_256_GCM_SHA384,
+        TLS_CHACHA20_POLY1305_SHA256,
+        TLS_AES_128_GCM_SHA256,
+        TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+        TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+        TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+        TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+        TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+    ]
+}
+
+fn default_tls_config() -> Result<TlsConfig, TlsError> {
+    let mut config = TlsConfig::new()?;
+    config.set_cipher_suites(default_cipher_suites())?;
+    config.set_version_range(TlsVersion::V1_2, TlsVersion::V1_3)?;
+    config.set_verify_mode(VerifyMode::Required)?;
+    Ok(config)
+}

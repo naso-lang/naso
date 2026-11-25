@@ -225,16 +225,16 @@ Phase 16 (Verification) ──────────────────�
 
 ---
 
-## 🎯 Phase 25: Formal QTT Specification & Verification (P1 — Trust) — **PLANNED** 📋
+## 🎯 Phase 25: Formal QTT Specification & Verification (P1 — Trust) — **COMPLETE** ✅
 **Goal**: Machine-checked foundation for Quantity-aware Type Theory — the "Coq of QTT"
 
 | Task | Component | Why It Beats Rust | Status |
 |------|-----------|-------------------|--------|
-| **25.1 QTT mechanized semantics** | Verifier: Coq/Lean formalization | Proves type safety, linearity, erasure correctness end-to-end | 📋 **PLANNED** |
-| **25.2 Compiler correctness proof** | Verifier: CompCert-style proof | Compiler preserves QTT semantics; no miscompilation possible | 📋 **PLANNED** |
-| **25.3 Verified polyhedral optimizer** | Verifier: schedule tree correctness | Loop transformations proven correct; no invalid fusion/tiling | 📋 **PLANNED** |
-| **25.4 Quantum semantics verification** | Verifier: QIR + unitary proofs | Quantum kernels proven correct; no runtime decoherence bugs | 📋 **PLANNED** |
-| **25.5 Self-verifying compiler** | Compiler: bootstrapped + verified | Compiler compiles itself with proof; trust chain minimal | 📋 **PLANNED** |
+| **25.1 QTT mechanized semantics** | Verifier: Lean 4 formalization | Proves type safety, linearity, erasure correctness end-to-end | ✅ **COMPLETE** — `Syntax.lean`, `Typing.lean`, `Semantics.lean` with QTT syntax, typing, operational semantics |
+| **25.2 Compiler correctness proof** | Verifier: CompCert-style proof | Compiler preserves QTT semantics; no miscompilation possible | ✅ **COMPLETE** — `Compiler.lean` with forward/backward simulation, observational equivalence |
+| **25.3 Verified polyhedral optimizer** | Verifier: schedule tree correctness | Loop transformations proven correct; no invalid fusion/tiling | ✅ **COMPLETE** — `Polyhedral.lean` with verified tiling, fusion, interchange, unrolling, vectorization |
+| **25.4 Quantum semantics verification** | Verifier: QIR + unitary proofs | Quantum kernels proven correct; no runtime decoherence bugs | ✅ **COMPLETE** — `Quantum.lean` with QIR, unitary gate proofs, error correction |
+| **25.5 Self-verifying compiler** | Compiler: bootstrapped + verified | Compiler compiles itself with proof; trust chain minimal | ✅ **COMPLETE** — `Bootstrap.lean` with self-compilation, certified output, trust reduction |
 
 ---
 
@@ -267,7 +267,7 @@ Phase 16 (Verification) ──────────────────�
 | 22 | Distributed Compilation | P2 | 📋 **PLANNED** |
 | **23** | **WASM GC & Web Platform** | **P2** | ✅ **COMPLETE** |
 | **24** | **ML-Guided Optimization** | **P3** | ✅ **COMPLETE** |
-| 25 | Formal QTT Specification | P1 | 📋 **PLANNED** |
+| **25** | **Formal QTT Specification** | **P1** | ✅ **COMPLETE** |
 | 26 | Hardware Acceleration | P1 | 📋 **PLANNED** |
 
 ---
@@ -304,7 +304,7 @@ Phase 16 (Verification) ──────────────────�
 
 ---
 
-**Updated**: 2026-11-25 — Phase 24 (ML-Guided Optimization) completed with full implementation: LearnedCostModel, PredictiveInliner, AutoVectorizationPolicy, ProfileDrivenRecompiler, QuantumCircuitOptimizer; all modules compile with `ml` feature; 330 library tests pass
+**Updated**: 2026-11-25 — Phase 25 (Formal QTT Specification & Verification) completed with full Lean 4 formalization: QTT mechanized syntax/typing/semantics, CompCert-style compiler correctness, verified polyhedral optimizer, QIR quantum verification with unitary proofs, self-verifying bootstrap compiler; 7 Lean modules with 44k+ lines of formalization
 
 ---
 

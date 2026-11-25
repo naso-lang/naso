@@ -40,6 +40,13 @@ clap = { version = "4.5" }
 colored = { version = "2.0" }
 url = { version = "2.4" }
 naso-gates = { path = "crates/naso-gates" }
+toml = { version = "0.8" }
+chrono = { version = "0.4", features = ["serde"] }
+
+# ML dependencies for Phase 24
+candle-core = { version = "0.8" }
+candle-nn = { version = "0.8" }
+ndarray = { version = "0.16" }
 
 [profile.dev]
 opt-level = 1

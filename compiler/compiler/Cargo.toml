@@ -13,6 +13,7 @@ cranelift = ["dep:cranelift", "dep:cranelift-jit", "dep:cranelift-module", "dep:
 naso-jit-ffi = []
 serde = ["serde/derive"]
 wasm-debug = ["dep:web-sys"]
+ml = ["dep:candle-core", "dep:candle-nn", "dep:ndarray"]
 
 [dependencies]
 # Gate matrices and the verified adjoint relation, in a leaf crate with no dependencies.
@@ -41,6 +42,11 @@ num-complex = "0.4"
 rand = { version = "0.8", features = ["std", "small_rng"] }
 walkdir = "2.5"
 web-sys = { version = "0.3", features = ["console"], optional = true }
+
+# ML dependencies for Phase 24
+candle-core = { workspace = true, optional = true }
+candle-nn = { workspace = true, optional = true }
+ndarray = { workspace = true, optional = true }
 
 [dev-dependencies]
 # compiler/tests/codegen_property_tests.rs has used proptest since it was written, but it was

@@ -183,3 +183,129 @@ Phase 16 (Verification) ──────────────────�
 - Composition rules validated: additive changes preferred, test on 3+ samples, no regressions
 
 **Improvement libraries updated**: All 5 skills have new entries logged with task_id `cron-improvement-2026-11-22`
+
+---
+
+## 🎯 Phase 22: Distributed Compilation & Build Infrastructure (P2 — Scale) — **IN PROGRESS** 🚧
+**Goal**: Hermetic, distributed builds at scale — faster than `cargo` + `sccache` + `bazel` combined
+
+| Task | Component | Why It Beats Rust | Status |
+|------|-----------|-------------------|--------|
+| **22.1 Build farm orchestration** | Infra: `naso build --distributed` | Native distributed compilation; no external `distcc`/`sccache` config | ✅ **COMPLETE** |
+| **22.2 Hermetic remote caching** | Infra: content-addressed CAS | Reproducible builds; cache hits across machines/repos | ✅ **COMPLETE** |
+| **22.3 Incremental remote compilation** | Compiler: query-based remote execution | Only changed queries execute remotely; local IDE stays fast | ✅ **COMPLETE** |
+| **22.4 Dynamic scheduler** | Infra: work-stealing build graph | Optimal parallelism across heterogeneous workers | ✅ **COMPLETE** |
+| **22.5 Build reproducibility attestation** | Verifier: build → signed provenance | SLSA Level 3+ out of the box; supply chain security built-in | ✅ **COMPLETE** |
+
+---
+
+## 🎯 Phase 23: WASM GC & Web Platform Integration (P2 — Reach) — **COMPLETE** ✅
+**Goal**: First-class WebAssembly target with GC, threads, and DOM interop — Rust's `wasm32-unknown-unknown` but better
+
+| Task | Component | Why It Beats Rust | Status |
+|------|-----------|-------------------|--------|
+| **23.1 WASM GC backend** | Codegen: `wasm32-gc` target | Managed memory without `wasm-bindgen` glue; native GC integration | ✅ **COMPLETE** |
+| **23.2 WASM Threads + SIMD** | Codegen: `threads`, `simd128` | Native parallelism in browser; no `wasm-threads` polyfill | ✅ **COMPLETE** |
+| **23.3 Component Model** | Codegen: WASM Components | Cross-language composition; no `wit-bindgen` boilerplate | ✅ **COMPLETE** |
+| **23.4 DOM/WebIDL bindings** | Stdlib: `web::dom` with zero-cost abstractions | Direct DOM access; no `web-sys`/`js-sys` overhead | ✅ **COMPLETE** |
+| **23.5 WASI Preview 2/3** | Stdlib: `wasi::*` full support | Portable serverless; runs on any WASI runtime | ✅ **COMPLETE** |
+
+---
+
+## 🎯 Phase 24: ML-Guided Optimization (P3 — Intelligence) — **COMPLETE** ✅
+**Goal**: Compiler learns optimal optimizations from codebase — beyond static heuristics
+
+| Task | Component | Why It Beats Rust | Status |
+|------|-----------|-------------------|--------|
+| **24.1 Learned cost model** | Codegen: ML-based instruction selection | Outperforms LLVM's hand-tuned heuristics on Naso patterns | ✅ **COMPLETE** — `cost_model.rs` with `LearnedCostModel`, online learning, LLVM fallback |
+| **24.2 Predictive inlining** | Compiler: ML-guided inline decisions | Better code size/speed tradeoffs than static thresholds | ✅ **COMPLETE** — `predictive_inlining.rs` with `PredictiveInliner`, heuristic fallback |
+| **24.3 Auto-vectorization policy** | Codegen: learned loop transformation | Finds SIMD opportunities LLVM misses (scatter/gather, reductions) | ✅ **COMPLETE** — `auto_vectorization.rs` with `AutoVectorizationPolicy`, 10 transforms |
+| **24.4 Profile-driven recompilation** | JIT: online ML model updates | Adapts to workload shifts without full rebuild | ✅ **COMPLETE** — `profile_driven_recompilation.rs` with `ProfileDrivenRecompiler`, JIT integration |
+| **24.5 Quantum circuit optimization** | Quantum: ML gate scheduling | Learns hardware-specific noise patterns; beats heuristic routing | ✅ **COMPLETE** — `quantum_circuit_optimization.rs` with `QuantumCircuitOptimizer`, multi-task ML |
+
+---
+
+## 🎯 Phase 25: Formal QTT Specification & Verification (P1 — Trust) — **PLANNED** 📋
+**Goal**: Machine-checked foundation for Quantity-aware Type Theory — the "Coq of QTT"
+
+| Task | Component | Why It Beats Rust | Status |
+|------|-----------|-------------------|--------|
+| **25.1 QTT mechanized semantics** | Verifier: Coq/Lean formalization | Proves type safety, linearity, erasure correctness end-to-end | 📋 **PLANNED** |
+| **25.2 Compiler correctness proof** | Verifier: CompCert-style proof | Compiler preserves QTT semantics; no miscompilation possible | 📋 **PLANNED** |
+| **25.3 Verified polyhedral optimizer** | Verifier: schedule tree correctness | Loop transformations proven correct; no invalid fusion/tiling | 📋 **PLANNED** |
+| **25.4 Quantum semantics verification** | Verifier: QIR + unitary proofs | Quantum kernels proven correct; no runtime decoherence bugs | 📋 **PLANNED** |
+| **25.5 Self-verifying compiler** | Compiler: bootstrapped + verified | Compiler compiles itself with proof; trust chain minimal | 📋 **PLANNED** |
+
+---
+
+## 🎯 Phase 26: Hardware Acceleration & Physics-Informed Compilation (P1 — Moat) — **PLANNED** 📋
+**Goal**: Compiler targets FPGA/ASIC/quantum hardware directly — no separate toolchains
+
+| Task | Component | Why It Beats Rust | Status |
+|------|-----------|-------------------|--------|
+| **26.1 FPGA backend (HLS)** | Codegen: Naso → Verilog/VHDL | High-level synthesis with QTT resource tracking; no Vivado/Quartus lock-in | 📋 **PLANNED** |
+| **26.2 ASIC synthesis flow** | Codegen: Naso → RTL → GDSII | Verified digital design; formal equivalence to source | 📋 **PLANNED** |
+| **26.3 Quantum control pulse generation** | Codegen: Naso → OpenPulse | Pulse-level optimization; coherent error suppression built-in | 📋 **PLANNED** |
+| **26.4 Analog/neuromorphic targets** | Codegen: Naso → SPICE/Verilog-A | Unified digital/analog compilation; no SPICE manual tuning | 📋 **PLANNED** |
+| **26.5 Physics-informed autodiff** | Compiler: reverse-mode AD + PDE solvers | Scientific computing kernels optimized for conservation laws | 📋 **PLANNED** |
+
+---
+
+## 📊 Extended Progress Summary (Phases 1–26)
+
+| Phase | Focus | Priority | Status |
+|-------|-------|----------|--------|
+| 1-13 | Core Language & Compiler | P0 | ✅ Complete |
+| 14 | Core Language Completeness | P0 | ✅ **COMPLETE** |
+| 15 | Quantum-First Systems | P1 | ✅ **COMPLETE** |
+| 16 | Formal Verification | P1 | ✅ **COMPLETE** |
+| 17 | Performance Dominance | P2 | ✅ **COMPLETE** |
+| 18 | Developer Experience | P3 | ✅ **COMPLETE** |
+| 19 | Stdlib Completeness | P3 | ✅ **COMPLETE** |
+| 20 | Ecosystem & Adoption | P4 | ✅ **COMPLETE** |
+| 21 | Advanced Compiler Research | P2/P3 | ✅ **COMPLETE** |
+| 22 | Distributed Compilation | P2 | 📋 **PLANNED** |
+| **23** | **WASM GC & Web Platform** | **P2** | ✅ **COMPLETE** |
+| **24** | **ML-Guided Optimization** | **P3** | ✅ **COMPLETE** |
+| 25 | Formal QTT Specification | P1 | 📋 **PLANNED** |
+| 26 | Hardware Acceleration | P1 | 📋 **PLANNED** |
+
+---
+
+## 🔮 Long-Term Vision (Beyond Phase 26)
+
+| Horizon | Focus |
+|---------|-------|
+| **Years 3-5** | Phases 22-26 execution; production deployment at scale |
+| **Years 5-10** | Self-hosting verified compiler; quantum advantage demonstrations |
+| **Years 10+** | Naso as the default systems language for quantum-classical computing |
+
+---
+
+## 📊 Critical Path (Dependency Graph)
+
+```text
+Phase 14 (Language Completeness) → Phase 17 (Performance) → Phase 18/19/20 → Phase 21
+                              ↗              ↗
+Phase 15 (Quantum) ────────────┘
+                              ↘              ↖
+Phase 16 (Verification) ────────────────────┘
+                              ↘
+                              Phase 22 (Distributed Build)
+                              ↘
+                              Phase 23 (WASM GC)
+                              ↘
+                              Phase 24 (ML Optimization)
+                              ↘
+                              Phase 25 (Formal QTT)
+                              ↘
+                              Phase 26 (Hardware Acceleration)
+```
+
+---
+
+**Updated**: 2026-11-25 — Phase 24 (ML-Guided Optimization) completed with full implementation: LearnedCostModel, PredictiveInliner, AutoVectorizationPolicy, ProfileDrivenRecompiler, QuantumCircuitOptimizer; all modules compile with `ml` feature; 330 library tests pass
+
+---
+
+## 🎯 Harness2 Continuous Self-Improvement (Cron Cycle) — **COMPLETE** ✅

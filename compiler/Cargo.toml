@@ -14,6 +14,7 @@ cranelift = ["dep:cranelift", "dep:cranelift-jit", "dep:cranelift-module", "dep:
 naso-jit-ffi = []
 serde = ["serde/derive"]
 wasm-debug = ["dep:web-sys"]
+ml = ["dep:candle-core", "dep:candle-nn", "dep:ndarray"]
 
 [dependencies]
 # Gate matrices and the verified adjoint relation, in a leaf crate with no dependencies.
@@ -29,9 +30,12 @@ serde_json = { workspace = true }
 indexmap = { workspace = true }
 smallvec = { workspace = true }
 anyhow = { workspace = true }
+toml = { workspace = true }
+chrono = { workspace = true }
 
-# Use inkwell 0.11.x with LLVM 15 - use llvm15-0 feature (includes typed-pointers)
-inkwell = { version = "0.11", features = ["llvm15-0"], optional = true }
+# Use inkwell 0.10.x with LLVM 15 - use llvm15-0 feature (includes typed-pointers)
+# Need to fix code to use Type::ptr_type instead of Context::ptr_type when typed-pointers enabled
+inkwell = { version = "0.10", features = ["llvm15-0"], optional = true }
 cranelift = { version = "0.115", features = ["jit"], optional = true }
 cranelift-jit = { version = "0.115", optional = true }
 cranelift-module = { version = "0.115", optional = true }
@@ -43,6 +47,19 @@ rand = { version = "0.8", features = ["std", "small_rng"] }
 walkdir = "2.5"
 web-sys = { version = "0.3", features = ["console"], optional = true }
 
+# ML dependencies for Phase 24
+candle-core = { workspace = true, optional = true }
+candle-nn = { workspace = true, optional = true }
+ndarray = { workspace = true, optional = true }
+
+# Distributed build dependencies
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+num_cpus = "1"
+ring = { version = "0.17", features = ["std"] }
+base64 = { version = "0.22", features = ["std"] }
+
 [dev-dependencies]
 # compiler/tests/codegen_property_tests.rs has used proptest since it was written, but it was
 # never declared here -- so the file never compiled, and nothing ran. Tests that do not build
@@ -52,12 +69,7 @@ proptest = "1"
 # driver checks first. Using it as the test oracle catches miscompilation (e.g. if/else
 # silently emitting `/* unsupported */`) that string-matching cannot.
 naga = { version = "25", features = ["wgsl-in"] }
-criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bin]]
 name = "naso"
 path = "src/main.rs"
-
-[[bench]]
-name = "async_benchmarks"
-harness = false

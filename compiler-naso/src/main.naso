@@ -1,4 +1,4 @@
-//! Test file for Naso compiler frontend (lexer + parser)
+//! Test file for Naso compiler frontend (lexer + parser + typechecker)
 
 use std::vec::Vec;
 use std::string::String;
@@ -6,6 +6,7 @@ use std::string::String;
 mod lexer;
 mod ast;
 mod parser;
+mod typecheck;
 
 fn main() {
     // Test lexer
@@ -30,6 +31,13 @@ fn main() {
             println!("Items: {}", program.items.len());
             for item in &program.items {
                 println!("  Item: {:?}", item);
+            }
+
+            // Test typechecker
+            println!("\nType checking...");
+            match typecheck::check_program(&program) {
+                Ok(()) => println!("Type checking passed!"),
+                Err(e) => println!("Type error: {}", e),
             }
         }
         Err(e) => {

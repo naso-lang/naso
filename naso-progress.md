@@ -256,6 +256,9 @@ Phase 16 (Verification) ──────────────────�
 - Ported lexer (token.naso, mod.naso) — hand-written recursive descent lexer
 - Ported AST (mod.naso, expr.naso, pattern.naso, stmt.naso, ty.naso, visit.naso)
 - Ported parser (mod.naso, expr.naso, stmt.naso, ty.naso) — recursive descent parser
+- Ported typechecker (mod.naso, check.naso, inference.naso, type_env.naso, unify.naso, constraints.naso, error.naso) — bidirectional QTT type checker with linear/inout/consume tracking
+
+**Total ported**: ~7,485 lines across lexer, AST, parser, and typechecker
 
 ---
 

@@ -1,0 +1,598 @@
+//! Type Environment for Naso Type Checker (Naso implementation)
+//!
+//! Tracks variables with their types, quantities, and mutabilities.
+//! Manages usage counting for linear variables, inout borrows, and consume moves.
+
+use crate::ast::*;
+use crate::typecheck::error::TypeError;
+use std::vec::Vec;
+use std::string::String;
+use std::option::Option;
+use std::collections::{HashMap, HashSet};
+use std::boxed::Box;
+
+/// Information about a variable binding
+pub struct VarInfo {
+    /// The variable's type
+    pub ty: Type,
+    /// Quantity annotation (0, 1, N, *)
+    pub quantity: Quantity,
+    /// Mutability mode (imm, inout, consume)
+    pub mutability: Mutability,
+    /// Source span where defined
+    pub defined_at: Span,
+    /// Spans where this variable was used
+    pub used_at: Vec<Span>,
+    /// Whether this variable has been moved (for consume)
+    pub moved: bool,
+    /// Whether this variable is erased (quantity 0)
+    pub erased: bool,
+}
+
+/// The use-state of a single variable, snapshotted across an erased region.
+#[derive(Debug, Clone)]
+pub struct VarUseState {
+    used_at: Vec<Span>,
+    moved: bool,
+}
+
+impl VarUseState {
+    fn from_info(info: &VarInfo) -> Self {
+        Self {
+            used_at: info.used_at.clone(),
+            moved: info.moved,
+        }
+    }
+
+    fn apply_to(&self, info: &mut VarInfo) {
+        info.used_at = self.used_at.clone();
+        info.moved = self.moved;
+    }
+
+    pub fn erase_uses_since_inner(&self, info: &mut VarInfo) {
+        info.used_at = self.used_at.clone();
+        info.moved = self.moved;
+    }
+
+    pub fn is_consumed(&self) -> bool {
+        self.moved || !self.used_at.is_empty()
+    }
+
+    fn consumed_at(span: Span) -> Self {
+        Self {
+            used_at: vec![span],
+            moved: true,
+        }
+    }
+}
+
+impl VarInfo {
+    pub fn new(ty: Type, quantity: Quantity, mutability: Mutability, defined_at: Span) -> Self {
+        Self {
+            ty,
+            quantity,
+            mutability,
+            defined_at,
+            used_at: Vec::new(),
+            moved: false,
+            erased: quantity == Quantity::Zero,
+        }
+    }
+
+    /// Record a use of this variable
+    pub fn record_use(&mut self, span: Span) {
+        self.used_at.push(span);
+    }
+
+    pub fn can_use(&self) -> bool {
+        if self.moved {
+            return false;
+        }
+        match self.quantity {
+            Quantity::Zero => false,
+            Quantity::One => !self.moved && self.used_at.is_empty(),
+            Quantity::Bounded(n) => (self.used_at.len() as u32) < n,
+            Quantity::Many => true,
+        }
+    }
+
+    /// Mark as moved (for consume)
+    pub fn mark_moved(&mut self, span: Span) {
+        self.moved = true;
+        self.record_use(span);
+    }
+}
+
+/// Active inout borrow tracking
+pub struct InOutBorrow {
+    /// The variable being borrowed
+    pub var: Ident,
+    /// The place expression borrowed (for alias checking)
+    pub place: Place,
+    /// Span where borrow started
+    pub borrow_span: Span,
+}
+
+/// Place expression for alias tracking
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Place {
+    /// Simple variable
+    Var(Ident),
+    /// Field projection
+    Field(Box<Place>, Ident),
+    /// Index projection (using a string key for simplicity)
+    Index(Box<Place>, String),
+    /// Deref projection
+    Deref(Box<Place>),
+}
+
+/// Pattern bindings produced during pattern matching
+pub struct PatternBindings {
+    pub vars: std::collections::IndexMap<Ident, VarInfo>,
+}
+
+impl PatternBindings {
+    pub fn new() -> Self {
+        Self { vars: std::collections::IndexMap::new() }
+    }
+
+    pub fn insert(&mut self, ident: Ident, info: VarInfo) {
+        self.vars.insert(ident, info);
+    }
+
+    pub fn extend(&mut self, other: PatternBindings) {
+        self.vars.extend(other.vars);
+    }
+}
+
+/// The consumption state of every in-scope linear variable, plus the sets that shadow it.
+pub struct LinearSnapshot {
+    uses: HashMap<Ident, VarUseState>,
+    moved_vars: HashSet<Ident>,
+    erasable_vars: HashSet<Ident>,
+}
+
+impl LinearSnapshot {
+    /// The names of the linear variables captured in this snapshot.
+    pub fn linear_names(&self) -> Vec<Ident> {
+        self.uses.keys().cloned().collect()
+    }
+
+    /// Whether the linear variable `name` is already spent in this snapshot.
+    pub fn is_consumed(&self, name: &Ident) -> bool {
+        self.uses.get(name).is_some_and(VarUseState::is_consumed)
+    }
+
+    /// Whether any captured linear variable is already spent in this snapshot.
+    pub fn any_consumed(&self) -> bool {
+        self.uses.values().any(VarUseState::is_consumed)
+    }
+}
+
+/// Function signature for type checking
+pub struct FunctionSig {
+    pub name: Ident,
+    pub generics: Vec<GenericParam>,
+    pub params: Vec<Param>,
+    pub ret_ty: Option<Type>,
+    pub quantity: Quantity,
+    pub is_reversible: bool,
+    pub span: Span,
+}
+
+/// Constant info
+pub struct ConstInfo {
+    pub name: Ident,
+    pub ty: Option<Type>,
+    pub value: Expr,
+    pub span: Span,
+}
+
+/// Type environment with quantitative tracking
+pub struct TypeEnv {
+    /// Variable bindings in scope
+    pub vars: std::collections::IndexMap<Ident, VarInfo>,
+    /// Type definitions (struct, enum, alias)
+    pub types: std::collections::IndexMap<Ident, TypeDef>,
+    /// Function signatures
+    pub functions: std::collections::IndexMap<Ident, FunctionSig>,
+    /// Constant definitions
+    pub constants: std::collections::IndexMap<Ident, ConstInfo>,
+    /// Active inout borrows (for alias checking)
+    pub inout_borrows: Vec<InOutBorrow>,
+    /// Variables that have been moved (consumed)
+    pub moved_vars: HashSet<Ident>,
+    /// Variables marked as erasable (quantity 0)
+    pub erasable_vars: HashSet<Ident>,
+    /// Depth of nesting inside ERASED regions -- `proof` blocks and `requires` blocks.
+    pub erased_depth: u32,
+    /// Generic parameters in scope
+    pub generics: std::collections::IndexMap<Ident, GenericParam>,
+    /// Quantity variables in scope (for dependent quantities)
+    pub qty_vars: std::collections::IndexMap<Ident, Quantity>,
+}
+
+impl TypeEnv {
+    /// Create a new empty type environment
+    pub fn new() -> Self {
+        Self {
+            vars: std::collections::IndexMap::new(),
+            types: std::collections::IndexMap::new(),
+            functions: std::collections::IndexMap::new(),
+            constants: std::collections::IndexMap::new(),
+            inout_borrows: Vec::new(),
+            moved_vars: HashSet::new(),
+            erasable_vars: HashSet::new(),
+            erased_depth: 0,
+            generics: std::collections::IndexMap::new(),
+            qty_vars: std::collections::IndexMap::new(),
+        }
+    }
+
+    /// Insert a variable binding
+    pub fn bind_var(&mut self, name: Ident, ty: Type, quantity: Quantity, mutability: Mutability) {
+        let info = VarInfo::new(ty, quantity, mutability, name.span);
+
+        if quantity == Quantity::Zero {
+            self.erasable_vars.insert(name.clone());
+        }
+        if mutability == Mutability::Consume {
+            // Consume bindings are tracked specially
+        }
+
+        self.vars.insert(name, info);
+    }
+
+    /// Lookup a variable
+    pub fn lookup_var(&self, name: &Ident) -> Option<&VarInfo> {
+        self.vars.get(name)
+    }
+
+    /// Lookup a variable mutably
+    pub fn lookup_var_mut(&mut self, name: &Ident) -> Option<&mut VarInfo> {
+        self.vars.get_mut(name)
+    }
+
+    /// Snapshot the use-state of every currently bound variable.
+    pub fn snapshot_uses(&self) -> HashMap<Ident, VarUseState> {
+        self.vars
+            .iter()
+            .map(|(k, v)| (k.clone(), VarUseState::from_info(v)))
+            .collect()
+    }
+
+    /// Erase the uses recorded since [`Self::snapshot_uses`].
+    pub fn erase_uses_since(&mut self, snapshot: &HashMap<Ident, VarUseState>) {
+        for (name, state) in snapshot {
+            if let Some(info) = self.vars.get_mut(name) {
+                state.erase_uses_since_inner(info);
+            }
+        }
+    }
+
+    /// Capture the consumption state at a program point, for a later restore or join.
+    pub fn snapshot_linear(&self) -> LinearSnapshot {
+        LinearSnapshot {
+            uses: self
+                .vars
+                .iter()
+                .filter(|(_, info)| info.quantity == Quantity::One)
+                .map(|(k, v)| (k.clone(), VarUseState::from_info(v)))
+                .collect(),
+            moved_vars: self.moved_vars.clone(),
+            erasable_vars: self.erasable_vars.clone(),
+        }
+    }
+
+    /// Return the consumption state to a snapshot, dropping any linear binding introduced since.
+    pub fn restore_linear(&mut self, snapshot: &LinearSnapshot) {
+        for (name, state) in &snapshot.uses {
+            if let Some(info) = self.vars.get_mut(name) {
+                state.apply_to(info);
+            }
+        }
+        // A linear variable that is not in the snapshot's bindings was bound after
+        // the snapshot; drop it so a later join cannot mistake it for pre-existing.
+        let introduced: Vec<Ident> = self
+            .vars
+            .iter()
+            .filter(|(name, info)| {
+                info.quantity == Quantity::One && !snapshot.uses.contains_key(*name)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in introduced {
+            self.vars.shift_remove(&name);
+        }
+        self.moved_vars = snapshot.moved_vars.clone();
+        self.erasable_vars = snapshot.erasable_vars.clone();
+    }
+
+    /// Join the states of several mutually exclusive branches.
+    pub fn join_linear(
+        &mut self,
+        entry: &LinearSnapshot,
+        branches: &[LinearSnapshot],
+        span: Span,
+    ) -> Result<(), TypeError> {
+        if branches.is_empty() {
+            return Ok(());
+        }
+        // Start from the entry state, then re-apply what the join established.
+        self.restore_linear(entry);
+
+        let names: Vec<Ident> = entry.uses.keys().cloned().collect();
+        for name in names {
+            let consumed_count = branches
+                .iter()
+                .filter(|b| b.uses.get(&name).is_some_and(VarUseState::is_consumed))
+                .count();
+
+            if consumed_count == branches.len() {
+                // Consumed on every path: the value is gone after the join.
+                let info = self.vars.get_mut(&name).expect("snapshot name in env");
+                VarUseState::consumed_at(span).apply_to(info);
+                self.moved_vars.insert(name);
+            } else if consumed_count > 0 {
+                let consumed_on: Vec<usize> = branches
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, b)| b.uses.get(&name).is_some_and(VarUseState::is_consumed))
+                    .map(|(i, _)| i)
+                    .collect();
+                return Err(TypeError::LinearNotConsumedOnAllPaths {
+                    name,
+                    consumed_on,
+                    total: branches.len(),
+                    span,
+                });
+            }
+            // Consumed on no path: leave the entry state, so a later consume works.
+        }
+        Ok(())
+    }
+
+    /// Record a use of a variable
+    pub fn use_var(&mut self, name: &Ident, span: Span) -> Result<(), TypeError> {
+        if let Some(info) = self.vars.get_mut(name) {
+            if info.moved {
+                return Err(TypeError::UseOfMovedValue {
+                    name: name.clone(),
+                    moved_at: info.used_at.last().cloned().unwrap_or(span),
+                    used_at: span,
+                });
+            }
+
+            // Check for Zero quantity - erased variables cannot be used at runtime
+            if info.quantity == Quantity::Zero {
+                return Err(TypeError::ErasedVariableUsedAtRuntime {
+                    name: name.clone(),
+                    span,
+                });
+            }
+
+            // A reference from an ERASED region observes without consuming
+            if self.erased_depth > 0 {
+                return Ok(());
+            }
+
+            // Check for linear variable used twice BEFORE recording the use
+            if info.quantity == Quantity::One && !info.used_at.is_empty() {
+                return Err(TypeError::LinearVariableUsedTwice {
+                    name: name.clone(),
+                    first_use: info.used_at[0],
+                    second_use: span,
+                });
+            }
+
+            // Record the use
+            info.record_use(span);
+
+            // Check quantity limits for bounded quantities AFTER recording the use
+            if let Quantity::Bounded(n) = info.quantity {
+                if (info.used_at.len() as u32) > n {
+                    return Err(TypeError::VariableNotAvailable {
+                        name: name.clone(),
+                        reason: "quantity exhausted".to_string(),
+                        span,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Mark a variable as moved (for consume)
+    pub fn move_var(&mut self, name: &Ident, span: Span) -> Result<(), TypeError> {
+        if let Some(info) = self.vars.get_mut(name) {
+            if info.moved {
+                return Err(TypeError::UseOfMovedValue {
+                    name: name.clone(),
+                    moved_at: info.used_at.last().cloned().unwrap_or(span),
+                    used_at: span,
+                });
+            }
+            info.mark_moved(span);
+            self.moved_vars.insert(name.clone());
+        }
+        Ok(())
+    }
+
+    /// Start an inout borrow
+    pub fn borrow_inout(&mut self, var: Ident, place: Place, span: Span) -> Result<(), TypeError> {
+        // Check for aliasing with existing borrows
+        for borrow in &self.inout_borrows {
+            if places_overlap(&borrow.place, &place) {
+                return Err(TypeError::InOutAliasing {
+                    var: var.clone(),
+                    existing_borrow: borrow.var.clone(),
+                    existing_span: borrow.borrow_span,
+                    new_span: span,
+                });
+            }
+        }
+
+        self.inout_borrows.push(InOutBorrow {
+            var,
+            place,
+            borrow_span: span,
+        });
+        Ok(())
+    }
+
+    /// End an inout borrow (at scope exit)
+    pub fn end_inout_borrow(&mut self, var: &Ident) {
+        self.inout_borrows.retain(|b| &b.var != var);
+    }
+
+    /// Check if a place is currently borrowed inout
+    pub fn is_borrowed_inout(&self, place: &Place) -> Option<&InOutBorrow> {
+        self.inout_borrows
+            .iter()
+            .find(|b| places_overlap(&b.place, place))
+    }
+
+    /// Insert a type definition
+    pub fn insert_type_def(&mut self, def: TypeDef) {
+        self.types.insert(def.name.clone(), def);
+    }
+
+    /// Lookup a type definition
+    pub fn lookup_type(&self, name: &Ident) -> Option<&TypeDef> {
+        self.types.get(name)
+    }
+
+    /// Insert a function signature and bind as callable variable
+    pub fn insert_function(&mut self, func: Function) {
+        let sig = FunctionSig {
+            name: func.name.clone(),
+            generics: func.generics.clone(),
+            params: func.params.clone(),
+            ret_ty: func.ret_ty.clone(),
+            quantity: func.quantity,
+            is_reversible: func.is_reversible,
+            span: func.span,
+        };
+        self.functions.insert(func.name.clone(), sig);
+
+        // Also bind as callable variable for function calls
+        let param_tys: Vec<Type> = func.params.iter().map(|p| p.ty.clone()).collect();
+        let ret_ty = func.ret_ty.clone().unwrap_or(Type::unit(func.span));
+        let func_ty = Type::new(
+            TypeKind::Function(param_tys, Box::new(ret_ty)),
+            func.quantity,
+            func.span,
+        );
+        self.bind_var(
+            func.name.clone(),
+            func_ty,
+            func.quantity,
+            Mutability::Immutable,
+        );
+    }
+
+    /// Lookup a function signature
+    pub fn lookup_function(&self, name: &Ident) -> Option<&FunctionSig> {
+        self.functions.get(name)
+    }
+
+    /// Insert a constant
+    pub fn insert_const(&mut self, c: ConstDef) {
+        let info = ConstInfo {
+            name: c.name.clone(),
+            ty: c.ty.clone(),
+            value: c.value.clone(),
+            span: c.span,
+        };
+        self.constants.insert(c.name.clone(), info);
+    }
+
+    /// Lookup a constant
+    pub fn lookup_const(&self, name: &Ident) -> Option<&ConstInfo> {
+        self.constants.get(name)
+    }
+
+    /// Check if a variable is erasable (quantity 0)
+    pub fn is_erasable(&self, name: &Ident) -> bool {
+        self.erasable_vars.contains(name)
+    }
+
+    /// Get all linear variables that haven't been used
+    pub fn unused_linear_vars(&self) -> Vec<&Ident> {
+        self.vars
+            .iter()
+            .filter(|(_, info)| {
+                info.quantity == Quantity::One && info.used_at.is_empty() && !info.moved
+            })
+            .map(|(name, _)| name)
+            .collect()
+    }
+}
+
+/// Scope guard for automatic cleanup
+pub struct ScopeGuard {
+    vars_initial_len: usize,
+    inout_borrows_len: usize,
+    moved_vars_snapshot: HashSet<Ident>,
+    erasable_vars_snapshot: HashSet<Ident>,
+}
+
+impl TypeEnv {
+    /// Enter a new scope (for block scoping)
+    pub fn enter_scope(&mut self) -> ScopeGuard {
+        ScopeGuard {
+            vars_initial_len: self.vars.len(),
+            inout_borrows_len: self.inout_borrows.len(),
+            moved_vars_snapshot: self.moved_vars.clone(),
+            erasable_vars_snapshot: self.erasable_vars.clone(),
+        }
+    }
+
+    /// Exit a scope, restoring state and checking for unused linear vars
+    pub fn exit_scope(&mut self, guard: ScopeGuard) -> Result<(), TypeError> {
+        // Check for unused linear variables bound in this scope
+        for (name, info) in self.vars.iter().skip(guard.vars_initial_len) {
+            if info.quantity == Quantity::One
+                && info.used_at.is_empty()
+                && !info.moved
+                && info.mutability != Mutability::Consume
+                && info.mutability != Mutability::InOut
+            {
+                return Err(TypeError::UnusedLinearVariable {
+                    name: name.clone(),
+                    defined_at: info.defined_at,
+                });
+            }
+        }
+
+        // Restore state - remove variables bound in this scope
+        let keys_to_remove: Vec<Ident> = self
+            .vars
+            .keys()
+            .skip(guard.vars_initial_len)
+            .cloned()
+            .collect();
+        for key in keys_to_remove {
+            self.vars.shift_remove(&key);
+        }
+
+        self.inout_borrows.truncate(guard.inout_borrows_len);
+        self.moved_vars = guard.moved_vars_snapshot.clone();
+        self.erasable_vars = guard.erasable_vars_snapshot.clone();
+
+        Ok(())
+    }
+}
+
+/// Check if two places overlap (for alias detection)
+fn places_overlap(p1: &Place, p2: &Place) -> bool {
+    match (p1, p2) {
+        (Place::Var(v1), Place::Var(v2)) => v1.name == v2.name,
+        (Place::Field(base1, field1), Place::Field(base2, field2)) => {
+            field1.name == field2.name && places_overlap(base1, base2)
+        }
+        (Place::Index(base1, _), Place::Index(base2, _)) => places_overlap(base1, base2),
+        (Place::Deref(base1), Place::Deref(base2)) => places_overlap(base1, base2),
+        _ => false,
+    }
+}

@@ -1,0 +1,1073 @@
+//! Type inference functions for the Naso type checker (Naso implementation)
+//!
+//! Implements the bidirectional typing rules: infer mode (synthesizes type)
+//! Full Quantitative Type Theory (QTT) enforcement:
+//! - [0] erased variables: compile-time only, cannot appear at runtime
+//! - [1] linear variables: consumed exactly once across all branches
+//! - [N] bounded variables: consumed at most N times
+//! - [*] unrestricted: any number of uses
+
+use crate::ast::*;
+use crate::typecheck::constraints::{is_erasable, qty_subtype};
+use crate::typecheck::error::TypeError;
+use crate::typecheck::type_env::VarInfo;
+use crate::typecheck::unify;
+use crate::typecheck::TypeChecker;
+use std::vec::Vec;
+use std::option::Option;
+use std::boxed::Box;
+
+/// Infer an expression's type (Infer mode)
+pub fn infer_expr(checker: &mut TypeChecker, expr: &Expr) -> Result<Type, TypeError> {
+    match &expr.kind {
+        ExprKind::Literal(lit) => infer_literal(lit, expr.span),
+        ExprKind::Var(name) => infer_var(checker, name, expr.span),
+        ExprKind::Binary(op, lhs, rhs) => infer_binary(checker, *op, lhs, rhs, expr.span),
+        ExprKind::Unary(op, operand) => infer_unary(checker, *op, operand, expr.span),
+        ExprKind::Call(callee, args) => infer_call(checker, callee, args, expr.span),
+        ExprKind::MethodCall(receiver, method, args) => infer_method_call(checker, receiver, method, args, expr.span),
+        ExprKind::Field(base, field) => infer_field(checker, base, field, expr.span),
+        ExprKind::Index(base, index) => infer_index(checker, base, index, expr.span),
+        ExprKind::Struct(name, fields) => infer_struct(checker, name, fields, expr.span),
+        ExprKind::Variant(enum_name, variant, args) => infer_variant(checker, enum_name, variant, args, expr.span),
+        ExprKind::Tuple(items) => infer_tuple(checker, items, expr.span),
+        ExprKind::Array(items) => infer_array(checker, items, expr.span),
+        ExprKind::ArrayRepeat(value, count) => infer_array_repeat(checker, value, count, expr.span),
+        ExprKind::Block(block) => infer_block(checker, block, expr.span),
+        ExprKind::If(cond, then_branch, else_branch) => infer_if(checker, cond, then_branch, else_branch.as_deref(), expr.span),
+        ExprKind::Match(scrutinee, arms) => infer_match(checker, scrutinee, arms, expr.span),
+        ExprKind::Let(let_binding) => infer_let(checker, let_binding, expr.span),
+        ExprKind::LetInOut(let_inout) => infer_let_inout(checker, let_inout, expr.span),
+        ExprKind::LetConsume(let_consume) => infer_let_consume(checker, let_consume, expr.span),
+        ExprKind::Reversible(rev_block) => infer_reversible(checker, rev_block, expr.span),
+        ExprKind::Lambda(lambda) => infer_lambda(checker, lambda, expr.span),
+        ExprKind::For(for_loop) => infer_for(checker, for_loop, expr.span),
+        ExprKind::Forall(forall_loop) => infer_forall(checker, forall_loop, expr.span),
+        ExprKind::Quantified(quant) => infer_quantified(checker, quant, expr.span),
+        ExprKind::While(cond, body) => infer_while(checker, cond, body, expr.span),
+        ExprKind::Loop(body) => infer_loop(checker, body, expr.span),
+        ExprKind::Return(opt_expr) => infer_return(checker, opt_expr.as_deref(), expr.span),
+        ExprKind::Break(opt_expr) => infer_break(checker, opt_expr.as_deref(), expr.span),
+        ExprKind::Continue => Ok(Type::never(expr.span)),
+        ExprKind::Assign(lhs, rhs) => infer_assign(checker, lhs, rhs, expr.span),
+        ExprKind::Projection(expr) => infer_projection(checker, expr, expr.span),
+        ExprKind::QuantumOp(qop) => infer_quantum_op(checker, qop, expr.span),
+        ExprKind::Ascribe(expr, ty) => infer_ascribe(checker, expr, ty, expr.span),
+        ExprKind::Range(lo, hi) => infer_range(checker, lo, hi, expr.span),
+        ExprKind::Async(block) => infer_async(checker, block, expr.span),
+        ExprKind::Await(expr) => infer_await(checker, expr, expr.span),
+        ExprKind::Error => Ok(Type::never(expr.span)),
+    }
+}
+
+/// Infer literal type
+fn infer_literal(lit: &Literal, span: Span) -> Result<Type, TypeError> {
+    let kind = match lit {
+        Literal::Int(_) => TypeKind::Int,
+        Literal::UInt(_) => TypeKind::UInt,
+        Literal::Float(_) => TypeKind::Float,
+        Literal::Bool(_) => TypeKind::Bool,
+        Literal::String(_) => TypeKind::String,
+        Literal::Char(_) => TypeKind::Char,
+        Literal::Unit => TypeKind::Unit,
+    };
+    Ok(Type::new(kind, Quantity::Many, span))
+}
+
+/// Infer variable type from environment
+fn infer_var(checker: &mut TypeChecker, ident: &Ident, span: Span) -> Result<Type, TypeError> {
+    if let Some(info) = checker.env.lookup_var(ident) {
+        // Record the use
+        checker.env.use_var(ident, span)?;
+        Ok(info.ty.clone())
+    } else {
+        Err(TypeError::VariableNotAvailable {
+            name: ident.clone(),
+            reason: "undefined variable".to_string(),
+            span,
+        })
+    }
+}
+
+/// Infer binary operation type
+fn infer_binary(
+    checker: &mut TypeChecker,
+    op: BinOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    span: Span,
+) -> Result<Type, TypeError> {
+    let lhs_ty = infer_expr(checker, lhs)?;
+    let rhs_ty = infer_expr(checker, rhs)?;
+
+    // Type check based on operator
+    let result_kind = match op {
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
+            // Arithmetic operators: both operands must be numeric, result is same type
+            unify::unify_types(checker, &lhs_ty, &rhs_ty)?;
+            lhs_ty.kind
+        }
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+            // Comparison operators: operands must be comparable, result is Bool
+            unify::unify_types(checker, &lhs_ty, &rhs_ty)?;
+            TypeKind::Bool
+        }
+        BinOp::And | BinOp::Or => {
+            // Logical operators: both must be Bool
+            if !matches!(lhs_ty.kind, TypeKind::Bool) || !matches!(rhs_ty.kind, TypeKind::Bool) {
+                return Err(TypeError::OperatorNotDefinedOnType {
+                    op: format!("{:?}", op),
+                    ty: if !matches!(lhs_ty.kind, TypeKind::Bool) {
+                        format!("{:?}", lhs_ty.kind)
+                    } else {
+                        format!("{:?}", rhs_ty.kind)
+                    },
+                    span,
+                });
+            }
+            TypeKind::Bool
+        }
+        BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
+            // Bitwise operators: both must be integer types
+            unify::unify_types(checker, &lhs_ty, &rhs_ty)?;
+            lhs_ty.kind
+        }
+        BinOp::Assign => {
+            // Assignment: lhs must be assignable, rhs type must match
+            unify::unify_types(checker, &lhs_ty, &rhs_ty)?;
+            TypeKind::Unit
+        }
+    };
+
+    // Result quantity is the join of operand quantities
+    let result_qty = crate::typecheck::unify::qty_join(lhs_ty.quantity, rhs_ty.quantity);
+    Ok(Type::new(result_kind, result_qty, span))
+}
+
+/// Infer unary operation type
+fn infer_unary(
+    checker: &mut TypeChecker,
+    op: UnOp,
+    expr: &Expr,
+    span: Span,
+) -> Result<Type, TypeError> {
+    let operand_ty = infer_expr(checker, expr)?;
+
+    let result_kind = match op {
+        UnOp::Neg => {
+            // Negation: operand must be numeric
+            operand_ty.kind
+        }
+        UnOp::Not => {
+            // Logical not: operand must be Bool
+            if !matches!(operand_ty.kind, TypeKind::Bool) {
+                return Err(TypeError::OperatorNotDefinedOnType {
+                    op: "!".to_string(),
+                    ty: format!("{:?}", operand_ty.kind),
+                    span,
+                });
+            }
+            TypeKind::Bool
+        }
+        UnOp::BitNot => {
+            // Bitwise not: operand must be integer
+            operand_ty.kind
+        }
+        UnOp::Deref => {
+            // Dereference: operand must be pointer or projection
+            match &operand_ty.kind {
+                TypeKind::Pointer(inner) => *inner.kind.clone(),
+                TypeKind::Projection(inner) => *inner.kind.clone(),
+                _ => return Err(TypeError::TypeMismatch {
+                    expected: Type::new(TypeKind::Pointer(Box::new(Type::new(TypeKind::Int, Quantity::Many, span))), Quantity::Many, span),
+                    found: operand_ty,
+                    span,
+                }),
+            }
+        }
+        UnOp::InOut => {
+            // Inout borrow: creates projection type
+            TypeKind::Projection(Box::new(operand_ty.clone()))
+        }
+        UnOp::Consume => {
+            // Consume move: marks variable as moved
+            // The type stays the same but quantity becomes One
+            let mut result = operand_ty.clone();
+            result.quantity = Quantity::One;
+            return Ok(result);
+        }
+        UnOp::AddrOf => {
+            // Address-of: creates pointer type
+            TypeKind::Pointer(Box::new(operand_ty.clone()))
+        }
+    };
+
+    Ok(Type::new(result_kind, operand_ty.quantity, span))
+}
+
+/// Infer function call type
+fn infer_call(
+    checker: &mut TypeChecker,
+    callee: &Expr,
+    args: &[Expr],
+    span: Span,
+) -> Result<Type, TypeError> {
+    // Get function name from call
+    let name = match &callee.kind {
+        ExprKind::Var(name) => name.name.clone(),
+        _ => "unknown".to_string(),
+    };
+
+    // Look up function signature
+    if let Some(sig) = checker.env.lookup_function(&Ident::new(name.clone(), span)) {
+        // Check argument count
+        if sig.params.len() != args.len() {
+            return Err(TypeError::ArgumentCountMismatch {
+                expected: sig.params.len(),
+                found: args.len(),
+                span,
+            });
+        }
+
+        // Check each argument against parameter type
+        for (param, arg) in sig.params.iter().zip(args.iter()) {
+            let arg_ty = infer_expr(checker, arg)?;
+            unify::unify_types(checker, &arg_ty, &param.ty)?;
+            if !qty_subtype(arg_ty.quantity, param.quantity) {
+                return Err(TypeError::QuantityMismatch {
+                    expected: param.quantity,
+                    found: arg_ty.quantity,
+                    span: arg.span,
+                });
+            }
+        }
+
+        // Record use of function
+        checker.env.use_var(&Ident::new(name, span), span)?;
+
+        let ret_ty = sig.ret_ty.clone().unwrap_or(Type::unit(span));
+        Ok(ret_ty)
+    } else {
+        // Unknown function - infer from arguments
+        let mut arg_tys = Vec::new();
+        for arg in args {
+            arg_tys.push(infer_expr(checker, arg)?);
+        }
+        // Default to unit return
+        Ok(Type::unit(span))
+    }
+}
+
+/// Infer method call type
+fn infer_method_call(
+    checker: &mut TypeChecker,
+    receiver: &Expr,
+    method: &Ident,
+    args: &[Expr],
+    span: Span,
+) -> Result<Type, TypeError> {
+    let receiver_ty = infer_expr(checker, receiver)?;
+
+    // Special handling for Result.unwrap()
+    if method.name == "unwrap" {
+        return Ok(receiver_ty);
+    }
+
+    // Special handling for .len() on arrays
+    if method.name == "len" {
+        return Ok(Type::int_width(64, span)); // usize = 64
+    }
+
+    // For other method calls, use mangled name
+    let name = format!("{}__{}", receiver_ty.to_string(), method.name);
+
+    // Look up function signature (simplified)
+    if let Some(sig) = checker.env.lookup_function(&Ident::new(name.clone(), span)) {
+        if sig.params.len() != args.len() + 1 { // +1 for self
+            return Err(TypeError::ArgumentCountMismatch {
+                expected: sig.params.len() - 1,
+                found: args.len(),
+                span,
+            });
+        }
+
+        // Check arguments (skip self)
+        for (param, arg) in sig.params.iter().skip(1).zip(args.iter()) {
+            let arg_ty = infer_expr(checker, arg)?;
+            unify::unify_types(checker, &arg_ty, &param.ty)?;
+        }
+
+        let ret_ty = sig.ret_ty.clone().unwrap_or(Type::unit(span));
+        Ok(ret_ty)
+    } else {
+        // Unknown method - default to unit
+        Ok(Type::unit(span))
+    }
+}
+
+/// Infer field access type
+fn infer_field(
+    checker: &mut TypeChecker,
+    base: &Expr,
+    field: &Ident,
+    span: Span,
+) -> Result<Type, TypeError> {
+    let base_ty = infer_expr(checker, base)?;
+
+    match &base_ty.kind {
+        TypeKind::Named(name, _) => {
+            // Look up struct definition
+            if let Some(type_def) = checker.env.lookup_type(name) {
+                if let TypeDefKind::Struct(fields) = &type_def.kind {
+                    for f in fields {
+                        if f.name.name == field.name {
+                            let mut result = f.ty.clone();
+                            result.span = span;
+                            return Ok(result);
+                        }
+                    }
+                }
+            }
+            Err(TypeError::FieldNotFound {
+                field: field.clone(),
+                ty: base_ty,
+                span,
+            })
+        }
+        TypeKind::Tuple(elems) => {
+            // Tuple field access by index (field name should be numeric)
+            if let Ok(idx) = field.name.parse::<usize>() {
+                if idx < elems.len() {
+                    let mut result = elems[idx].clone();
+                    result.span = span;
+                    return Ok(result);
+                }
+            }
+            Err(TypeError::FieldNotFound {
+                field: field.clone(),
+                ty: base_ty,
+                span,
+            })
+        }
+        _ => Err(TypeError::FieldNotFound {
+            field: field.clone(),
+            ty: base_ty,
+            span,
+        }),
+    }
+}
+
+/// Infer index access type
+fn infer_index(
+    checker: &mut TypeChecker,
+    base: &Expr,
+    index: &Expr,
+    span: Span,
+) -> Result<Type, TypeError> {
+    let base_ty = infer_expr(checker, base)?;
+    let _index_ty = infer_expr(checker, index)?;
+
+    match &base_ty.kind {
+        TypeKind::Array(elem, _) => Ok(Type::new(elem.kind.clone(), base_ty.quantity, span)),
+        TypeKind::Tensor(elems) => {
+            // Tensor indexing returns element type
+            if let Some(elem) = elems.first() {
+                Ok(Type::new(elem.kind.clone(), base_ty.quantity, span))
+            } else {
+                Err(TypeError::NotIndexable { ty: base_ty, span })
+            }
+        }
+        _ => Err(TypeError::NotIndexable { ty: base_ty, span }),
+    }
+}
+
+/// Infer struct construction type
+fn infer_struct(
+    checker: &mut TypeChecker,
+    name: &Ident,
+    fields: &[crate::ast::expr::FieldExpr],
+    span: Span,
+) -> Result<Type, TypeError> {
+    // Look up struct definition
+    if let Some(type_def) = checker.env.lookup_type(name) {
+        if let TypeDefKind::Struct(def_fields) = &type_def.kind {
+            // Check each field
+            for field_expr in fields {
+                let def_field = def_fields.iter().find(|f| f.name.name == field_expr.name.name);
+                if let Some(def_field) = def_field {
+                    let field_ty = infer_expr(checker, &field_expr.value)?;
+                    unify::unify_types(checker, &field_ty, &def_field.ty)?;
+                }
+            }
+            Ok(Type::new(TypeKind::Named(name.clone(), Vec::new()), Quantity::Many, span))
+        } else {
+            Err(TypeError::NotAStruct { name: name.clone(), span })
+        }
+    } else {
+        Err(TypeError::UndefinedType { name: name.clone(), span })
+    }
+}
+
+/// Infer enum variant construction type
+fn infer_variant(
+    checker: &mut TypeChecker,
+    enum_name: &Ident,
+    variant_name: &Ident,
+    args: &[Expr],
+    span: Span,
+) -> Result<Type, TypeError> {
+    if let Some(type_def) = checker.env.lookup_type(enum_name) {
+        if let TypeDefKind::Enum(variants) = &type_def.kind {
+            for variant in variants {
+                if variant.name.name == variant_name.name {
+                    // Check argument count and types
+                    if variant.fields.len() != args.len() {
+                        return Err(TypeError::ArgumentCountMismatch {
+                            expected: variant.fields.len(),
+                            found: args.len(),
+                            span,
+                        });
+                    }
+                    for (arg, field) in args.iter().zip(variant.fields.iter()) {
+                        let arg_ty = infer_expr(checker, arg)?;
+                        unify::unify_types(checker, &arg_ty, &field.ty)?;
+                    }
+                    return Ok(Type::new(TypeKind::Named(enum_name.clone(), Vec::new()), Quantity::Many, span));
+                }
+            }
+        }
+    }
+    Err(TypeError::VariantNotFound {
+        enum_name: enum_name.clone(),
+        variant_name: variant_name.clone(),
+        span,
+    })
+}
+
+/// Infer tuple type
+fn infer_tuple(
+    checker: &mut TypeChecker,
+    items: &[Expr],
+    span: Span,
+) -> Result<Type, TypeError> {
+    let mut elems = Vec::new();
+    for item in items {
+        elems.push(infer_expr(checker, item)?);
+    }
+    Ok(Type::new(TypeKind::Tuple(elems), Quantity::Many, span))
+}
+
+/// Infer array type
+fn infer_array(
+    checker: &mut TypeChecker,
+    elems: &[Expr],
+    span: Span,
+) -> Result<Type, TypeError> {
+    if elems.is_empty() {
+        // Empty array - type unknown
+        return Ok(Type::new(TypeKind::Array(Box::new(Type::new(TypeKind::Error, Quantity::Many, span)), None), Quantity::Many, span));
+    }
+
+    let first_ty = infer_expr(checker, &elems[0])?;
+    for elem in &elems[1..] {
+        let elem_ty = infer_expr(checker, elem)?;
+        unify::unify_types(checker, &first_ty, &elem_ty)?;
+    }
+
+    let size = Some(crate::ast::ty::NatExpr::Lit(elems.len() as u64));
+    Ok(Type::new(
+        TypeKind::Array(Box::new(first_ty), size),
+        Quantity::Many,
+        span,
+    ))
+}
+
+/// Infer array repeat type
+fn infer_array_repeat(
+    checker: &mut TypeChecker,
+    value: &Expr,
+    count: &Expr,
+    span: Span,
+) -> Result<Type, TypeError> {
+    let value_ty = infer_expr(checker, value)?;
+    let count_ty = infer_expr(checker, count)?;
+
+    // Count should be a Nat or integer
+    let size = match &count_ty.kind {
+        TypeKind::Nat => count_ty.nat_const().map(|n| crate::ast::ty::NatExpr::Lit(n)),
+        _ => None,
+    };
+
+    Ok(Type::new(
+        TypeKind::Array(Box::new(value_ty), size),
+        Quantity::Many,
+        span,
+    ))
+}
+
+/// Infer block expression type
+fn infer_block(
+    checker: &mut TypeChecker,
+    block: &Block,
+    span: Span,
+) -> Result<Type, TypeError> {
+    let _scope = checker.env.enter_scope();
+
+    for stmt in &block.stmts {
+        check_stmt(checker, stmt)?;
+    }
+
+    if let Some(tail) = &block.expr {
+        infer_expr(checker, tail)
+    } else {
+        Ok(Type::unit(span))
+    }
+}
+
+/// Infer if expression type
+fn infer_if(
+    checker: &mut TypeChecker,
+    cond: &Expr,
+    then_branch: &Expr,
+    else_branch: Option<&Expr>,
+    span: Span,
+) -> Result<Type, TypeError> {
+    let cond_ty = infer_expr(checker, cond)?;
+    if !matches!(cond_ty.kind, TypeKind::Bool) {
+        return Err(TypeError::TypeMismatch {
+            expected: Type::bool(cond.span),
+            found: cond_ty,
+            span: cond.span,
+        });
+    }
+
+    let then_ty = infer_expr(checker, then_branch)?;
+
+    if let Some(else_branch) = else_branch {
+        let else_ty = infer_expr(checker, else_branch)?;
+        // Unify then and else types
+        let unified = unify::unify_types(checker, &then_ty, &else_ty)?;
+        Ok(unified)
+    } else {
+        // No else branch - must be unit
+        if !matches!(then_ty.kind, TypeKind::Unit) {
+            return Err(TypeError::TypeMismatch {
+                expected: Type::unit(span),
+                found: then_ty,
+                span,
+            });
+        }
+        Ok(Type::unit(span))
+    }
+}
+
+/// Infer match expression type
+fn infer_match(
+    checker: &mut TypeChecker,
+    scrutinee: &Expr,
+    arms: &[crate::ast::expr::MatchArm],
+    span: Span,
+) -> Result<Type, TypeError> {
+    let scrutinee_ty = infer_expr(checker, scrutinee)?;
+
+    if arms.is_empty() {
+        return Ok(Type::never(span));
+    }
+
+    let mut arm_types = Vec::new();
+    for arm in arms {
+        let _scope = checker.env.enter_scope();
+
+        // Check pattern
+        let bindings = check_pattern(checker, &arm.pattern, &scrutinee_ty)?;
+        for (name, info) in bindings.vars {
+            checker.env.bind_var(name, info.ty, info.quantity, info.mutability);
+        }
+
+        // Check guard
+        if let Some(guard) = &arm.guard {
+            let guard_ty = infer_expr(checker, guard)?;
+            if !matches!(guard_ty.kind, TypeKind::Bool) {
+                return Err(TypeError::TypeMismatch {
+                    expected: Type::bool(guard.span),
+                    found: guard_ty,
+                    span: guard.span,
+                });
+            }
+        }
+
+        // Infer body type
+        let body_ty = infer_expr(checker, &arm.body)?;
+        arm_types.push(body_ty);
+    }
+
+    // Unify all arm types
+    let mut result = arm_types[0].clone();
+    for ty in &arm_types[1..] {
+        result = unify::unify_types(checker, &result, ty)?;
+    }
+
+    Ok(result)
+}
+
+/// Infer let expression type
+fn infer_let(
+    checker: &mut TypeChecker,
+    let_binding: &crate::ast::expr::LetBinding,
+    span: Span,
+) -> Result<Type, TypeError> {
+    let value_ty = infer_expr(checker, &let_binding.value)?;
+
+    // Bind variable
+    checker.env.bind_var(
+        let_binding.name.clone(),
+        value_ty.clone(),
+        let_binding.quantity,
+        let_binding.mutability,
+    );
+
+    // Let expression type is the body type (unit if no body)
+    Ok(Type::unit(span))
+}
+
+/// Infer let inout expression type
+fn infer_let_inout(
+    checker: &mut TypeChecker,
+    let_inout: &LetInOutBinding,
+    span: Span,
+) -> Result<Type, TypeError> {
+    let value_ty = infer_expr(checker, &let_inout.value)?;
+
+    if value_ty.quantity != Quantity::One {
+        return Err(TypeError::InOutRequiresUnique {
+            found_qty: value_ty.quantity,
+            span,
+        });
+    }
+
+    checker.env.bind_var(
+        let_inout.name.clone(),
+        value_ty.clone(),
+        Quantity::One,
+        Mutability::InOut,
+    );
+
+    let place = Place::Var(let_inout.name.clone());
+    checker.env.borrow_inout(let_inout.name.clone(), place, span)?;
+
+    Ok(Type::unit(span))
+}
+
+/// Infer let consume expression type
+fn infer_let_consume(
+    checker: &mut TypeChecker,
+    let_consume: &LetConsumeBinding,
+    span: Span,
+) -> Result<Type, TypeError> {
+    let value_ty = infer_expr(checker, &let_consume.value)?;
+
+    if value_ty.quantity != Quantity::One {
+        return Err(TypeError::InOutRequiresUnique {
+            found_qty: value_ty.quantity,
+            span,
+        });
+    }
+
+    checker.env.bind_var(
+        let_consume.name.clone(),
+        value_ty.clone(),
+        Quantity::One,
+        Mutability::Consume,
+    );
+
+    Ok(Type::unit(span))
+}
+
+/// Infer reversible block type
+fn infer_reversible(
+    checker: &mut TypeChecker,
+    rev_block: &ReversibleBlock,
+    span: Span,
+) -> Result<Type, TypeError> {
+    let prev_reversible = checker.in_reversible;
+    checker.in_reversible = true;
+
+    let _scope = checker.env.enter_scope();
+
+    for stmt in &rev_block.body.stmts {
+        check_stmt(checker, stmt)?;
+    }
+
+    if let Some(tail) = &rev_block.body.expr {
+        let _tail_ty = infer_expr(checker, tail)?;
+    }
+
+    checker.in_reversible = prev_reversible;
+    Ok(Type::unit(span)) // Reversible blocks don't produce values directly
+}
+
+/// Infer lambda type
+fn infer_lambda(
+    checker: &mut TypeChecker,
+    lambda: &LambdaExpr,
+    span: Span,
+) -> Result<Type, TypeError> {
+    let _scope = checker.env.enter_scope();
+
+    // Bind parameters
+    for param in &lambda.params {
+        checker.env.bind_var(
+            param.name.clone(),
+            param.ty.clone(),
+            param.quantity,
+            param.mutability,
+        );
+    }
+
+    // Infer body type
+    let body_ty = infer_expr(checker, &lambda.body)?;
+
+    let ret_ty = lambda.ret_ty.clone().unwrap_or(body_ty);
+    let param_tys: Vec<Type> = lambda.params.iter().map(|p| p.ty.clone()).collect();
+
+    Ok(Type::new(
+        TypeKind::Function(param_tys, Box::new(ret_ty)),
+        Quantity::Many,
+        span,
+    ))
+}
+
+/// Infer for loop type
+fn infer_for(
+    checker: &mut TypeChecker,
+    for_loop: &ForLoop,
+    span: Span,
+) -> Result<Type, TypeError> {
+    let iter_ty = infer_expr(checker, &for_loop.iter)?;
+
+    // Check that iter is iterable (array, range, etc.)
+    let _scope = checker.env.enter_scope();
+
+    // Bind loop variable
+    checker.env.bind_var(
+        for_loop.var.clone(),
+        Type::int_width(64, for_loop.var.span), // Index is usize/i64
+        Quantity::Many,
+        Mutability::Immutable,
+    );
+
+    for stmt in &for_loop.body.stmts {
+        check_stmt(checker, stmt)?;
+    }
+
+    Ok(Type::unit(span))
+}
+
+/// Infer forall loop type
+fn infer_forall(
+    checker: &mut TypeChecker,
+    forall_loop: &ForallLoop,
+    span: Span,
+) -> Result<Type, TypeError> {
+    let _scope = checker.env.enter_scope();
+
+    // Bind loop variables
+    for (var, lower, upper) in &forall_loop.bindings {
+        let lower_ty = infer_expr(checker, lower)?;
+        let upper_ty = infer_expr(checker, upper)?;
+
+        // Check bounds are numeric
+        unify::unify_types(checker, &lower_ty, &Type::int_width(64, lower.span))?;
+        unify::unify_types(checker, &upper_ty, &Type::int_width(64, upper.span))?;
+
+        checker.env.bind_var(
+            var.clone(),
+            Type::int_width(64, var.span),
+            Quantity::Many,
+            Mutability::Immutable,
+        );
+    }
+
+    for stmt in &forall_loop.body.stmts {
+        check_stmt(checker, stmt)?;
+    }
+
+    Ok(Type::unit(span))
+}
+
+/// Infer quantified proposition type
+fn infer_quantified(
+    checker: &mut TypeChecker,
+    quant: &ForallLoop,
+    span: Span,
+) -> Result<Type, TypeError> {
+    // Quantified propositions must have boolean body
+    let _scope = checker.env.enter_scope();
+
+    for (var, lower, upper) in &quant.bindings {
+        let lower_ty = infer_expr(checker, lower)?;
+        let upper_ty = infer_expr(checker, upper)?;
+
+        unify::unify_types(checker, &lower_ty, &Type::int_width(64, lower.span))?;
+        unify::unify_types(checker, &upper_ty, &Type::int_width(64, upper.span))?;
+
+        checker.env.bind_var(
+            var.clone(),
+            Type::int_width(64, var.span),
+            Quantity::Many,
+            Mutability::Immutable,
+        );
+    }
+
+    // Body must be boolean
+    if let Some(tail) = &quant.body.expr {
+        let body_ty = infer_expr(checker, tail)?;
+        if !matches!(body_ty.kind, TypeKind::Bool) {
+            return Err(TypeError::QuantifiedBodyNotBool { span: tail.span });
+        }
+    }
+
+    Ok(Type::bool(span))
+}
+
+/// Infer while loop type
+fn infer_while(
+    checker: &mut TypeChecker,
+    cond: &Expr,
+    body: &Expr,
+    span: Span,
+) -> Result<Type, TypeError> {
+    let cond_ty = infer_expr(checker, cond)?;
+    if !matches!(cond_ty.kind, TypeKind::Bool) {
+        return Err(TypeError::TypeMismatch {
+            expected: Type::bool(cond.span),
+            found: cond_ty,
+            span: cond.span,
+        });
+    }
+
+    let _scope = checker.env.enter_scope();
+    let _body_ty = infer_expr(checker, body)?;
+
+    Ok(Type::unit(span))
+}
+
+/// Infer infinite loop type
+fn infer_loop(
+    checker: &mut TypeChecker,
+    body: &Block,
+    span: Span,
+) -> Result<Type, TypeError> {
+    let _scope = checker.env.enter_scope();
+    for stmt in &body.stmts {
+        check_stmt(checker, stmt)?;
+    }
+    Ok(Type::never(span)) // Infinite loop never returns
+}
+
+/// Infer return expression type
+fn infer_return(
+    checker: &mut TypeChecker,
+    opt_expr: Option<&Expr>,
+    span: Span,
+) -> Result<Type, TypeError> {
+    if let Some(expr) = opt_expr {
+        let expr_ty = infer_expr(checker, expr)?;
+        if let Some(expected) = &checker.current_fn_ret {
+            unify::unify_types(checker, &expr_ty, expected)?;
+        }
+        Ok(expr_ty)
+    } else {
+        Ok(Type::unit(span))
+    }
+}
+
+/// Infer break expression type
+fn infer_break(
+    checker: &mut TypeChecker,
+    opt_expr: Option<&Expr>,
+    span: Span,
+) -> Result<Type, TypeError> {
+    if let Some(expr) = opt_expr {
+        infer_expr(checker, expr)
+    } else {
+        Ok(Type::unit(span))
+    }
+}
+
+/// Infer assignment type
+fn infer_assign(
+    checker: &mut TypeChecker,
+    lhs: &Expr,
+    rhs: &Expr,
+    span: Span,
+) -> Result<Type, TypeError> {
+    // LHS must be a place expression (variable, field, index)
+    let lhs_ty = infer_expr(checker, lhs)?;
+    let rhs_ty = infer_expr(checker, rhs)?;
+
+    unify::unify_types(checker, &lhs_ty, &rhs_ty)?;
+
+    Ok(Type::unit(span))
+}
+
+/// Infer projection type
+fn infer_projection(
+    checker: &mut TypeChecker,
+    expr: &Expr,
+    span: Span,
+) -> Result<Type, TypeError> {
+    let expr_ty = infer_expr(checker, expr)?;
+    Ok(Type::new(
+        TypeKind::Projection(Box::new(expr_ty)),
+        expr_ty.quantity,
+        span,
+    ))
+}
+
+/// Infer quantum operation type
+fn infer_quantum_op(
+    checker: &mut TypeChecker,
+    qop: &QuantumOp,
+    span: Span,
+) -> Result<Type, TypeError> {
+    match qop {
+        QuantumOp::Alloc(name) => {
+            checker.env.bind_var(
+                name.clone(),
+                Type::qubit(span),
+                Quantity::One,
+                Mutability::Immutable,
+            );
+            Ok(Type::qubit(span))
+        }
+        QuantumOp::Measure(target) => {
+            let target_ty = infer_expr(checker, target)?;
+            unify::unify_types(checker, &target_ty, &Type::qubit(span))?;
+            // Mark qubit as moved
+            if let ExprKind::Var(ident) = &target.kind {
+                checker.env.move_var(ident, span)?;
+            }
+            Ok(Type::bool(span))
+        }
+        QuantumOp::ApplyGate(gate, args) => {
+            let arity = gate_arity(gate);
+            if let Some(expected) = arity {
+                if args.len() != expected {
+                    return Err(TypeError::ArgumentCountMismatch {
+                        expected,
+                        found: args.len(),
+                        span,
+                    });
+                }
+            }
+            for arg in args {
+                infer_expr(checker, arg)?;
+            }
+            Ok(Type::unit(span))
+        }
+        QuantumOp::Entangle(qubits) => {
+            for q in qubits {
+                let q_ty = infer_expr(checker, q)?;
+                unify::unify_types(checker, &q_ty, &Type::qubit(span))?;
+            }
+            Ok(Type::unit(span))
+        }
+        QuantumOp::Phase(a, b) | QuantumOp::Hamiltonian(a, b) => {
+            infer_expr(checker, a)?;
+            infer_expr(checker, b)?;
+            Ok(Type::unit(span))
+        }
+    }
+}
+
+/// Infer type ascription
+fn infer_ascribe(
+    checker: &mut TypeChecker,
+    expr: &Expr,
+    ty: &Type,
+    span: Span,
+) -> Result<Type, TypeError> {
+    let expr_ty = infer_expr(checker, expr)?;
+    unify::unify_types(checker, &expr_ty, ty)?;
+    Ok(ty.clone())
+}
+
+/// Infer range expression type
+fn infer_range(
+    checker: &mut TypeChecker,
+    lo: &Expr,
+    hi: &Expr,
+    span: Span,
+) -> Result<Type, TypeError> {
+    let lo_ty = infer_expr(checker, lo)?;
+    let hi_ty = infer_expr(checker, hi)?;
+
+    unify::unify_types(checker, &lo_ty, &Type::int_width(64, lo.span))?;
+    unify::unify_types(checker, &hi_ty, &Type::int_width(64, hi.span))?;
+
+    Ok(Type::new(TypeKind::Tuple(vec![Type::int_width(64, span), Type::int_width(64, span)]), Quantity::Many, span))
+}
+
+/// Infer async block type
+fn infer_async(
+    checker: &mut TypeChecker,
+    block: &Block,
+    span: Span,
+) -> Result<Type, TypeError> {
+    let _scope = checker.env.enter_scope();
+    for stmt in &block.stmts {
+        check_stmt(checker, stmt)?;
+    }
+    let ret_ty = if let Some(tail) = &block.expr {
+        infer_expr(checker, tail)?
+    } else {
+        Type::unit(span)
+    };
+    // Async returns a Future
+    Ok(Type::new(
+        TypeKind::Named(Ident::new("Future".to_string(), span), vec![TypeArg::Type(ret_ty)]),
+        Quantity::Many,
+        span,
+    ))
+}
+
+/// Infer await expression type
+fn infer_await(
+    checker: &mut TypeChecker,
+    expr: &Expr,
+    span: Span,
+) -> Result<Type, TypeError> {
+    let expr_ty = infer_expr(checker, expr)?;
+
+    // Extract inner type from Future
+    if let TypeKind::Named(name, args) = &expr_ty.kind {
+        if name.name == "Future" && !args.is_empty() {
+            if let TypeArg::Type(inner) = &args[0] {
+                return Ok(inner.clone());
+            }
+        }
+    }
+
+    Err(TypeError::TypeMismatch {
+        expected: Type::new(TypeKind::Named(Ident::new("Future".to_string(), span), Vec::new()), Quantity::Many, span),
+        found: expr_ty,
+        span,
+    })
+}
+
+/// Gate arity lookup
+fn gate_arity(gate: &GateKind) -> Option<usize> {
+    use crate::ast::expr::GateKind as G;
+    Some(match gate {
+        G::H | G::X | G::Y | G::Z | G::S | G::T | G::Reset => 1,
+        G::Crx(_) | G::Cry(_) | G::Crz(_) => 2,
+        G::Rxx(_) | G::Ryy(_) | G::Rzz(_) => 2,
+        G::Cphase(_) => 2,
+        G::Iswap | G::IswapDag => 2,
+        G::Cswap => 3,
+        G::CX | G::CY | G::CZ => 2,
+        G::RX(_) | G::RY(_) | G::RZ(_) => 1,
+        G::Custom(_) => return None,
+    })
+}

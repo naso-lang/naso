@@ -1,0 +1,171 @@
+//! Error types for the Naso type checker (Naso implementation)
+
+use crate::ast::{Ident, Quantity, Span, Type, MetaVar};
+use std::vec::Vec;
+use std::string::String;
+use std::option::Option;
+
+/// Type checker errors with span information
+pub enum TypeError {
+    VariableNotAvailable {
+        name: Ident,
+        reason: String,
+        span: Span,
+    },
+    LinearVariableUsedTwice {
+        name: Ident,
+        first_use: Span,
+        second_use: Span,
+    },
+    UseOfMovedValue {
+        name: Ident,
+        moved_at: Span,
+        used_at: Span,
+    },
+    InOutAliasing {
+        var: Ident,
+        existing_borrow: Ident,
+        existing_span: Span,
+        new_span: Span,
+    },
+    UnusedLinearVariable {
+        name: Ident,
+        defined_at: Span,
+    },
+    LinearNotConsumedOnAllPaths {
+        name: Ident,
+        consumed_on: Vec<usize>,
+        total: usize,
+        span: Span,
+    },
+    LinearConsumedUnderGuard {
+        span: Span,
+    },
+    TypeMismatch {
+        expected: Type,
+        found: Type,
+        span: Span,
+    },
+    OperatorNotDefinedOnType {
+        op: String,
+        ty: String,
+        span: Span,
+    },
+    QuantityMismatch {
+        expected: Quantity,
+        found: Quantity,
+        span: Span,
+    },
+    ArgumentCountMismatch {
+        expected: usize,
+        found: usize,
+        span: Span,
+    },
+    TypeArgumentCountMismatch {
+        name: Ident,
+        expected: usize,
+        found: usize,
+        span: Span,
+    },
+    QuantifiedBodyNotBool {
+        span: Span,
+    },
+    AssertOutsideProof {
+        span: Span,
+    },
+    InvalidCast {
+        from: Type,
+        to: Type,
+        span: Span,
+    },
+    FieldNotFound {
+        field: Ident,
+        ty: Type,
+        span: Span,
+    },
+    VariantNotFound {
+        enum_name: Ident,
+        variant_name: Ident,
+        span: Span,
+    },
+    NotAStruct {
+        name: Ident,
+        span: Span,
+    },
+    NotAFunction {
+        ty: Type,
+        span: Span,
+    },
+    NotIndexable {
+        ty: Type,
+        span: Span,
+    },
+    InOutRequiresUnique {
+        found_qty: Quantity,
+        span: Span,
+    },
+    OccursCheck {
+        meta_var: MetaVar,
+        ty: Type,
+        span: Span,
+    },
+    UndefinedType {
+        name: Ident,
+        span: Span,
+    },
+    ErasedVariableUsedAtRuntime {
+        name: Ident,
+        span: Span,
+    },
+    ImpureInReversible {
+        operation: String,
+        span: Span,
+    },
+    MissingUncompute {
+        name: Ident,
+        span: Span,
+    },
+    CyclicUncompute {
+        name: Ident,
+        span: Span,
+    },
+    QubitQuantityMismatch {
+        found: Quantity,
+        span: Span,
+    },
+    PatternTupleArityMismatch {
+        pattern_len: usize,
+        tuple_len: usize,
+        span: Span,
+    },
+    MeasureRequiresConsumeQubit {
+        span: Span,
+    },
+    EntangleRequiresConsumeQubits {
+        span: Span,
+    },
+    GenericMismatch {
+        message: String,
+        span: Span,
+    },
+    DependentTypeError {
+        message: String,
+        span: Span,
+    },
+    NonExhaustiveMatch {
+        span: Span,
+    },
+    ControlFlowOutsideLoop {
+        span: Span,
+    },
+    ReturnOutsideFunction {
+        span: Span,
+    },
+    InferenceError {
+        message: String,
+        span: Span,
+    },
+}
+
+/// Result type for type checking operations
+pub type TypeResult<T> = Result<T, TypeError>;

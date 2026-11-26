@@ -1,0 +1,438 @@
+//! Naso Type Checker (Naso implementation)
+//!
+//! Bidirectional type checker with Quantitative Type Theory (QTT) support:
+//! - Quantity tracking: [0] erased, [1] linear, [N] bounded, [*] unrestricted
+//! - Mutable value semantics: inout (unique mutable projection), consume (linear move)
+//! - Dependent types: Pi/Sigma, Nat expressions
+//! - Reversible computation with uncomputation verification
+//! - Quantum linearity: Qubit/QRegister are always [1]
+
+pub mod check;
+pub mod constraints;
+pub mod error;
+pub mod inference;
+pub mod type_env;
+pub mod unify;
+
+#[cfg(test)]
+pub mod tests;
+
+pub use error::TypeError;
+pub use error::TypeResult;
+
+use crate::ast::*;
+use crate::typecheck::type_env::TypeEnv;
+use crate::typecheck::constraints::ConstraintSet;
+use crate::typecheck::unify::MetaVar;
+use std::collections::IndexMap;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Metavariable supply for type inference
+static META_VAR_SUPPLY: AtomicU32 = AtomicU32::new(0);
+
+/// Generate a fresh metavariable
+pub fn fresh_meta_var() -> MetaVar {
+    MetaVar(META_VAR_SUPPLY.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Generate a fresh type variable
+pub fn fresh_type_var() -> TypeVar {
+    TypeVar(META_VAR_SUPPLY.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Bidirectional typing mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Check mode: expression checks against expected type
+    Check,
+    /// Infer mode: expression synthesizes its type
+    Infer,
+}
+
+/// Type checker state
+pub struct TypeChecker {
+    /// Type environment with quantity/mutability tracking
+    pub env: TypeEnv,
+    /// Metavariable store
+    pub meta_vars: IndexMap<MetaVar, Option<Type>>,
+    /// Quantity constraints to solve
+    pub qty_constraints: ConstraintSet,
+    /// Current typing mode
+    pub mode: Mode,
+    /// Errors accumulated during checking
+    pub errors: Vec<error::TypeError>,
+    /// Whether we're inside a reversible block (affects purity checks)
+    pub in_reversible: bool,
+    /// Whether we're inside a `proof { .. }` block.
+    pub in_proof: bool,
+    /// Current function signature being checked (for return type)
+    pub current_fn_ret: Option<Type>,
+}
+
+impl TypeChecker {
+    /// Create a new type checker with empty environment
+    pub fn new() -> Self {
+        Self {
+            env: TypeEnv::new(),
+            meta_vars: IndexMap::new(),
+            qty_constraints: ConstraintSet::new(),
+            mode: Mode::Infer,
+            errors: Vec::new(),
+            in_reversible: false,
+            in_proof: false,
+            current_fn_ret: None,
+        }
+    }
+
+    /// Create a type checker with a pre-populated environment
+    pub fn with_env(env: TypeEnv) -> Self {
+        Self {
+            env,
+            meta_vars: IndexMap::new(),
+            qty_constraints: ConstraintSet::new(),
+            mode: Mode::Infer,
+            errors: Vec::new(),
+            in_reversible: false,
+            in_proof: false,
+            current_fn_ret: None,
+        }
+    }
+
+    /// Enter check mode with expected type
+    pub fn check_expr(&mut self, expr: &Expr, expected: &Type) -> Result<(), error::TypeError> {
+        let prev_mode = self.mode;
+        self.mode = Mode::Check;
+        let result = check::check_expr(self, expr, expected);
+        self.mode = prev_mode;
+        result
+    }
+
+    /// Enter infer mode to synthesize type
+    pub fn infer_expr(&mut self, expr: &Expr) -> Result<Type, error::TypeError> {
+        let prev_mode = self.mode;
+        self.mode = Mode::Infer;
+        let result = inference::infer_expr(self, expr);
+        self.mode = prev_mode;
+        result
+    }
+
+    /// Check a statement
+    pub fn check_stmt(&mut self, stmt: &Stmt) -> Result<(), error::TypeError> {
+        check::check_stmt(self, stmt)
+    }
+
+    /// Check a block
+    pub fn check_block(&mut self, block: &Block, expected_ret: Option<&Type>) -> Result<(), error::TypeError> {
+        check::check_block(self, block, expected_ret)
+    }
+
+    /// Check a function definition
+    pub fn check_function(&mut self, func: &Function) -> Result<(), error::TypeError> {
+        check::check_function(self, func)
+    }
+
+    /// Check a pattern against a scrutinee type
+    pub fn check_pattern(
+        &mut self,
+        pattern: &Pattern,
+        scrutinee_ty: &Type,
+    ) -> Result<crate::typecheck::type_env::PatternBindings, error::TypeError> {
+        check::check_pattern(self, pattern, scrutinee_ty)
+    }
+
+    /// Add a quantity constraint
+    pub fn add_qty_constraint(&mut self, constraint: crate::typecheck::constraints::QtyConstraint) {
+        self.qty_constraints.add(constraint);
+    }
+
+    /// Solve all accumulated constraints
+    pub fn solve_constraints(&mut self) -> Result<(), error::TypeError> {
+        constraints::solve(
+            &mut self.qty_constraints,
+            &mut self.env,
+            &mut self.meta_vars,
+        )
+    }
+
+    /// Register a metavariable with optional solution
+    pub fn register_meta(&mut self, mv: MetaVar, solution: Option<Type>) {
+        self.meta_vars.insert(mv, solution);
+    }
+
+    /// Lookup a metavariable solution
+    pub fn lookup_meta(&self, mv: &MetaVar) -> Option<&Option<Type>> {
+        self.meta_vars.get(mv)
+    }
+
+    /// Report an error
+    pub fn error(&mut self, err: error::TypeError) {
+        self.errors.push(err);
+    }
+
+    /// Check if any errors have been reported
+    pub fn has_errors(&self) -> bool {
+        !self.errors.is_empty()
+    }
+
+    /// Take all errors
+    pub fn take_errors(&mut self) -> Vec<error::TypeError> {
+        let mut errors = Vec::new();
+        std::mem::swap(&mut self.errors, &mut errors);
+        errors
+    }
+}
+
+impl Default for TypeChecker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Check a whole program
+pub fn check_program(program: &Program) -> Result<(), error::TypeError> {
+    let mut checker = TypeChecker::new();
+    load_prelude(&mut checker.env);
+
+    for item in &program.items {
+        check_item(&mut checker, item)?;
+    }
+
+    // Solve all constraints
+    checker.solve_constraints()?;
+
+    if checker.has_errors() {
+        Err(checker.take_errors().into_iter().next().unwrap())
+    } else {
+        Ok(())
+    }
+}
+
+/// Load the standard library prelude into the type environment
+fn load_prelude(env: &mut TypeEnv) {
+    use crate::ast::{
+        Block, Function, Ident, Param, Quantity, Span, Type, TypeDef, TypeDefKind, TypeKind,
+    };
+
+    /// Configuration for a prelude function
+    struct PreludeFn {
+        name: &'static str,
+        params: Vec<Param>,
+        ret_ty: Option<Type>,
+        quantity: Quantity,
+        is_reversible: bool,
+    }
+
+    // Add built-in types
+    let span = Span::default();
+
+    // Add Qubit type
+    env.insert_type_def(TypeDef {
+        name: Ident::new("Qubit".to_string(), span),
+        generics: Vec::new(),
+        kind: TypeDefKind::Alias(Type::qubit(span)),
+        span,
+        attributes: Vec::new(),
+    });
+
+    // Add QRegister type
+    env.insert_type_def(TypeDef {
+        name: Ident::new("QRegister".to_string(), span),
+        generics: Vec::new(),
+        kind: TypeDefKind::Alias(Type::qregister(Vec::new(), span)),
+        span,
+        attributes: Vec::new(),
+    });
+
+    // Add Tensor type
+    env.insert_type_def(TypeDef {
+        name: Ident::new("Tensor".to_string(), span),
+        generics: Vec::new(),
+        kind: TypeDefKind::Alias(Type::tensor(Vec::new(), span)),
+        span,
+        attributes: Vec::new(),
+    });
+
+    // Add standard library functions as extern declarations
+    // qalloc()
+    let qalloc = Function {
+        name: Ident::new("qalloc".to_string(), span),
+        generics: Vec::new(),
+        params: Vec::new(),
+        ret_ty: Some(Type::qubit(span)),
+        body: Block::new(Vec::new(), None, span),
+        span,
+        attributes: Vec::new(),
+        is_reversible: false,
+        is_async: false,
+        quantity: Quantity::Many,
+        requires: Vec::new(),
+    };
+    env.insert_function(qalloc);
+
+    // measure(q: Qubit) -> bool
+    let measure = Function {
+        name: Ident::new("measure".to_string(), span),
+        generics: Vec::new(),
+        params: vec![Param {
+            name: Ident::new("q".to_string(), span),
+            ty: Type::qubit(span),
+            quantity: Quantity::One,
+            mutability: Mutability::Consume,
+            span,
+        }],
+        ret_ty: Some(Type::bool(span)),
+        body: Block::new(Vec::new(), None, span),
+        span,
+        attributes: Vec::new(),
+        is_reversible: false,
+        is_async: false,
+        quantity: Quantity::Many,
+        requires: Vec::new(),
+    };
+    env.insert_function(measure);
+
+    // hadamard(q: Qubit) -> ()
+    let hadamard = Function {
+        name: Ident::new("hadamard".to_string(), span),
+        generics: Vec::new(),
+        params: vec![Param {
+            name: Ident::new("q".to_string(), span),
+            ty: Type::qubit(span),
+            quantity: Quantity::One,
+            mutability: Mutability::InOut,
+            span,
+        }],
+        ret_ty: Some(Type::unit(span)),
+        body: Block::new(Vec::new(), None, span),
+        span,
+        attributes: Vec::new(),
+        is_reversible: false,
+        is_async: false,
+        quantity: Quantity::Many,
+        requires: Vec::new(),
+    };
+    env.insert_function(hadamard);
+
+    // cnot(q1: Qubit, q2: Qubit) -> ()
+    let cnot = Function {
+        name: Ident::new("cnot".to_string(), span),
+        generics: Vec::new(),
+        params: vec![
+            Param {
+                name: Ident::new("ctrl".to_string(), span),
+                ty: Type::qubit(span),
+                quantity: Quantity::One,
+                mutability: Mutability::InOut,
+                span,
+            },
+            Param {
+                name: Ident::new("target".to_string(), span),
+                ty: Type::qubit(span),
+                quantity: Quantity::One,
+                mutability: Mutability::InOut,
+                span,
+            },
+        ],
+        ret_ty: Some(Type::unit(span)),
+        body: Block::new(Vec::new(), None, span),
+        span,
+        attributes: Vec::new(),
+        is_reversible: false,
+        is_async: false,
+        quantity: Quantity::Many,
+        requires: Vec::new(),
+    };
+    env.insert_function(cnot);
+
+    // entangle(qs: [Qubit; N]) -> ()
+    let entangle = Function {
+        name: Ident::new("entangle".to_string(), span),
+        generics: Vec::new(),
+        params: vec![Param {
+            name: Ident::new("qs".to_string(), span),
+            ty: Type::new(TypeKind::Array(Box::new(Type::qubit(span)), Some(NatExpr::Lit(2))), Quantity::One, span),
+            quantity: Quantity::One,
+            mutability: Mutability::Consume,
+            span,
+        }],
+        ret_ty: Some(Type::unit(span)),
+        body: Block::new(Vec::new(), None, span),
+        span,
+        attributes: Vec::new(),
+        is_reversible: false,
+        is_async: false,
+        quantity: Quantity::Many,
+        requires: Vec::new(),
+    };
+    env.insert_function(entangle);
+
+    // assert(cond: bool) -> ()
+    let assert_fn = Function {
+        name: Ident::new("assert".to_string(), span),
+        generics: Vec::new(),
+        params: vec![Param {
+            name: Ident::new("cond".to_string(), span),
+            ty: Type::bool(span),
+            quantity: Quantity::Many,
+            mutability: Mutability::Immutable,
+            span,
+        }],
+        ret_ty: Some(Type::unit(span)),
+        body: Block::new(Vec::new(), None, span),
+        span,
+        attributes: Vec::new(),
+        is_reversible: false,
+        is_async: false,
+        quantity: Quantity::Many,
+        requires: Vec::new(),
+    };
+    env.insert_function(assert_fn);
+
+    // Integer arithmetic functions
+    for (name, op_name) in [
+        ("add", "+"), ("sub", "-"), ("mul", "*"), ("div", "/"), ("rem", "%"),
+    ] {
+        let fn_item = Function {
+            name: Ident::new(name.to_string(), span),
+            generics: Vec::new(),
+            params: vec![
+                Param {
+                    name: Ident::new("a".to_string(), span),
+                    ty: Type::int_width(64, span),
+                    quantity: Quantity::Many,
+                    mutability: Mutability::Immutable,
+                    span,
+                },
+                Param {
+                    name: Ident::new("b".to_string(), span),
+                    ty: Type::int_width(64, span),
+                    quantity: Quantity::Many,
+                    mutability: Mutability::Immutable,
+                    span,
+                },
+            ],
+            ret_ty: Some(Type::int_width(64, span)),
+            body: Block::new(Vec::new(), None, span),
+            span,
+            attributes: Vec::new(),
+            is_reversible: false,
+            is_async: false,
+            quantity: Quantity::Many,
+            requires: Vec::new(),
+        };
+        env.insert_function(fn_item);
+    }
+}
+
+fn check_item(checker: &mut TypeChecker, item: &Item) -> Result<(), error::TypeError> {
+    match item {
+        Item::Function(func) => check::check_function(checker, func),
+        Item::TypeDef(type_def) => check::check_type_def(checker, type_def),
+        Item::Trait(trait_def) => check::check_trait_def(checker, trait_def),
+        Item::Impl(trait_impl) => check::check_trait_impl(checker, trait_impl),
+        Item::Module(module) => check::check_module(checker, module),
+        Item::Import(_) => Ok(()),
+        Item::Const(const_def) => check::check_const(checker, const_def),
+        Item::Extern(_) => Ok(()),
+    }
+}

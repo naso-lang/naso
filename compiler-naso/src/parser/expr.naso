@@ -1,0 +1,608 @@
+//! Expression parser for Naso (Naso implementation)
+
+use crate::ast::*;
+use crate::lexer::{Token, TokenKind as TK};
+use crate::parser::Parser;
+
+pub fn parse_expr(parser: &mut Parser) -> Result<Expr, crate::parser::ParseError> {
+    parse_assignment(parser)
+}
+
+fn parse_assignment(parser: &mut Parser) -> Result<Expr, crate::parser::ParseError> {
+    let left = parse_logical_or(parser)?;
+
+    if parser.check(TK::Assign) {
+        parser.advance();
+        let right = parse_assignment(parser)?;
+        let span = left.span.merge(right.span);
+        return Ok(Expr::new(
+            ExprKind::Assign(Box::new(left), Box::new(right)),
+            span,
+            parser.id_gen.next_id(),
+        ));
+    }
+
+    Ok(left)
+}
+
+fn parse_logical_or(parser: &mut Parser) -> Result<Expr, crate::parser::ParseError> {
+    let mut left = parse_logical_and(parser)?;
+
+    while parser.check(TK::OrOr) {
+        parser.advance();
+        let right = parse_logical_and(parser)?;
+        let span = left.span.merge(right.span);
+        left = Expr::new(
+            ExprKind::Binary(BinOp::Or, Box::new(left), Box::new(right)),
+            span,
+            parser.id_gen.next_id(),
+        );
+    }
+
+    Ok(left)
+}
+
+fn parse_logical_and(parser: &mut Parser) -> Result<Expr, crate::parser::ParseError> {
+    let mut left = parse_equality(parser)?;
+
+    while parser.check(TK::AndAnd) {
+        parser.advance();
+        let right = parse_equality(parser)?;
+        let span = left.span.merge(right.span);
+        left = Expr::new(
+            ExprKind::Binary(BinOp::And, Box::new(left), Box::new(right)),
+            span,
+            parser.id_gen.next_id(),
+        );
+    }
+
+    Ok(left)
+}
+
+fn parse_equality(parser: &mut Parser) -> Result<Expr, crate::parser::ParseError> {
+    let mut left = parse_comparison(parser)?;
+
+    while matches!(parser.current_kind(), Some(TK::Eq | TK::Ne)) {
+        let op = match parser.current_kind() {
+            Some(TK::Eq) => BinOp::Eq,
+            Some(TK::Ne) => BinOp::Ne,
+            _ => unreachable!(),
+        };
+        parser.advance();
+        let right = parse_comparison(parser)?;
+        let span = left.span.merge(right.span);
+        left = Expr::new(
+            ExprKind::Binary(op, Box::new(left), Box::new(right)),
+            span,
+            parser.id_gen.next_id(),
+        );
+    }
+
+    Ok(left)
+}
+
+fn parse_comparison(parser: &mut Parser) -> Result<Expr, crate::parser::ParseError> {
+    let mut left = parse_additive(parser)?;
+
+    while matches!(parser.current_kind(), Some(TK::Lt | TK::Le | TK::Gt | TK::Ge)) {
+        let op = match parser.current_kind() {
+            Some(TK::Lt) => BinOp::Lt,
+            Some(TK::Le) => BinOp::Le,
+            Some(TK::Gt) => BinOp::Gt,
+            Some(TK::Ge) => BinOp::Ge,
+            _ => unreachable!(),
+        };
+        parser.advance();
+        let right = parse_additive(parser)?;
+        let span = left.span.merge(right.span);
+        left = Expr::new(
+            ExprKind::Binary(op, Box::new(left), Box::new(right)),
+            span,
+            parser.id_gen.next_id(),
+        );
+    }
+
+    Ok(left)
+}
+
+fn parse_additive(parser: &mut Parser) -> Result<Expr, crate::parser::ParseError> {
+    let mut left = parse_multiplicative(parser)?;
+
+    while matches!(parser.current_kind(), Some(TK::Plus | TK::Minus)) {
+        let op = match parser.current_kind() {
+            Some(TK::Plus) => BinOp::Add,
+            Some(TK::Minus) => BinOp::Sub,
+            _ => unreachable!(),
+        };
+        parser.advance();
+        let right = parse_multiplicative(parser)?;
+        let span = left.span.merge(right.span);
+        left = Expr::new(
+            ExprKind::Binary(op, Box::new(left), Box::new(right)),
+            span,
+            parser.id_gen.next_id(),
+        );
+    }
+
+    Ok(left)
+}
+
+fn parse_multiplicative(parser: &mut Parser) -> Result<Expr, crate::parser::ParseError> {
+    let mut left = parse_unary(parser)?;
+
+    while matches!(parser.current_kind(), Some(TK::Star | TK::Slash | TK::Percent)) {
+        let op = match parser.current_kind() {
+            Some(TK::Star) => BinOp::Mul,
+            Some(TK::Slash) => BinOp::Div,
+            Some(TK::Percent) => BinOp::Rem,
+            _ => unreachable!(),
+        };
+        parser.advance();
+        let right = parse_unary(parser)?;
+        let span = left.span.merge(right.span);
+        left = Expr::new(
+            ExprKind::Binary(op, Box::new(left), Box::new(right)),
+            span,
+            parser.id_gen.next_id(),
+        );
+    }
+
+    Ok(left)
+}
+
+fn parse_unary(parser: &mut Parser) -> Result<Expr, crate::parser::ParseError> {
+    if let Some(token) = parser.current_token() {
+        let op = match &token.kind {
+            TK::Not => UnOp::Not,
+            TK::Minus => UnOp::Neg,
+            TK::Amp => UnOp::InOut,
+            TK::Star => UnOp::Deref,
+            _ => return parse_postfix(parser),
+        };
+        parser.advance();
+        let operand = parse_unary(parser)?;
+        let span = token.span.merge(operand.span);
+        return Ok(Expr::new(
+            ExprKind::Unary(op, Box::new(operand)),
+            span,
+            parser.id_gen.next_id(),
+        ));
+    }
+    parse_postfix(parser)
+}
+
+fn parse_postfix(parser: &mut Parser) -> Result<Expr, crate::parser::ParseError> {
+    let mut expr = parse_primary(parser)?;
+
+    loop {
+        if parser.check(TK::LParen) {
+            // Function call
+            parser.advance();
+            let mut args = Vec::new();
+            while !parser.check(TK::RParen) && !parser.is_eof() {
+                args.push(parser.parse_expr()?);
+                if parser.check(TK::Comma) {
+                    parser.advance();
+                }
+            }
+            parser.expect(TK::RParen)?;
+            let span = expr.span.merge(parser.current_span().unwrap_or(expr.span));
+            expr = Expr::new(
+                ExprKind::Call(Box::new(expr), args),
+                span,
+                parser.id_gen.next_id(),
+            );
+        } else if parser.check(TK::Dot) {
+            parser.advance();
+            if let Some(TK::Ident(name)) = parser.current_kind() {
+                let ident = parser.parse_ident()?;
+                if parser.check(TK::LParen) {
+                    // Method call
+                    parser.advance();
+                    let mut args = Vec::new();
+                    while !parser.check(TK::RParen) && !parser.is_eof() {
+                        args.push(parser.parse_expr()?);
+                        if parser.check(TK::Comma) {
+                            parser.advance();
+                        }
+                    }
+                    parser.expect(TK::RParen)?;
+                    let span = expr.span.merge(parser.current_span().unwrap_or(expr.span));
+                    expr = Expr::new(
+                        ExprKind::MethodCall(Box::new(expr), ident, args),
+                        span,
+                        parser.id_gen.next_id(),
+                    );
+                } else {
+                    // Field access
+                    let span = expr.span.merge(ident.span);
+                    expr = Expr::new(
+                        ExprKind::Field(Box::new(expr), ident),
+                        span,
+                        parser.id_gen.next_id(),
+                    );
+                }
+            }
+        } else if parser.check(TK::LBracket) {
+            // Index access
+            parser.advance();
+            let index = parser.parse_expr()?;
+            parser.expect(TK::RBracket)?;
+            let span = expr.span.merge(index.span);
+            expr = Expr::new(
+                ExprKind::Index(Box::new(expr), Box::new(index)),
+                span,
+                parser.id_gen.next_id(),
+            );
+        } else if parser.check(TK::As) {
+            // Type ascription
+            parser.advance();
+            let ty = parser.parse_type()?;
+            let span = expr.span.merge(ty.span);
+            expr = Expr::new(
+                ExprKind::Ascribe(Box::new(expr), ty),
+                span,
+                parser.id_gen.next_id(),
+            );
+        } else {
+            break;
+        }
+    }
+
+    Ok(expr)
+}
+
+fn parse_primary(parser: &mut Parser) -> Result<Expr, crate::parser::ParseError> {
+    let span = parser.current_span().unwrap_or(Span::new(0, 0, 1, 1));
+
+    match parser.current_kind() {
+        Some(TK::Int(val)) => {
+            parser.advance();
+            Ok(Expr::new(ExprKind::Literal(Literal::Int(val)), span, parser.id_gen.next_id()))
+        }
+        Some(TK::Float(val)) => {
+            parser.advance();
+            Ok(Expr::new(ExprKind::Literal(Literal::Float(val)), span, parser.id_gen.next_id()))
+        }
+        Some(TK::Bool(val)) => {
+            parser.advance();
+            Ok(Expr::new(ExprKind::Literal(Literal::Bool(val)), span, parser.id_gen.next_id()))
+        }
+        Some(TK::Str(val)) => {
+            parser.advance();
+            Ok(Expr::new(ExprKind::Literal(Literal::String(val)), span, parser.id_gen.next_id()))
+        }
+        Some(TK::Char(val)) => {
+            parser.advance();
+            Ok(Expr::new(ExprKind::Literal(Literal::Char(val)), span, parser.id_gen.next_id()))
+        }
+        Some(TK::Ident(_)) | Some(TK::TypeIdent(_)) => {
+            let ident = parser.parse_ident()?;
+            Ok(Expr::new(ExprKind::Var(ident), ident.span, parser.id_gen.next_id()))
+        }
+        Some(TK::LParen) => {
+            parser.advance();
+            let expr = parser.parse_expr()?;
+            parser.expect(TK::RParen)?;
+            Ok(expr)
+        }
+        Some(TK::LBrace) => {
+            // Block expression
+            let block = parser.parse_block()?;
+            Ok(Expr::new(ExprKind::Block(Box::new(block)), block.span, parser.id_gen.next_id()))
+        }
+        Some(TK::If) => parse_if_expr(parser),
+        Some(TK::Match) => parse_match_expr(parser),
+        Some(TK::Let) => parse_let_expr(parser),
+        Some(TK::Reversible) => parse_reversible_expr(parser),
+        Some(TK::Async) => parse_async_expr(parser),
+        Some(TK::Await) => parse_await_expr(parser),
+        Some(TK::For) => parse_for_expr(parser),
+        Some(TK::Forall) => parse_forall_expr(parser),
+        Some(TK::While) => parse_while_expr(parser),
+        Some(TK::Loop) => parse_loop_expr(parser),
+        Some(TK::Return) => parse_return_expr(parser),
+        Some(TK::Break) => parse_break_expr(parser),
+        Some(TK::Continue) => {
+            parser.advance();
+            Ok(Expr::new(ExprKind::Continue, span, parser.id_gen.next_id()))
+        }
+        Some(TK::QAlloc) => parse_qalloc_expr(parser),
+        Some(TK::Measure) => parse_measure_expr(parser),
+        Some(TK::Hadamard) | Some(TK::CNot) | Some(TK::Rz) | Some(TK::Gate) => parse_quantum_op(parser),
+        _ => {
+            Err(crate::parser::ParseError {
+                message: format!("expected expression, found {:?}", parser.current_kind()),
+                span,
+            })
+        }
+    }
+}
+
+fn parse_if_expr(parser: &mut Parser) -> Result<Expr, crate::parser::ParseError> {
+    let start_span = parser.current_span().unwrap_or(Span::new(0, 0, 1, 1));
+    parser.advance(); // if
+    let cond = parser.parse_expr()?;
+    let then_branch = parser.parse_expr()?;
+    let else_branch = if parser.check(TK::Else) {
+        parser.advance();
+        Some(Box::new(parser.parse_expr()?))
+    } else {
+        None
+    };
+    let span = start_span.merge(parser.current_span().unwrap_or(start_span));
+    Ok(Expr::new(
+        ExprKind::If(Box::new(cond), Box::new(then_branch), else_branch),
+        span,
+        parser.id_gen.next_id(),
+    ))
+}
+
+fn parse_match_expr(parser: &mut Parser) -> Result<Expr, crate::parser::ParseError> {
+    let start_span = parser.current_span().unwrap_or(Span::new(0, 0, 1, 1));
+    parser.advance(); // match
+    let scrutinee = parser.parse_expr()?;
+    parser.expect(TK::LBrace)?;
+    let mut arms = Vec::new();
+    while !parser.check(TK::RBrace) && !parser.is_eof() {
+        // Simplified arm parsing
+        let pattern = Pattern::new(
+            PatternKind::Wildcard,
+            parser.current_span().unwrap_or(Span::new(0, 0, 1, 1)),
+            parser.id_gen.next_id(),
+        );
+        parser.expect(TK::FatArrow)?;
+        let body = parser.parse_expr()?;
+        arms.push(MatchArm {
+            pattern,
+            guard: None,
+            body,
+            span: parser.current_span().unwrap_or(Span::new(0, 0, 1, 1)),
+        });
+        if parser.check(TK::Comma) {
+            parser.advance();
+        }
+    }
+    parser.expect(TK::RBrace)?;
+    let span = start_span.merge(parser.current_span().unwrap_or(start_span));
+    Ok(Expr::new(
+        ExprKind::Match(Box::new(scrutinee), arms),
+        span,
+        parser.id_gen.next_id(),
+    ))
+}
+
+fn parse_let_expr(parser: &mut Parser) -> Result<Expr, crate::parser::ParseError> {
+    let start_span = parser.current_span().unwrap_or(Span::new(0, 0, 1, 1));
+    parser.advance(); // let
+    let name = parser.parse_ident()?;
+    let ty = if parser.check(TK::Colon) {
+        parser.advance();
+        Some(parser.parse_type()?)
+    } else {
+        None
+    };
+    parser.expect(TK::Assign)?;
+    let value = parser.parse_expr()?;
+    let span = start_span.merge(parser.current_span().unwrap_or(start_span));
+    Ok(Expr::new(
+        ExprKind::Let(Box::new(LetBinding {
+            name,
+            ty,
+            quantity: Quantity::Many,
+            mutability: Mutability::Immutable,
+            value,
+            span: start_span,
+        })),
+        span,
+        parser.id_gen.next_id(),
+    ))
+}
+
+fn parse_reversible_expr(parser: &mut Parser) -> Result<Expr, crate::parser::ParseError> {
+    let start_span = parser.current_span().unwrap_or(Span::new(0, 0, 1, 1));
+    parser.advance(); // reversible
+    let rev_block = parser.parse_reversible_block()?;
+    let span = start_span.merge(rev_block.span);
+    Ok(Expr::new(
+        ExprKind::Reversible(Box::new(rev_block)),
+        span,
+        parser.id_gen.next_id(),
+    ))
+}
+
+fn parse_async_expr(parser: &mut Parser) -> Result<Expr, crate::parser::ParseError> {
+    let start_span = parser.current_span().unwrap_or(Span::new(0, 0, 1, 1));
+    parser.advance(); // async
+    let block = parser.parse_block()?;
+    let span = start_span.merge(block.span);
+    Ok(Expr::new(
+        ExprKind::Async(Box::new(block)),
+        span,
+        parser.id_gen.next_id(),
+    ))
+}
+
+fn parse_await_expr(parser: &mut Parser) -> Result<Expr, crate::parser::ParseError> {
+    let start_span = parser.current_span().unwrap_or(Span::new(0, 0, 1, 1));
+    parser.advance(); // await
+    let expr = parser.parse_expr()?;
+    let span = start_span.merge(expr.span);
+    Ok(Expr::new(
+        ExprKind::Await(Box::new(expr)),
+        span,
+        parser.id_gen.next_id(),
+    ))
+}
+
+fn parse_for_expr(parser: &mut Parser) -> Result<Expr, crate::parser::ParseError> {
+    let start_span = parser.current_span().unwrap_or(Span::new(0, 0, 1, 1));
+    parser.advance(); // for
+    let var = parser.parse_ident()?;
+    parser.expect(TK::In)?;
+    let iter = parser.parse_expr()?;
+    let body = parser.parse_block()?;
+    let span = start_span.merge(body.span);
+    Ok(Expr::new(
+        ExprKind::For(Box::new(ForLoop {
+            var,
+            iter,
+            body,
+            span: start_span,
+        })),
+        span,
+        parser.id_gen.next_id(),
+    ))
+}
+
+fn parse_forall_expr(parser: &mut Parser) -> Result<Expr, crate::parser::ParseError> {
+    let start_span = parser.current_span().unwrap_or(Span::new(0, 0, 1, 1));
+    parser.advance(); // forall
+    let mut bindings = Vec::new();
+    while !parser.check(TK::LBrace) && !parser.is_eof() {
+        let var = parser.parse_ident()?;
+        parser.expect(TK::In)?;
+        let lower = parser.parse_expr()?;
+        parser.expect(TK::DotDot)?;
+        let upper = parser.parse_expr()?;
+        bindings.push((var, lower, upper));
+        if parser.check(TK::Comma) {
+            parser.advance();
+        }
+    }
+    let body = parser.parse_block()?;
+    let span = start_span.merge(body.span);
+    Ok(Expr::new(
+        ExprKind::Forall(Box::new(ForallLoop {
+            bindings,
+            body,
+            span: start_span,
+        })),
+        span,
+        parser.id_gen.next_id(),
+    ))
+}
+
+fn parse_while_expr(parser: &mut Parser) -> Result<Expr, crate::parser::ParseError> {
+    let start_span = parser.current_span().unwrap_or(Span::new(0, 0, 1, 1));
+    parser.advance(); // while
+    let cond = parser.parse_expr()?;
+    let body = parser.parse_expr()?; // While body is an expression
+    let span = start_span.merge(body.span);
+    Ok(Expr::new(
+        ExprKind::While(Box::new(cond), Box::new(body)),
+        span,
+        parser.id_gen.next_id(),
+    ))
+}
+
+fn parse_loop_expr(parser: &mut Parser) -> Result<Expr, crate::parser::ParseError> {
+    let start_span = parser.current_span().unwrap_or(Span::new(0, 0, 1, 1));
+    parser.advance(); // loop
+    let body = parser.parse_block()?;
+    let span = start_span.merge(body.span);
+    Ok(Expr::new(
+        ExprKind::Loop(Box::new(body)),
+        span,
+        parser.id_gen.next_id(),
+    ))
+}
+
+fn parse_return_expr(parser: &mut Parser) -> Result<Expr, crate::parser::ParseError> {
+    let start_span = parser.current_span().unwrap_or(Span::new(0, 0, 1, 1));
+    parser.advance(); // return
+    let expr = if !parser.check(TK::Semicolon) && !parser.check(TK::RBrace) {
+        Some(Box::new(parser.parse_expr()?))
+    } else {
+        None
+    };
+    let span = start_span.merge(parser.current_span().unwrap_or(start_span));
+    Ok(Expr::new(
+        ExprKind::Return(expr),
+        span,
+        parser.id_gen.next_id(),
+    ))
+}
+
+fn parse_break_expr(parser: &mut Parser) -> Result<Expr, crate::parser::ParseError> {
+    let start_span = parser.current_span().unwrap_or(Span::new(0, 0, 1, 1));
+    parser.advance(); // break
+    let expr = if !parser.check(TK::Semicolon) && !parser.check(TK::RBrace) {
+        Some(Box::new(parser.parse_expr()?))
+    } else {
+        None
+    };
+    let span = start_span.merge(parser.current_span().unwrap_or(start_span));
+    Ok(Expr::new(
+        ExprKind::Break(expr),
+        span,
+        parser.id_gen.next_id(),
+    ))
+}
+
+fn parse_qalloc_expr(parser: &mut Parser) -> Result<Expr, crate::parser::ParseError> {
+    let start_span = parser.current_span().unwrap_or(Span::new(0, 0, 1, 1));
+    parser.advance(); // qalloc
+    parser.expect(TK::LParen)?;
+    parser.expect(TK::RParen)?;
+    // Would parse qalloc arguments
+    let ident = Ident::new("q".to_string(), start_span);
+    Ok(Expr::new(
+        ExprKind::QuantumOp(QuantumOp::Alloc(ident)),
+        start_span,
+        parser.id_gen.next_id(),
+    ))
+}
+
+fn parse_measure_expr(parser: &mut Parser) -> Result<Expr, crate::parser::ParseError> {
+    let start_span = parser.current_span().unwrap_or(Span::new(0, 0, 1, 1));
+    parser.advance(); // measure
+    parser.expect(TK::LParen)?;
+    let expr = parser.parse_expr()?;
+    parser.expect(TK::RParen)?;
+    let span = start_span.merge(expr.span);
+    Ok(Expr::new(
+        ExprKind::QuantumOp(QuantumOp::Measure(Box::new(expr))),
+        span,
+        parser.id_gen.next_id(),
+    ))
+}
+
+fn parse_quantum_op(parser: &mut Parser) -> Result<Expr, crate::parser::ParseError> {
+    // Simplified quantum operation parsing
+    let start_span = parser.current_span().unwrap_or(Span::new(0, 0, 1, 1));
+    let gate = match parser.current_kind() {
+        Some(TK::Hadamard) => { parser.advance(); GateKind::H }
+        Some(TK::CNot) => { parser.advance(); GateKind::CX }
+        Some(TK::Rz) => { parser.advance(); GateKind::RZ(Box::new(Expr::new(ExprKind::Literal(Literal::Float(0.0)), start_span, parser.id_gen.next_id()))) }
+        _ => { parser.advance(); GateKind::H }
+    };
+    parser.expect(TK::LParen)?;
+    let mut args = Vec::new();
+    while !parser.check(TK::RParen) && !parser.is_eof() {
+        args.push(parser.parse_expr()?);
+        if parser.check(TK::Comma) {
+            parser.advance();
+        }
+    }
+    parser.expect(TK::RParen)?;
+    let span = start_span.merge(parser.current_span().unwrap_or(start_span));
+    Ok(Expr::new(
+        ExprKind::QuantumOp(QuantumOp::ApplyGate(gate, args)),
+        span,
+        parser.id_gen.next_id(),
+    ))
+}
+
+// Forward declarations
+pub enum BinOp;
+pub enum UnOp;
+pub enum ExprKind;
+pub enum PatternKind;
+pub enum MatchArm;
+pub enum LetBinding;
+pub enum ReversibleBlock;
+pub enum ForLoop;
+pub enum ForallLoop;
+pub enum QuantumOp;
+pub enum GateKind;

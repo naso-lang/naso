@@ -51,7 +51,7 @@ pub enum ExprKind {
     /// Unary operation
     Unary(UnOp, Box<Expr>),
     /// Function call
-    Call(Box<Expr>, Vec<Expr>, Vec<Expr>),
+    Call(Box<Expr>, Vec<Expr>),
     /// Method call
     MethodCall(Box<Expr>, Ident, Vec<Expr>),
     /// Field access
@@ -368,15 +368,25 @@ pub enum GateKind {
     CX,
     CY,
     CZ,
+    /// Controlled rotations (RX, RY, RZ with control qubit)
+    Crx(Box<Expr>),
+    Cry(Box<Expr>),
+    Crz(Box<Expr>),
+    /// Two-qubit Ising couplings
+    Rxx(Box<Expr>),
+    Ryy(Box<Expr>),
+    Rzz(Box<Expr>),
+    /// Controlled phase
+    Cphase(Box<Expr>),
+    /// iSwap and variants
+    Iswap,
+    IswapDag,
+    /// Controlled swap
+    Cswap,
     RX(Box<Expr>),
     RY(Box<Expr>),
     RZ(Box<Expr>),
     /// `reset(q)` -- returns the qubit to |0> IN PLACE.
-    ///
-    /// Not consuming: like `hadamard`, it mutates the qubit and leaves the binding
-    /// usable, because the qubit still exists afterwards. It just happens to be
-    /// guaranteed to put it back in |0>, which is what makes a measured temporary
-    /// dischargeable.
     Reset,
     Custom(Ident),
 }
@@ -393,6 +403,16 @@ impl fmt::Display for GateKind {
             GateKind::CX => write!(f, "CX"),
             GateKind::CY => write!(f, "CY"),
             GateKind::CZ => write!(f, "CZ"),
+            GateKind::Crx(_) => write!(f, "CRX"),
+            GateKind::Cry(_) => write!(f, "CRY"),
+            GateKind::Crz(_) => write!(f, "CRZ"),
+            GateKind::Rxx(_) => write!(f, "RXX"),
+            GateKind::Ryy(_) => write!(f, "RYY"),
+            GateKind::Rzz(_) => write!(f, "RZZ"),
+            GateKind::Cphase(_) => write!(f, "CPHASE"),
+            GateKind::Iswap => write!(f, "ISWAP"),
+            GateKind::IswapDag => write!(f, "ISWAP_DAG"),
+            GateKind::Cswap => write!(f, "CSWAP"),
             GateKind::RX(_) => write!(f, "RX"),
             GateKind::RY(_) => write!(f, "RY"),
             GateKind::RZ(_) => write!(f, "RZ"),
@@ -410,7 +430,7 @@ impl fmt::Display for ExprKind {
             ExprKind::Var(v) => write!(f, "{}", v),
             ExprKind::Binary(op, l, r) => write!(f, "({:?} {} {:?})", l, op, r),
             ExprKind::Unary(op, e) => write!(f, "({}{:?})", op, e),
-            ExprKind::Call(fun, _args, _const_args) => write!(f, "{:?}(...)", fun),
+            ExprKind::Call(fun, _args) => write!(f, "{:?}(...)", fun),
             ExprKind::Block(_) => write!(f, "{{ ... }}"),
             ExprKind::If(c, t, e) => {
                 write!(f, "if {:?} then {:?} else {:?}", c, t, e)

@@ -1,0 +1,15 @@
+//! Type parser for Naso (Naso implementation)
+
+use crate::ast::*;
+use crate::lexer::{Token, TokenKind as TK};
+use crate::parser::Parser;
+
+impl Parser<'_> {
+    // Type parsing is handled in the main parser module
+    // This module would contain additional type-specific parsing logic
+}
+
+// Forward declarations
+pub enum TypeKind;
+pub enum TypeArg;
+pub enum NatExpr;

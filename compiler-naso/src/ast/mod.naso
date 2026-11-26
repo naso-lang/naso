@@ -1,0 +1,394 @@
+//! Naso Compiler - Core AST Definitions (Naso implementation)
+//!
+//! This module defines the Abstract Syntax Tree (AST) for the Naso language,
+//! including quantitative type annotations, reversible blocks, and mutable value semantics.
+
+use std::vec::Vec;
+use std::string::String;
+use std::option::Option;
+use std::boxed::Box;
+
+/// Unique identifier for AST nodes
+pub struct NodeId(pub u32);
+
+impl NodeId {
+    pub fn new(id: u32) -> Self {
+        Self(id)
+    }
+}
+
+/// Source location information
+pub struct Span {
+    pub start: u32,
+    pub end: u32,
+    pub line: u32,
+    pub column: u32,
+}
+
+impl Span {
+    pub fn new(start: u32, end: u32, line: u32, column: u32) -> Self {
+        Self { start, end, line, column }
+    }
+
+    pub fn merge(self, other: Span) -> Span {
+        Span {
+            start: self.start.min(other.start),
+            end: self.end.max(other.end),
+            line: self.line.min(other.line),
+            column: self.column.min(other.column),
+        }
+    }
+}
+
+/// Quantitative usage annotation: [0], [1], [*], [N]
+pub enum Quantity {
+    /// Erased at compile time - proofs, invariants
+    Zero,
+    /// Linear - must be consumed exactly once
+    One,
+    /// Bounded reuse - exactly N times (stored separately)
+    Bounded(u32),
+    /// Unrestricted - can be used any number of times
+    Many,
+}
+
+impl Quantity {
+    pub fn is_linear(&self) -> bool {
+        matches!(self, Quantity::One)
+    }
+
+    pub fn is_erased(&self) -> bool {
+        matches!(self, Quantity::Zero)
+    }
+
+    pub fn is_unrestricted(&self) -> bool {
+        matches!(self, Quantity::Many)
+    }
+}
+
+/// Mutability mode for bindings and parameters
+pub enum Mutability {
+    /// Immutable binding (default)
+    Immutable,
+    /// Mutable binding (mut)
+    Mut,
+    /// Mutable via inout projection (no aliasing)
+    InOut,
+    /// Consumed exactly once (linear move)
+    Consume,
+}
+
+/// Top-level program AST
+pub struct Program {
+    pub items: Vec<Item>,
+    pub span: Span,
+}
+
+impl Program {
+    pub fn new(items: Vec<Item>, span: Span) -> Self {
+        Self { items, span }
+    }
+}
+
+/// Top-level items (functions, types, modules, etc.)
+pub enum Item {
+    /// Function definition
+    Function(Function),
+    /// Type definition (struct, enum, alias)
+    TypeDef(TypeDef),
+    /// Trait definition
+    Trait(TraitDef),
+    /// Trait implementation
+    Impl(TraitImpl),
+    /// Module declaration
+    Module(Module),
+    /// Import declaration
+    Import(Import),
+    /// Constant definition
+    Const(ConstDef),
+    /// External function block (extern "C" { ... })
+    Extern(ExternBlock),
+}
+
+impl Item {
+    pub fn span(&self) -> Span {
+        match self {
+            Item::Function(f) => f.span,
+            Item::TypeDef(t) => t.span,
+            Item::Trait(t) => t.span,
+            Item::Impl(i) => i.span,
+            Item::Module(m) => m.span,
+            Item::Import(i) => i.span,
+            Item::Const(c) => c.span,
+            Item::Extern(e) => e.span,
+        }
+    }
+}
+
+/// External function block: extern "C" { fn name(...); ... }
+pub struct ExternBlock {
+    pub abi: String,
+    pub functions: Vec<ExternFn>,
+    pub span: Span,
+}
+
+/// External function declaration within extern block
+pub struct ExternFn {
+    pub name: Ident,
+    pub params: Vec<ExternParam>,
+    pub ret_ty: Option<Type>,
+    pub link_name: Option<String>,
+    pub span: Span,
+    pub is_async: bool,
+}
+
+/// Parameter of an external function
+pub struct ExternParam {
+    pub name: Ident,
+    pub ty: Type,
+    pub quantity: Quantity,
+    pub mutability: Mutability,
+    pub span: Span,
+}
+
+/// Trait definition: `trait Name { ... }`
+pub struct TraitDef {
+    pub name: Ident,
+    pub generics: Vec<GenericParam>,
+    pub items: Vec<TraitItem>,
+    pub span: Span,
+}
+
+/// Items inside a trait definition
+pub enum TraitItem {
+    /// Associated type: `type Item;`
+    AssocType(AssocTypeDef),
+    /// Function signature: `fn name(...) -> ...;`
+    Fn(TraitFnSig),
+}
+
+/// Associated type definition: `type Item;` or `type Item: Bound;`
+pub struct AssocTypeDef {
+    pub name: Ident,
+    pub generics: Vec<GenericParam>,
+    pub bounds: Vec<TraitBound>,
+    pub span: Span,
+}
+
+/// Trait bound: `TraitName` or `TraitName<Args>`
+pub struct TraitBound {
+    pub path: Vec<Ident>,
+    pub args: Vec<TypeArg>,
+    pub span: Span,
+}
+
+/// Function signature in a trait: `fn name[Generics](params) -> Ret;`
+pub struct TraitFnSig {
+    pub name: Ident,
+    pub generics: Vec<GenericParam>,
+    pub params: Vec<Param>,
+    pub ret_ty: Option<Type>,
+    pub span: Span,
+}
+
+/// Trait implementation: `impl[T] Trait for Type { ... }`
+pub struct TraitImpl {
+    pub generics: Vec<GenericParam>,
+    pub trait_path: Vec<Ident>,
+    pub trait_args: Vec<TypeArg>,
+    pub for_type: Type,
+    pub items: Vec<ImplItem>,
+    pub span: Span,
+}
+
+/// Items inside a trait implementation
+pub enum ImplItem {
+    /// Associated type implementation: `type Item = ConcreteType;`
+    AssocType(ImplAssocType),
+    /// Function implementation
+    Fn(Function),
+}
+
+/// Associated type implementation: `type Item = ConcreteType;`
+pub struct ImplAssocType {
+    pub name: Ident,
+    pub generics: Vec<GenericParam>,
+    pub ty: Type,
+    pub span: Span,
+}
+
+/// Function definition with quantitative parameters
+pub struct Function {
+    pub name: Ident,
+    pub generics: Vec<GenericParam>,
+    pub params: Vec<Param>,
+    pub ret_ty: Option<Type>,
+    pub body: Block,
+    pub span: Span,
+    pub attributes: Vec<Attribute>,
+    pub is_reversible: bool,
+    pub is_async: bool,
+    pub quantity: Quantity,
+    /// Claims the CALLER must satisfy, written `requires { assert(..); .. }`.
+    pub requires: Vec<Expr>,
+}
+
+/// Generic type parameter
+pub struct GenericParam {
+    pub name: Ident,
+    pub kind: GenericKind,
+    pub span: Span,
+}
+
+pub enum GenericKind {
+    /// Type parameter
+    Type,
+    /// Natural number parameter (for dependent types)
+    Nat,
+    /// Quantity parameter
+    Quantity,
+}
+
+/// Function parameter with quantity and mutability
+pub struct Param {
+    pub name: Ident,
+    pub ty: Type,
+    pub quantity: Quantity,
+    pub mutability: Mutability,
+    pub span: Span,
+}
+
+/// Function body (block of statements)
+pub struct Block {
+    pub stmts: Vec<Stmt>,
+    pub expr: Option<Box<Expr>>,
+    pub span: Span,
+}
+
+impl Block {
+    pub fn new(stmts: Vec<Stmt>, expr: Option<Expr>, span: Span) -> Self {
+        Self {
+            stmts,
+            expr: expr.map(Box::new),
+            span,
+        }
+    }
+}
+
+/// Type definitions (struct, enum, type alias)
+pub struct TypeDef {
+    pub name: Ident,
+    pub generics: Vec<GenericParam>,
+    pub kind: TypeDefKind,
+    pub span: Span,
+    pub attributes: Vec<Attribute>,
+}
+
+pub enum TypeDefKind {
+    /// struct Name { fields }
+    Struct(Vec<Field>),
+    /// enum Name { variants }
+    Enum(Vec<Variant>),
+    /// type Name = Type;
+    Alias(Type),
+}
+
+/// Struct/enum field
+pub struct Field {
+    pub name: Ident,
+    pub ty: Type,
+    pub quantity: Quantity,
+    pub span: Span,
+    pub attributes: Vec<Attribute>,
+}
+
+/// Enum variant
+pub struct Variant {
+    pub name: Ident,
+    pub fields: Vec<Field>,
+    pub span: Span,
+    pub attributes: Vec<Attribute>,
+}
+
+/// Module declaration
+pub struct Module {
+    pub name: Ident,
+    pub items: Vec<Item>,
+    pub span: Span,
+}
+
+/// Import declaration
+pub struct Import {
+    pub path: Vec<Ident>,
+    pub items: ImportItems,
+    pub span: Span,
+}
+
+pub enum ImportItems {
+    /// import path::*;
+    All,
+    /// import path::{item1, item2}
+    Specific(Vec<Ident>),
+}
+
+/// Constant definition
+pub struct ConstDef {
+    pub name: Ident,
+    pub ty: Option<Type>,
+    pub value: Expr,
+    pub span: Span,
+}
+
+/// Attribute (e.g., #[inline], #[test])
+pub struct Attribute {
+    pub name: Ident,
+    pub args: Vec<AttributeArg>,
+    pub span: Span,
+}
+
+pub enum AttributeArg {
+    Ident(Ident),
+    Literal(Literal),
+    Nested(Attribute),
+}
+
+/// Identifier with span
+pub struct Ident {
+    pub name: String,
+    pub span: Span,
+}
+
+impl Ident {
+    pub fn new(name: String, span: Span) -> Self {
+        Self { name, span }
+    }
+}
+
+/// Literal values
+pub enum Literal {
+    Int(i64),
+    UInt(u64),
+    Float(f64),
+    Bool(bool),
+    String(String),
+    Char(char),
+    Unit,
+}
+
+// Forward declarations for types used in AST
+pub enum Expr;
+pub enum Stmt;
+pub enum Type;
+pub enum TypeArg;
+
+mod expr;
+mod pattern;
+mod stmt;
+mod ty;
+mod visit;
+
+pub use expr::*;
+pub use pattern::*;
+pub use stmt::*;
+pub use ty::*;
+pub use visit::*;

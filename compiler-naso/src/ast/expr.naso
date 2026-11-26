@@ -1,0 +1,295 @@
+//! Naso Expression AST (Naso implementation)
+
+use crate::ast::{Ident, Literal, Mutability, NodeId, Quantity, Span};
+use std::vec::Vec;
+use std::option::Option;
+use std::boxed::Box;
+
+/// Expression with metadata
+pub struct Expr {
+    pub kind: ExprKind,
+    pub ty: Option<Type>,
+    pub quantity: Quantity,
+    pub span: Span,
+    pub id: NodeId,
+}
+
+impl Expr {
+    pub fn new(kind: ExprKind, span: Span, id: NodeId) -> Self {
+        Self {
+            kind,
+            ty: None,
+            quantity: Quantity::Many,
+            span,
+            id,
+        }
+    }
+
+    pub fn with_ty(mut self, ty: Type) -> Self {
+        self.ty = Some(ty);
+        self
+    }
+
+    pub fn with_qty(mut self, qty: Quantity) -> Self {
+        self.quantity = qty;
+        self
+    }
+}
+
+/// Expression kinds
+pub enum ExprKind {
+    /// Literal value
+    Literal(Literal),
+    /// Variable reference
+    Var(Ident),
+    /// Binary operation
+    Binary(BinOp, Box<Expr>, Box<Expr>),
+    /// Unary operation
+    Unary(UnOp, Box<Expr>),
+    /// Function call
+    Call(Box<Expr>, Vec<Expr>),
+    /// Method call
+    MethodCall(Box<Expr>, Ident, Vec<Expr>),
+    /// Field access
+    Field(Box<Expr>, Ident),
+    /// Index access
+    Index(Box<Expr>, Box<Expr>),
+    /// Struct construction
+    Struct(Ident, Vec<FieldExpr>),
+    /// Enum variant construction
+    Variant(Ident, Ident, Vec<Expr>),
+    /// Tuple construction
+    Tuple(Vec<Expr>),
+    /// Array/list construction
+    Array(Vec<Expr>),
+    /// Array repeat: [value; count]
+    ArrayRepeat(Box<Expr>, Box<Expr>),
+    /// Block expression
+    Block(Box<Block>),
+    /// If expression
+    If(Box<Expr>, Box<Expr>, Option<Box<Expr>>),
+    /// Match expression
+    Match(Box<Expr>, Vec<MatchArm>),
+    /// Let binding
+    Let(Box<LetBinding>),
+    /// Mutable binding (inout projection)
+    LetInOut(Box<LetInOutBinding>),
+    /// Consume binding (linear move)
+    LetConsume(Box<LetConsumeBinding>),
+    /// Reversible block
+    Reversible(Box<ReversibleBlock>),
+    /// Lambda/closure
+    Lambda(Box<LambdaExpr>),
+    /// For loop
+    For(Box<ForLoop>),
+    /// Forall loop (parallel polyhedral loop)
+    Forall(Box<ForallLoop>),
+    /// Quantified proposition
+    Quantified(Box<ForallLoop>),
+    /// While loop
+    While(Box<Expr>, Box<Expr>),
+    /// Infinite loop: `loop { ... }`
+    Loop(Box<Block>),
+    /// Return expression
+    Return(Option<Box<Expr>>),
+    /// Break expression
+    Break(Option<Box<Expr>>),
+    /// Continue expression
+    Continue,
+    /// Assignment
+    Assign(Box<Expr>, Box<Expr>),
+    /// Inout projection creation
+    Projection(Box<Expr>),
+    /// Quantum operations
+    QuantumOp(QuantumOp),
+    /// Type ascription
+    Ascribe(Box<Expr>, Type),
+    /// Range expression `start..end` (exclusive)
+    Range(Box<Expr>, Box<Expr>),
+    /// Async block: `async { ... }` - creates a future
+    Async(Box<Block>),
+    /// Await expression: `await future` - suspends until future completes
+    Await(Box<Expr>),
+    /// Error placeholder
+    Error,
+}
+
+pub struct FieldExpr {
+    pub name: Ident,
+    pub value: Expr,
+    pub span: Span,
+}
+
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub guard: Option<Expr>,
+    pub body: Expr,
+    pub span: Span,
+}
+
+pub struct LetBinding {
+    pub name: Ident,
+    pub ty: Option<Type>,
+    pub quantity: Quantity,
+    pub mutability: Mutability,
+    pub value: Expr,
+    pub span: Span,
+}
+
+pub struct LetInOutBinding {
+    pub name: Ident,
+    pub ty: Option<Type>,
+    pub value: Expr,
+    pub span: Span,
+}
+
+pub struct LetConsumeBinding {
+    pub name: Ident,
+    pub ty: Option<Type>,
+    pub value: Expr,
+    pub span: Span,
+}
+
+/// Reversible computation block
+pub struct ReversibleBlock {
+    pub body: Block,
+    pub uncomputes: Vec<UncomputeStep>,
+    pub span: Span,
+}
+
+/// A proof block: `proof { .. }`
+pub struct ProofBlock {
+    pub body: Block,
+    pub span: Span,
+}
+
+/// Step in the uncomputation DAG
+pub struct UncomputeStep {
+    pub target: Ident,
+    pub inverse_expr: Expr,
+    pub dependencies: Vec<Ident>,
+    pub span: Span,
+}
+
+/// Lambda expression
+pub struct LambdaExpr {
+    pub params: Vec<Param>,
+    pub ret_ty: Option<Type>,
+    pub body: Box<Expr>,
+    pub span: Span,
+    pub captures: Vec<Capture>,
+}
+
+pub struct Capture {
+    pub name: Ident,
+    pub mode: CaptureMode,
+    pub span: Span,
+}
+
+pub enum CaptureMode {
+    ByValue,
+    ByInOut,
+    ByConsume,
+}
+
+/// For loop
+pub struct ForLoop {
+    pub var: Ident,
+    pub iter: Expr,
+    pub body: Block,
+    pub span: Span,
+}
+
+/// Forall loop (parallel polyhedral loop)
+pub struct ForallLoop {
+    /// Multiple loop bindings: (var, lower, upper)
+    pub bindings: Vec<(Ident, Expr, Expr)>,
+    pub body: Block,
+    pub span: Span,
+}
+
+/// Reduction expression
+pub struct ReduceExpr {
+    pub var: Ident,
+    pub init: Expr,
+    pub binding: (Ident, Expr, Expr),
+    pub body: Expr,
+    pub span: Span,
+}
+
+/// Binary operators
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    And,
+    Or,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    Assign,
+}
+
+/// Unary operators
+pub enum UnOp {
+    Neg,
+    Not,
+    BitNot,
+    Deref,
+    /// Inout borrow
+    InOut,
+    /// Consume move
+    Consume,
+    /// Address-of operator for function pointers
+    AddrOf,
+}
+
+/// Quantum operations
+pub enum QuantumOp {
+    /// Allocate new qubit
+    Alloc(Ident),
+    /// Measure qubit
+    Measure(Box<Expr>),
+    /// Apply gate
+    ApplyGate(GateKind, Vec<Expr>),
+    /// Entangle qubits
+    Entangle(Vec<Expr>),
+    /// Quantum phase
+    Phase(Box<Expr>, Box<Expr>),
+    /// Hamiltonian evolution
+    Hamiltonian(Box<Expr>, Box<Expr>),
+}
+
+pub enum GateKind {
+    H,
+    X,
+    Y,
+    Z,
+    S,
+    T,
+    CX,
+    CY,
+    CZ,
+    RX(Box<Expr>),
+    RY(Box<Expr>),
+    RZ(Box<Expr>),
+    Reset,
+    Custom(Ident),
+}
+
+// Forward declarations
+pub enum Pattern;
+pub enum Block;
+pub enum Param;
+pub enum Type;
+pub enum Stmt;

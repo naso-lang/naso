@@ -1,0 +1,19 @@
+//! Statement parser for Naso (Naso implementation)
+
+use crate::ast::*;
+use crate::lexer::{Token, TokenKind as TK};
+use crate::parser::Parser;
+
+impl Parser<'_> {
+    // Statement parsing is handled in the main parser module
+    // This module would contain additional statement-specific parsing logic
+}
+
+// Forward declarations
+pub enum StmtKind;
+pub enum LetStmt;
+pub enum LetInOutStmt;
+pub enum LetConsumeStmt;
+pub enum Block;
+pub enum ReversibleBlock;
+pub enum ProofBlock;

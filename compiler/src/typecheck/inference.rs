@@ -6,8 +6,8 @@
 #![allow(clippy::collapsible_if)]
 #![allow(clippy::single_match)]
 
-use crate::ast::ty::{TypeKind, TypeVar, NatExpr};
-use crate::ast::{GenericKind, *};
+use crate::ast::ty::{TypeKind, TypeVar};
+use crate::ast::*;
 use crate::typecheck::check::{check_block, check_stmt, type_of_range_bound};
 use crate::typecheck::error::TypeError;
 use crate::typecheck::*;
@@ -62,7 +62,7 @@ pub fn infer_expr(checker: &mut TypeChecker, expr: &Expr) -> Result<Type, TypeEr
         ExprKind::Var(ident) => infer_var(checker, ident, expr.span),
         ExprKind::Binary(op, lhs, rhs) => infer_binary(checker, *op, lhs, rhs, expr.span),
         ExprKind::Unary(op, operand) => infer_unary(checker, *op, operand, expr.span),
-        ExprKind::Call(callee, args, const_args) => infer_call_with_const(checker, callee, args, const_args, expr.span),
+        ExprKind::Call(callee, args) => infer_call(checker, callee, args, expr.span),
         ExprKind::MethodCall(receiver, method, args) => {
             infer_method_call(checker, receiver, method, args, expr.span)
         }
@@ -130,34 +130,15 @@ pub fn infer_expr(checker: &mut TypeChecker, expr: &Expr) -> Result<Type, TypeEr
 /// Infer literal type
 fn infer_literal(lit: &Literal, span: Span) -> Result<Type, TypeError> {
     let ty = match lit {
-        Literal::Int(_, Some(ty)) => typed_int_ty(*ty, span),
-        Literal::Int(_, None) => Type::new(TypeKind::Int, Quantity::Many, span),
-        Literal::UInt(_, Some(ty)) => typed_int_ty(*ty, span),
-        Literal::UInt(_, None) => Type::new(TypeKind::UInt, Quantity::Many, span),
-        Literal::Float(_) => Type::new(TypeKind::Float, Quantity::Many, span),
-        Literal::Bool(_) => Type::new(TypeKind::Bool, Quantity::Many, span),
-        Literal::String(_) => Type::new(TypeKind::String, Quantity::Many, span),
-        Literal::Char(_) => Type::new(TypeKind::Char, Quantity::Many, span),
-        Literal::Unit => Type::new(TypeKind::Unit, Quantity::Many, span),
+        Literal::Int(_) => TypeKind::Int,
+        Literal::UInt(_) => TypeKind::UInt,
+        Literal::Float(_) => TypeKind::Float,
+        Literal::Bool(_) => TypeKind::Bool,
+        Literal::String(_) => TypeKind::String,
+        Literal::Char(_) => TypeKind::Char,
+        Literal::Unit => TypeKind::Unit,
     };
-    Ok(ty)
-}
-
-/// Convert IntTy to Type with appropriate bit width
-fn typed_int_ty(ty: crate::ast::IntTy, span: Span) -> Type {
-    use crate::ast::IntTy;
-    match ty {
-        IntTy::U8 => Type::uint_width(8, span),
-        IntTy::U16 => Type::uint_width(16, span),
-        IntTy::U32 => Type::uint_width(32, span),
-        IntTy::U64 => Type::uint_width(64, span),
-        IntTy::USize => Type::uint_width(64, span), // usize = 64 on this target
-        IntTy::I8 => Type::int_width(8, span),
-        IntTy::I16 => Type::int_width(16, span),
-        IntTy::I32 => Type::int_width(32, span),
-        IntTy::I64 => Type::int_width(64, span),
-        IntTy::ISize => Type::int_width(64, span), // isize = 64 on this target
-    }
+    Ok(Type::new(ty, Quantity::Many, span))
 }
 
 /// Infer variable type from environment
@@ -426,161 +407,6 @@ fn infer_unary(
     Ok(result_ty)
 }
 
-/// Infer function call type with const generic arguments
-fn infer_call_with_const(
-    checker: &mut TypeChecker,
-    callee: &Expr,
-    args: &[Expr],
-    const_args: &[Expr],
-    span: Span,
-) -> Result<Type, TypeError> {
-    // If callee is a variable, try to look up its function signature with generics
-    if let ExprKind::Var(ident) = &callee.kind {
-        let sig = checker.env.lookup_function(ident).cloned();
-        if let Some(sig) = sig {
-            // First, evaluate const generic arguments to NatExpr
-            let mut const_arg_values = Vec::new();
-            for const_arg in const_args {
-                let nat_expr = infer_const_generic_arg(checker, const_arg)?;
-                const_arg_values.push(nat_expr);
-            }
-
-            // Build substitution map for all generic parameters
-            let mut subst = std::collections::HashMap::new();
-            let mut const_arg_idx = 0;
-            
-            for generic in &sig.generics {
-                match generic.kind {
-                    GenericKind::Type => {
-                        // Type parameters get fresh metavariables (as before)
-                        let mv = fresh_meta_var();
-                        checker.register_meta(mv, None);
-                        subst.insert(generic.name.clone(), Type::new(TypeKind::Meta(mv), Quantity::Many, span));
-                    }
-                    GenericKind::Nat => {
-                        // Nat parameters get the provided const generic argument
-                        if const_arg_idx < const_arg_values.len() {
-                            let nat_expr = &const_arg_values[const_arg_idx];
-                            // Try to evaluate the NatExpr to a concrete value
-                            if let Some(value) = eval_nat_expr(nat_expr) {
-                                subst.insert(generic.name.clone(), Type::nat_lit(value, generic.span));
-                            } else if let Some(value) = eval_nat_expr_with_subst(nat_expr, &subst) {
-                                // Try evaluating with already-substituted variables
-                                subst.insert(generic.name.clone(), Type::nat_lit(value, generic.span));
-                            } else {
-                                // For non-evaluable NatExpr (like N + 1 where N is not yet known),
-                                // create a metavariable - the actual value will be resolved during unification
-                                let mv = fresh_meta_var();
-                                checker.register_meta(mv, None);
-                                subst.insert(generic.name.clone(), Type::new(TypeKind::Meta(mv), Quantity::Many, generic.span));
-                            }
-                            const_arg_idx += 1;
-                        } else {
-                            // Missing const argument - create metavariable
-                            let mv = fresh_meta_var();
-                            checker.register_meta(mv, None);
-                            subst.insert(generic.name.clone(), Type::new(TypeKind::Meta(mv), Quantity::Many, generic.span));
-                        }
-                    }
-                    GenericKind::Quantity => {
-                        // Quantity parameters - create metavariable for now
-                        let mv = fresh_meta_var();
-                        checker.register_meta(mv, None);
-                        subst.insert(generic.name.clone(), Type::new(TypeKind::Meta(mv), Quantity::Many, generic.span));
-                    }
-                }
-            }
-
-            // Substitute metavariables in parameter types
-            let inst_params: Vec<Type> = sig.params.iter().map(|p| {
-                substitute_type(&p.ty, &subst)
-            }).collect();
-
-            // Substitute in return type
-            let inst_ret = sig.ret_ty.as_ref().map(|r| substitute_type(r, &subst)).unwrap_or(Type::unit(span));
-
-            // Trait bound checking is deferred until after type unification
-            // TODO: Check trait bounds after type parameters are resolved
-
-            // Check argument count
-            if inst_params.len() != args.len() {
-                return Err(TypeError::ArgumentCountMismatch {
-                    expected: inst_params.len(),
-                    found: args.len(),
-                    span,
-                });
-            }
-
-            // Check each argument against instantiated parameter type
-            for (param, arg) in inst_params.iter().zip(args) {
-                let arg_ty = infer_expr(checker, arg)?;
-                unify::unify_types(checker, &arg_ty, param)?;
-                if !crate::typecheck::unify::qty_subtype(param.quantity, arg_ty.quantity) {
-                    return Err(crate::typecheck::error::TypeError::QuantityMismatch {
-                        expected: param.quantity,
-                        found: arg_ty.quantity,
-                        span: arg.span,
-                    });
-                }
-            }
-
-            return Ok(inst_ret);
-        }
-    }
-
-    // Fall back to regular call inference for non-variable callees
-    infer_call(checker, callee, args, span)
-}
-
-/// Infer a const generic argument expression to a NatExpr
-fn infer_const_generic_arg(
-    checker: &mut TypeChecker,
-    expr: &Expr,
-) -> Result<NatExpr, TypeError> {
-    match &expr.kind {
-        ExprKind::Literal(Literal::Int(n, _)) => Ok(NatExpr::Lit(*n as u64)),
-        ExprKind::Literal(Literal::UInt(n, _)) => Ok(NatExpr::Lit(*n)),
-        ExprKind::Var(ident) => Ok(NatExpr::Var(ident.clone())),
-        ExprKind::Binary(BinOp::Add, lhs, rhs) => {
-            let lhs_ne = infer_const_generic_arg(checker, lhs)?;
-            let rhs_ne = infer_const_generic_arg(checker, rhs)?;
-            Ok(NatExpr::Add(Box::new(lhs_ne), Box::new(rhs_ne)))
-        }
-        ExprKind::Binary(BinOp::Mul, lhs, rhs) => {
-            let lhs_ne = infer_const_generic_arg(checker, lhs)?;
-            let rhs_ne = infer_const_generic_arg(checker, rhs)?;
-            Ok(NatExpr::Mul(Box::new(lhs_ne), Box::new(rhs_ne)))
-        }
-        ExprKind::Binary(BinOp::Sub, lhs, rhs) => {
-            let lhs_ne = infer_const_generic_arg(checker, lhs)?;
-            let rhs_ne = infer_const_generic_arg(checker, rhs)?;
-            Ok(NatExpr::Sub(Box::new(lhs_ne), Box::new(rhs_ne)))
-        }
-        ExprKind::Binary(BinOp::Div, lhs, rhs) => {
-            let lhs_ne = infer_const_generic_arg(checker, lhs)?;
-            let rhs_ne = infer_const_generic_arg(checker, rhs)?;
-            Ok(NatExpr::Div(Box::new(lhs_ne), Box::new(rhs_ne)))
-        }
-        ExprKind::If(cond, then_branch, else_branch) => {
-            let cond_ne = infer_const_generic_arg(checker, cond)?;
-            let then_ne = infer_const_generic_arg(checker, then_branch)?;
-            let else_ne = else_branch.as_ref()
-                .map(|e| infer_const_generic_arg(checker, e))
-                .transpose()?
-                .unwrap_or(NatExpr::Zero);
-            Ok(NatExpr::If(
-                Box::new(Type::new(TypeKind::Nat, Quantity::Many, cond.span)), // placeholder condition type
-                Box::new(then_ne),
-                Box::new(else_ne),
-            ))
-        }
-        _ => {
-            // For unsupported expressions, return a variable
-            Ok(NatExpr::Var(Ident::new("unknown", expr.span)))
-        }
-    }
-}
-
 /// Infer function call type
 fn infer_call(
     checker: &mut TypeChecker,
@@ -735,7 +561,7 @@ fn infer_method_call(
     checker: &mut TypeChecker,
     receiver: &Expr,
     method: &Ident,
-    args: &[Expr],
+    _args: &[Expr],
     span: Span,
 ) -> Result<Type, TypeError> {
     let receiver_ty = infer_expr(checker, receiver)?;
@@ -759,30 +585,6 @@ fn infer_method_call(
     if method.name == "len" {
         if let TypeKind::Array(_, _) = &receiver_ty.kind {
             return Ok(Type::new(TypeKind::Int, Quantity::Many, span));
-        }
-    }
-
-    // Look up method on receiver type via trait resolution
-    if let TypeKind::Named(name, _) = &receiver_ty.kind {
-        // Get all trait impls and find ones that match the receiver type
-        // We need to iterate over all trait impls and find those where for_ty matches receiver_ty
-        for impl_def in checker.env.all_trait_impls() {
-            if types_match(&impl_def.for_ty, &receiver_ty) {
-                // Found matching impl for the receiver type
-                // Check if it has the method
-                for item in &impl_def.items {
-                    if let ImplItem::Method(func) = item {
-                        if func.name.name == method.name {
-                            // Check argument count (+1 for self)
-                            if func.params.len() != args.len() + 1 {
-                                continue;
-                            }
-                            // Return the method's return type
-                            return Ok(func.ret_ty.clone().unwrap_or(Type::unit(span)));
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -977,12 +779,7 @@ fn infer_array(checker: &mut TypeChecker, elems: &[Expr], span: Span) -> Result<
     }
 
     // For array literals with known size, include the size as a NatExpr literal
-    // If in check mode with expected array size, use that instead of counting elements
-    let size = if let Some(expected_size) = checker.expected_array_size {
-        Some(crate::ast::ty::NatExpr::Lit(expected_size))
-    } else {
-        Some(crate::ast::ty::NatExpr::Lit(elems.len() as u64))
-    };
+    let size = Some(crate::ast::ty::NatExpr::Lit(elems.len() as u64));
 
     Ok(Type::new(
         TypeKind::Array(Box::new(first_ty), size),
@@ -1549,6 +1346,16 @@ fn gate_arity(gate: &crate::ast::GateKind) -> Option<usize> {
     Some(match gate {
         // single-qubit gates
         G::H | G::X | G::Y | G::Z | G::S | G::T | G::Reset => 1,
+        // controlled single-qubit rotations: (control, target)
+        G::Crx(_) | G::Cry(_) | G::Crz(_) => 2,
+        // two-qubit Ising couplings
+        G::Rxx(_) | G::Ryy(_) | G::Rzz(_) => 2,
+        // controlled phase: (control, target)
+        G::Cphase(_) => 2,
+        // iSwap variants: (q1, q2)
+        G::Iswap | G::IswapDag => 2,
+        // controlled swap: (control, target1, target2)
+        G::Cswap => 3,
         // controlled gates: (control, target)
         G::CX | G::CY | G::CZ => 2,
         // rotations take an angle, which is not a qubit; the qubit count is 1 and
@@ -1813,10 +1620,8 @@ fn substitute_nat_expr_inner(ne: &crate::ast::ty::NatExpr, subst: &std::collecti
             if let Some(replacement_type) = subst.get(ident) {
                 // If the replacement is a Nat literal, extract its value
                 if let TypeKind::Nat = &replacement_type.kind {
-                    if let Some(value) = replacement_type.nat_const() {
-                        return NatExpr::Lit(value);
-                    }
-                    // Fall back to original if no value
+                    // We can't easily extract the value from a Nat type here
+                    // For now, return as-is and let unification handle it
                     ne.clone()
                 } else if let TypeKind::Named(name, args) = &replacement_type.kind {
                     if name.name == "Int" || name.name == "UInt" || name.name == "Nat" {
@@ -1838,15 +1643,7 @@ fn substitute_nat_expr_inner(ne: &crate::ast::ty::NatExpr, subst: &std::collecti
             Box::new(substitute_nat_expr_inner(a, subst)),
             Box::new(substitute_nat_expr_inner(b, subst))
         ),
-        NatExpr::Sub(a, b) => NatExpr::Sub(
-            Box::new(substitute_nat_expr_inner(a, subst)),
-            Box::new(substitute_nat_expr_inner(b, subst))
-        ),
         NatExpr::Mul(a, b) => NatExpr::Mul(
-            Box::new(substitute_nat_expr_inner(a, subst)),
-            Box::new(substitute_nat_expr_inner(b, subst))
-        ),
-        NatExpr::Div(a, b) => NatExpr::Div(
             Box::new(substitute_nat_expr_inner(a, subst)),
             Box::new(substitute_nat_expr_inner(b, subst))
         ),
@@ -1864,125 +1661,5 @@ fn substitute_type_arg(arg: &TypeArg, subst: &std::collections::HashMap<Ident, T
         TypeArg::Type(ty) => TypeArg::Type(substitute_type(ty, subst)),
         TypeArg::Nat(n) => TypeArg::Nat(n.clone()),
         TypeArg::Quantity(q) => TypeArg::Quantity(*q),
-    }
-}
-
-/// Evaluate a NatExpr to a concrete u64 value if possible.
-/// This performs compile-time evaluation of type-level arithmetic.
-fn eval_nat_expr(nat_expr: &NatExpr) -> Option<u64> {
-    use crate::ast::ty::NatExpr;
-    match nat_expr {
-        NatExpr::Lit(n) => Some(*n),
-        NatExpr::Zero => Some(0),
-        NatExpr::Succ(inner) => eval_nat_expr(inner).map(|n| n + 1),
-        NatExpr::Add(a, b) => {
-            let a_val = eval_nat_expr(a)?;
-            let b_val = eval_nat_expr(b)?;
-            Some(a_val + b_val)
-        }
-        NatExpr::Sub(a, b) => {
-            let a_val = eval_nat_expr(a)?;
-            let b_val = eval_nat_expr(b)?;
-            Some(a_val - b_val)
-        }
-        NatExpr::Mul(a, b) => {
-            let a_val = eval_nat_expr(a)?;
-            let b_val = eval_nat_expr(b)?;
-            Some(a_val * b_val)
-        }
-        NatExpr::Div(a, b) => {
-            let a_val = eval_nat_expr(a)?;
-            let b_val = eval_nat_expr(b)?;
-            if b_val != 0 {
-                Some(a_val / b_val)
-            } else {
-                None
-            }
-        }
-        NatExpr::Var(_) => None, // Cannot evaluate variable without substitution
-        NatExpr::If(_, _, _) => None, // Cannot evaluate conditional without type-level boolean
-    }
-}
-
-/// Evaluate a NatExpr with a substitution map for variables
-fn eval_nat_expr_with_subst(
-    nat_expr: &NatExpr,
-    subst: &std::collections::HashMap<Ident, Type>,
-) -> Option<u64> {
-    use crate::ast::ty::NatExpr;
-    match nat_expr {
-        NatExpr::Lit(n) => Some(*n),
-        NatExpr::Zero => Some(0),
-        NatExpr::Succ(inner) => eval_nat_expr_with_subst(inner, subst).map(|n| n + 1),
-        NatExpr::Add(a, b) => {
-            let a_val = eval_nat_expr_with_subst(a, subst)?;
-            let b_val = eval_nat_expr_with_subst(b, subst)?;
-            Some(a_val + b_val)
-        }
-        NatExpr::Sub(a, b) => {
-            let a_val = eval_nat_expr_with_subst(a, subst)?;
-            let b_val = eval_nat_expr_with_subst(b, subst)?;
-            Some(a_val - b_val)
-        }
-        NatExpr::Mul(a, b) => {
-            let a_val = eval_nat_expr_with_subst(a, subst)?;
-            let b_val = eval_nat_expr_with_subst(b, subst)?;
-            Some(a_val * b_val)
-        }
-        NatExpr::Div(a, b) => {
-            let a_val = eval_nat_expr_with_subst(a, subst)?;
-            let b_val = eval_nat_expr_with_subst(b, subst)?;
-            if b_val != 0 {
-                Some(a_val / b_val)
-            } else {
-                None
-            }
-        }
-        NatExpr::Var(ident) => {
-            // Look up variable in substitution map
-            if let Some(replacement) = subst.get(ident) {
-                if let TypeKind::Nat = &replacement.kind {
-                    replacement.nat_value
-                } else if let TypeKind::Named(name, _) = &replacement.kind {
-                    if name.name == "Nat" {
-                        replacement.nat_value
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        }
-        NatExpr::If(_, _, _) => None,
-    }
-}
-
-/// Helper function to check if two types match for trait impl matching
-fn types_match(impl_ty: &Type, for_ty: &Type) -> bool {
-    // Simple structural match - could be enhanced for generics
-    match (&impl_ty.kind, &for_ty.kind) {
-        (TypeKind::Named(name1, args1), TypeKind::Named(name2, args2)) => {
-            name1.name == name2.name && args1.len() == args2.len() &&
-            args1.iter().zip(args2.iter()).all(|(a1, a2)| type_args_match(a1, a2))
-        }
-        (TypeKind::Pointer(inner1), TypeKind::Pointer(inner2)) => {
-            types_match(inner1, inner2)
-        }
-        (TypeKind::Array(elem1, size1), TypeKind::Array(elem2, size2)) => {
-            types_match(elem1, elem2) && size1 == size2
-        }
-        _ => impl_ty.kind == for_ty.kind,
-    }
-}
-
-fn type_args_match(arg1: &TypeArg, arg2: &TypeArg) -> bool {
-    match (arg1, arg2) {
-        (TypeArg::Type(t1), TypeArg::Type(t2)) => types_match(t1, t2),
-        (TypeArg::Nat(n1), TypeArg::Nat(n2)) => n1 == n2,
-        (TypeArg::Quantity(q1), TypeArg::Quantity(q2)) => q1 == q2,
-        _ => false,
     }
 }

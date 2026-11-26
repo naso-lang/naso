@@ -1,0 +1,76 @@
+//! Naso Statement AST (Naso implementation)
+
+use crate::ast::expr::Expr;
+use crate::ast::{Ident, Mutability, NodeId, Pattern, Quantity, Span, Item};
+use std::vec::Vec;
+use std::option::Option;
+use std::boxed::Box;
+
+/// Statement
+pub struct Stmt {
+    pub kind: StmtKind,
+    pub span: Span,
+    pub id: NodeId,
+}
+
+impl Stmt {
+    pub fn new(kind: StmtKind, span: Span, id: NodeId) -> Self {
+        Self { kind, span, id }
+    }
+}
+
+/// Statement kinds
+pub enum StmtKind {
+    /// Let binding
+    Let(LetStmt),
+    /// Inout let binding
+    LetInOut(LetInOutStmt),
+    /// Consume let binding
+    LetConsume(LetConsumeStmt),
+    /// Expression statement
+    Expr(Expr),
+    /// Item declaration (function, type, etc.)
+    Item(Item),
+    /// Reversible block statement
+    Reversible(ReversibleBlock),
+    /// Proof block: obligations the verifier must discharge
+    Proof(ProofBlock),
+    /// Return statement
+    Return(Option<Expr>),
+    /// Break statement
+    Break(Option<Expr>),
+    /// Continue statement
+    Continue,
+    /// Empty statement
+    Empty,
+    /// Error statement
+    Error,
+}
+
+pub struct LetStmt {
+    pub pattern: Pattern,
+    pub ty: Option<Type>,
+    pub quantity: Quantity,
+    pub mutability: Mutability,
+    pub value: Expr,
+    pub span: Span,
+}
+
+pub struct LetInOutStmt {
+    pub name: Ident,
+    pub ty: Option<Type>,
+    pub value: Expr,
+    pub span: Span,
+}
+
+pub struct LetConsumeStmt {
+    pub name: Ident,
+    pub ty: Option<Type>,
+    pub value: Expr,
+    pub span: Span,
+}
+
+// Forward declarations
+pub enum Type;
+pub enum ReversibleBlock;
+pub enum ProofBlock;

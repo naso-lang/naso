@@ -1,0 +1,12 @@
+[project]
+name = "naso-compiler"
+version = "0.1.0"
+description = "Naso compiler written in Naso (self-hosting)"
+
+[build]
+target = "llvm"
+opt = 2
+
+[dependencies]
+# stdlib is implicitly available
+# naso-ffi = { path = "../../crates/naso-ffi" }

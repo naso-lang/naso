@@ -1,0 +1,960 @@
+//! Recursive-descent parser for the Naso language (Naso implementation).
+//!
+//! The parser consumes a token stream (produced by [`crate::lexer`]) and
+//! produces the AST types defined in [`crate::ast`].
+
+use crate::ast::*;
+use crate::lexer::{Lexer, Token, TokenKind as TK};
+
+pub mod expr;
+pub mod stmt;
+pub mod ty;
+
+/// Monotonic node-id counter for AST nodes created during parsing.
+pub struct NodeIdGenerator {
+    next_id: u32,
+}
+
+impl NodeIdGenerator {
+    pub fn new() -> Self {
+        Self { next_id: 1 }
+    }
+
+    pub fn next_id(&mut self) -> NodeId {
+        let id = self.next_id;
+        self.next_id += 1;
+        NodeId::new(id)
+    }
+}
+
+/// A syntax error, with the span needed to point at it.
+pub struct ParseError {
+    /// Human-readable description, e.g. "expected `)`, found `{`".
+    pub message: String,
+    pub span: Span,
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+/// Result type for parsing
+pub type ParseResult<T> = Result<T, ParseError>;
+
+/// Hand-written recursive-descent parser over a token slice.
+pub struct Parser<'a> {
+    tokens: &'a [Token],
+    pos: usize,
+    no_block_expr: bool,
+    error: Option<ParseError>,
+    id_gen: NodeIdGenerator,
+}
+
+impl<'a> Parser<'a> {
+    pub fn new(tokens: &'a [Token]) -> Self {
+        // Filter out comments and newlines
+        let filtered: Vec<Token> = tokens
+            .iter()
+            .filter(|t| !matches!(t.kind, TK::Comment | TK::Newline))
+            .cloned()
+            .collect();
+        Self {
+            tokens: &filtered,
+            pos: 0,
+            no_block_expr: false,
+            error: None,
+            id_gen: NodeIdGenerator::new(),
+        }
+    }
+
+    pub fn parse_program(&mut self) -> Result<Program, ParseError> {
+        let mut items = Vec::new();
+        let start_span = self.current_span().unwrap_or(Span::new(0, 0, 1, 1));
+
+        while !self.is_eof() {
+            match self.parse_item() {
+                Ok(item) => items.push(item),
+                Err(e) => {
+                    self.error = Some(e);
+                    break;
+                }
+            }
+        }
+
+        if let Some(err) = self.error.take() {
+            return Err(err);
+        }
+
+        let end_span = self.current_span().unwrap_or(start_span);
+        Ok(Program::new(items, start_span.merge(end_span)))
+    }
+
+    fn is_eof(&self) -> bool {
+        self.error.is_some() || self.pos >= self.tokens.len()
+    }
+
+    fn current_span(&self) -> Option<Span> {
+        if self.pos < self.tokens.len() {
+            let t = &self.tokens[self.pos];
+            Some(Span::new(t.span.start as u32, t.span.end as u32, t.span.line, t.span.column))
+        } else if self.pos > 0 {
+            let t = &self.tokens[self.pos - 1];
+            Some(Span::new(t.span.start as u32, t.span.end as u32, t.span.line, t.span.column))
+        } else {
+            None
+        }
+    }
+
+    fn current_token(&self) -> Option<&Token> {
+        if self.pos < self.tokens.len() {
+            Some(&self.tokens[self.pos])
+        } else {
+            None
+        }
+    }
+
+    fn current_kind(&self) -> Option<TK> {
+        self.current_token().map(|t| t.kind.clone())
+    }
+
+    fn advance(&mut self) {
+        if self.pos < self.tokens.len() {
+            self.pos += 1;
+        }
+    }
+
+    fn expect(&mut self, expected: TK) -> Result<Token, ParseError> {
+        if let Some(token) = self.current_token() {
+            if std::mem::discriminant(&token.kind) == std::mem::discriminant(&expected) {
+                let t = token.clone();
+                self.advance();
+                Ok(t)
+            } else {
+                let span = self.current_span().unwrap_or(Span::new(0, 0, 1, 1));
+                Err(ParseError {
+                    message: format!("expected {:?}, found {:?}", expected, token.kind),
+                    span,
+                })
+            }
+        } else {
+            let span = self.current_span().unwrap_or(Span::new(0, 0, 1, 1));
+            Err(ParseError {
+                message: format!("expected {:?}, found EOF", expected),
+                span,
+            })
+        }
+    }
+
+    fn check(&self, expected: TK) -> bool {
+        matches!(self.current_kind(), Some(k) if std::mem::discriminant(&k) == std::mem::discriminant(&expected))
+    }
+
+    fn parse_item(&mut self) -> ParseResult<Item> {
+        // Check for attributes
+        let attributes = self.parse_attributes()?;
+
+        // Check for extern block
+        if self.check(TK::Extern) {
+            return self.parse_extern_block(attributes);
+        }
+
+        // Check for keywords
+        match self.current_kind() {
+            Some(TK::Fn) => self.parse_function(attributes),
+            Some(TK::Struct) | Some(TK::Enum) | Some(TK::Type) => self.parse_type_def(attributes),
+            Some(TK::Trait) => self.parse_trait_def(attributes),
+            Some(TK::Impl) => self.parse_trait_impl(attributes),
+            Some(TK::Mod) => self.parse_module(attributes),
+            Some(TK::Import) => self.parse_import(attributes),
+            Some(TK::Const) => self.parse_const(attributes),
+            _ => {
+                let span = self.current_span().unwrap_or(Span::new(0, 0, 1, 1));
+                Err(ParseError {
+                    message: format!("expected item, found {:?}", self.current_kind()),
+                    span,
+                })
+            }
+        }
+    }
+
+    fn parse_attributes(&mut self) -> ParseResult<Vec<Attribute>> {
+        let mut attrs = Vec::new();
+        while self.check(TK::Hash) {
+            self.advance(); // #
+            self.expect(TK::LParen)?;
+            let name = self.parse_ident()?;
+            let mut args = Vec::new();
+            if self.check(TK::LParen) {
+                self.advance(); // (
+                while !self.check(TK::RParen) && !self.is_eof() {
+                    // Simplified attribute argument parsing
+                    if let Some(TK::Ident(s)) = self.current_kind() {
+                        args.push(AttributeArg::Ident(self.parse_ident()?));
+                    } else if let Some(TK::Str(s)) = self.current_kind() {
+                        // Would need to handle string literals
+                        self.advance();
+                        args.push(AttributeArg::Literal(Literal::String(s)));
+                    } else {
+                        break;
+                    }
+                    if self.check(TK::Comma) {
+                        self.advance();
+                    }
+                }
+                self.expect(TK::RParen)?;
+            }
+            self.expect(TK::RParen)?;
+            attrs.push(Attribute { name, args, span: name.span });
+        }
+        Ok(attrs)
+    }
+
+    fn parse_ident(&mut self) -> ParseResult<Ident> {
+        if let Some(token) = self.current_token() {
+            let name = match &token.kind {
+                TK::Ident(s) => s.clone(),
+                TK::TypeIdent(s) => s.clone(),
+                _ => {
+                    return Err(ParseError {
+                        message: format!("expected identifier, found {:?}", token.kind),
+                        span: Span::new(token.span.start as u32, token.span.end as u32, token.span.line, token.span.column),
+                    });
+                }
+            };
+            let span = Span::new(token.span.start as u32, token.span.end as u32, token.span.line, token.span.column);
+            self.advance();
+            Ok(Ident::new(name, span))
+        } else {
+            Err(ParseError {
+                message: "expected identifier, found EOF".to_string(),
+                span: Span::new(0, 0, 1, 1),
+            })
+        }
+    }
+
+    fn parse_extern_block(&mut self, _attributes: Vec<Attribute>) -> ParseResult<Item> {
+        self.advance(); // extern
+        let abi = if self.check(TK::Str("")) {
+            // Simplified - would need actual string parsing
+            "C".to_string()
+        } else {
+            "C".to_string()
+        };
+        self.expect(TK::LBrace)?;
+        let mut functions = Vec::new();
+        while !self.check(TK::RBrace) && !self.is_eof() {
+            // Parse extern function declarations
+            functions.push(self.parse_extern_fn()?);
+        }
+        self.expect(TK::RBrace)?;
+        let span = Span::new(0, 0, 1, 1); // Would need proper span
+        Ok(Item::Extern(ExternBlock { abi, functions, span }))
+    }
+
+    fn parse_extern_fn(&mut self) -> ParseResult<ExternFn> {
+        // Simplified extern function parsing
+        self.expect(TK::Fn)?;
+        let name = self.parse_ident()?;
+        self.expect(TK::LParen)?;
+        let mut params = Vec::new();
+        while !self.check(TK::RParen) && !self.is_eof() {
+            // Simplified param parsing
+            let param_name = self.parse_ident()?;
+            self.expect(TK::Colon)?;
+            let ty = self.parse_type()?;
+            params.push(ExternParam {
+                name: param_name,
+                ty,
+                quantity: Quantity::Many,
+                mutability: Mutability::Immutable,
+                span: Span::new(0, 0, 1, 1),
+            });
+            if self.check(TK::Comma) {
+                self.advance();
+            }
+        }
+        self.expect(TK::RParen)?;
+        let ret_ty = if self.check(TK::Arrow) {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        self.expect(TK::Semicolon)?;
+        Ok(ExternFn {
+            name,
+            params,
+            ret_ty,
+            link_name: None,
+            span: Span::new(0, 0, 1, 1),
+            is_async: false,
+        })
+    }
+
+    fn parse_function(&mut self, attributes: Vec<Attribute>) -> ParseResult<Item> {
+        let span = self.current_span().unwrap_or(Span::new(0, 0, 1, 1));
+        self.advance(); // fn
+
+        let is_async = if self.check(TK::Async) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+
+        let name = self.parse_ident()?;
+        let generics = self.parse_generics()?;
+        self.expect(TK::LParen)?;
+        let mut params = Vec::new();
+        while !self.check(TK::RParen) && !self.is_eof() {
+            params.push(self.parse_param()?);
+            if self.check(TK::Comma) {
+                self.advance();
+            }
+        }
+        self.expect(TK::RParen)?;
+
+        let ret_ty = if self.check(TK::Arrow) {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+
+        let is_reversible = if self.check(TK::Reversible) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+
+        let requires = if self.check(TK::Requires) {
+            self.advance();
+            self.expect(TK::LBrace)?;
+            let mut reqs = Vec::new();
+            while !self.check(TK::RBrace) && !self.is_eof() {
+                reqs.push(self.parse_expr()?);
+                if self.check(TK::Semicolon) {
+                    self.advance();
+                }
+            }
+            self.expect(TK::RBrace)?;
+            reqs
+        } else {
+            Vec::new()
+        };
+
+        let body = self.parse_block()?;
+
+        let quantity = Quantity::Many; // Would parse from attribute
+
+        Ok(Item::Function(Function {
+            name,
+            generics,
+            params,
+            ret_ty,
+            body,
+            span,
+            attributes,
+            is_reversible,
+            is_async,
+            quantity,
+            requires,
+        }))
+    }
+
+    fn parse_generics(&mut self) -> ParseResult<Vec<GenericParam>> {
+        if !self.check(TK::LBracket) {
+            return Ok(Vec::new());
+        }
+        self.advance(); // [
+        let mut generics = Vec::new();
+        while !self.check(TK::RBracket) && !self.is_eof() {
+            let name = self.parse_ident()?;
+            let kind = if self.check(TK::Colon) {
+                self.advance();
+                if self.check(TK::Nat) {
+                    self.advance();
+                    GenericKind::Nat
+                } else {
+                    GenericKind::Type
+                }
+            } else {
+                GenericKind::Type
+            };
+            let span = name.span;
+            generics.push(GenericParam { name, kind, span });
+            if self.check(TK::Comma) {
+                self.advance();
+            }
+        }
+        self.expect(TK::RBracket)?;
+        Ok(generics)
+    }
+
+    fn parse_param(&mut self) -> ParseResult<Param> {
+        let span = self.current_span().unwrap_or(Span::new(0, 0, 1, 1));
+
+        let quantity = if self.check(TK::LBracket) {
+            self.advance(); // [
+            let qty = if self.check(TK::Int(0)) {
+                self.advance();
+                self.expect(TK::RBracket)?;
+                Quantity::Zero
+            } else if self.check(TK::Int(1)) {
+                self.advance();
+                self.expect(TK::RBracket)?;
+                Quantity::One
+            } else if self.check(TK::QtyStar) {
+                self.advance();
+                self.expect(TK::RBracket)?;
+                Quantity::Many
+            } else if let Some(TK::TypeIdent(s)) = self.current_kind() {
+                let name = s.clone();
+                self.advance();
+                self.expect(TK::RBracket)?;
+                Quantity::Bounded(name.parse().unwrap_or(0))
+            } else {
+                self.expect(TK::RBracket)?;
+                Quantity::Many
+            };
+            qty
+        } else {
+            Quantity::Many
+        };
+
+        let mutability = if self.check(TK::Mut) {
+            self.advance();
+            Mutability::Mut
+        } else if self.check(TK::InOut) {
+            self.advance();
+            Mutability::InOut
+        } else if self.check(TK::Consume) {
+            self.advance();
+            Mutability::Consume
+        } else {
+            Mutability::Immutable
+        };
+
+        let name = self.parse_ident()?;
+        self.expect(TK::Colon)?;
+        let ty = self.parse_type()?;
+
+        Ok(Param { name, ty, quantity, mutability, span })
+    }
+
+    fn parse_type(&mut self) -> ParseResult<Type> {
+        // Simplified type parsing - would need full implementation
+        let span = self.current_span().unwrap_or(Span::new(0, 0, 1, 1));
+        let kind = if self.check(TK::Qubit) {
+            self.advance();
+            TypeKind::Qubit
+        } else if self.check(TK::QRegister) {
+            self.advance();
+            self.expect(TK::LBracket)?;
+            let mut dims = Vec::new();
+            while !self.check(TK::RBracket) && !self.is_eof() {
+                dims.push(self.parse_type()?);
+                if self.check(TK::Comma) {
+                    self.advance();
+                }
+            }
+            self.expect(TK::RBracket)?;
+            TypeKind::QRegister(dims)
+        } else if self.check(TK::Tensor) {
+            self.advance();
+            self.expect(TK::LBracket)?;
+            let mut dims = Vec::new();
+            while !self.check(TK::RBracket) && !self.is_eof() {
+                dims.push(self.parse_type()?);
+                if self.check(TK::Comma) {
+                    self.advance();
+                }
+            }
+            self.expect(TK::RBracket)?;
+            TypeKind::Tensor(dims)
+        } else if self.check(TK::IntKw) || self.check(TK::Int8) || self.check(TK::Int16) || self.check(TK::Int32) || self.check(TK::Int64) {
+            // Integer type
+            self.advance();
+            TypeKind::Int
+        } else if self.check(TK::BoolKw) {
+            self.advance();
+            TypeKind::Bool
+        } else if self.check(TK::FloatKw) || self.check(TK::Float32) || self.check(TK::Float64) {
+            self.advance();
+            TypeKind::Float
+        } else if let Some(TK::TypeIdent(name)) = self.current_kind() {
+            let ident = self.parse_ident()?;
+            let args = if self.check(TK::Lt) {
+                self.advance();
+                let mut args = Vec::new();
+                while !self.check(TK::Gt) && !self.is_eof() {
+                    // Simplified - would parse TypeArg
+                    if self.check(TK::TypeIdent("")) {
+                        args.push(TypeArg::Type(self.parse_type()?));
+                    }
+                    if self.check(TK::Comma) {
+                        self.advance();
+                    }
+                }
+                self.expect(TK::Gt)?;
+                args
+            } else {
+                Vec::new()
+            };
+            TypeKind::Named(ident, args)
+        } else {
+            TypeKind::Error
+        };
+        Ok(Type::new(kind, Quantity::Many, span))
+    }
+
+    fn parse_block(&mut self) -> ParseResult<Block> {
+        self.expect(TK::LBrace)?;
+        let mut stmts = Vec::new();
+        let mut final_expr = None;
+        while !self.check(TK::RBrace) && !self.is_eof() {
+            // Check if this is an expression statement (no semicolon) at the end
+            let stmt = self.parse_stmt()?;
+            if let StmtKind::Expr(e) = &stmt.kind {
+                // Peek ahead to see if next is RBrace (no semicolon)
+                if self.check(TK::RBrace) {
+                    final_expr = Some(*e.clone());
+                } else {
+                    stmts.push(stmt);
+                }
+            } else {
+                stmts.push(stmt);
+            }
+        }
+        self.expect(TK::RBrace)?;
+        let span = Span::new(0, 0, 1, 1); // Would need proper span
+        Ok(Block::new(stmts, final_expr, span))
+    }
+
+    fn parse_stmt(&mut self) -> ParseResult<Stmt> {
+        let span = self.current_span().unwrap_or(Span::new(0, 0, 1, 1));
+
+        // Let bindings
+        if self.check(TK::Let) {
+            self.advance();
+            // Check for inout/consume
+            if self.check(TK::InOut) {
+                self.advance();
+                return self.parse_let_inout(span);
+            } else if self.check(TK::Consume) {
+                self.advance();
+                return self.parse_let_consume(span);
+            } else {
+                return self.parse_let(span);
+            }
+        }
+
+        // Return
+        if self.check(TK::Return) {
+            self.advance();
+            let expr = if !self.check(TK::Semicolon) && !self.check(TK::RBrace) {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+            self.expect(TK::Semicolon)?;
+            return Ok(Stmt::new(StmtKind::Return(expr), span, self.id_gen.next_id()));
+        }
+
+        // Break
+        if self.check(TK::Break) {
+            self.advance();
+            let expr = if !self.check(TK::Semicolon) && !self.check(TK::RBrace) {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+            self.expect(TK::Semicolon)?;
+            return Ok(Stmt::new(StmtKind::Break(expr), span, self.id_gen.next_id()));
+        }
+
+        // Continue
+        if self.check(TK::Continue) {
+            self.advance();
+            self.expect(TK::Semicolon)?;
+            return Ok(Stmt::new(StmtKind::Continue, span, self.id_gen.next_id()));
+        }
+
+        // Reversible block
+        if self.check(TK::Reversible) {
+            self.advance();
+            let rev_block = self.parse_reversible_block()?;
+            return Ok(Stmt::new(StmtKind::Reversible(rev_block), span, self.id_gen.next_id()));
+        }
+
+        // Proof block
+        if self.check(TK::Proof) {
+            self.advance();
+            let proof_block = self.parse_proof_block()?;
+            return Ok(Stmt::new(StmtKind::Proof(proof_block), span, self.id_gen.next_id()));
+        }
+
+        // Item declaration
+        if matches!(self.current_kind(), Some(TK::Fn | TK::Struct | TK::Enum | TK::Type | TK::Trait | TK::Impl | TK::Mod | TK::Import | TK::Const)) {
+            let item = self.parse_item()?;
+            return Ok(Stmt::new(StmtKind::Item(item), span, self.id_gen.next_id()));
+        }
+
+        // Expression statement
+        let expr = self.parse_expr()?;
+        if self.check(TK::Semicolon) {
+            self.advance();
+            Ok(Stmt::new(StmtKind::Expr(expr), span, self.id_gen.next_id()))
+        } else {
+            // Expression without semicolon - treat as final expression in block
+            Ok(Stmt::new(StmtKind::Expr(expr), span, self.id_gen.next_id()))
+        }
+    }
+
+    fn parse_let(&mut self, span: Span) -> ParseResult<Stmt> {
+        // Simplified let parsing
+        let name = self.parse_ident()?;
+        self.expect(TK::Colon)?;
+        let ty = self.parse_type()?;
+        self.expect(TK::Assign)?;
+        let value = self.parse_expr()?;
+        self.expect(TK::Semicolon)?;
+
+        let pattern = Pattern::new(
+            PatternKind::Ident(name.clone()),
+            name.span,
+            self.id_gen.next_id(),
+        );
+
+        Ok(Stmt::new(
+            StmtKind::Let(LetStmt {
+                pattern,
+                ty: Some(ty),
+                quantity: Quantity::Many,
+                mutability: Mutability::Immutable,
+                value,
+                span,
+            }),
+            span,
+            self.id_gen.next_id(),
+        ))
+    }
+
+    fn parse_let_inout(&mut self, span: Span) -> ParseResult<Stmt> {
+        let name = self.parse_ident()?;
+        self.expect(TK::Colon)?;
+        let ty = self.parse_type()?;
+        self.expect(TK::Assign)?;
+        let value = self.parse_expr()?;
+        self.expect(TK::Semicolon)?;
+
+        Ok(Stmt::new(
+            StmtKind::LetInOut(LetInOutStmt {
+                name,
+                ty: Some(ty),
+                value,
+                span,
+            }),
+            span,
+            self.id_gen.next_id(),
+        ))
+    }
+
+    fn parse_let_consume(&mut self, span: Span) -> ParseResult<Stmt> {
+        let name = self.parse_ident()?;
+        self.expect(TK::Colon)?;
+        let ty = self.parse_type()?;
+        self.expect(TK::Assign)?;
+        let value = self.parse_expr()?;
+        self.expect(TK::Semicolon)?;
+
+        Ok(Stmt::new(
+            StmtKind::LetConsume(LetConsumeStmt {
+                name,
+                ty: Some(ty),
+                value,
+                span,
+            }),
+            span,
+            self.id_gen.next_id(),
+        ))
+    }
+
+    fn parse_reversible_block(&mut self) -> ParseResult<ReversibleBlock> {
+        let body = self.parse_block()?;
+        // Uncomputes would be parsed here
+        Ok(ReversibleBlock {
+            body,
+            uncomputes: Vec::new(),
+            span: Span::new(0, 0, 1, 1),
+        })
+    }
+
+    fn parse_proof_block(&mut self) -> ParseResult<ProofBlock> {
+        let body = self.parse_block()?;
+        Ok(ProofBlock {
+            body,
+            span: Span::new(0, 0, 1, 1),
+        })
+    }
+
+    fn parse_type_def(&mut self, attributes: Vec<Attribute>) -> ParseResult<Item> {
+        let span = self.current_span().unwrap_or(Span::new(0, 0, 1, 1));
+        let name = self.parse_ident()?;
+        let generics = self.parse_generics()?;
+
+        let kind = if self.check(TK::Struct) {
+            self.advance();
+            self.expect(TK::LBrace)?;
+            let mut fields = Vec::new();
+            while !self.check(TK::RBrace) && !self.is_eof() {
+                let field_name = self.parse_ident()?;
+                self.expect(TK::Colon)?;
+                let ty = self.parse_type()?;
+                fields.push(Field {
+                    name: field_name,
+                    ty,
+                    quantity: Quantity::Many,
+                    span: field_name.span,
+                    attributes: Vec::new(),
+                });
+                if self.check(TK::Comma) {
+                    self.advance();
+                }
+            }
+            self.expect(TK::RBrace)?;
+            TypeDefKind::Struct(fields)
+        } else if self.check(TK::Enum) {
+            self.advance();
+            self.expect(TK::LBrace)?;
+            let mut variants = Vec::new();
+            while !self.check(TK::RBrace) && !self.is_eof() {
+                let variant_name = self.parse_ident()?;
+                let fields = if self.check(TK::LParen) {
+                    self.advance();
+                    let mut fields = Vec::new();
+                    while !self.check(TK::RParen) && !self.is_eof() {
+                        let field_name = self.parse_ident()?;
+                        self.expect(TK::Colon)?;
+                        let ty = self.parse_type()?;
+                        fields.push(Field {
+                            name: field_name,
+                            ty,
+                            quantity: Quantity::Many,
+                            span: field_name.span,
+                            attributes: Vec::new(),
+                        });
+                        if self.check(TK::Comma) {
+                            self.advance();
+                        }
+                    }
+                    self.expect(TK::RParen)?;
+                    fields
+                } else {
+                    Vec::new()
+                };
+                variants.push(Variant {
+                    name: variant_name,
+                    fields,
+                    span: variant_name.span,
+                    attributes: Vec::new(),
+                });
+                if self.check(TK::Comma) {
+                    self.advance();
+                }
+            }
+            self.expect(TK::RBrace)?;
+            TypeDefKind::Enum(variants)
+        } else if self.check(TK::Type) {
+            self.advance();
+            self.expect(TK::Assign)?;
+            let ty = self.parse_type()?;
+            self.expect(TK::Semicolon)?;
+            TypeDefKind::Alias(ty)
+        } else {
+            TypeDefKind::Alias(Type::new(TypeKind::Error, Quantity::Many, span))
+        };
+
+        Ok(Item::TypeDef(TypeDef {
+            name,
+            generics,
+            kind,
+            span,
+            attributes,
+        }))
+    }
+
+    fn parse_trait_def(&mut self, attributes: Vec<Attribute>) -> ParseResult<Item> {
+        // Simplified trait parsing
+        self.advance(); // trait
+        let name = self.parse_ident()?;
+        let generics = self.parse_generics()?;
+        self.expect(TK::LBrace)?;
+        let mut items = Vec::new();
+        while !self.check(TK::RBrace) && !self.is_eof() {
+            // Would parse trait items
+            if self.check(TK::Fn) {
+                // Simplified
+                self.advance();
+                let fn_name = self.parse_ident()?;
+                self.expect(TK::LParen)?;
+                let mut params = Vec::new();
+                while !self.check(TK::RParen) && !self.is_eof() {
+                    let param_name = self.parse_ident()?;
+                    self.expect(TK::Colon)?;
+                    let ty = self.parse_type()?;
+                    params.push(Param {
+                        name: param_name,
+                        ty,
+                        quantity: Quantity::Many,
+                        mutability: Mutability::Immutable,
+                        span: param_name.span,
+                    });
+                    if self.check(TK::Comma) {
+                        self.advance();
+                    }
+                }
+                self.expect(TK::RParen)?;
+                let ret_ty = if self.check(TK::Arrow) {
+                    self.advance();
+                    Some(self.parse_type()?)
+                } else {
+                    None
+                };
+                self.expect(TK::Semicolon)?;
+                items.push(TraitItem::Fn(TraitFnSig {
+                    name: fn_name,
+                    generics: Vec::new(),
+                    params,
+                    ret_ty,
+                    span: fn_name.span,
+                }));
+            } else {
+                break;
+            }
+        }
+        self.expect(TK::RBrace)?;
+        Ok(Item::Trait(TraitDef {
+            name,
+            generics,
+            items,
+            span: Span::new(0, 0, 1, 1),
+        }))
+    }
+
+    fn parse_trait_impl(&mut self, _attributes: Vec<Attribute>) -> ParseResult<Item> {
+        // Simplified impl parsing
+        self.advance(); // impl
+        let generics = self.parse_generics()?;
+        // Would parse trait path, for_type, items
+        self.expect(TK::LBrace)?;
+        let mut items = Vec::new();
+        while !self.check(TK::RBrace) && !self.is_eof() {
+            // Would parse impl items
+            if self.check(TK::Fn) {
+                let func = self.parse_function(Vec::new())?;
+                if let Item::Function(f) = func {
+                    items.push(ImplItem::Fn(f));
+                }
+            } else {
+                break;
+            }
+        }
+        self.expect(TK::RBrace)?;
+        Ok(Item::Impl(TraitImpl {
+            generics,
+            trait_path: Vec::new(),
+            trait_args: Vec::new(),
+            for_type: Type::new(TypeKind::Error, Quantity::Many, Span::new(0, 0, 1, 1)),
+            items,
+            span: Span::new(0, 0, 1, 1),
+        }))
+    }
+
+    fn parse_module(&mut self, _attributes: Vec<Attribute>) -> ParseResult<Item> {
+        self.advance(); // mod
+        let name = self.parse_ident()?;
+        self.expect(TK::LBrace)?;
+        let mut items = Vec::new();
+        while !self.check(TK::RBrace) && !self.is_eof() {
+            items.push(self.parse_item()?);
+        }
+        self.expect(TK::RBrace)?;
+        Ok(Item::Module(Module {
+            name,
+            items,
+            span: Span::new(0, 0, 1, 1),
+        }))
+    }
+
+    fn parse_import(&mut self, _attributes: Vec<Attribute>) -> ParseResult<Item> {
+        self.advance(); // import
+        let mut path = Vec::new();
+        while !self.is_eof() {
+            path.push(self.parse_ident()?);
+            if self.check(TK::ColonColon) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        let items = if self.check(TK::LBrace) {
+            self.advance();
+            let mut items = Vec::new();
+            while !self.check(TK::RBrace) && !self.is_eof() {
+                items.push(self.parse_ident()?);
+                if self.check(TK::Comma) {
+                    self.advance();
+                }
+            }
+            self.expect(TK::RBrace)?;
+            ImportItems::Specific(items)
+        } else if self.check(TK::Star) {
+            self.advance();
+            ImportItems::All
+        } else {
+            ImportItems::All
+        };
+        self.expect(TK::Semicolon)?;
+        Ok(Item::Import(Import {
+            path,
+            items,
+            span: Span::new(0, 0, 1, 1),
+        }))
+    }
+
+    fn parse_const(&mut self, _attributes: Vec<Attribute>) -> ParseResult<Item> {
+        self.advance(); // const
+        let name = self.parse_ident()?;
+        let ty = if self.check(TK::Colon) {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        self.expect(TK::Assign)?;
+        let value = self.parse_expr()?;
+        self.expect(TK::Semicolon)?;
+        Ok(Item::Const(ConstDef {
+            name,
+            ty,
+            value,
+            span: Span::new(0, 0, 1, 1),
+        }))
+    }
+
+    fn parse_expr(&mut self) -> ParseResult<Expr> {
+        // Delegate to expr parser
+        expr::parse_expr(self)
+    }
+}
+
+/// Parse a source string into a Program AST
+pub fn parse_program(source: &str) -> Result<Program, ParseError> {
+    let tokens = Lexer::lex(source);
+    let mut parser = Parser::new(&tokens);
+    parser.parse_program()
+}

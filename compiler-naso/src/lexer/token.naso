@@ -1,0 +1,329 @@
+//! Token definitions for the Naso lexer.
+//!
+//! This is the Naso implementation of the lexer, ported from the Rust version.
+//! The lexer uses a hand-written recursive descent approach since logos is not available.
+
+use std::vec::Vec;
+use std::string::String;
+use std::option::Option;
+use std::result::Result;
+
+/// Location of a token within the source.
+/// `start`/`end` are byte offsets; `line`/`column` are 1-based and describe
+/// the start of the token.
+pub struct TokenSpan {
+    pub start: usize,
+    pub end: usize,
+    pub line: u32,
+    pub column: u32,
+}
+
+impl TokenSpan {
+    pub fn new(start: usize, end: usize) -> Self {
+        Self {
+            start,
+            end,
+            line: 1,
+            column: 1,
+        }
+    }
+
+    pub fn with_position(start: usize, end: usize, line: u32, column: u32) -> Self {
+        Self { start, end, line, column }
+    }
+
+    pub fn merge(self, other: TokenSpan) -> TokenSpan {
+        TokenSpan {
+            start: self.start.min(other.start),
+            end: self.end.max(other.end),
+            line: self.line.min(other.line),
+            column: self.column.min(other.column),
+        }
+    }
+}
+
+/// A single lexical token produced by the [`Lexer`].
+pub struct Token {
+    pub kind: TokenKind,
+    pub span: TokenSpan,
+}
+
+/// The kinds of lexical tokens: quantity markers, keywords, quantum keywords,
+/// operators, punctuation, identifiers, and literals.
+pub enum TokenKind {
+    // ===== Comments & newlines =====
+    Comment,
+    Newline,
+
+    // ===== Quantity marker [*] =====
+    QtyStar,
+
+    // ===== Keywords =====
+    Fn,
+    Let,
+    InOut,
+    Consume,
+    Mut,
+    Reversible,
+    Return,
+    If,
+    Else,
+    Match,
+    For,
+    While,
+    Forall,
+    Break,
+    Continue,
+    In,
+    Struct,
+    Enum,
+    Type,
+    Mod,
+    Import,
+    Extern,
+    Const,
+    Loop,
+    Async,
+    Await,
+    Proof,
+    Requires,
+    As,
+    Int8,
+    Int4,
+    Int16,
+    Int32,
+    Int64,
+    ISize,
+    UInt8,
+    UInt4,
+    UInt16,
+    UInt32,
+    UInt64,
+    Quint8,
+    Quint4,
+    USize,
+    Float32,
+    Float64,
+    Qubit,
+    QRegister,
+    Measure,
+    Gate,
+    Entangle,
+    Hadamard,
+    Reset,
+    CNot,
+    Rz,
+    QAlloc,
+    Nat,
+    FloatKw,
+    IntKw,
+    BoolKw,
+    Trait,
+    Impl,
+    Tensor,
+    Bool(bool),
+
+    // ===== Literals =====
+    Int(i64),
+    Float(f64),
+    Str(String),
+    Char(char),
+
+    // ===== Identifiers =====
+    TypeIdent(String),
+    Ident(String),
+
+    // ===== Operators =====
+    Not,
+    Eq,
+    Ne,
+    Le,
+    Ge,
+    AndAnd,
+    OrOr,
+    Shl,
+    Shr,
+    Arrow,
+    FatArrow,
+    DotDot,
+    PlusEq,
+    MinusEq,
+    StarEq,
+    SlashEq,
+    PercentEq,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Percent,
+    Lt,
+    Gt,
+    Amp,
+    Pipe,
+    Caret,
+    Assign,
+    At,
+    Hash,
+
+    // ===== Punctuation =====
+    ColonColon,
+    Colon,
+    Semicolon,
+    Comma,
+    Dot,
+    LParen,
+    RParen,
+    LBracket,
+    RBracket,
+    LBrace,
+    RBrace,
+
+    // ===== Error =====
+    Error,
+}
+
+impl TokenKind {
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            TokenKind::Fn => "'fn'",
+            TokenKind::Let => "'let'",
+            TokenKind::InOut => "'inout'",
+            TokenKind::Consume => "'consume'",
+            TokenKind::Reversible => "'reversible'",
+            TokenKind::Return => "'return'",
+            TokenKind::If => "'if'",
+            TokenKind::Else => "'else'",
+            TokenKind::Match => "'match'",
+            TokenKind::For => "'for'",
+            TokenKind::While => "'while'",
+            TokenKind::Forall => "'forall'",
+            TokenKind::Break => "'break'",
+            TokenKind::Continue => "'continue'",
+            TokenKind::In => "'in'",
+            TokenKind::Struct => "'struct'",
+            TokenKind::Enum => "'enum'",
+            TokenKind::Type => "'type'",
+            TokenKind::Mod => "'mod'",
+            TokenKind::Import => "'import'",
+            TokenKind::Extern => "'extern'",
+            TokenKind::Const => "'const'",
+            TokenKind::Loop => "'loop'",
+            TokenKind::Async => "'async'",
+            TokenKind::Await => "'await'",
+            TokenKind::Proof => "'proof'",
+            TokenKind::Requires => "'requires'",
+            TokenKind::As => "'as'",
+            TokenKind::Mut => "'mut'",
+            TokenKind::Int4 => "'i4'",
+            TokenKind::Int8 => "'i8'",
+            TokenKind::Int16 => "'i16'",
+            TokenKind::Int32 => "'i32'",
+            TokenKind::Int64 => "'i64'",
+            TokenKind::ISize => "'isize'",
+            TokenKind::UInt4 => "'u4'",
+            TokenKind::UInt8 => "'u8'",
+            TokenKind::UInt16 => "'u16'",
+            TokenKind::UInt32 => "'u32'",
+            TokenKind::UInt64 => "'u64'",
+            TokenKind::Quint8 => "'quint8'",
+            TokenKind::Quint4 => "'quint4'",
+            TokenKind::USize => "'usize'",
+            TokenKind::Float32 => "'f32'",
+            TokenKind::Float64 => "'f64'",
+            TokenKind::Qubit => "'qubit'",
+            TokenKind::QRegister => "'qregister'",
+            TokenKind::Measure => "'measure'",
+            TokenKind::Gate => "'gate'",
+            TokenKind::Entangle => "'entangle'",
+            TokenKind::Hadamard => "'hadamard'",
+            TokenKind::Reset => "'reset'",
+            TokenKind::CNot => "'cnot'",
+            TokenKind::Rz => "'rz'",
+            TokenKind::QAlloc => "'qalloc'",
+            TokenKind::Nat => "'nat'",
+            TokenKind::FloatKw => "'float'",
+            TokenKind::IntKw => "'int'",
+            TokenKind::BoolKw => "'bool'",
+            TokenKind::Trait => "'trait'",
+            TokenKind::Impl => "'impl'",
+            TokenKind::Tensor => "'tensor'",
+            TokenKind::QtyStar => "'[*]'",
+            TokenKind::Int(_) => "integer literal",
+            TokenKind::Float(_) => "float literal",
+            TokenKind::Bool(_) => "boolean literal",
+            TokenKind::Str(_) => "string literal",
+            TokenKind::Char(_) => "char literal",
+            TokenKind::Ident(_) => "identifier",
+            TokenKind::TypeIdent(_) => "type name",
+            TokenKind::Plus => "'+'",
+            TokenKind::Not => "'!'",
+            TokenKind::Minus => "'-'",
+            TokenKind::Star => "'*'",
+            TokenKind::Slash => "'/'",
+            TokenKind::Percent => "'%'",
+            TokenKind::PlusEq => "'+='",
+            TokenKind::MinusEq => "'-'",
+            TokenKind::StarEq => "'*='",
+            TokenKind::SlashEq => "'/'",
+            TokenKind::PercentEq => "'%'",
+            TokenKind::Eq => "'=='",
+            TokenKind::Ne => "'!='",
+            TokenKind::Lt => "'<'",
+            TokenKind::Le => "'<='",
+            TokenKind::Gt => "'>'",
+            TokenKind::Ge => "'>='",
+            TokenKind::AndAnd => "'&&'",
+            TokenKind::OrOr => "'||'",
+            TokenKind::Amp => "'&'",
+            TokenKind::Pipe => "'|'",
+            TokenKind::Caret => "'^'",
+            TokenKind::Shl => "'<<'",
+            TokenKind::Shr => "'>>'",
+            TokenKind::Assign => "'='",
+            TokenKind::Arrow => "'->'",
+            TokenKind::FatArrow => "'=>'",
+            TokenKind::Colon => "':'",
+            TokenKind::Semicolon => "';'",
+            TokenKind::Comma => "','",
+            TokenKind::Dot => "'.'",
+            TokenKind::DotDot => "'..'",
+            TokenKind::LParen => "'('",
+            TokenKind::RParen => "')'",
+            TokenKind::LBracket => "'['",
+            TokenKind::RBracket => "']'",
+            TokenKind::LBrace => "'{'",
+            TokenKind::RBrace => "'}'",
+            TokenKind::ColonColon => "'::'",
+            TokenKind::At => "'@'",
+            TokenKind::Hash => "'#'",
+            TokenKind::Newline => "newline",
+            TokenKind::Comment => "comment",
+            TokenKind::Error => "<lex error>",
+        }
+    }
+}
+
+/// Whether a token is pure trivia that can be skipped between grammar tokens.
+pub fn is_trivia(kind: &TokenKind) -> bool {
+    matches!(kind, TokenKind::Newline | TokenKind::Comment)
+}
+
+/// A lexical error with the byte offset at which the lexer failed.
+pub struct LexError {
+    pub offset: usize,
+    pub message: String,
+}
+
+impl std::fmt::Display for LexError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "lex error at byte {}: {}", self.offset, self.message)
+    }
+}
+
+/// The result of lexing a source string.
+pub struct LexResult {
+    /// Tokens, including `Newline` and `Comment` markers.
+    pub tokens: Vec<Token>,
+    /// The first lexical error encountered, if any.
+    pub error: Option<LexError>,
+}

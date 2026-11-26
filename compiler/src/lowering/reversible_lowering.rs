@@ -107,11 +107,12 @@
 //! spend the effort now.
 
 use super::{LoweringContext, LoweringError};
-use crate::ast::Quantity;
+use crate::ast::{Mutability, Quantity};
 use crate::ir::{
     AffineDomain, AffineMap, Matrix, PirExpr, PirStatement, QuantityMap, ScheduleNode,
     ScheduleTree, StmtId,
 };
+use naso_gates::statevector::Gate;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -658,7 +659,6 @@ fn generate_quantum_adjoint(
         Gate::Cz => ("CZ".to_string(), args.to_vec()),
         Gate::Ccx => ("CCX".to_string(), args.to_vec()),
         Gate::Swap => ("SWAP".to_string(), args.to_vec()),
-        Gate::Iswap => ("ISWAP".to_string(), args.to_vec()),
         Gate::Rx(_) => ("RX".to_string(), negate_first_angle(args)),
         Gate::Ry(_) => ("RY".to_string(), negate_first_angle(args)),
         Gate::Rz(_) => ("RZ".to_string(), negate_first_angle(args)),
@@ -670,7 +670,7 @@ fn generate_quantum_adjoint(
         Gate::Rzz(_) => ("RZZ".to_string(), negate_first_angle(args)),
         Gate::Cphase(_) => ("CPHASE".to_string(), negate_first_angle(args)),
         Gate::Iswap => ("ISWAP".to_string(), args.to_vec()),
-        Gate::IswapDag => ("ISWAPDAG".to_string(), args.to_vec()),
+        Gate::IswapDag => ("ISWAP_DAG".to_string(), args.to_vec()),
         Gate::Cswap => ("CSWAP".to_string(), args.to_vec()),
     };
 

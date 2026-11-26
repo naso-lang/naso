@@ -1,0 +1,79 @@
+//! Naso Pattern Matching AST (Naso implementation)
+
+use crate::ast::{Ident, Literal, NodeId, Quantity, Span};
+use std::vec::Vec;
+use std::option::Option;
+use std::boxed::Box;
+
+/// Pattern for matching
+pub struct Pattern {
+    pub kind: PatternKind,
+    pub ty: Option<Type>,
+    pub quantity: Quantity,
+    pub span: Span,
+    pub id: NodeId,
+}
+
+impl Pattern {
+    pub fn new(kind: PatternKind, span: Span, id: NodeId) -> Self {
+        Self {
+            kind,
+            ty: None,
+            quantity: Quantity::Many,
+            span,
+            id,
+        }
+    }
+
+    pub fn with_ty(mut self, ty: Type) -> Self {
+        self.ty = Some(ty);
+        self
+    }
+
+    pub fn with_qty(mut self, qty: Quantity) -> Self {
+        self.quantity = qty;
+        self
+    }
+}
+
+/// Pattern kinds
+pub enum PatternKind {
+    /// Wildcard pattern _
+    Wildcard,
+    /// Identifier binding
+    Ident(Ident),
+    /// Literal pattern
+    Literal(Literal),
+    /// Tuple pattern
+    Tuple(Vec<Pattern>),
+    /// Struct pattern
+    Struct(Ident, Vec<FieldPattern>),
+    /// Enum variant pattern
+    Variant(Ident, Ident, Vec<Pattern>),
+    /// Array/slice pattern
+    Array(Vec<Pattern>),
+    /// Range pattern (start..end)
+    Range(Box<Pattern>, Box<Pattern>),
+    /// Or pattern (a | b)
+    Or(Box<Pattern>, Box<Pattern>),
+    /// Reference pattern (&pattern)
+    Ref(Box<Pattern>),
+    /// Inout pattern (&mut pattern)
+    InOut(Box<Pattern>),
+    /// Consume pattern (consume pattern)
+    Consume(Box<Pattern>),
+    /// Guard pattern (pattern if expr)
+    Guard(Box<Pattern>, Box<Expr>),
+    /// Error pattern
+    Error,
+}
+
+pub struct FieldPattern {
+    pub name: Ident,
+    pub pattern: Pattern,
+    pub span: Span,
+}
+
+// Forward declarations
+pub enum Expr;
+pub enum Type;

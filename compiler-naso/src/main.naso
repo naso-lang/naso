@@ -1,0 +1,39 @@
+//! Test file for Naso compiler frontend (lexer + parser)
+
+use std::vec::Vec;
+use std::string::String;
+
+mod lexer;
+mod ast;
+mod parser;
+
+fn main() {
+    // Test lexer
+    let source = r#"
+fn main() {
+    let x: i32 = 42;
+    let y = x + 1;
+    return y;
+}
+"#;
+
+    let tokens = lexer::Lexer::lex(source);
+    println!("Tokens ({}):", tokens.len());
+    for token in &tokens {
+        println!("  {:?} {:?}", token.kind, token.span);
+    }
+
+    // Test parser
+    match parser::parse_program(source) {
+        Ok(program) => {
+            println!("\nParsed successfully!");
+            println!("Items: {}", program.items.len());
+            for item in &program.items {
+                println!("  Item: {:?}", item);
+            }
+        }
+        Err(e) => {
+            println!("\nParse error: {}", e);
+        }
+    }
+}

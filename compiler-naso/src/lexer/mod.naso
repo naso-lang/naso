@@ -1,0 +1,504 @@
+//! Lexer for the Naso language.
+//!
+//! Hand-written recursive descent lexer ported from the Rust logos-based implementation.
+
+use crate::lexer::token::{Token, TokenKind, TokenSpan, LexResult, LexError};
+
+/// A hand-written lexer for Naso source code.
+pub struct Lexer {
+    source: String,
+    pos: usize,
+    line: u32,
+    column: u32,
+}
+
+impl Lexer {
+    /// Lex `source`, returning all tokens (comment and newline tokens included).
+    pub fn lex(source: &str) -> Vec<Token> {
+        Self::lex_with_error(source).tokens
+    }
+
+    /// Lex `source`, returning the tokens and the first error encountered.
+    pub fn lex_with_error(source: &str) -> LexResult {
+        let mut lexer = Lexer {
+            source: source.to_string(),
+            pos: 0,
+            line: 1,
+            column: 1,
+        };
+        let mut tokens = Vec::new();
+        let mut error: Option<LexError> = None;
+
+        while lexer.pos < lexer.source.len() {
+            match lexer.next_token() {
+                Ok(token) => {
+                    tokens.push(token);
+                }
+                Err(e) => {
+                    if error.is_none() {
+                        error = Some(e);
+                    }
+                    // Surface an explicit error token and stop lexing.
+                    tokens.push(Token {
+                        kind: TokenKind::Error,
+                        span: TokenSpan::new(lexer.pos, lexer.pos + 1),
+                    });
+                    break;
+                }
+            }
+        }
+
+        LexResult { tokens, error }
+    }
+
+    /// Lex `source`, skipping comments and newlines. Convenient for tests.
+    pub fn tokenize(source: &str) -> Vec<TokenKind> {
+        Lexer::lex(source)
+            .into_iter()
+            .filter(|t| !matches!(t.kind, TokenKind::Comment | TokenKind::Newline))
+            .map(|t| t.kind)
+            .collect()
+    }
+
+    /// Get the next token from the source.
+    fn next_token(&mut self) -> Result<Token, LexError> {
+        self.skip_whitespace();
+
+        if self.pos >= self.source.len() {
+            // End of input - return a dummy token (caller should handle EOF)
+            return Ok(Token {
+                kind: TokenKind::Error, // Will be filtered out
+                span: TokenSpan::new(self.pos, self.pos),
+            });
+        }
+
+        let start = self.pos;
+        let start_line = self.line;
+        let start_col = self.column;
+        let ch = self.current_char();
+
+        // Handle newlines first
+        if ch == '\n' {
+            self.advance();
+            return Ok(Token {
+                kind: TokenKind::Newline,
+                span: TokenSpan::with_position(start, start + 1, start_line, start_col),
+            });
+        }
+
+        // Handle comments
+        if ch == '/' && self.peek() == Some('/') {
+            return self.lex_comment(start, start_line, start_col);
+        }
+
+        // Handle string literals
+        if ch == '"' {
+            return self.lex_string(start, start_line, start_col);
+        }
+
+        // Handle char literals
+        if ch == '\'' {
+            return self.lex_char(start, start_line, start_col);
+        }
+
+        // Handle numbers (integers and floats)
+        if ch.is_ascii_digit() {
+            return self.lex_number(start, start_line, start_col);
+        }
+
+        // Handle identifiers and keywords
+        if ch.is_ascii_alphabetic() || ch == '_' {
+            return self.lex_identifier_or_keyword(start, start_line, start_col);
+        }
+
+        // Handle operators and punctuation
+        return self.lex_operator_or_punct(start, start_line, start_col);
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self.pos < self.source.len() {
+            let ch = self.current_char();
+            if ch == ' ' || ch == '\t' || ch == '\r' {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn current_char(&self) -> char {
+        self.source.chars().nth(self.pos).unwrap_or('\0')
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.source.chars().nth(self.pos + 1)
+    }
+
+    fn advance(&mut self) {
+        if self.pos < self.source.len() {
+            let ch = self.current_char();
+            if ch == '\n' {
+                self.line += 1;
+                self.column = 1;
+            } else {
+                self.column += 1;
+            }
+            self.pos += 1;
+        }
+    }
+
+    fn advance_n(&mut self, n: usize) {
+        for _ in 0..n {
+            self.advance();
+        }
+    }
+
+    fn lex_comment(&mut self, start: usize, line: u32, col: u32) -> Result<Token, LexError> {
+        self.advance(); // '/'
+        self.advance(); // '/'
+        while self.pos < self.source.len() && self.current_char() != '\n' {
+            self.advance();
+        }
+        Ok(Token {
+            kind: TokenKind::Comment,
+            span: TokenSpan::with_position(start, self.pos, line, col),
+        })
+    }
+
+    fn lex_string(&mut self, start: usize, line: u32, col: u32) -> Result<Token, LexError> {
+        self.advance(); // opening quote
+        let mut content = String::new();
+        while self.pos < self.source.len() {
+            let ch = self.current_char();
+            if ch == '"' {
+                self.advance(); // closing quote
+                let unescaped = Self::unescape(&content);
+                return Ok(Token {
+                    kind: TokenKind::Str(unescaped),
+                    span: TokenSpan::with_position(start, self.pos, line, col),
+                });
+            } else if ch == '\\' {
+                self.advance();
+                if self.pos < self.source.len() {
+                    let escaped = self.current_char();
+                    match escaped {
+                        'n' => content.push('\n'),
+                        't' => content.push('\t'),
+                        'r' => content.push('\r'),
+                        '0' => content.push('\0'),
+                        '\\' => content.push('\\'),
+                        '\'' => content.push('\''),
+                        '"' => content.push('"'),
+                        other => content.push(other),
+                    }
+                    self.advance();
+                } else {
+                    content.push('\\');
+                }
+            } else if ch == '\n' {
+                return Err(LexError {
+                    offset: self.pos,
+                    message: "unterminated string literal".to_string(),
+                });
+            } else {
+                content.push(ch);
+                self.advance();
+            }
+        }
+        Err(LexError {
+            offset: start,
+            message: "unterminated string literal".to_string(),
+        })
+    }
+
+    fn lex_char(&mut self, start: usize, line: u32, col: u32) -> Result<Token, LexError> {
+        self.advance(); // opening quote
+        if self.pos >= self.source.len() {
+            return Err(LexError {
+                offset: start,
+                message: "unterminated char literal".to_string(),
+            });
+        }
+        let ch = self.current_char();
+        let mut result_char = ch;
+        self.advance();
+        if ch == '\\' {
+            if self.pos < self.source.len() {
+                let escaped = self.current_char();
+                result_char = match escaped {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    '0' => '\0',
+                    '\\' => '\\',
+                    '\'' => '\'',
+                    '"' => '"',
+                    other => other,
+                };
+                self.advance();
+            }
+        }
+        if self.pos >= self.source.len() || self.current_char() != '\'' {
+            return Err(LexError {
+                offset: start,
+                message: "unterminated char literal".to_string(),
+            });
+        }
+        self.advance(); // closing quote
+        Ok(Token {
+            kind: TokenKind::Char(result_char),
+            span: TokenSpan::with_position(start, self.pos, line, col),
+        })
+    }
+
+    fn lex_number(&mut self, start: usize, line: u32, col: u32) -> Result<Token, LexError> {
+        let mut has_dot = false;
+        let mut has_exp = false;
+
+        // Scan digits and optional dot/exp
+        while self.pos < self.source.len() {
+            let ch = self.current_char();
+            if ch.is_ascii_digit() || ch == '_' {
+                self.advance();
+            } else if ch == '.' && !has_dot && !has_exp {
+                has_dot = true;
+                self.advance();
+            } else if (ch == 'e' || ch == 'E') && !has_exp {
+                has_exp = true;
+                self.advance();
+                // Optional sign after e/E
+                if self.pos < self.source.len() {
+                    let next = self.current_char();
+                    if next == '+' || next == '-' {
+                        self.advance();
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+
+        let end = self.pos;
+        let slice = &self.source[start..end];
+        let cleaned: String = slice.chars().filter(|c| *c != '_').collect();
+
+        if has_dot || has_exp {
+            let val = cleaned.parse().unwrap_or(0.0);
+            Ok(Token {
+                kind: TokenKind::Float(val),
+                span: TokenSpan::with_position(start, end, line, col),
+            })
+        } else {
+            let val = cleaned.parse().unwrap_or(0);
+            Ok(Token {
+                kind: TokenKind::Int(val),
+                span: TokenSpan::with_position(start, end, line, col),
+            })
+        }
+    }
+
+    fn lex_identifier_or_keyword(&mut self, start: usize, line: u32, col: u32) -> Result<Token, LexError> {
+        let mut end = start;
+        while end < self.source.len() {
+            let ch = self.source.chars().nth(end).unwrap();
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        let ident = &self.source[start..end];
+        self.pos = end;
+
+        // Check for keywords (case-insensitive)
+        let kind = Self::keyword_from_ident(ident);
+        match kind {
+            Some(k) => Ok(Token {
+                kind: k,
+                span: TokenSpan::with_position(start, end, line, col),
+            }),
+            None => {
+                // Check if it's a type identifier (starts with uppercase)
+                let first_char = ident.chars().next().unwrap();
+                if first_char.is_ascii_uppercase() {
+                    Ok(Token {
+                        kind: TokenKind::TypeIdent(ident.to_string()),
+                        span: TokenSpan::with_position(start, end, line, col),
+                    })
+                } else {
+                    Ok(Token {
+                        kind: TokenKind::Ident(ident.to_string()),
+                        span: TokenSpan::with_position(start, end, line, col),
+                    })
+                }
+            }
+        }
+    }
+
+    fn keyword_from_ident(ident: &str) -> Option<TokenKind> {
+        match ident.to_ascii_lowercase().as_str() {
+            "fn" => Some(TokenKind::Fn),
+            "let" => Some(TokenKind::Let),
+            "inout" => Some(TokenKind::InOut),
+            "consume" => Some(TokenKind::Consume),
+            "mut" => Some(TokenKind::Mut),
+            "reversible" => Some(TokenKind::Reversible),
+            "return" => Some(TokenKind::Return),
+            "if" => Some(TokenKind::If),
+            "else" => Some(TokenKind::Else),
+            "match" => Some(TokenKind::Match),
+            "for" => Some(TokenKind::For),
+            "while" => Some(TokenKind::While),
+            "forall" => Some(TokenKind::Forall),
+            "break" => Some(TokenKind::Break),
+            "continue" => Some(TokenKind::Continue),
+            "in" => Some(TokenKind::In),
+            "struct" => Some(TokenKind::Struct),
+            "enum" => Some(TokenKind::Enum),
+            "type" => Some(TokenKind::Type),
+            "mod" => Some(TokenKind::Mod),
+            "import" => Some(TokenKind::Import),
+            "extern" => Some(TokenKind::Extern),
+            "const" => Some(TokenKind::Const),
+            "loop" => Some(TokenKind::Loop),
+            "async" => Some(TokenKind::Async),
+            "await" => Some(TokenKind::Await),
+            "proof" => Some(TokenKind::Proof),
+            "requires" => Some(TokenKind::Requires),
+            "as" => Some(TokenKind::As),
+            "i8" => Some(TokenKind::Int8),
+            "i4" => Some(TokenKind::Int4),
+            "i16" => Some(TokenKind::Int16),
+            "i32" => Some(TokenKind::Int32),
+            "i64" => Some(TokenKind::Int64),
+            "isize" => Some(TokenKind::ISize),
+            "u8" => Some(TokenKind::UInt8),
+            "u4" => Some(TokenKind::UInt4),
+            "u16" => Some(TokenKind::UInt16),
+            "u32" => Some(TokenKind::UInt32),
+            "u64" => Some(TokenKind::UInt64),
+            "quint8" => Some(TokenKind::Quint8),
+            "quint4" => Some(TokenKind::Quint4),
+            "usize" => Some(TokenKind::USize),
+            "f32" => Some(TokenKind::Float32),
+            "f64" => Some(TokenKind::Float64),
+            "qubit" => Some(TokenKind::Qubit),
+            "qregister" => Some(TokenKind::QRegister),
+            "measure" => Some(TokenKind::Measure),
+            "gate" => Some(TokenKind::Gate),
+            "entangle" => Some(TokenKind::Entangle),
+            "hadamard" => Some(TokenKind::Hadamard),
+            "reset" => Some(TokenKind::Reset),
+            "cnot" => Some(TokenKind::CNot),
+            "rz" => Some(TokenKind::Rz),
+            "qalloc" => Some(TokenKind::QAlloc),
+            "nat" => Some(TokenKind::Nat),
+            "float" => Some(TokenKind::FloatKw),
+            "int" => Some(TokenKind::IntKw),
+            "bool" => Some(TokenKind::BoolKw),
+            "trait" => Some(TokenKind::Trait),
+            "impl" => Some(TokenKind::Impl),
+            "tensor" => Some(TokenKind::Tensor),
+            "true" => Some(TokenKind::Bool(true)),
+            "false" => Some(TokenKind::Bool(false)),
+            _ => None,
+        }
+    }
+
+    fn lex_operator_or_punct(&mut self, start: usize, line: u32, col: u32) -> Result<Token, LexError> {
+        // Two-character operators first
+        if self.pos + 1 < self.source.len() {
+            let two = &self.source[self.pos..self.pos + 2];
+            let kind = match two {
+                "==" => Some(TokenKind::Eq),
+                "!=" => Some(TokenKind::Ne),
+                "<=" => Some(TokenKind::Le),
+                ">=" => Some(TokenKind::Ge),
+                "&&" => Some(TokenKind::AndAnd),
+                "||" => Some(TokenKind::OrOr),
+                "<<" => Some(TokenKind::Shl),
+                ">>" => Some(TokenKind::Shr),
+                "->" => Some(TokenKind::Arrow),
+                "=>" => Some(TokenKind::FatArrow),
+                ".." => Some(TokenKind::DotDot),
+                "+=" => Some(TokenKind::PlusEq),
+                "-=" => Some(TokenKind::MinusEq),
+                "*=" => Some(TokenKind::StarEq),
+                "/=" => Some(TokenKind::SlashEq),
+                "%=" => Some(TokenKind::PercentEq),
+                "::" => Some(TokenKind::ColonColon),
+                _ => None,
+            };
+            if let Some(k) = kind {
+                self.advance_n(2);
+                return Ok(Token {
+                    kind: k,
+                    span: TokenSpan::with_position(start, start + 2, line, col),
+                });
+            }
+        }
+
+        // Single character
+        let ch = self.current_char();
+        self.advance();
+        let kind = match ch {
+            '!' => TokenKind::Not,
+            '+' => TokenKind::Plus,
+            '-' => TokenKind::Minus,
+            '*' => TokenKind::Star,
+            '/' => TokenKind::Slash,
+            '%' => TokenKind::Percent,
+            '<' => TokenKind::Lt,
+            '>' => TokenKind::Gt,
+            '&' => TokenKind::Amp,
+            '|' => TokenKind::Pipe,
+            '^' => TokenKind::Caret,
+            '=' => TokenKind::Assign,
+            '@' => TokenKind::At,
+            '#' => TokenKind::Hash,
+            ':' => TokenKind::Colon,
+            ';' => TokenKind::Semicolon,
+            ',' => TokenKind::Comma,
+            '.' => TokenKind::Dot,
+            '(' => TokenKind::LParen,
+            ')' => TokenKind::RParen,
+            '[' => TokenKind::LBracket,
+            ']' => TokenKind::RBracket,
+            '{' => TokenKind::LBrace,
+            '}' => TokenKind::RBrace,
+            _ => {
+                return Err(LexError {
+                    offset: start,
+                    message: format!("unexpected character {:?}", ch),
+                });
+            }
+        };
+        Ok(Token {
+            kind,
+            span: TokenSpan::with_position(start, start + 1, line, col),
+        })
+    }
+
+    fn unescape(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.next() {
+                    Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some('r') => out.push('\r'),
+                    Some('0') => out.push('\0'),
+                    Some('\\') => out.push('\\'),
+                    Some('\'') => out.push('\''),
+                    Some('"') => out.push('"'),
+                    Some(other) => out.push(other),
+                    None => out.push('\\'),
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+}

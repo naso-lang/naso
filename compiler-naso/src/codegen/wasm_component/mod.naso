@@ -1,0 +1,22 @@
+//! WASM Component Codegen (Naso implementation)
+
+use crate::codegen::error::{CodegenError, CodegenResult};
+use crate::codegen::context::CodegenContext;
+use crate::ir::pir_types::PirModule;
+use std::string::String;
+
+/// WASM Component Codegen
+pub fn emit_wasm_component(_module: &PirModule, _context: &CodegenContext) -> CodegenResult<String> {
+    let mut wasm = String::new();
+    wasm.push_str("; WASM Component Module built by Naso\n");
+    wasm.push_str("(module\n");
+    wasm.push_str("  (core module $core\n");
+    wasm.push_str("    (type $func (func))\n");
+    wasm.push_str("    (func $main (type $func))\n");
+    wasm.push_str("    (export \"main\" (func $main))\n");
+    wasm.push_str("  )\n");
+    wasm.push_str("  (core instance $instance (instantiate $core))\n");
+    wasm.push_str("  (export \"main\" (core func $instance \"main\"))\n");
+    wasm.push_str(")\n");
+    Ok(wasm)
+}

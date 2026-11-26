@@ -1,0 +1,38 @@
+//! QIR Primitives (Naso implementation)
+
+use crate::codegen::error::{CodegenError, CodegenResult};
+
+/// QIR Intrinsic
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QirIntrinsic {
+    QubitAllocate,
+    QubitRelease,
+    Hadamard,
+    CX,
+    Measure,
+    Reset,
+    RZ,
+}
+
+impl QirIntrinsic {
+    pub fn name(&self) -> &str {
+        match self {
+            QirIntrinsic::QubitAllocate => "__quantum__rt__qubit_allocate",
+            QirIntrinsic::QubitRelease => "__quantum__rt__qubit_release",
+            QirIntrinsic::Hadamard => "__quantum__qis__h__body",
+            QirIntrinsic::CX => "__quantum__qis__cx__body",
+            QirIntrinsic::Measure => "__quantum__rt__result_get_one",
+            QirIntrinsic::Reset => "__quantum__qis__reset__body",
+            QirIntrinsic::RZ => "__quantum__qis__rz__body",
+        }
+    }
+}
+
+/// QIR Primitive
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QirPrimitive {
+    Qubit,
+    Result,
+    Double,
+    Int64,
+}

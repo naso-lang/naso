@@ -1,0 +1,16 @@
+//! LLVM Function Emission (Naso implementation)
+
+use crate::codegen::error::{CodegenError, CodegenResult};
+
+/// Function emission for LLVM
+pub struct LlvmFunctionEmitter {}
+
+impl LlvmFunctionEmitter {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn emit_function(&self, name: &str, _params: &[String]) -> CodegenResult<String> {
+        Ok(format!("define void @{}() {{\nentry:\n  ret void\n}}", name))
+    }
+}

@@ -1,0 +1,45 @@
+//! LLVM Type Lowering (Naso implementation)
+
+use crate::codegen::abi::{LlvmAggregateType, LlvmPointerType, QuantityAwareType};
+use crate::codegen::context::CodegenContext;
+use crate::codegen::error::{CodegenError, CodegenResult};
+
+/// LLVM Type Lowering helper
+pub struct LlvmTypeLowering<'ctx> {
+    context: &'ctx CodegenContext,
+}
+
+impl<'ctx> LlvmTypeLowering<'ctx> {
+    pub fn new(context: &'ctx CodegenContext) -> Self {
+        Self { context }
+    }
+
+    /// Lower quantity-aware type to LLVM aggregate type
+    pub fn lower_aggregate(&self, qty_ty: &QuantityAwareType) -> CodegenResult<LlvmAggregateType> {
+        match qty_ty {
+            QuantityAwareType::Linear(agg) => Ok(agg.clone()),
+            QuantityAwareType::Unrestricted(_) => Err(CodegenError::TypeLoweringError(
+                "Unrestricted type not valid as aggregate".to_string(),
+            )),
+            QuantityAwareType::Erased => Ok(LlvmAggregateType::Int(crate::codegen::abi::IntWidth::I1)),
+            QuantityAwareType::Qubit => Ok(LlvmAggregateType::Int(crate::codegen::abi::IntWidth::I64)),
+            QuantityAwareType::Result => Ok(LlvmAggregateType::Int(crate::codegen::abi::IntWidth::I1)),
+        }
+    }
+
+    /// Lower quantity-aware type to LLVM pointer type
+    pub fn lower_pointer(&self, qty_ty: &QuantityAwareType) -> CodegenResult<LlvmPointerType> {
+        match qty_ty {
+            QuantityAwareType::Unrestricted(ptr) => Ok(ptr.clone()),
+            QuantityAwareType::Linear(agg) => {
+                Ok(LlvmPointerType {
+                    pointee: Box::new(QuantityAwareType::Linear(agg.clone())),
+                    address_space: 0,
+                })
+            }
+            _ => Err(CodegenError::TypeLoweringError(
+                "Cannot create pointer from this quantity type".to_string(),
+            )),
+        }
+    }
+}

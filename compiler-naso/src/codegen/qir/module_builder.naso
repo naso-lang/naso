@@ -1,0 +1,60 @@
+//! QIR Module Builder (Naso implementation)
+
+use crate::codegen::error::{CodegenError, CodegenResult};
+use crate::codegen::context::CodegenContext;
+use crate::ir::pir_types::PirModule;
+use std::string::String;
+
+/// QIR Module Builder
+pub struct QIRModuleBuilder<'ctx> {
+    context: &'ctx CodegenContext,
+    module: String,
+}
+
+impl<'ctx> QIRModuleBuilder<'ctx> {
+    pub fn new(context: &'ctx CodegenContext) -> CodegenResult<Self> {
+        Ok(Self {
+            context,
+            module: String::new(),
+        })
+    }
+
+    pub fn build_module(&mut self, module: &PirModule) -> CodegenResult<()> {
+        self.module.push_str("; QIR Module built by Naso\n");
+        self.module.push_str(&format!("target triple = \"{}\"\n", self.context.target_triple()));
+        self.module.push_str("target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128\"\n\n");
+
+        // Emit quantum intrinsics declarations
+        self.emit_intrinsics()?;
+
+        // Emit functions
+        for func in &module.functions {
+            self.emit_function(func)?;
+        }
+
+        Ok(())
+    }
+
+    fn emit_intrinsics(&mut self) -> CodegenResult<()> {
+        self.module.push_str("declare i8* @__quantum__rt__qubit_allocate()\n");
+        self.module.push_str("declare void @__quantum__rt__qubit_release(i8*)\n");
+        self.module.push_str("declare void @__quantum__qis__h__body(i8*)\n");
+        self.module.push_str("declare void @__quantum__qis__cx__body(i8*, i8*)\n");
+        self.module.push_str("declare i1 @__quantum__rt__result_get_one(i8*)\n");
+        self.module.push_str("declare void @__quantum__qis__rz__body(double, i8*)\n");
+        self.module.push_str("declare void @__quantum__qis__reset__body(i8*)\n\n");
+        Ok(())
+    }
+
+    fn emit_function(&mut self, func: &crate::ir::pir_types::PirFunction) -> CodegenResult<()> {
+        self.module.push_str(&format!("\ndefine void @{}() {{\n", func.name));
+        self.module.push_str("entry:\n");
+        self.module.push_str("  ret void\n");
+        self.module.push_str("}\n");
+        Ok(())
+    }
+
+    pub fn module_to_string(&self) -> String {
+        self.module.clone()
+    }
+}

@@ -1,0 +1,35 @@
+//! QIR Profile (Naso implementation)
+
+use crate::codegen::error::{CodegenError, CodegenResult};
+
+/// QIR Profile Kind
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QirProfileKind {
+    Base,
+    Full,
+}
+
+impl QirProfileKind {
+    pub fn name(&self) -> &str {
+        match self {
+            QirProfileKind::Base => "base",
+            QirProfileKind::Full => "full",
+        }
+    }
+}
+
+/// QIR Profile
+#[derive(Debug, Clone)]
+pub struct QirProfile {
+    pub kind: QirProfileKind,
+    pub target_triple: String,
+}
+
+impl QirProfile {
+    pub fn new(kind: QirProfileKind) -> Self {
+        Self {
+            kind,
+            target_triple: "x86_64-pc-windows-msvc".to_string(),
+        }
+    }
+}

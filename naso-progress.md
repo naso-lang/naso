@@ -259,8 +259,11 @@ Phase 16 (Verification) ──────────────────�
 - Ported typechecker (mod.naso, check.naso, inference.naso, type_env.naso, unify.naso, constraints.naso, error.naso) — bidirectional QTT type checker with linear/inout/consume tracking
 - Ported IR (mod.naso, pir_types.naso, schedule_tree.naso, affine_domain.naso, affine_map.naso, access_relation.naso) — PIR types, schedule trees, affine domains/maps
 - Ported lowering (mod.naso, loop_extraction.naso, polyhedral_scheduling.naso, reversible_lowering.naso, uncomputation.naso, simd.naso, access_analysis.naso, ast_to_pir.naso) — AST→PIR lowering with polyhedral scheduling, reversible blocks, uncomputation
+- Ported codegen (mod.naso, abi.naso, context.naso, error.naso, schedule_consumer.naso, validate.naso, wgsl.naso, wgsl_compute.naso, wgsl_straight.naso, llvm/*.naso, qir/*.naso, wasm_gc.naso, wasm_component.naso, distributed.naso) — LLVM, QIR, WGSL, WASM GC/Component, Distributed backends
 
-**Total ported**: ~9,866 lines across lexer, AST, parser, typechecker, IR, and lowering
+**Total ported**: ~11,490 lines across lexer, AST, parser, typechecker, IR, lowering, and codegen
+
+**Next milestone**: Verification Integration (Layer 8) — integrate `naso-verify` as compiler phase, then Bootstrap Harness (Layer 9) — build self-hosted compiler
 
 ---
 

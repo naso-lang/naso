@@ -1,0 +1,18 @@
+//! WASM GC Codegen (Naso implementation)
+
+use crate::codegen::error::{CodegenError, CodegenResult};
+use crate::codegen::context::CodegenContext;
+use crate::ir::pir_types::PirModule;
+use std::string::String;
+
+/// WASM GC Codegen
+pub fn emit_wasm_gc(_module: &PirModule, _context: &CodegenContext) -> CodegenResult<String> {
+    let mut wasm = String::new();
+    wasm.push_str("; WASM GC Module built by Naso\n");
+    wasm.push_str("(module\n");
+    wasm.push_str("  (type $func (func))\n");
+    wasm.push_str("  (func $main (type $func))\n");
+    wasm.push_str("  (export \"main\" (func $main))\n");
+    wasm.push_str(")\n");
+    Ok(wasm)
+}

@@ -1,0 +1,20 @@
+//! LLVM Access Emission (Naso implementation)
+
+use crate::codegen::error::{CodegenError, CodegenResult};
+
+/// Access emission for LLVM
+pub struct LlvmAccessEmitter {}
+
+impl LlvmAccessEmitter {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn emit_load(&self, _ptr: &str) -> CodegenResult<String> {
+        Ok("load".to_string())
+    }
+
+    pub fn emit_store(&self, _ptr: &str, _value: &str) -> CodegenResult<String> {
+        Ok("store".to_string())
+    }
+}

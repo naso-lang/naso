@@ -1,0 +1,16 @@
+//! LLVM Parallel Emission (Naso implementation)
+
+use crate::codegen::error::{CodegenError, CodegenResult};
+
+/// Parallel emission for LLVM
+pub struct LlvmParallelEmitter {}
+
+impl LlvmParallelEmitter {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn emit_parallel(&self, _body: &str) -> CodegenResult<String> {
+        Ok("; parallel".to_string())
+    }
+}

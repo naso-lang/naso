@@ -1,0 +1,31 @@
+//! LLVM Value Builder (Naso implementation)
+
+use crate::codegen::error::{CodegenError, CodegenResult};
+
+/// LLVM Value Builder helper
+pub struct LlvmValueBuilder<'ctx> {
+    context: &'ctx crate::codegen::context::CodegenContext,
+}
+
+impl<'ctx> LlvmValueBuilder<'ctx> {
+    pub fn new(context: &'ctx crate::codegen::context::CodegenContext) -> Self {
+        Self { context }
+    }
+
+    pub fn build_int(&self, value: i64) -> CodegenResult<String> {
+        Ok(value.to_string())
+    }
+
+    pub fn build_float(&self, value: f64) -> CodegenResult<String> {
+        Ok(value.to_string())
+    }
+
+    pub fn build_binary_op(&self, op: &str, lhs: &str, rhs: &str) -> CodegenResult<String> {
+        Ok(format!("({} {} {})", lhs, op, rhs))
+    }
+
+    pub fn build_call(&self, name: &str, args: &[String]) -> CodegenResult<String> {
+        let args_str = args.join(", ");
+        Ok(format!("call {} ({})", name, args_str))
+    }
+}

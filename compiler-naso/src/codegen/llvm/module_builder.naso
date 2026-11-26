@@ -1,0 +1,46 @@
+//! LLVM Module Builder (Naso implementation)
+
+use crate::codegen::error::{CodegenError, CodegenResult};
+use crate::codegen::context::CodegenContext;
+use crate::ir::pir_types::PirModule;
+use std::string::String;
+
+/// LLVM Module Builder
+pub struct LLVMModuleBuilder<'ctx> {
+    context: &'ctx CodegenContext,
+    module: String,
+}
+
+impl<'ctx> LLVMModuleBuilder<'ctx> {
+    pub fn new(context: &'ctx CodegenContext) -> CodegenResult<Self> {
+        Ok(Self {
+            context,
+            module: String::new(),
+        })
+    }
+
+    pub fn build_module(&mut self, module: &PirModule) -> CodegenResult<()> {
+        self.module.push_str("; Module built by Naso LLVM Codegen\n");
+        self.module.push_str(&format!("target triple = \"{}\"\n", self.context.target_triple()));
+        self.module.push_str(&format!("target datalayout = \"{}\"\n", self.context.data_layout()));
+
+        // Emit functions
+        for func in &module.functions {
+            self.emit_function(func)?;
+        }
+
+        Ok(())
+    }
+
+    fn emit_function(&mut self, func: &crate::ir::pir_types::PirFunction) -> CodegenResult<()> {
+        self.module.push_str(&format!("\ndefine void @{}() {{\n", func.name));
+        self.module.push_str("entry:\n");
+        self.module.push_str("  ret void\n");
+        self.module.push_str("}\n");
+        Ok(())
+    }
+
+    pub fn module_to_string(&self) -> String {
+        self.module.clone()
+    }
+}

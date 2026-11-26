@@ -1,0 +1,25 @@
+//! LLVM Expression Lowering (Naso implementation)
+
+use crate::codegen::error::{CodegenError, CodegenResult};
+
+/// Expression lowering for LLVM
+pub struct LlvmExprLowering {}
+
+impl LlvmExprLowering {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn lower_binary(&self, op: &str, lhs: &str, rhs: &str) -> CodegenResult<String> {
+        Ok(format!("({} {} {})", lhs, op, rhs))
+    }
+
+    pub fn lower_unary(&self, op: &str, expr: &str) -> CodegenResult<String> {
+        Ok(format!("({}{})", op, expr))
+    }
+
+    pub fn lower_call(&self, name: &str, args: &[String]) -> CodegenResult<String> {
+        let args_str = args.join(", ");
+        Ok(format!("call {} ({})", name, args_str))
+    }
+}

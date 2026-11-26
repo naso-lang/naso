@@ -1,0 +1,294 @@
+//! Code Generation Validation (Naso implementation)
+//!
+//! Bitcode validation and structural verification for generated LLVM IR
+
+/// Validation report for LLVM module
+#[derive(Debug, Clone)]
+pub struct ValidationReport {
+    pub passed_checks: Vec<String>,
+    pub warnings: Vec<ValidationWarning>,
+    pub errors: Vec<ValidationError>,
+}
+
+impl ValidationReport {
+    pub fn new() -> Self {
+        Self {
+            passed_checks: Vec::new(),
+            warnings: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
+
+    pub fn has_errors(&self) -> bool {
+        !self.errors.is_empty()
+    }
+
+    pub fn has_warnings(&self) -> bool {
+        !self.warnings.is_empty()
+    }
+
+    pub fn summary(&self) -> String {
+        format!(
+            "Validation Report: {} passed, {} warnings, {} errors",
+            self.passed_checks.len(),
+            self.warnings.len(),
+            self.errors.len()
+        )
+    }
+}
+
+impl Default for ValidationReport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Validation warning
+#[derive(Debug, Clone)]
+pub struct ValidationWarning {
+    pub check: String,
+    pub message: String,
+}
+
+/// Validation error
+#[derive(Debug, Clone)]
+pub struct ValidationError {
+    pub check: String,
+    pub message: String,
+    pub severity: ValidationSeverity,
+}
+
+/// Validation severity
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationSeverity {
+    Warning,
+    Error,
+    Fatal,
+}
+
+/// QIR validation report
+#[derive(Debug, Clone)]
+pub struct QirValidationReport {
+    pub passed_checks: Vec<String>,
+    pub warnings: Vec<QirValidationWarning>,
+    pub errors: Vec<QirValidationError>,
+}
+
+impl Default for QirValidationReport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl QirValidationReport {
+    pub fn new() -> Self {
+        Self {
+            passed_checks: Vec::new(),
+            warnings: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
+
+    pub fn has_errors(&self) -> bool {
+        !self.errors.is_empty()
+    }
+
+    pub fn summary(&self) -> String {
+        format!(
+            "QIR Validation: {} passed, {} warnings, {} errors",
+            self.passed_checks.len(),
+            self.warnings.len(),
+            self.errors.len()
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct QirValidationWarning {
+    pub check: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct QirValidationError {
+    pub check: String,
+    pub message: String,
+    pub severity: ValidationSeverity,
+}
+
+/// Structural verifier for PIR -> LLVM/QIR codegen output
+pub struct StructuralVerifier;
+
+impl StructuralVerifier {
+    /// Verify PIR to LLVM IR structural correctness
+    pub fn verify_pir_to_llvm(pir_module: &str, llvm_ir: &str) -> crate::codegen::error::CodegenResult<StructuralReport> {
+        let mut report = StructuralReport::new();
+
+        let pir_structure = Self::parse_pir_structure(pir_module)?;
+        Self::verify_llvm_matches_pir(&pir_structure, llvm_ir, &mut report)?;
+
+        Ok(report)
+    }
+
+    /// Verify PIR to QIR structural correctness
+    pub fn verify_pir_to_qir(pir_module: &str, qir: &str) -> crate::codegen::error::CodegenResult<StructuralReport> {
+        let mut report = StructuralReport::new();
+
+        let pir_structure = Self::parse_pir_structure(pir_module)?;
+        Self::verify_qir_matches_pir(&pir_structure, qir, &mut report)?;
+
+        Ok(report)
+    }
+
+    /// Parse PIR structure for verification
+    fn parse_pir_structure(pir: &str) -> crate::codegen::error::CodegenResult<PirStructure> {
+        let mut structure = PirStructure::default();
+
+        for line in pir.lines() {
+            let line = line.trim();
+            if line.starts_with('S') && line.contains('=') {
+                if let Some(stmt_name) = line.split('=').next() {
+                    structure.statements.push(stmt_name.trim().to_string());
+                }
+            } else if line.contains("domain") && line.contains('=') {
+                if let Some(domain_name) = line.split('=').next() {
+                    structure.domains.push(domain_name.trim().to_string());
+                }
+            } else if line.contains("array_name") {
+                if let Some(arr) = line.split('"').nth(1) {
+                    structure.arrays.push(arr.to_string());
+                }
+            }
+        }
+
+        Ok(structure)
+    }
+
+    /// Verify LLVM IR matches PIR structure
+    fn verify_llvm_matches_pir(
+        pir: &PirStructure,
+        llvm: &str,
+        report: &mut StructuralReport,
+    ) -> crate::codegen::error::CodegenResult<()> {
+        for stmt in &pir.statements {
+            let fn_name = format!("fn_{}", stmt.to_lowercase());
+            if llvm.contains(&fn_name) || llvm.contains(&format!("define.*{}", stmt)) {
+                report
+                    .matched_elements
+                    .push(format!("Statement -> Function: {}", stmt));
+            } else {
+                report
+                    .mismatched_elements
+                    .push(format!("Missing function for statement: {}", stmt));
+            }
+        }
+
+        for array in &pir.arrays {
+            let global_name = format!("@{}", array);
+            if llvm.contains(&global_name) || llvm.contains(&format!("%{}", array)) {
+                report
+                    .matched_elements
+                    .push(format!("Array -> Global/Value: {}", array));
+            } else {
+                report
+                    .mismatched_elements
+                    .push(format!("Missing allocation for array: {}", array));
+            }
+        }
+
+        if pir.domains.iter().any(|d| d.contains("Band")) {
+            if llvm.contains("br label") || llvm.contains("loop") {
+                report.matched_elements.push("Loop structure".to_string());
+            } else {
+                report
+                    .mismatched_elements
+                    .push("Missing loop structure".to_string());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Verify QIR matches PIR structure
+    fn verify_qir_matches_pir(
+        pir: &PirStructure,
+        qir: &str,
+        report: &mut StructuralReport,
+    ) -> crate::codegen::error::CodegenResult<()> {
+        for stmt in &pir.statements {
+            if stmt.contains("quantum")
+                || stmt.contains("H ")
+                || stmt.contains("CNOT")
+                || stmt.contains("measure")
+            {
+                let has_quantum_op = qir.contains("__quantum__");
+                if has_quantum_op {
+                    report
+                        .matched_elements
+                        .push(format!("Quantum statement -> QIR: {}", stmt));
+                } else {
+                    report
+                        .mismatched_elements
+                        .push(format!("Missing QIR for quantum statement: {}", stmt));
+                }
+            }
+        }
+
+        if pir
+            .arrays
+            .iter()
+            .any(|a| a.contains('q') || a.contains("qubit"))
+        {
+            if qir.contains("__quantum__rt__qubit_allocate") {
+                report
+                    .matched_elements
+                    .push("Qubit register allocation".to_string());
+            } else {
+                report
+                    .mismatched_elements
+                    .push("Missing qubit allocation in QIR".to_string());
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Parsed PIR structure for verification
+#[derive(Debug, Default)]
+struct PirStructure {
+    statements: Vec<String>,
+    domains: Vec<String>,
+    arrays: Vec<String>,
+}
+
+/// Structural verification report
+#[derive(Debug, Clone)]
+pub struct StructuralReport {
+    pub matched_elements: Vec<String>,
+    pub mismatched_elements: Vec<String>,
+}
+
+impl StructuralReport {
+    pub fn new() -> Self {
+        Self {
+            matched_elements: Vec::new(),
+            mismatched_elements: Vec::new(),
+        }
+    }
+
+    pub fn all_matched(&self) -> bool {
+        self.mismatched_elements.is_empty()
+    }
+
+    pub fn summary(&self) -> String {
+        format!(
+            "Structural Verification: {} matched, {} mismatched",
+            self.matched_elements.len(),
+            self.mismatched_elements.len()
+        )
+    }
+}
+
+// Public type alias for CodegenResult when not using LLVM feature
+pub type CodegenResult<T> = Result<T, crate::codegen::error::CodegenError>;

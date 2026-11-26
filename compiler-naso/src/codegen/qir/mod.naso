@@ -1,0 +1,9 @@
+//! QIR Codegen Module (Naso implementation)
+
+pub mod module_builder;
+pub mod primitives;
+pub mod profile;
+
+pub use module_builder::QIRModuleBuilder;
+pub use primitives::{QirIntrinsic, QirPrimitive};
+pub use profile::{QirProfile, QirProfileKind};

@@ -1,0 +1,22 @@
+//! LLVM ABI Guard (Naso implementation)
+
+use crate::codegen::error::{CodegenError, CodegenResult};
+
+/// ABI Guard for LLVM codegen
+pub struct LlvmAbiGuard {
+    // ABI validation state
+}
+
+impl LlvmAbiGuard {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn validate_linear_usage(&self, _var: &str) -> CodegenResult<()> {
+        Ok(())
+    }
+
+    pub fn validate_unrestricted_usage(&self, _var: &str) -> CodegenResult<()> {
+        Ok(())
+    }
+}

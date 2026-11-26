@@ -1,0 +1,20 @@
+//! LLVM Loop Emission (Naso implementation)
+
+use crate::codegen::error::{CodegenError, CodegenResult};
+
+/// Loop emission for LLVM
+pub struct LlvmLoopEmitter {}
+
+impl LlvmLoopEmitter {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn emit_forall(&self, _var: &str, _lower: &str, _upper: &str, _body: &str) -> CodegenResult<String> {
+        Ok("; forall loop".to_string())
+    }
+
+    pub fn emit_while(&self, _cond: &str, _body: &str) -> CodegenResult<String> {
+        Ok("; while loop".to_string())
+    }
+}

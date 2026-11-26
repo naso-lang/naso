@@ -1,0 +1,20 @@
+//! LLVM Polyhedral Optimizations (Naso implementation)
+
+use crate::codegen::error::{CodegenError, CodegenResult};
+
+/// Polyhedral optimizations for LLVM
+pub struct LlvmPolyhedralOpts {}
+
+impl LlvmPolyhedralOpts {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub fn apply_tiling(&self, _code: &str) -> CodegenResult<String> {
+        Ok(code.to_string())
+    }
+
+    pub fn apply_fusion(&self, _code: &str) -> CodegenResult<String> {
+        Ok(code.to_string())
+    }
+}

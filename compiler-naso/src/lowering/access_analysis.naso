@@ -1,0 +1,105 @@
+//! Access Analysis for Polyhedral Lowering (Naso implementation)
+
+use crate::ast::*;
+use crate::ir::{AccessRelation, AccessRelations, AccessType, AffineDomain, AffineMap, StmtId};
+use crate::lowering::LoweringContext;
+use std::vec::Vec;
+
+/// Analyze memory accesses in a statement
+pub fn analyze_stmt_accesses(
+    stmt: &PirStatement,
+    _ctx: &LoweringContext,
+) -> Vec<AccessRelation> {
+    let mut relations = Vec::new();
+    collect_accesses(&stmt.body, stmt.id, &mut relations);
+    relations
+}
+
+/// Collect memory accesses from an expression
+fn collect_accesses(
+    expr: &crate::ir::PirExpr,
+    stmt_id: StmtId,
+    relations: &mut Vec<AccessRelation>,
+) {
+    match expr {
+        crate::ir::PirExpr::Index { base, indices } => {
+            // Determine accessed variable
+            let var_name = match base.as_ref() {
+                crate::ir::PirExpr::Var(name) => name.clone(),
+                _ => "unknown".to_string(),
+            };
+
+            // Create a simple access relation
+            // In a full implementation, this would use the affine domain and map
+            let domain = AffineDomain::universe(indices.len(), 0);
+            let index_map = AffineMap::new(AffineDomain::universe(indices.len(), 0), indices.len());
+
+            relations.push(AccessRelation {
+                stmt_id,
+                var_name,
+                access_type: AccessType::ReadWrite, // Conservative
+                domain,
+                index_map,
+                elem_type: crate::ir::pir_types::ElemType::I64, // Would be inferred
+            });
+
+            // Recurse into base and indices
+            collect_accesses(base, stmt_id, relations);
+            for idx in indices {
+                collect_accesses(idx, stmt_id, relations);
+            }
+        }
+        crate::ir::PirExpr::Field { base, .. } => {
+            collect_accesses(base, stmt_id, relations);
+        }
+        crate::ir::PirExpr::Let { value, body, .. } => {
+            collect_accesses(value, stmt_id, relations);
+            collect_accesses(body, stmt_id, relations);
+        }
+        crate::ir::PirExpr::Call { args, .. } => {
+            for arg in args {
+                collect_accesses(arg, stmt_id, relations);
+            }
+        }
+        crate::ir::PirExpr::Binary { left, right, .. } => {
+            collect_accesses(left, stmt_id, relations);
+            collect_accesses(right, stmt_id, relations);
+        }
+        crate::ir::PirExpr::Unary { expr, .. } => {
+            collect_accesses(expr, stmt_id, relations);
+        }
+        crate::ir::PirExpr::If { cond, then_branch, else_branch } => {
+            collect_accesses(cond, stmt_id, relations);
+            collect_accesses(then_branch, stmt_id, relations);
+            collect_accesses(else_branch, stmt_id, relations);
+        }
+        crate::ir::PirExpr::Stmts(stmts) => {
+            for s in stmts {
+                collect_accesses(s, stmt_id, relations);
+            }
+        }
+        crate::ir::PirExpr::Struct { fields } => {
+            for f in fields {
+                collect_accesses(f, stmt_id, relations);
+            }
+        }
+        crate::ir::PirExpr::Array { items } => {
+            for item in items {
+                collect_accesses(item, stmt_id, relations);
+            }
+        }
+        crate::ir::PirExpr::QuantumOp { args, qubits, .. } => {
+            for arg in args {
+                collect_accesses(arg, stmt_id, relations);
+            }
+            for q in qubits {
+                collect_accesses(q, stmt_id, relations);
+            }
+        }
+        crate::ir::PirExpr::Assign { target, value } => {
+            collect_accesses(target, stmt_id, relations);
+            collect_accesses(value, stmt_id, relations);
+        }
+        _ => {}
+    }
+}

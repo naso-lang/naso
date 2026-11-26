@@ -1,0 +1,272 @@
+//! PIR Type Definitions (Naso implementation)
+
+use crate::ast::{Mutability, Quantity};
+use crate::ir::access_relation::AccessRelations;
+use crate::ir::affine_domain::AffineDomain;
+use crate::ir::schedule_tree::{ScheduleTree, StmtId};
+use std::vec::Vec;
+use std::option::Option;
+use std::boxed::Box;
+use std::collections::HashMap;
+
+/// Binary operations in PIR
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    And,
+    Or,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+}
+
+/// Unary operations in PIR
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    Neg,
+    Not,
+    BitNot,
+    Deref,
+}
+
+/// Simplified expression for PIR (lowered from AST)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PirExpr {
+    /// Integer literal
+    IntLit(i64),
+    /// Float literal (uses string to avoid Eq issue with f64)
+    FloatLit(String),
+    /// String literal
+    StringLit(String),
+    /// Boolean literal
+    BoolLit(bool),
+    /// Variable reference
+    Var(String),
+    /// Binary operation
+    Binary {
+        op: BinaryOp,
+        left: Box<PirExpr>,
+        right: Box<PirExpr>,
+    },
+    /// Unary operation
+    Unary { op: UnaryOp, expr: Box<PirExpr> },
+    /// Function call
+    Call { name: String, args: Vec<PirExpr> },
+    /// Array access
+    Index {
+        base: Box<PirExpr>,
+        indices: Vec<PirExpr>,
+    },
+    /// Struct field access
+    Field { base: Box<PirExpr>, field: String },
+    /// Struct literal - tuple of fields
+    Struct { fields: Vec<PirExpr> },
+    /// Array literal
+    Array { items: Vec<PirExpr> },
+    /// Array repeat: `[value; count]`
+    ArrayRepeat {
+        value: Box<PirExpr>,
+        count: Box<PirExpr>,
+    },
+    /// Let binding (for SSA form)
+    Let {
+        name: String,
+        qty: Quantity,
+        mutability: Mutability,
+        value: Box<PirExpr>,
+        body: Box<PirExpr>,
+    },
+    /// If expression
+    If {
+        cond: Box<PirExpr>,
+        then_branch: Box<PirExpr>,
+        else_branch: Box<PirExpr>,
+    },
+    /// Reversible block
+    Reversible {
+        body: Box<PirExpr>,
+        inverse: Box<PirExpr>,
+    },
+    /// Quantum operation (qalloc, gates, measure, etc.)
+    QuantumOp {
+        op: String,
+        args: Vec<PirExpr>,
+        qubits: Vec<PirExpr>,
+    },
+    /// Assignment
+    Assign {
+        target: Box<PirExpr>,
+        value: Box<PirExpr>,
+    },
+    /// Cast
+    Cast {
+        expr: Box<PirExpr>,
+        width: Option<u8>,
+        signed: bool,
+        float_target: Option<crate::ir::pir_types::ElemType>,
+    },
+    /// Return
+    Return { value: Option<Box<PirExpr>> },
+    /// Sequence of statements
+    Stmts(Vec<PirExpr>),
+}
+
+/// PIR Statement
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PirStatement {
+    pub id: StmtId,
+    pub domain: AffineDomain,
+    pub body: PirExpr,
+    pub quantity: Quantity,
+    pub mutability: Mutability,
+    pub span: Option<crate::ast::Span>,
+}
+
+/// Function parameter for ABI
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionParam {
+    pub name: String,
+    pub kind: ParamKind,
+    pub quantity: Quantity,
+    pub mutability: Mutability,
+}
+
+/// Parameter kind for ABI
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParamKind {
+    /// Tensor parameter: element type + optional shape
+    Tensor { elem: ElemType, shape: Option<Vec<u64>> },
+    /// Scalar parameter
+    Scalar(ElemType),
+    /// Quantum register
+    QRegister,
+    /// Struct parameter (opaque pointer)
+    Struct,
+    /// Unsupported type (for diagnostics)
+    Unsupported(String),
+}
+
+/// Element types for LLVM ABI
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElemType {
+    Bool,
+    I4,
+    I8,
+    I16,
+    I32,
+    I64,
+    U8,
+    U16,
+    U32,
+    U64,
+    F64,
+    Quint8,
+    Quint4,
+}
+
+/// Function return type for ABI
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FnReturn {
+    Void,
+    Scalar(ElemType),
+    Unsupported(String),
+}
+
+/// PIR Function with its own statements and schedule
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PirFunction {
+    pub name: String,
+    pub params: Vec<FunctionParam>,
+    pub schedule: ScheduleTree,
+    pub statements: Vec<PirStatement>,
+    pub accesses: AccessRelations,
+    pub quantities: QuantityMap,
+    pub return_type: FnReturn,
+    pub return_stmt: Option<StmtId>,
+    pub tail_return_stmt: Option<StmtId>,
+    pub span: Option<crate::ast::Span>,
+}
+
+/// External function declaration
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternFunction {
+    pub name: String,
+    pub params: Vec<ExternParam>,
+    pub return_type: Option<String>,
+}
+
+/// External parameter
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternParam {
+    pub name: String,
+    pub ty: String,
+    pub quantity: Quantity,
+    pub mutability: Mutability,
+}
+
+/// PIR Module: top-level container
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PirModule {
+    /// All statements in the module (flat list for compatibility)
+    pub statements: Vec<PirStatement>,
+    /// Schedule tree
+    pub schedule: ScheduleTree,
+    /// Access relations
+    pub accesses: AccessRelations,
+    /// Quantity annotations
+    pub quantities: QuantityMap,
+    /// Parameter names (for main function)
+    pub param_names: Vec<String>,
+    /// Function parameters (typed ABI)
+    pub function_params: Vec<FunctionParam>,
+    /// Functions with their own PIR
+    pub functions: Vec<PirFunction>,
+    /// External functions
+    pub extern_functions: Vec<ExternFunction>,
+    /// Type definitions
+    pub type_definitions: Vec<crate::ast::TypeDef>,
+}
+
+impl PirModule {
+    pub fn new(
+        statements: Vec<PirStatement>,
+        schedule: ScheduleTree,
+        accesses: AccessRelations,
+        quantities: QuantityMap,
+        param_names: Vec<String>,
+    ) -> Self {
+        Self {
+            statements,
+            schedule,
+            accesses,
+            quantities,
+            param_names,
+            function_params: Vec::new(),
+            functions: Vec::new(),
+            extern_functions: Vec::new(),
+            type_definitions: Vec::new(),
+        }
+    }
+}
+
+/// Quantity map: variable name -> quantity
+pub type QuantityMap = HashMap<String, Quantity>;
+
+/// Validation error
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationError {
+    pub message: String,
+    pub span: Option<crate::ast::Span>,
+}

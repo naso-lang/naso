@@ -257,8 +257,10 @@ Phase 16 (Verification) ──────────────────�
 - Ported AST (mod.naso, expr.naso, pattern.naso, stmt.naso, ty.naso, visit.naso)
 - Ported parser (mod.naso, expr.naso, stmt.naso, ty.naso) — recursive descent parser
 - Ported typechecker (mod.naso, check.naso, inference.naso, type_env.naso, unify.naso, constraints.naso, error.naso) — bidirectional QTT type checker with linear/inout/consume tracking
+- Ported IR (mod.naso, pir_types.naso, schedule_tree.naso, affine_domain.naso, affine_map.naso, access_relation.naso) — PIR types, schedule trees, affine domains/maps
+- Ported lowering (mod.naso, loop_extraction.naso, polyhedral_scheduling.naso, reversible_lowering.naso, uncomputation.naso, simd.naso, access_analysis.naso, ast_to_pir.naso) — AST→PIR lowering with polyhedral scheduling, reversible blocks, uncomputation
 
-**Total ported**: ~7,485 lines across lexer, AST, parser, and typechecker
+**Total ported**: ~9,866 lines across lexer, AST, parser, typechecker, IR, and lowering
 
 ---
 

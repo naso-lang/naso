@@ -1,0 +1,119 @@
+//! Schedule Tree for Polyhedral IR (Naso implementation)
+
+use crate::ast::*;
+use crate::ir::affine_domain::AffineDomain;
+use std::vec::Vec;
+use std::option::Option;
+use std::boxed::Box;
+
+/// Unique identifier for statements
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StmtId(pub usize);
+
+impl StmtId {
+    pub fn new(id: usize) -> Self {
+        Self(id)
+    }
+}
+
+/// Schedule node in the polyhedral schedule tree
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScheduleNode {
+    /// Domain node: executes statement(s) at given domain
+    Domain {
+        stmt_id: StmtId,
+        domain: AffineDomain,
+    },
+    /// Band node: loop band with coincident flags and iterators
+    Band {
+        members: Vec<BandMember>,
+        coincident: Vec<bool>,
+        iterators: Vec<String>,
+        child: Box<ScheduleNode>,
+    },
+    /// Sequence node: sequential composition
+    Sequence(Vec<ScheduleNode>),
+    /// Empty node: no operation
+    Empty,
+}
+
+/// Band member: a statement in a loop band
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BandMember {
+    /// Statement ID
+    pub stmt_id: StmtId,
+    /// Iteration domain pieces
+    pub pieces: Vec<DomainPiece>,
+}
+
+/// Domain piece for a band member
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DomainPiece {
+    /// The affine domain
+    pub domain: AffineDomain,
+    /// Scattering function (affine map)
+    pub scattering: Option<crate::ir::affine_map::AffineMap>,
+}
+
+impl ScheduleNode {
+    /// Create a domain node
+    pub fn domain(stmt_id: StmtId, domain: AffineDomain) -> Self {
+        Self::Domain { stmt_id, domain }
+    }
+
+    /// Create a band node
+    pub fn band(
+        members: Vec<BandMember>,
+        coincident: Vec<bool>,
+        iterators: Vec<String>,
+        child: Box<ScheduleNode>,
+    ) -> Self {
+        Self::Band {
+            members,
+            coincident,
+            iterators,
+            child,
+        }
+    }
+
+    /// Create a sequence node
+    pub fn sequence(nodes: Vec<ScheduleNode>) -> Self {
+        if nodes.len() == 1 {
+            nodes.into_iter().next().unwrap()
+        } else {
+            Self::Sequence(nodes)
+        }
+    }
+
+    /// Create an empty node
+    pub fn empty() -> Self {
+        Self::Empty
+    }
+}
+
+/// Schedule tree: root node + parameter names
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleTree {
+    /// Root schedule node
+    pub root: ScheduleNode,
+    /// Parameter names for the schedule
+    pub param_names: Vec<String>,
+}
+
+impl ScheduleTree {
+    /// Create a new schedule tree
+    pub fn new(root: ScheduleNode, param_names: Vec<String>) -> Self {
+        Self { root, param_names }
+    }
+}
+
+/// Schedule validation errors
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScheduleValidationError {
+    /// Invalid domain
+    InvalidDomain(String),
+    /// Invalid band
+    InvalidBand(String),
+    /// Overlapping statements
+    OverlappingStatements(String),
+}

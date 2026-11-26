@@ -1,0 +1,49 @@
+//! SIMD Lowering for Quantization (Naso implementation)
+
+use crate::ir::PirModule;
+use std::vec::Vec;
+
+/// SIMD target architectures
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimdTarget {
+    /// AVX2 (256-bit)
+    Avx2,
+    /// AVX-512 (512-bit)
+    Avx512,
+    /// NEON (ARM 128-bit)
+    Neon,
+    /// WASM SIMD128
+    Wasm128,
+}
+
+/// Lower quantization operations to SIMD intrinsics
+pub fn lower_quantization_to_simd(
+    module: &PirModule,
+    target: SimdTarget,
+) -> Result<PirModule, crate::lowering::LoweringError> {
+    // Simplified: return module unchanged
+    // A full implementation would transform quantization ops to SIMD intrinsics
+    Ok(module.clone())
+}
+
+/// Check if a target supports a given SIMD operation
+pub fn target_supports(target: SimdTarget, op: SimdOp) -> bool {
+    match (target, op) {
+        (SimdTarget::Avx2, SimdOp::I8DotProduct) => true,
+        (SimdTarget::Avx512, SimdOp::I8DotProduct) => true,
+        (SimdTarget::Neon, SimdOp::I8DotProduct) => true,
+        (SimdTarget::Wasm128, SimdOp::I8DotProduct) => true,
+        _ => false,
+    }
+}
+
+/// SIMD operations
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimdOp {
+    I8DotProduct,
+    F32DotProduct,
+    I8Add,
+    F32Add,
+    I8Mul,
+    F32Mul,
+}

@@ -1,0 +1,109 @@
+//! Affine Domain for Polyhedral IR (Naso implementation)
+
+use crate::ast::*;
+use std::vec::Vec;
+use std::option::Option;
+use std::boxed::Box;
+
+/// Type of affine constraint
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstraintType {
+    /// Equality: a == b
+    Eq,
+    /// Inequality: a <= b
+    Le,
+    /// Inequality: a >= b
+    Ge,
+}
+
+/// Affine constraint: linear combination of variables + constant
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AffineConstraint {
+    /// Coefficients for variables
+    pub coeffs: Vec<i64>,
+    /// Constant term
+    pub constant: i64,
+    /// Constraint type
+    pub constraint_type: ConstraintType,
+}
+
+/// Affine domain: iteration space with parameters
+/// Represents a set of integer points satisfying affine constraints
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AffineDomain {
+    /// Dimension of the domain (number of iteration variables)
+    pub dim: usize,
+    /// Number of parameters
+    pub n_params: usize,
+    /// Constraints defining the domain
+    pub constraints: Vec<AffineConstraint>,
+    /// Symbolic names for dimensions (for debugging)
+    pub dim_names: Vec<String>,
+    /// Symbolic names for parameters
+    pub param_names: Vec<String>,
+}
+
+impl AffineDomain {
+    /// Create a new empty domain
+    pub fn new(dim: usize, n_params: usize) -> Self {
+        Self {
+            dim,
+            n_params,
+            constraints: Vec::new(),
+            dim_names: Vec::new(),
+            param_names: Vec::new(),
+        }
+    }
+
+    /// Create a universe domain (unbounded)
+    pub fn universe(dim: usize, n_params: usize) -> Self {
+        Self::new(dim, n_params)
+    }
+
+    /// Add a constraint
+    pub fn add_constraint(&mut self, constraint: AffineConstraint) {
+        self.constraints.push(constraint);
+    }
+
+    /// Add a dimension name
+    pub fn add_dim_name(&mut self, name: String) {
+        self.dim_names.push(name);
+    }
+
+    /// Add a parameter name
+    pub fn add_param_name(&mut self, name: String) {
+        self.param_names.push(name);
+    }
+}
+
+/// Matrix for affine maps
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Matrix {
+    pub rows: usize,
+    pub cols: usize,
+    pub data: Vec<i64>,
+}
+
+impl Matrix {
+    pub fn new(rows: usize, cols: usize) -> Self {
+        Self {
+            rows,
+            cols,
+            data: vec![0; rows * cols],
+        }
+    }
+
+    pub fn set(&mut self, row: usize, col: usize, value: i64) {
+        if row < self.rows && col < self.cols {
+            self.data[row * self.cols + col] = value;
+        }
+    }
+
+    pub fn get(&self, row: usize, col: usize) -> i64 {
+        if row < self.rows && col < self.cols {
+            self.data[row * self.cols + col]
+        } else {
+            0
+        }
+    }
+}

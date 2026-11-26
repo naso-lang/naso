@@ -1,0 +1,45 @@
+//! Affine Map for Polyhedral IR (Naso implementation)
+
+use crate::ast::*;
+use crate::ir::affine_domain::Matrix;
+use std::vec::Vec;
+use std::option::Option;
+use std::boxed::Box;
+
+/// Piece of a piecewise affine map
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AffineMapPiece {
+    /// Domain where this piece applies
+    pub domain: AffineDomain,
+    /// Affine transformation matrix
+    pub matrix: Matrix,
+    /// Constant vector
+    pub constant: Vec<i64>,
+}
+
+/// Affine map: piecewise quasi-affine function
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AffineMap {
+    /// Input domain
+    pub input_domain: AffineDomain,
+    /// Output dimension
+    pub output_dim: usize,
+    /// Pieces of the piecewise map
+    pub pieces: Vec<AffineMapPiece>,
+}
+
+impl AffineMap {
+    /// Create a new empty affine map
+    pub fn new(input_domain: AffineDomain, output_dim: usize) -> Self {
+        Self {
+            input_domain,
+            output_dim,
+            pieces: Vec::new(),
+        }
+    }
+
+    /// Add a piece to the map
+    pub fn add_piece(&mut self, piece: AffineMapPiece) {
+        self.pieces.push(piece);
+    }
+}

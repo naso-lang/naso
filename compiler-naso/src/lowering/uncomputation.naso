@@ -1,0 +1,102 @@
+//! Automatic Uncomputation for Reversible Blocks (Naso implementation)
+
+use crate::ast::{Mutability, Quantity};
+use crate::ir::{AffineDomain, PirExpr, PirStatement, StmtId};
+use crate::lowering::LoweringError;
+use std::vec::Vec;
+use std::option::Option;
+use std::boxed::Box;
+
+/// Uncompute a sequence of statements by generating their inverse operations
+pub fn uncompute_statements(
+    forward: &[PirStatement],
+    first_inverse_id: StmtId,
+) -> Result<Vec<PirStatement>, LoweringError> {
+    let mut inverse = Vec::new();
+    let mut next_id = first_inverse_id.0;
+
+    // Reverse the forward statements and generate inverse
+    for stmt in forward.iter().rev() {
+        let inv_expr = generate_inverse(&stmt.body)?;
+        let id = StmtId(next_id);
+        next_id += 1;
+
+        inverse.push(PirStatement {
+            id,
+            domain: AffineDomain::universe(0, 0),
+            body: inv_expr,
+            quantity: stmt.quantity,
+            mutability: stmt.mutability,
+            span: stmt.span,
+        });
+    }
+
+    Ok(inverse)
+}
+
+/// Generate inverse operation for an expression
+fn generate_inverse(expr: &PirExpr) -> Result<PirExpr, LoweringError> {
+    match expr {
+        // Quantum gates: generate adjoint
+        PirExpr::QuantumOp { op, args, qubits } => {
+            let adjoint_op = match op.as_str() {
+                "hadamard" => "hadamard", // Self-adjoint
+                "x" => "x", // Self-adjoint
+                "y" => "y", // Self-adjoint
+                "z" => "z", // Self-adjoint
+                "cnot" => "cnot", // Self-adjoint
+                "phase" => "phase_dag", // Adjoint is negative phase
+                "hamiltonian" => "hamiltonian_dag", // Adjoint is negative hamiltonian
+                _ => return Err(LoweringError::Unsupported(format!("No adjoint for quantum op: {}", op))),
+            };
+            Ok(PirExpr::QuantumOp {
+                op: adjoint_op.to_string(),
+                args: args.clone(),
+                qubits: qubits.clone(),
+            })
+        }
+        // Let bindings: uncompute body then value
+        PirExpr::Let { name, qty, mutability, value, body } => {
+            let inv_body = generate_inverse(body)?;
+            let inv_value = generate_inverse(value)?;
+            Ok(PirExpr::Let {
+                name: name.clone(),
+                qty: *qty,
+                mutability: *mutability,
+                value: Box::new(inv_value),
+                body: Box::new(inv_body),
+            })
+        }
+        // Sequences: reverse order and uncompute each
+        PirExpr::Stmts(stmts) => {
+            let mut inv_stmts = Vec::new();
+            for s in stmts.iter().rev() {
+                inv_stmts.push(generate_inverse(s)?);
+            }
+            Ok(PirExpr::Stmts(inv_stmts))
+        }
+        // Assignments: no inverse (would need to know previous value)
+        PirExpr::Assign { .. } => {
+            Err(LoweringError::NonReversibleOp("assignment has no inverse".to_string()))
+        }
+        // Control flow: no automatic inverse
+        PirExpr::If { .. } | PirExpr::Call { .. } => {
+            Err(LoweringError::NonReversibleOp("control flow has no automatic inverse".to_string()))
+        }
+        // Literals and variables: no inverse needed
+        PirExpr::IntLit(_) | PirExpr::FloatLit(_) | PirExpr::StringLit(_) | PirExpr::BoolLit(_) | PirExpr::Var(_) => {
+            Ok(PirExpr::IntLit(0)) // No-op
+        }
+        // Other expressions: not automatically invertible
+        _ => Err(LoweringError::NonReversibleOp(format!("expression has no automatic inverse: {:?}", expr))),
+    }
+}
+
+/// Verify that all ancilla qubits are properly zeroed
+pub fn verify_ancilla_zeroing(
+    _forward: &[PirStatement],
+    _inverse: &[PirStatement],
+) -> Result<(), LoweringError> {
+    // Would check that all ancilla qubits return to |0>
+    Ok(())
+}

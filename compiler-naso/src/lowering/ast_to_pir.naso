@@ -1,0 +1,11 @@
+//! AST to PIR Lowering Entry Point (Naso implementation)
+
+use crate::ast::Program;
+use crate::ir::PirModule;
+use crate::lowering::LoweringError;
+
+/// Convert AST program directly to PIR module
+/// This is a convenience wrapper around the full lowering pipeline
+pub fn ast_to_pir(program: &Program) -> Result<PirModule, LoweringError> {
+    crate::lowering::lower_program(program)
+}

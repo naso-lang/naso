@@ -1,0 +1,56 @@
+//! Access Relations for Polyhedral IR (Naso implementation)
+
+use crate::ast::*;
+use crate::ir::affine_domain::AffineDomain;
+use crate::ir::affine_map::AffineMap;
+use std::vec::Vec;
+use std::option::Option;
+use std::boxed::Box;
+
+/// Type of memory access
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessType {
+    /// Read access
+    Read,
+    /// Write access
+    Write,
+    /// Read-write access
+    ReadWrite,
+}
+
+/// Access relation: describes how a statement accesses memory
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessRelation {
+    /// Statement ID
+    pub stmt_id: crate::ir::schedule_tree::StmtId,
+    /// Variable name being accessed
+    pub var_name: String,
+    /// Access type
+    pub access_type: AccessType,
+    /// Affine domain of the access (iteration space)
+    pub domain: AffineDomain,
+    /// Affine map from iteration space to array indices
+    pub index_map: AffineMap,
+    /// Accessed element type
+    pub elem_type: crate::ir::pir_types::ElemType,
+}
+
+/// Collection of access relations
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessRelations {
+    pub relations: Vec<AccessRelation>,
+}
+
+impl AccessRelations {
+    pub fn new() -> Self {
+        Self { relations: Vec::new() }
+    }
+
+    pub fn add(&mut self, relation: AccessRelation) {
+        self.relations.push(relation);
+    }
+
+    pub fn relations_for_stmt(&self, stmt_id: crate::ir::schedule_tree::StmtId) -> Vec<&AccessRelation> {
+        self.relations.iter().filter(|r| r.stmt_id == stmt_id).collect()
+    }
+}

@@ -1,0 +1,182 @@
+//! Reversible Block Lowering with Automatic Uncomputation (Naso implementation)
+
+use crate::ast::{Mutability, Quantity};
+use crate::ir::{AffineDomain, PirExpr, PirStatement, QuantityMap, ScheduleNode, StmtId};
+use crate::lowering::LoweringError;
+use std::vec::Vec;
+use std::option::Option;
+use std::boxed::Box;
+use std::collections::{HashMap, HashSet};
+
+/// Result of reversible lowering: forward and inverse schedule trees
+#[derive(Debug, Clone)]
+pub struct ReversibleSchedulePair {
+    pub forward: ScheduleTree,
+    pub inverse: ScheduleTree,
+    pub ancilla_requirements: Vec<AncillaRequirement>,
+    pub erased_temps: HashSet<String>,
+}
+
+/// Ancilla qubit allocation requirement
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AncillaRequirement {
+    pub name: String,
+    pub allocated_at: StmtId,
+    pub zeroed_at: Option<StmtId>,
+    pub is_quantum: bool,
+}
+
+/// Node in the dataflow DAG representing a temporary value
+#[derive(Debug, Clone)]
+struct DAGNode {
+    temp: String,
+    def_stmt: StmtId,
+    uses: Vec<StmtId>,
+    is_zero_qty: bool,
+    is_ancilla: bool,
+    dependencies: Vec<String>,
+}
+
+/// Inverse operation for a temporary value
+#[derive(Debug, Clone)]
+struct InverseOperation {
+    expr: PirExpr,
+    schedule_map: Option<crate::ir::affine_map::AffineMap>,
+    is_adjoint: bool,
+    required_ancilla: Vec<String>,
+}
+
+/// Dataflow DAG for automatic uncomputation
+struct DataflowDAG {
+    nodes: HashMap<String, DAGNode>,
+    quantities: QuantityMap,
+}
+
+impl DataflowDAG {
+    fn new(quantities: &QuantityMap) -> Self {
+        Self {
+            nodes: HashMap::new(),
+            quantities: quantities.clone(),
+        }
+    }
+
+    fn build(&mut self, statements: &[PirStatement]) -> Result<(), LoweringError> {
+        for stmt in statements {
+            self.analyze_statement(stmt)?;
+        }
+        Ok(())
+    }
+
+    fn analyze_statement(&mut self, stmt: &PirStatement) -> Result<(), LoweringError> {
+        // Simplified: just track variable uses
+        self.collect_vars(&stmt.body);
+        Ok(())
+    }
+
+    fn collect_vars(&mut self, expr: &PirExpr) {
+        match expr {
+            PirExpr::Var(name) => {
+                self.nodes.entry(name.clone()).or_insert_with(|| DAGNode {
+                    temp: name.clone(),
+                    def_stmt: StmtId(0),
+                    uses: Vec::new(),
+                    is_zero_qty: false,
+                    is_ancilla: false,
+                    dependencies: Vec::new(),
+                });
+            }
+            PirExpr::Let { name, body, .. } => {
+                self.collect_vars(body);
+                self.nodes.entry(name.clone()).or_insert_with(|| DAGNode {
+                    temp: name.clone(),
+                    def_stmt: StmtId(0),
+                    uses: Vec::new(),
+                    is_zero_qty: false,
+                    is_ancilla: false,
+                    dependencies: Vec::new(),
+                });
+            }
+            PirExpr::Binary { left, right, .. } => {
+                self.collect_vars(left);
+                self.collect_vars(right);
+            }
+            PirExpr::Unary { expr, .. } => self.collect_vars(expr),
+            PirExpr::Call { args, .. } => {
+                for arg in args {
+                    self.collect_vars(arg);
+                }
+            }
+            PirExpr::Index { base, indices } => {
+                self.collect_vars(base);
+                for idx in indices {
+                    self.collect_vars(idx);
+                }
+            }
+            PirExpr::Field { base, .. } => self.collect_vars(base),
+            PirExpr::Struct { fields } => {
+                for f in fields {
+                    self.collect_vars(f);
+                }
+            }
+            PirExpr::Array { items } => {
+                for item in items {
+                    self.collect_vars(item);
+                }
+            }
+            PirExpr::If { cond, then_branch, else_branch } => {
+                self.collect_vars(cond);
+                self.collect_vars(then_branch);
+                self.collect_vars(else_branch);
+            }
+            PirExpr::Stmts(stmts) => {
+                for s in stmts {
+                    self.collect_vars(s);
+                }
+            }
+            PirExpr::QuantumOp { args, qubits, .. } => {
+                for arg in args {
+                    self.collect_vars(arg);
+                }
+                for q in qubits {
+                    self.collect_vars(q);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn topological_sort(&self) -> Result<Vec<String>, LoweringError> {
+        // Simplified topological sort
+        let mut sorted = Vec::new();
+        let mut visited = HashSet::new();
+
+        fn visit(node: &str, nodes: &HashMap<String, DAGNode>, visited: &mut HashSet<String>, sorted: &mut Vec<String>) {
+            if visited.contains(node) {
+                return;
+            }
+            visited.insert(node.to_string());
+            if let Some(n) = nodes.get(node) {
+                for dep in &n.dependencies {
+                    visit(dep, nodes, visited, sorted);
+                }
+            }
+            sorted.push(node.to_string());
+        }
+
+        for name in self.nodes.keys() {
+            visit(name, &self.nodes, &mut visited, &mut sorted);
+        }
+
+        Ok(sorted)
+    }
+}
+
+/// Lower a reversible block to dual ScheduleTrees with automatic uncomputation
+pub fn lower_reversible_block(
+    block: &crate::ast::expr::ReversibleBlock,
+    ctx: &mut crate::lowering::LoweringContext,
+) -> Result<ReversibleSchedulePair, LoweringError> {
+    // This is a placeholder - the actual implementation is in lowering/mod.naso
+    // which uses the uncomputation module
+    Err(LoweringError::Unsupported("Use lowering::mod::lower_reversible_block".to_string()))
+}

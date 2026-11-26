@@ -1,0 +1,17 @@
+//! Polyhedral Intermediate Representation (PIR) for Naso Compiler (Naso implementation)
+
+pub mod access_relation;
+pub mod affine_domain;
+pub mod affine_map;
+pub mod pir_types;
+pub mod schedule_tree;
+
+// Re-exports for convenience
+pub use access_relation::{AccessRelation, AccessRelations, AccessType};
+pub use affine_domain::{AffineConstraint, AffineDomain, ConstraintType};
+pub use affine_map::{AffineMap, AffineMapPiece, Matrix};
+pub use pir_types::{
+    BinaryOp, ElemType, ExternFunction, ExternParam, FnReturn, FunctionParam, ParamKind,
+    PirExpr, PirFunction, PirModule, PirStatement, QuantityMap, UnaryOp, ValidationError,
+};
+pub use schedule_tree::{ScheduleNode, ScheduleTree, ScheduleValidationError, StmtId};

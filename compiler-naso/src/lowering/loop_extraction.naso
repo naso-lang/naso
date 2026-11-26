@@ -1,0 +1,136 @@
+//! Loop Extraction for Polyhedral Lowering (Naso implementation)
+
+use crate::ast::*;
+use crate::ir::{AffineDomain, ScheduleNode, StmtId};
+use std::vec::Vec;
+use std::option::Option;
+use std::boxed::Box;
+
+/// Extracted loop nest information
+#[derive(Debug, Clone)]
+pub struct LoopNest {
+    /// Loop bindings: (var, lower, upper)
+    pub bindings: Vec<(Ident, Expr, Expr)>,
+    /// Loop body expression
+    pub body: Expr,
+    /// Span of the loop
+    pub span: Span,
+}
+
+/// Band member for schedule tree
+#[derive(Debug, Clone)]
+pub struct BandMember {
+    pub stmt_id: StmtId,
+    pub pieces: Vec<DomainPiece>,
+}
+
+/// Domain piece for a band member
+#[derive(Debug, Clone)]
+pub struct DomainPiece {
+    pub domain: AffineDomain,
+    pub scattering: Option<crate::ir::affine_map::AffineMap>,
+}
+
+/// Extract loop nest from a statement
+pub fn extract_loop_nest(stmt: &Stmt) -> Option<LoopNest> {
+    match &stmt.kind {
+        StmtKind::Expr(expr) => extract_loop_nest_from_expr(expr),
+        _ => None,
+    }
+}
+
+/// Extract loop nest from an expression
+pub fn extract_loop_nest_from_expr(expr: &Expr) -> Option<LoopNest> {
+    match &expr.kind {
+        ExprKind::Forall(loop_) => {
+            let mut bindings = Vec::new();
+            for (var, lower, upper) in &loop_.bindings {
+                bindings.push((var.clone(), *lower.clone(), *upper.clone()));
+            }
+            Some(LoopNest {
+                bindings,
+                body: Expr::new(
+                    ExprKind::Block(Box::new(loop_.body.clone())),
+                    loop_.body.span,
+                    loop_.body.stmts.first().map_or(NodeId::new(0), |s| s.id),
+                ),
+                span: loop_.span,
+            })
+        }
+        ExprKind::For(fl) => {
+            // For loops are desugared to while in lowering
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Convert loop nest to schedule bands
+pub fn loop_nest_to_bands(
+    nest: &LoopNest,
+    accesses: &AccessRelations,
+    ctx: &mut crate::lowering::LoweringContext,
+) -> Result<Vec<ScheduleNode>, crate::lowering::LoweringError> {
+    if nest.bindings.is_empty() {
+        return Err(crate::lowering::LoweringError::Unsupported(
+            "empty loop nest".to_string(),
+        ));
+    }
+
+    let mut members = Vec::new();
+    let mut coincident = Vec::new();
+    let mut iterators = Vec::new();
+
+    for (i, (var, lower, upper)) in nest.bindings.iter().enumerate() {
+        let stmt_id = ctx.next_stmt_id();
+
+        // Create domain for this loop level
+        let mut domain = AffineDomain::new(1, 0);
+        domain.add_dim_name(var.name.clone());
+
+        // Add bounds: lower <= idx < upper
+        // For simplicity, we use a universe domain
+        // A full implementation would add affine constraints
+
+        let piece = DomainPiece {
+            domain,
+            scattering: None,
+        };
+
+        members.push(BandMember {
+            stmt_id,
+            pieces: vec![piece],
+        });
+
+        coincident.push(true); // Assume innermost is parallel for now
+        iterators.push(var.name.clone());
+    }
+
+    // Create child domain node
+    let child_stmt_id = ctx.next_stmt_id();
+    let child_domain = AffineDomain::universe(0, 0);
+    let leaf = ScheduleNode::Domain {
+        stmt_id: child_stmt_id,
+        domain: child_domain,
+    };
+
+    let band = ScheduleNode::Band {
+        members,
+        coincident,
+        iterators,
+        child: Box::new(leaf),
+    };
+
+    Ok(vec![band])
+}
+
+/// Check if a loop level is parallel
+fn level_is_parallel(
+    _level: usize,
+    _accesses: &AccessRelations,
+    _ctx: &crate::lowering::LoweringContext,
+) -> bool {
+    // For now, assume all levels are sequential
+    // A full implementation would check for dependencies
+    false
+}

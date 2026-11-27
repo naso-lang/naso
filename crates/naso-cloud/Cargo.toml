@@ -1,0 +1,43 @@
+[package]
+name = "naso-cloud"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/naso-lang/naso"
+description = "Cloud-native runtime for Naso: Kubernetes, VMs, serverless"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+naso-std = { path = "../stdlib", package = "naso_std" }
+async-runtime = { path = "../async-runtime" }
+naso-ffi = { path = "../naso-ffi" }
+tokio = { version = "1.35", features = ["rt", "net", "io-util", "rt-multi-thread", "macros"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+toml = "0.8"
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"] }
+kube = { version = "0.90", features = ["derive", "runtime", "client"], optional = true }
+k8s-openapi = { version = "0.20", features = ["v1_22"], optional = true }
+prometheus = "0.13"
+opentelemetry = { version = "0.25", features = ["trace", "metrics"] }
+opentelemetry-otlp = { version = "0.17", features = ["tonic"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+anyhow = "1.0"
+thiserror = "2.0"
+rand = "0.8"
+uuid = { version = "1.8", features = ["v4", "serde", "fast-rng"] }
+chrono = { version = "0.4", features = ["serde"] }
+url = "2.5"
+notify = "6.1"
+libloading = "0.8"
+humantime = "2.1"
+base64 = "0.22"
+
+[features]
+default = []
+k8s = ["k8s-openapi", "kube"]

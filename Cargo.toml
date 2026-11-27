@@ -11,6 +11,7 @@ members = [
     "crates/async-runtime",
     "crates/naso-quantum-runtime",
     "crates/naso-verify",
+    "crates/naso-cloud",
     "bench_runner",
 ]
 

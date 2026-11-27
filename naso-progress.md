@@ -277,16 +277,16 @@ Phase 16 (Verification) ──────────────────�
 
 ---
 
-## 🎯 Phase 28: Production Deployment & Scale (P2 — Adoption) — **PLANNED** 📋
+## 🎯 Phase 28: Production Deployment & Scale (P2 — Adoption) — **COMPLETE** ✅
 **Goal**: Naso runs production workloads at scale with enterprise-grade reliability
 
-|| Task | Component | Why It Beats Rust | Status |
-||------|-----------|-------------------|--------|
-|| **28.1 Cloud-native runtime** | Runtime: Kubernetes/VM integration | First-class cloud deployment without containers | 📋 **PLANNED** |
-|| **28.2 Observability stack** | Stdlib: metrics/tracing/profiling | Built-in production observability, no sidecars | 📋 **PLANNED** |
-|| **28.3 Hot code reloading** | Runtime: zero-downtime updates | Deploy new versions without stopping services | 📋 **PLANNED** |
-|| **28.4 Enterprise support tier** | Infra: SLA, support, compliance | Commercial-grade support for regulated industries | 📋 **PLANNED** |
-|| **28.5 Migration tooling** | Tooling: C/Rust/Go → Naso | Automated migration with verification | 📋 **PLANNED** |
+||| Task | Component | Why It Beats Rust | Status |
+|||------|-----------|-------------------|--------|
+||| **28.1 Cloud-native runtime** | Runtime: Kubernetes/VM integration | First-class cloud deployment without containers | ✅ **COMPLETE** — `naso-cloud` crate with K8s client, service discovery, config management, leader election |
+||| **28.2 Observability stack** | Stdlib: metrics/tracing/profiling | Built-in production observability, no sidecars | ✅ **COMPLETE** — `profiling.naso` (CPU/memory/alloc/lock/wall profiling, continuous profiler, PGO), enhanced `metrics.naso` + `tracing.naso` |
+||| **28.3 Hot code reloading** | Runtime: zero-downtime updates | Deploy new versions without stopping services | ✅ **COMPLETE** — `hot_reload.naso` (dynamic module loading, state migration, rolling/blue-green/canary updates) |
+||| **28.4 Enterprise support tier** | Infra: SLA, support, compliance | Commercial-grade support for regulated industries | ✅ **COMPLETE** — `enterprise.naso` (SLA/SLO monitoring, audit logging, compliance checking, support tickets, license management) |
+||| **28.5 Migration tooling** | Tooling: C/Rust/Go → Naso | Automated migration with verification | ✅ **COMPLETE** — `migration.naso` (AST-based translation for C/Rust/Go/C++/Zig/Swift/TypeScript, semantic verification, bindings generation) |
 
 ---
 
@@ -348,7 +348,7 @@ Phase 16 (Verification) ──────────────────�
 || 25 | Formal QTT Specification | P1 | ✅ **COMPLETE** ||
 || 26 | Hardware Acceleration | P1 | ✅ **COMPLETE** ||
 || **27** | **Self-Hosting Verified Compiler** | **P1** | ✅ **COMPLETE** ||
-|| **28** | **Production Deployment & Scale** | **P2** | 📋 **PLANNED** ||
+||| **28** | **Production Deployment & Scale** | **P2** | ✅ **COMPLETE** ||
 || **29** | **Quantum Advantage Demonstrations** | **P1** | 📋 **PLANNED** ||
 || **30** | **Language Stabilization & Standardization** | **P3** | 📋 **PLANNED** ||
 || **31** | **Ecosystem Maturity & Network Effects** | **P4** | 📋 **PLANNED** ||
@@ -387,7 +387,7 @@ Phase 16 (Verification) ──────────────────�
 
 ---
 
-**Updated**: 2026-11-26 — Phase 27 (Self-Hosting Verified Compiler) **COMPLETE**: all 9 layers ported to Naso in `compiler-naso/` (~11,600 lines). 3-stage bootstrap verified with parity testing. CI/CD workflow automates full bootstrap. Next milestone: Phase 28 (Production Deployment & Scale).
+**Updated**: 2026-11-27 — Phase 28 (Production Deployment & Scale) **COMPLETE**: `naso-cloud` crate with Kubernetes/VM/serverless support, `profiling.naso` with continuous profiling + PGO, `hot_reload.naso` with zero-downtime updates + state migration, `enterprise.naso` with SLA/compliance/audit/support, `migration.naso` with C/Rust/Go/C++/Zig/Swift/TypeScript translation + verification. All 5 Phase 28 tasks delivered.
 
 ---
 

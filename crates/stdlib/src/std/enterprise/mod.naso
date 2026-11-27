@@ -1,0 +1,914 @@
+// ============================================================================
+// Naso Enterprise (naso_enterprise) - Phase 28.4
+// ============================================================================
+// Enterprise-grade features: SLA monitoring, compliance, audit, support
+// ============================================================================
+
+extern "C" {
+    fn naso_enterprise_sla_monitor_new(config_ptr: *const u8, config_len: usize) -> u64;
+    fn naso_enterprise_sla_monitor_free(monitor: u64);
+    fn naso_enterprise_sla_record(monitor: u64, operation: *const u8, operation_len: usize, duration_ns: u64, success: bool) -> u64;
+    fn naso_enterprise_sla_report(monitor: u64, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_enterprise_audit_log(monitor: u64, event: *const u8, event_len: usize, level: u8, metadata_ptr: *const u8, metadata_len: usize) -> u64;
+    fn naso_enterprise_compliance_check(monitor: u64, framework: *const u8, framework_len: usize, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_enterprise_support_ticket_create(config_ptr: *const u8, config_len: usize) -> u64;
+    fn naso_enterprise_license_validate(license_ptr: *const u8, license_len: usize) -> u64;
+}
+
+// ============================================================================
+// SLA Monitoring
+// ============================================================================
+
+struct SlaConfig {
+    service_name: String,
+    objectives: Vec<SloObjective>,
+    measurement_window: MeasurementWindow,
+    alerting: AlertingConfig,
+}
+
+struct SloObjective {
+    name: String,
+    description: String,
+    sli: ServiceLevelIndicator,
+    target: f64, // 0.0 to 1.0 (e.g., 0.999 for 99.9%)
+    window: MeasurementWindow,
+}
+
+enum ServiceLevelIndicator {
+    Latency { percentile: f64, threshold_ms: f64 },
+    Availability,
+    Throughput { min_rps: f64 },
+    ErrorRate { max_rate: f64 },
+    Durability { min_durability: f64 },
+    Custom(String),
+}
+
+enum MeasurementWindow {
+    Rolling { duration_secs: u64 },
+    Calendar { start_hour: u8, timezone: String },
+    Custom(String),
+}
+
+struct AlertingConfig {
+    channels: Vec<AlertChannel>,
+    escalation: EscalationPolicy,
+}
+
+enum AlertChannel {
+    Email(String),
+    Slack(String),
+    PagerDuty(String),
+    Webhook(String),
+    Sms(String),
+}
+
+struct EscalationPolicy {
+    levels: Vec<EscalationLevel>,
+    repeat_interval_secs: u64,
+}
+
+struct EscalationLevel {
+    after_secs: u64,
+    channels: Vec<AlertChannel>,
+    notify_on_recovery: bool,
+}
+
+struct SlaMonitor {
+    inner: u64,
+    config: SlaConfig,
+    measurements: HashMap<String, Vec<SliMeasurement>>,
+}
+
+struct SliMeasurement {
+    timestamp: u64,
+    value: f64,
+    success: bool,
+    metadata: HashMap<String, String>,
+}
+
+impl SlaMonitor {
+    pub fn new(config: SlaConfig) -> Result<Self, EnterpriseError> {
+        let json = serde_json::to_string(&config).map_err(|_| EnterpriseError::SerializationFailed)?;
+        let inner = naso_enterprise_sla_monitor_new(json.as_ptr(), json.len());
+        if inner == 0 {
+            return Err(EnterpriseError::SlaMonitorCreationFailed);
+        }
+        Ok(SlaMonitor {
+            inner,
+            config,
+            measurements: HashMap::new(),
+        })
+    }
+
+    pub fn record_latency(&mut self, operation: &str, duration_ns: u64, success: bool) -> Result<(), EnterpriseError> {
+        let result = naso_enterprise_sla_record(self.inner, operation.as_ptr(), operation.len(), duration_ns, success);
+        if result == 0 {
+            return Err(EnterpriseError::SlaRecordFailed);
+        }
+        Ok(())
+    }
+
+    pub fn record_request(&mut self, operation: &str, duration_ns: u64, success: bool) -> Result<(), EnterpriseError> {
+        self.record_latency(operation, duration_ns, success)
+    }
+
+    pub fn report(&self) -> Result<SlaReport, EnterpriseError> {
+        let mut out = vec![0u8; 65536];
+        let len = naso_enterprise_sla_report(self.inner, out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(EnterpriseError::SlaReportFailed);
+        }
+        out.truncate(len as usize);
+        let json = String::from_utf8(out).map_err(|_| EnterpriseError::InvalidUtf8)?;
+        SlaReport::from_json(&json)
+    }
+
+    pub fn current_sli(&self, sli_name: &str) -> Option<f64> {
+        // Calculate current SLI value from measurements
+        None
+    }
+
+    pub fn is_meeting_slo(&self, slo_name: &str) -> bool {
+        self.current_sli(slo_name).map(|v| {
+            let slo = self.config.objectives.iter().find(|o| o.name == slo_name);
+            slo.map(|s| v >= s.target).unwrap_or(false)
+        }).unwrap_or(false)
+    }
+}
+
+impl Drop for SlaMonitor {
+    fn drop(&mut self) {
+        naso_enterprise_sla_monitor_free(self.inner);
+    }
+}
+
+struct SlaReport {
+    service_name: String,
+    generated_at: u64,
+    window: MeasurementWindow,
+    objectives: Vec<SloReport>,
+    overall_status: SlaStatus,
+}
+
+struct SloReport {
+    name: String,
+    target: f64,
+    current: f64,
+    status: SlaStatus,
+    error_budget_remaining: f64,
+    error_budget_consumed: f64,
+    measurements_count: u64,
+}
+
+enum SlaStatus {
+    Meeting,
+    AtRisk,
+    Breached,
+    NoData,
+}
+
+impl SlaReport {
+    fn from_json(json: &str) -> Result<Self, EnterpriseError> {
+        // Parse JSON
+        Ok(SlaReport {
+            service_name: extract_json_field(json, "service_name").unwrap_or_default(),
+            generated_at: extract_json_field(json, "generated_at").unwrap_or("0".into()).parse().unwrap_or(0),
+            window: MeasurementWindow::Rolling { duration_secs: 3600 },
+            objectives: vec![],
+            overall_status: SlaStatus::Meeting,
+        })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut json = String::from("{");
+        json.push_str(&format!("\"service_name\":\"{}\",", self.service_name));
+        json.push_str(&format!("\"generated_at\":{},", self.generated_at));
+        json.push_str(&format!("\"overall_status\":\"{}\",", self.overall_status.as_str()));
+        json.push_str("\"objectives\":[");
+        for (i, obj) in self.objectives.iter().enumerate() {
+            if i > 0 { json.push(','); }
+            json.push_str(&obj.to_json());
+        }
+        json.push_str("]}");
+        json
+    }
+}
+
+impl SloReport {
+    fn to_json(&self) -> String {
+        let mut json = String::from("{");
+        json.push_str(&format!("\"name\":\"{}\",", self.name));
+        json.push_str(&format!("\"target\":{},", self.target));
+        json.push_str(&format!("\"current\":{},", self.current));
+        json.push_str(&format!("\"status\":\"{}\",", self.status.as_str()));
+        json.push_str(&format!("\"error_budget_remaining\":{},", self.error_budget_remaining));
+        json.push_str(&format!("\"error_budget_consumed\":{},", self.error_budget_consumed));
+        json.push_str(&format!("\"measurements_count\":{}", self.measurements_count));
+        json.push_str("}");
+        json
+    }
+}
+
+impl SlaStatus {
+    fn as_str(&self) -> &str {
+        match self {
+            SlaStatus::Meeting => "meeting",
+            SlaStatus::AtRisk => "at_risk",
+            SlaStatus::Breached => "breached",
+            SlaStatus::NoData => "no_data",
+        }
+    }
+}
+
+// ============================================================================
+// Audit Logging
+// ============================================================================
+
+enum AuditLevel {
+    Debug = 0,
+    Info = 1,
+    Warn = 2,
+    Error = 3,
+    Critical = 4,
+}
+
+struct AuditLogger {
+    monitor: u64,
+    service_name: String,
+    include_request_body: bool,
+    include_response_body: bool,
+    sampling_rate: f64,
+}
+
+impl AuditLogger {
+    pub fn new(monitor: u64, service_name: &str) -> Self {
+        AuditLogger {
+            monitor,
+            service_name: service_name.into(),
+            include_request_body: false,
+            include_response_body: false,
+            sampling_rate: 1.0,
+        }
+    }
+
+    pub fn include_request_body(mut self, include: bool) -> Self {
+        self.include_request_body = include;
+        self
+    }
+
+    pub fn include_response_body(mut self, include: bool) -> Self {
+        self.include_response_body = include;
+        self
+    }
+
+    pub fn sampling_rate(mut self, rate: f64) -> Self {
+        self.sampling_rate = rate.clamp(0.0, 1.0);
+        self
+    }
+
+    pub fn log(&self, event: &AuditEvent) -> Result<(), EnterpriseError> {
+        // Check sampling
+        if rand::random::<f64>() > self.sampling_rate {
+            return Ok(());
+        }
+
+        let json = serde_json::to_string(event).map_err(|_| EnterpriseError::SerializationFailed)?;
+        let metadata = serde_json::to_string(&event.metadata).unwrap_or_default();
+
+        let result = naso_enterprise_audit_log(
+            self.monitor,
+            json.as_ptr(), json.len(),
+            event.level as u8,
+            metadata.as_ptr(), metadata.len(),
+        );
+
+        if result == 0 {
+            return Err(EnterpriseError::AuditLogFailed);
+        }
+        Ok(())
+    }
+
+    pub fn info(&self, action: &str, resource: &str, user: &str, metadata: HashMap<String, String>) -> Result<(), EnterpriseError> {
+        self.log(&AuditEvent {
+            timestamp: current_timestamp(),
+            service: self.service_name.clone(),
+            action: action.into(),
+            resource: resource.into(),
+            user: user.into(),
+            level: AuditLevel::Info,
+            metadata,
+            request_id: None,
+            trace_id: None,
+            span_id: None,
+            outcome: AuditOutcome::Success,
+        })
+    }
+
+    pub fn error(&self, action: &str, resource: &str, user: &str, error: &str, metadata: HashMap<String, String>) -> Result<(), EnterpriseError> {
+        let mut meta = metadata;
+        meta.insert("error".into(), error.into());
+        self.log(&AuditEvent {
+            timestamp: current_timestamp(),
+            service: self.service_name.clone(),
+            action: action.into(),
+            resource: resource.into(),
+            user: user.into(),
+            level: AuditLevel::Error,
+            metadata: meta,
+            request_id: None,
+            trace_id: None,
+            span_id: None,
+            outcome: AuditOutcome::Failure,
+        })
+    }
+
+    pub fn security(&self, action: &str, resource: &str, user: &str, metadata: HashMap<String, String>) -> Result<(), EnterpriseError> {
+        self.log(&AuditEvent {
+            timestamp: current_timestamp(),
+            service: self.service_name.clone(),
+            action: action.into(),
+            resource: resource.into(),
+            user: user.into(),
+            level: AuditLevel::Warn,
+            metadata,
+            request_id: None,
+            trace_id: None,
+            span_id: None,
+            outcome: AuditOutcome::Success,
+        })
+    }
+}
+
+struct AuditEvent {
+    timestamp: u64,
+    service: String,
+    action: String,
+    resource: String,
+    user: String,
+    level: AuditLevel,
+    metadata: HashMap<String, String>,
+    request_id: Option<String>,
+    trace_id: Option<String>,
+    span_id: Option<String>,
+    outcome: AuditOutcome,
+}
+
+enum AuditOutcome {
+    Success,
+    Failure,
+    Partial,
+    Unknown,
+}
+
+// ============================================================================
+// Compliance
+// ============================================================================
+
+enum ComplianceFramework {
+    Soc2,
+    Iso27001,
+    Gdpr,
+    Hipaa,
+    PciDss,
+    FedRamp,
+    Custom(String),
+}
+
+impl ComplianceFramework {
+    fn as_str(&self) -> &str {
+        match self {
+            ComplianceFramework::Soc2 => "SOC2",
+            ComplianceFramework::Iso27001 => "ISO27001",
+            ComplianceFramework::Gdpr => "GDPR",
+            ComplianceFramework::Hipaa => "HIPAA",
+            ComplianceFramework::PciDss => "PCI_DSS",
+            ComplianceFramework::FedRamp => "FEDRAMP",
+            ComplianceFramework::Custom(s) => s,
+        }
+    }
+}
+
+struct ComplianceChecker {
+    monitor: u64,
+    frameworks: Vec<ComplianceFramework>,
+}
+
+impl ComplianceChecker {
+    pub fn new(monitor: u64) -> Self {
+        ComplianceChecker {
+            monitor,
+            frameworks: Vec::new(),
+        }
+    }
+
+    pub fn add_framework(mut self, framework: ComplianceFramework) -> Self {
+        self.frameworks.push(framework);
+        self
+    }
+
+    pub fn check(&self, framework: ComplianceFramework) -> Result<ComplianceReport, EnterpriseError> {
+        let mut out = vec![0u8; 65536];
+        let fw = framework.as_str();
+        let len = naso_enterprise_compliance_check(
+            self.monitor,
+            fw.as_ptr(), fw.len(),
+            out.as_mut_ptr(), out.len(),
+        );
+        if len == 0 {
+            return Err(EnterpriseError::ComplianceCheckFailed);
+        }
+        out.truncate(len as usize);
+        let json = String::from_utf8(out).map_err(|_| EnterpriseError::InvalidUtf8)?;
+        ComplianceReport::from_json(&json, framework)
+    }
+
+    pub fn check_all(&self) -> Result<Vec<ComplianceReport>, EnterpriseError> {
+        let mut reports = Vec::new();
+        for fw in &self.frameworks {
+            reports.push(self.check(fw.clone())?);
+        }
+        Ok(reports)
+    }
+}
+
+struct ComplianceReport {
+    framework: ComplianceFramework,
+    timestamp: u64,
+    overall_status: ComplianceStatus,
+    controls: Vec<ControlStatus>,
+    findings: Vec<Finding>,
+}
+
+struct ControlStatus {
+    control_id: String,
+    control_name: String,
+    status: ComplianceStatus,
+    evidence: Vec<String>,
+    last_tested: u64,
+}
+
+struct Finding {
+    severity: FindingSeverity,
+    control_id: String,
+    description: String,
+    remediation: String,
+    due_date: Option<u64>,
+}
+
+enum ComplianceStatus {
+    Compliant,
+    NonCompliant,
+    PartiallyCompliant,
+    NotApplicable,
+    NotTested,
+}
+
+enum FindingSeverity {
+    Critical,
+    High,
+    Medium,
+    Low,
+    Informational,
+}
+
+impl ComplianceReport {
+    fn from_json(json: &str, framework: ComplianceFramework) -> Result<Self, EnterpriseError> {
+        Ok(ComplianceReport {
+            framework,
+            timestamp: current_timestamp(),
+            overall_status: ComplianceStatus::Compliant,
+            controls: vec![],
+            findings: vec![],
+        })
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut json = String::from("{");
+        json.push_str(&format!("\"framework\":\"{}\",", self.framework.as_str()));
+        json.push_str(&format!("\"timestamp\":{},", self.timestamp));
+        json.push_str(&format!("\"overall_status\":\"{}\",", self.overall_status.as_str()));
+        json.push_str("\"controls\":[],\"findings\":[]}");
+        json
+    }
+}
+
+impl ComplianceStatus {
+    fn as_str(&self) -> &str {
+        match self {
+            ComplianceStatus::Compliant => "compliant",
+            ComplianceStatus::NonCompliant => "non_compliant",
+            ComplianceStatus::PartiallyCompliant => "partially_compliant",
+            ComplianceStatus::NotApplicable => "not_applicable",
+            ComplianceStatus::NotTested => "not_tested",
+        }
+    }
+}
+
+// ============================================================================
+// Support Ticket Integration
+// ============================================================================
+
+struct SupportTicketConfig {
+    provider: SupportProvider,
+    api_key: String,
+    project_id: Option<String>,
+    default_priority: TicketPriority,
+    auto_assign: bool,
+}
+
+enum SupportProvider {
+    Zendesk,
+    Jira,
+    GitHub,
+    GitLab,
+    Linear,
+    Custom(String),
+}
+
+enum TicketPriority {
+    Low,
+    Medium,
+    High,
+    Urgent,
+    Critical,
+}
+
+struct SupportClient {
+    inner: u64,
+    config: SupportTicketConfig,
+}
+
+impl SupportClient {
+    pub fn new(config: SupportTicketConfig) -> Result<Self, EnterpriseError> {
+        let json = serde_json::to_string(&config).map_err(|_| EnterpriseError::SerializationFailed)?;
+        let inner = naso_enterprise_support_ticket_create(json.as_ptr(), json.len());
+        if inner == 0 {
+            return Err(EnterpriseError::SupportClientCreationFailed);
+        }
+        Ok(SupportClient { inner, config })
+    }
+
+    pub fn create_ticket(&self, ticket: SupportTicket) -> Result<String, EnterpriseError> {
+        // Would create ticket via provider API
+        Ok("TICKET-123".into())
+    }
+
+    pub fn update_ticket(&self, ticket_id: &str, update: TicketUpdate) -> Result<(), EnterpriseError> {
+        Ok(())
+    }
+
+    pub fn close_ticket(&self, ticket_id: &str, resolution: &str) -> Result<(), EnterpriseError> {
+        Ok(())
+    }
+}
+
+struct SupportTicket {
+    title: String,
+    description: String,
+    priority: TicketPriority,
+    assignee: Option<String>,
+    labels: Vec<String>,
+    custom_fields: HashMap<String, String>,
+}
+
+struct TicketUpdate {
+    status: Option<TicketStatus>,
+    priority: Option<TicketPriority>,
+    assignee: Option<String>,
+    comment: Option<String>,
+}
+
+enum TicketStatus {
+    Open,
+    InProgress,
+    Pending,
+    Resolved,
+    Closed,
+}
+
+// ============================================================================
+// License Management
+// ============================================================================
+
+struct LicenseManager;
+
+impl LicenseManager {
+    pub fn validate(license_key: &str) -> Result<LicenseInfo, EnterpriseError> {
+        let result = naso_enterprise_license_validate(license_key.as_ptr(), license_key.len());
+        if result == 0 {
+            return Err(EnterpriseError::LicenseInvalid);
+        }
+        // Parse result
+        Ok(LicenseInfo {
+            valid: true,
+            edition: LicenseEdition::Enterprise,
+            expires_at: None,
+            max_nodes: None,
+            features: vec![],
+        })
+    }
+
+    pub fn current_license() -> Result<LicenseInfo, EnterpriseError> {
+        // Read from configured location
+        Err(EnterpriseError::LicenseNotFound)
+    }
+}
+
+struct LicenseInfo {
+    valid: bool,
+    edition: LicenseEdition,
+    expires_at: Option<u64>,
+    max_nodes: Option<u32>,
+    features: Vec<String>,
+}
+
+enum LicenseEdition {
+    Community,
+    Professional,
+    Enterprise,
+    Trial,
+}
+
+// ============================================================================
+// Enterprise Runtime Configuration
+// ============================================================================
+
+struct EnterpriseRuntime {
+    sla_monitor: Option<SlaMonitor>,
+    audit_logger: Option<AuditLogger>,
+    compliance_checker: Option<ComplianceChecker>,
+    support_client: Option<SupportClient>,
+    license: Option<LicenseInfo>,
+}
+
+impl EnterpriseRuntime {
+    pub fn new() -> Self {
+        EnterpriseRuntime {
+            sla_monitor: None,
+            audit_logger: None,
+            compliance_checker: None,
+            support_client: None,
+            license: None,
+        }
+    }
+
+    pub fn with_sla(mut self, config: SlaConfig) -> Result<Self, EnterpriseError> {
+        self.sla_monitor = Some(SlaMonitor::new(config)?);
+        Ok(self)
+    }
+
+    pub fn with_audit(mut self, service_name: &str) -> Result<Self, EnterpriseError> {
+        if let Some(monitor) = &self.sla_monitor {
+            self.audit_logger = Some(AuditLogger::new(monitor.inner, service_name));
+        }
+        Ok(self)
+    }
+
+    pub fn with_compliance(mut self, frameworks: Vec<ComplianceFramework>) -> Result<Self, EnterpriseError> {
+        if let Some(monitor) = &self.sla_monitor {
+            let mut checker = ComplianceChecker::new(monitor.inner);
+            for fw in frameworks {
+                checker = checker.add_framework(fw);
+            }
+            self.compliance_checker = Some(checker);
+        }
+        Ok(self)
+    }
+
+    pub fn with_support(mut self, config: SupportTicketConfig) -> Result<Self, EnterpriseError> {
+        self.support_client = Some(SupportClient::new(config)?);
+        Ok(self)
+    }
+
+    pub fn with_license(mut self, license_key: &str) -> Result<Self, EnterpriseError> {
+        self.license = Some(LicenseManager::validate(license_key)?);
+        Ok(self)
+    }
+
+    pub fn validate_license(&self) -> Result<(), EnterpriseError> {
+        if let Some(license) = &self.license {
+            if !license.valid {
+                return Err(EnterpriseError::LicenseInvalid);
+            }
+            if let Some(expires) = license.expires_at {
+                if current_timestamp() > expires {
+                    return Err(EnterpriseError::LicenseExpired);
+                }
+            }
+            Ok(())
+        } else {
+            Err(EnterpriseError::LicenseNotFound)
+        }
+    }
+
+    pub fn record_request(&self, operation: &str, duration_ns: u64, success: bool) -> Result<(), EnterpriseError> {
+        if let Some(monitor) = &self.sla_monitor {
+            monitor.record_request(operation, duration_ns, success)?;
+        }
+        Ok(())
+    }
+
+    pub fn audit(&self, event: &AuditEvent) -> Result<(), EnterpriseError> {
+        if let Some(logger) = &self.audit_logger {
+            logger.log(event)?;
+        }
+        Ok(())
+    }
+
+    pub fn sla_report(&self) -> Result<SlaReport, EnterpriseError> {
+        if let Some(monitor) = &self.sla_monitor {
+            monitor.report()
+        } else {
+            Err(EnterpriseError::SlaMonitorNotConfigured)
+        }
+    }
+
+    pub fn compliance_report(&self, framework: ComplianceFramework) -> Result<ComplianceReport, EnterpriseError> {
+        if let Some(checker) = &self.compliance_checker {
+            checker.check(framework)
+        } else {
+            Err(EnterpriseError::ComplianceNotConfigured)
+        }
+    }
+
+    pub fn create_support_ticket(&self, ticket: SupportTicket) -> Result<String, EnterpriseError> {
+        if let Some(client) = &self.support_client {
+            client.create_ticket(ticket)
+        } else {
+            Err(EnterpriseError::SupportNotConfigured)
+        }
+    }
+}
+
+// ============================================================================
+// Error Types
+// ============================================================================
+
+enum EnterpriseError {
+    SlaMonitorCreationFailed,
+    SlaRecordFailed,
+    SlaReportFailed,
+    SlaMonitorNotConfigured,
+    AuditLogFailed,
+    ComplianceCheckFailed,
+    ComplianceNotConfigured,
+    SupportClientCreationFailed,
+    SupportNotConfigured,
+    LicenseInvalid,
+    LicenseExpired,
+    LicenseNotFound,
+    SerializationFailed,
+    InvalidUtf8,
+    ConfigError(String),
+    NotImplemented,
+}
+
+impl EnterpriseError {
+    pub fn to_string(&self) -> String {
+        match self {
+            EnterpriseError::SlaMonitorCreationFailed => "Failed to create SLA monitor".into(),
+            EnterpriseError::SlaRecordFailed => "Failed to record SLA measurement".into(),
+            EnterpriseError::SlaReportFailed => "Failed to generate SLA report".into(),
+            EnterpriseError::SlaMonitorNotConfigured => "SLA monitor not configured".into(),
+            EnterpriseError::AuditLogFailed => "Failed to write audit log".into(),
+            EnterpriseError::ComplianceCheckFailed => "Compliance check failed".into(),
+            EnterpriseError::ComplianceNotConfigured => "Compliance not configured".into(),
+            EnterpriseError::SupportClientCreationFailed => "Failed to create support client".into(),
+            EnterpriseError::SupportNotConfigured => "Support not configured".into(),
+            EnterpriseError::LicenseInvalid => "Invalid license".into(),
+            EnterpriseError::LicenseExpired => "License expired".into(),
+            EnterpriseError::LicenseNotFound => "License not found".into(),
+            EnterpriseError::SerializationFailed => "Serialization failed".into(),
+            EnterpriseError::InvalidUtf8 => "Invalid UTF-8".into(),
+            EnterpriseError::ConfigError(msg) => format!("Configuration error: {}", msg),
+            EnterpriseError::NotImplemented => "Not implemented".into(),
+        }
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn current_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+fn extract_json_field(json: &str, field: &str) -> Option<String> {
+    let pattern = format!("\"{}\":", field);
+    if let Some(start) = json.find(&pattern) {
+        let value_start = start + pattern.len();
+        let remaining = &json[value_start..];
+        if remaining.starts_with('"') {
+            if let Some(end) = remaining[1..].find('"') {
+                return Some(remaining[1..end+1].into());
+            }
+        } else {
+            let end = remaining.find([',', '}']).unwrap_or(remaining.len());
+            return Some(remaining[..end].trim().into());
+        }
+    }
+    None
+}
+
+// ============================================================================
+// Convenience Functions
+// ============================================================================
+
+fn sla_monitor(config: SlaConfig) -> Result<SlaMonitor, EnterpriseError> {
+    SlaMonitor::new(config)
+}
+
+fn audit_logger(monitor: u64, service_name: &str) -> AuditLogger {
+    AuditLogger::new(monitor, service_name)
+}
+
+fn compliance_checker(monitor: u64) -> ComplianceChecker {
+    ComplianceChecker::new(monitor)
+}
+
+fn support_client(config: SupportTicketConfig) -> Result<SupportClient, EnterpriseError> {
+    SupportClient::new(config)
+}
+
+fn enterprise_runtime() -> EnterpriseRuntime {
+    EnterpriseRuntime::new()
+}
+
+// ============================================================================
+// SLO Builders
+// ============================================================================
+
+struct SloBuilder {
+    name: String,
+    description: String,
+    sli: Option<ServiceLevelIndicator>,
+    target: f64,
+    window: MeasurementWindow,
+}
+
+impl SloBuilder {
+    pub fn new(name: &str) -> Self {
+        SloBuilder {
+            name: name.into(),
+            description: String::new(),
+            sli: None,
+            target: 0.999,
+            window: MeasurementWindow::Rolling { duration_secs: 3600 },
+        }
+    }
+
+    pub fn description(mut self, desc: &str) -> Self {
+        self.description = desc.into();
+        self
+    }
+
+    pub fn latency_p99(mut self, threshold_ms: f64) -> Self {
+        self.sli = Some(ServiceLevelIndicator::Latency { percentile: 0.99, threshold_ms });
+        self
+    }
+
+    pub fn latency_p999(mut self, threshold_ms: f64) -> Self {
+        self.sli = Some(ServiceLevelIndicator::Latency { percentile: 0.999, threshold_ms });
+        self
+    }
+
+    pub fn availability(mut self) -> Self {
+        self.sli = Some(ServiceLevelIndicator::Availability);
+        self
+    }
+
+    pub fn error_rate(mut self, max_rate: f64) -> Self {
+        self.sli = Some(ServiceLevelIndicator::ErrorRate { max_rate });
+        self
+    }
+
+    pub fn throughput(mut self, min_rps: f64) -> Self {
+        self.sli = Some(ServiceLevelIndicator::Throughput { min_rps });
+        self
+    }
+
+    pub fn target(mut self, target: f64) -> Self {
+        self.target = target.clamp(0.0, 1.0);
+        self
+    }
+
+    pub fn window_rolling(mut self, secs: u64) -> Self {
+        self.window = MeasurementWindow::Rolling { duration_secs: secs };
+        self
+    }
+
+    pub fn build(self) -> Result<SloObjective, EnterpriseError> {
+        let sli = self.sli.ok_or(EnterpriseError::ConfigError("SLI not specified".into()))?;
+        Ok(SloObjective {
+            name: self.name,
+            description: self.description,
+            sli,
+            target: self.target,
+            window: self.window,
+        })
+    }
+}

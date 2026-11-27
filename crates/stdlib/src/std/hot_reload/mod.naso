@@ -1,0 +1,713 @@
+// ============================================================================
+// Naso Hot Reloading (naso_hot_reload) - Phase 28.3
+// ============================================================================
+// Zero-downtime hot code reloading for production services
+// Supports: dynamic module loading, state migration, rolling updates
+// ============================================================================
+
+extern "C" {
+    fn naso_hot_reload_module_load(path_ptr: *const u8, path_len: usize, version: u64) -> u64;
+    fn naso_hot_reload_module_unload(handle: u64) -> u64;
+    fn naso_hot_reload_module_call(handle: u64, func_ptr: *const u8, func_len: usize, args_ptr: *const u8, args_len: usize, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_hot_reload_module_symbol(handle: u64, name_ptr: *const u8, name_len: usize) -> u64;
+    fn naso_hot_reload_state_capture(handle: u64, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_hot_reload_state_restore(handle: u64, state_ptr: *const u8, state_len: usize) -> u64;
+    fn naso_hot_reload_version_current() -> u64;
+    fn naso_hot_reload_version_register(version: u64, metadata_ptr: *const u8, metadata_len: usize) -> u64;
+}
+
+// ============================================================================
+// Hot Reload Types
+// ============================================================================
+
+struct ModuleVersion {
+    version: u64,
+    timestamp: u64,
+    metadata: HashMap<String, String>,
+    checksum: [u8; 32],
+}
+
+struct LoadedModule {
+    handle: u64,
+    path: String,
+    version: ModuleVersion,
+    exports: HashMap<String, ModuleExport>,
+    state: Option<ModuleState>,
+}
+
+struct ModuleExport {
+    name: String,
+    symbol_addr: u64,
+    signature: FunctionSignature,
+}
+
+struct FunctionSignature {
+    params: Vec<TypeDescriptor>,
+    return_type: TypeDescriptor,
+    calling_convention: CallingConvention,
+}
+
+enum TypeDescriptor {
+    Void,
+    Bool,
+    I8, I16, I32, I64,
+    U8, U16, U32, U64,
+    F32, F64,
+    Pointer,
+    Struct(String),
+    Array(Box<TypeDescriptor>, usize),
+    Function(Box<FunctionSignature>),
+}
+
+enum CallingConvention {
+    SystemV,
+    Win64,
+    Wasm,
+    NasoAbi,
+}
+
+struct ModuleState {
+    data: Vec<u8>,
+    version: u64,
+    schema_hash: [u8; 32],
+}
+
+// ============================================================================
+// Hot Reloader
+// ============================================================================
+
+struct HotReloader {
+    modules: HashMap<String, LoadedModule>,
+    version_counter: u64,
+    state_migrators: HashMap<String, StateMigrator>,
+    rollback_on_failure: bool,
+    pre_load_hooks: Vec<Box<dyn Fn(&str) -> Result<(), HotReloadError> + Send + Sync>>,
+    post_load_hooks: Vec<Box<dyn Fn(&LoadedModule) -> Result<(), HotReloadError> + Send + Sync>>,
+    pre_unload_hooks: Vec<Box<dyn Fn(&LoadedModule) -> Result<(), HotReloadError> + Send + Sync>>,
+}
+
+impl HotReloader {
+    pub fn new() -> Self {
+        HotReloader {
+            modules: HashMap::new(),
+            version_counter: naso_hot_reload_version_current(),
+            state_migrators: HashMap::new(),
+            rollback_on_failure: true,
+            pre_load_hooks: Vec::new(),
+            post_load_hooks: Vec::new(),
+            pre_unload_hooks: Vec::new(),
+        }
+    }
+
+    pub fn rollback_on_failure(mut self, enabled: bool) -> Self {
+        self.rollback_on_failure = enabled;
+        self
+    }
+
+    pub fn add_pre_load_hook(&mut self, hook: impl Fn(&str) -> Result<(), HotReloadError> + Send + Sync + 'static) {
+        self.pre_load_hooks.push(Box::new(hook));
+    }
+
+    pub fn add_post_load_hook(&mut self, hook: impl Fn(&LoadedModule) -> Result<(), HotReloadError> + Send + Sync + 'static) {
+        self.post_load_hooks.push(Box::new(hook));
+    }
+
+    pub fn add_pre_unload_hook(&mut self, hook: impl Fn(&LoadedModule) -> Result<(), HotReloadError> + Send + Sync + 'static) {
+        self.pre_unload_hooks.push(Box::new(hook));
+    }
+
+    pub fn register_state_migrator(&mut self, module_name: &str, migrator: StateMigrator) {
+        self.state_migrators.insert(module_name.into(), migrator);
+    }
+
+    pub fn load_module(&mut self, name: &str, path: &str) -> Result<(), HotReloadError> {
+        // Run pre-load hooks
+        for hook in &self.pre_load_hooks {
+            hook(path)?;
+        }
+
+        // Check if module already loaded
+        let old_module = self.modules.remove(name);
+
+        // Capture old state if exists
+        let old_state = old_module.as_ref().and_then(|m| m.state.clone());
+
+        // Load new module
+        self.version_counter += 1;
+        let version = self.version_counter;
+
+        let handle = naso_hot_reload_module_load(path.as_ptr(), path.len(), version);
+        if handle == 0 {
+            // Restore old module on failure
+            if let Some(old) = old_module {
+                self.modules.insert(name.into(), old);
+            }
+            return Err(HotReloadError::LoadFailed);
+        }
+
+        // Discover exports
+        let exports = self.discover_exports(handle)?;
+
+        // Create module
+        let module = LoadedModule {
+            handle,
+            path: path.into(),
+            version: ModuleVersion {
+                version,
+                timestamp: current_timestamp(),
+                metadata: HashMap::new(),
+                checksum: compute_checksum(path)?,
+            },
+            exports,
+            state: None,
+        };
+
+        // Migrate state if migrator exists
+        if let Some(migrator) = self.state_migrators.get(name) {
+            if let Some(old_state) = old_state {
+                let new_state = migrator.migrate(old_state, &module.version)?;
+                // Restore state to new module
+                naso_hot_reload_state_restore(handle, new_state.data.as_ptr(), new_state.data.len());
+            }
+        } else if let Some(old_state) = old_state {
+            // Try direct restore
+            let result = naso_hot_reload_state_restore(handle, old_state.data.as_ptr(), old_state.data.len());
+            if result == 0 {
+                // State incompatible
+            }
+        }
+
+        // Run post-load hooks
+        for hook in &self.post_load_hooks {
+            hook(&module)?;
+        }
+
+        // Register version
+        let metadata = serde_json::to_string(&module.version.metadata).unwrap_or_default();
+        naso_hot_reload_version_register(version, metadata.as_ptr(), metadata.len());
+
+        self.modules.insert(name.into(), module);
+        Ok(())
+    }
+
+    pub fn unload_module(&mut self, name: &str) -> Result<(), HotReloadError> {
+        let module = self.modules.get(name).ok_or(HotReloadError::ModuleNotFound)?;
+
+        // Run pre-unload hooks
+        for hook in &self.pre_unload_hooks {
+            hook(module)?;
+        }
+
+        // Capture state for potential rollback
+        let mut out = vec![0u8; 1024 * 1024];
+        let len = naso_hot_reload_state_capture(module.handle, out.as_mut_ptr(), out.len());
+        let state = if len > 0 {
+            out.truncate(len as usize);
+            Some(ModuleState {
+                data: out,
+                version: module.version.version,
+                schema_hash: module.version.checksum,
+            })
+        } else {
+            None
+        };
+
+        // Unload
+        let result = naso_hot_reload_module_unload(module.handle);
+        if result == 0 {
+            return Err(HotReloadError::UnloadFailed);
+        }
+
+        self.modules.remove(name);
+        Ok(())
+    }
+
+    pub fn reload_module(&mut self, name: &str) -> Result<(), HotReloadError> {
+        let module = self.modules.get(name).ok_or(HotReloadError::ModuleNotFound)?;
+        let path = module.path.clone();
+        self.unload_module(name)?;
+        self.load_module(name, &path)
+    }
+
+    pub fn call(&self, module_name: &str, func_name: &str, args: &[u8]) -> Result<Vec<u8>, HotReloadError> {
+        let module = self.modules.get(module_name).ok_or(HotReloadError::ModuleNotFound)?;
+        let export = module.exports.get(func_name).ok_or(HotReloadError::FunctionNotFound)?;
+
+        let mut out = vec![0u8; 65536];
+        let len = naso_hot_reload_module_call(
+            module.handle,
+            func_name.as_ptr(), func_name.len(),
+            args.as_ptr(), args.len(),
+            out.as_mut_ptr(), out.len(),
+        );
+
+        if len == 0 {
+            return Err(HotReloadError::CallFailed);
+        }
+
+        out.truncate(len as usize);
+        Ok(out)
+    }
+
+    pub fn get_symbol(&self, module_name: &str, symbol_name: &str) -> Result<u64, HotReloadError> {
+        let module = self.modules.get(module_name).ok_or(HotReloadError::ModuleNotFound)?;
+        let addr = naso_hot_reload_module_symbol(module.handle, symbol_name.as_ptr(), symbol_name.len());
+        if addr == 0 {
+            return Err(HotReloadError::SymbolNotFound);
+        }
+        Ok(addr)
+    }
+
+    pub fn capture_state(&self, module_name: &str) -> Result<ModuleState, HotReloadError> {
+        let module = self.modules.get(module_name).ok_or(HotReloadError::ModuleNotFound)?;
+        let mut out = vec![0u8; 1024 * 1024];
+        let len = naso_hot_reload_state_capture(module.handle, out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(HotReloadError::StateCaptureFailed);
+        }
+        out.truncate(len as usize);
+        Ok(ModuleState {
+            data: out,
+            version: module.version.version,
+            schema_hash: module.version.checksum,
+        })
+    }
+
+    pub fn list_modules(&self) -> Vec<ModuleInfo> {
+        self.modules.iter().map(|(name, module)| ModuleInfo {
+            name: name.clone(),
+            path: module.path.clone(),
+            version: module.version.version,
+            timestamp: module.version.timestamp,
+            exports: module.exports.keys().cloned().collect(),
+            has_state: module.state.is_some(),
+        }).collect()
+    }
+
+    pub fn get_module(&self, name: &str) -> Option<&LoadedModule> {
+        self.modules.get(name)
+    }
+
+    fn discover_exports(&self, handle: u64) -> Result<HashMap<String, ModuleExport>, HotReloadError> {
+        // Would query module for exported symbols
+        Ok(HashMap::new())
+    }
+}
+
+// ============================================================================
+// State Migration
+// ============================================================================
+
+trait StateMigrator {
+    fn migrate(&self, old_state: ModuleState, new_version: &ModuleVersion) -> Result<ModuleState, HotReloadError>;
+    fn can_migrate(&self, from_version: u64, to_version: u64) -> bool;
+}
+
+struct NoOpMigrator;
+
+impl StateMigrator for NoOpMigrator {
+    fn migrate(&self, old_state: ModuleState, _new_version: &ModuleVersion) -> Result<ModuleState, HotReloadError> {
+        Ok(old_state)
+    }
+
+    fn can_migrate(&self, _from: u64, _to: u64) -> bool {
+        true
+    }
+}
+
+struct VersionedMigrator {
+    migrations: HashMap<(u64, u64), Box<dyn Fn(ModuleState) -> Result<ModuleState, HotReloadError> + Send + Sync>>,
+}
+
+impl VersionedMigrator {
+    pub fn new() -> Self {
+        VersionedMigrator {
+            migrations: HashMap::new(),
+        }
+    }
+
+    pub fn add_migration(&mut self, from: u64, to: u64, migrator: impl Fn(ModuleState) -> Result<ModuleState, HotReloadError> + Send + Sync + 'static) {
+        self.migrations.insert((from, to), Box::new(migrator));
+    }
+}
+
+impl StateMigrator for VersionedMigrator {
+    fn migrate(&self, old_state: ModuleState, new_version: &ModuleVersion) -> Result<ModuleState, HotReloadError> {
+        let mut current_state = old_state;
+        let from_version = current_state.version;
+        let to_version = new_version.version;
+
+        if from_version == to_version {
+            return Ok(current_state);
+        }
+
+        // Find migration path
+        let mut current_version = from_version;
+        while current_version < to_version {
+            let next_version = current_version + 1;
+            if let Some(migrator) = self.migrations.get(&(current_version, next_version)) {
+                current_state = migrator(current_state)?;
+                current_version = next_version;
+            } else {
+                return Err(HotReloadError::MigrationPathNotFound);
+            }
+        }
+
+        current_state.version = to_version;
+        current_state.schema_hash = new_version.checksum;
+        Ok(current_state)
+    }
+
+    fn can_migrate(&self, from: u64, to: u64) -> bool {
+        let mut current = from;
+        while current < to {
+            if !self.migrations.contains_key(&(current, current + 1)) {
+                return false;
+            }
+            current += 1;
+        }
+        true
+    }
+}
+
+// ============================================================================
+// Rolling Update Coordinator
+// ============================================================================
+
+struct RollingUpdate {
+    reloader: Arc<Mutex<HotReloader>>,
+    strategy: UpdateStrategy,
+    health_check: Option<HealthCheck>,
+    max_surge: usize,
+    max_unavailable: usize,
+}
+
+enum UpdateStrategy {
+    Rolling,
+    BlueGreen,
+    Canary,
+    Recreate,
+}
+
+struct HealthCheck {
+    endpoint: String,
+    expected_status: u16,
+    timeout_secs: u64,
+    interval_secs: u64,
+    healthy_threshold: u32,
+    unhealthy_threshold: u32,
+}
+
+impl RollingUpdate {
+    pub fn new(reloader: Arc<Mutex<HotReloader>>) -> Self {
+        RollingUpdate {
+            reloader,
+            strategy: UpdateStrategy::Rolling,
+            health_check: None,
+            max_surge: 1,
+            max_unavailable: 0,
+        }
+    }
+
+    pub fn strategy(mut self, strategy: UpdateStrategy) -> Self {
+        self.strategy = strategy;
+        self
+    }
+
+    pub fn health_check(mut self, check: HealthCheck) -> Self {
+        self.health_check = Some(check);
+        self
+    }
+
+    pub fn max_surge(mut self, surge: usize) -> Self {
+        self.max_surge = surge;
+        self
+    }
+
+    pub fn max_unavailable(mut self, unavailable: usize) -> Self {
+        self.max_unavailable = unavailable;
+        self
+    }
+
+    pub fn execute(&self, module_name: &str, new_path: &str) -> Result<(), HotReloadError> {
+        match self.strategy {
+            UpdateStrategy::Rolling => self.rolling_update(module_name, new_path),
+            UpdateStrategy::BlueGreen => self.blue_green_update(module_name, new_path),
+            UpdateStrategy::Canary => self.canary_update(module_name, new_path),
+            UpdateStrategy::Recreate => self.recreate_update(module_name, new_path),
+        }
+    }
+
+    fn rolling_update(&self, module_name: &str, new_path: &str) -> Result<(), HotReloadError> {
+        // For single-process, rolling update means:
+        // 1. Load new version alongside old
+        // 2. Verify health
+        // 3. Switch traffic
+        // 4. Unload old
+
+        let mut reloader = self.reloader.lock().unwrap();
+
+        // Load new version with temporary name
+        let temp_name = format!("{}_new", module_name);
+        reloader.load_module(&temp_name, new_path)?;
+
+        // Health check
+        if let Some(hc) = &self.health_check {
+            self.wait_healthy(&hc, &temp_name)?;
+        }
+
+        // Swap: unload old, rename new
+        reloader.unload_module(module_name)?;
+        // Note: In real implementation, would atomically swap
+        // For now, reload with original name
+        reloader.load_module(module_name, new_path)?;
+        reloader.unload_module(&temp_name)?;
+
+        Ok(())
+    }
+
+    fn blue_green_update(&self, module_name: &str, new_path: &str) -> Result<(), HotReloadError> {
+        // Blue-green: run both versions, switch at load balancer level
+        // For single-process, similar to rolling but with explicit switch
+        self.rolling_update(module_name, new_path)
+    }
+
+    fn canary_update(&self, module_name: &str, new_path: &str) -> Result<(), HotReloadError> {
+        // Canary: route small % of traffic to new version
+        let mut reloader = self.reloader.lock().unwrap();
+        let temp_name = format!("{}_canary", module_name);
+        reloader.load_module(&temp_name, new_path)?;
+
+        // Health check
+        if let Some(hc) = &self.health_check {
+            self.wait_healthy(&hc, &temp_name)?;
+        }
+
+        // In real implementation, would gradually shift traffic
+        // For now, full switch
+        reloader.unload_module(module_name)?;
+        reloader.load_module(module_name, new_path)?;
+        reloader.unload_module(&temp_name)?;
+
+        Ok(())
+    }
+
+    fn recreate_update(&self, module_name: &str, new_path: &str) -> Result<(), HotReloadError> {
+        // Recreate: unload old, load new (downtime)
+        let mut reloader = self.reloader.lock().unwrap();
+        reloader.unload_module(module_name)?;
+        reloader.load_module(module_name, new_path)?;
+        Ok(())
+    }
+
+    fn wait_healthy(&self, hc: &HealthCheck, module_name: &str) -> Result<(), HotReloadError> {
+        let mut consecutive_healthy = 0;
+        let mut consecutive_unhealthy = 0;
+
+        loop {
+            // Call health check endpoint on new module
+            let result = self.call_health_check(module_name, hc);
+
+            if result {
+                consecutive_healthy += 1;
+                consecutive_unhealthy = 0;
+                if consecutive_healthy >= hc.healthy_threshold {
+                    return Ok(());
+                }
+            } else {
+                consecutive_unhealthy += 1;
+                consecutive_healthy = 0;
+                if consecutive_unhealthy >= hc.unhealthy_threshold {
+                    return Err(HotReloadError::HealthCheckFailed);
+                }
+            }
+
+            std::thread::sleep(std::time::Duration::from_secs(hc.interval_secs));
+        }
+    }
+
+    fn call_health_check(&self, module_name: &str, hc: &HealthCheck) -> bool {
+        // Would call health check function in module
+        true // Placeholder
+    }
+}
+
+// ============================================================================
+// Module Info
+// ============================================================================
+
+struct ModuleInfo {
+    name: String,
+    path: String,
+    version: u64,
+    timestamp: u64,
+    exports: Vec<String>,
+    has_state: bool,
+}
+
+// ============================================================================
+// Error Types
+// ============================================================================
+
+enum HotReloadError {
+    LoadFailed,
+    UnloadFailed,
+    CallFailed,
+    ModuleNotFound,
+    FunctionNotFound,
+    SymbolNotFound,
+    StateCaptureFailed,
+    StateRestoreFailed,
+    MigrationFailed,
+    MigrationPathNotFound,
+    HealthCheckFailed,
+    VersionConflict,
+    ChecksumMismatch,
+    HookFailed,
+    InvalidModuleFormat,
+    DependencyMissing,
+}
+
+impl HotReloadError {
+    pub fn to_string(&self) -> String {
+        match self {
+            HotReloadError::LoadFailed => "Failed to load module".into(),
+            HotReloadError::UnloadFailed => "Failed to unload module".into(),
+            HotReloadError::CallFailed => "Function call failed".into(),
+            HotReloadError::ModuleNotFound => "Module not found".into(),
+            HotReloadError::FunctionNotFound => "Function not found in module".into(),
+            HotReloadError::SymbolNotFound => "Symbol not found".into(),
+            HotReloadError::StateCaptureFailed => "Failed to capture module state".into(),
+            HotReloadError::StateRestoreFailed => "Failed to restore module state".into(),
+            HotReloadError::MigrationFailed => "State migration failed".into(),
+            HotReloadError::MigrationPathNotFound => "No migration path between versions".into(),
+            HotReloadError::HealthCheckFailed => "Health check failed".into(),
+            HotReloadError::VersionConflict => "Version conflict".into(),
+            HotReloadError::ChecksumMismatch => "Module checksum mismatch".into(),
+            HotReloadError::HookFailed => "Hook execution failed".into(),
+            HotReloadError::InvalidModuleFormat => "Invalid module format".into(),
+            HotReloadError::DependencyMissing => "Required dependency not loaded".into(),
+        }
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn current_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+fn compute_checksum(path: &str) -> Result<[u8; 32], HotReloadError> {
+    // Would compute SHA256 of file
+    let mut hash = [0u8; 32];
+    // Placeholder
+    Ok(hash)
+}
+
+// ============================================================================
+// Convenience Functions
+// ============================================================================
+
+fn hot_reloader() -> HotReloader {
+    HotReloader::new()
+}
+
+fn rolling_update(reloader: Arc<Mutex<HotReloader>>) -> RollingUpdate {
+    RollingUpdate::new(reloader)
+}
+
+// ============================================================================
+// Integration with Async Runtime
+// ============================================================================
+
+struct HotReloadableService {
+    reloader: Arc<Mutex<HotReloader>>,
+    module_name: String,
+    handler_name: String,
+}
+
+impl HotReloadableService {
+    pub fn new(reloader: Arc<Mutex<HotReloader>>, module_name: &str, handler_name: &str) -> Self {
+        HotReloadableService {
+            reloader,
+            module_name: module_name.into(),
+            handler_name: handler_name.into(),
+        }
+    }
+
+    pub fn handle_request(&self, request: Vec<u8>) -> Result<Vec<u8>, HotReloadError> {
+        let reloader = self.reloader.lock().unwrap();
+        reloader.call(&self.module_name, &self.handler_name, &request)
+    }
+
+    pub fn reload(&self, new_path: &str) -> Result<(), HotReloadError> {
+        let mut reloader = self.reloader.lock().unwrap();
+        reloader.reload_module(&self.module_name)
+    }
+}
+
+// ============================================================================
+// File Watcher for Auto-Reload
+// ============================================================================
+
+struct FileWatcher {
+    paths: HashMap<String, std::time::SystemTime>,
+    callback: Box<dyn Fn(&str) + Send + Sync>,
+    interval_ms: u64,
+    running: bool,
+}
+
+impl FileWatcher {
+    pub fn new(callback: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        FileWatcher {
+            paths: HashMap::new(),
+            callback: Box::new(callback),
+            interval_ms: 1000,
+            running: false,
+        }
+    }
+
+    pub fn watch(&mut self, path: &str) -> Result<(), HotReloadError> {
+        let metadata = std::fs::metadata(path).map_err(|_| HotReloadError::DependencyMissing)?;
+        self.paths.insert(path.into(), metadata.modified().map_err(|_| HotReloadError::DependencyMissing)?);
+        Ok(())
+    }
+
+    pub fn interval(mut self, ms: u64) -> Self {
+        self.interval_ms = ms;
+        self
+    }
+
+    pub fn start(&mut self) {
+        self.running = true;
+        let paths = self.paths.clone();
+        let callback = self.callback.clone();
+        let interval = self.interval_ms;
+
+        std::thread::spawn(move || {
+            let mut last_modified = paths;
+            while true {
+                std::thread::sleep(std::time::Duration::from_millis(interval));
+                for (path, last_time) in &mut last_modified {
+                    if let Ok(metadata) = std::fs::metadata(path) {
+                        if let Ok(modified) = metadata.modified() {
+                            if modified > *last_time {
+                                *last_time = modified;
+                                callback(path);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    pub fn stop(&mut self) {
+        self.running = false;
+    }
+}

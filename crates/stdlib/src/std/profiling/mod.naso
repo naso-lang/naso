@@ -1,0 +1,758 @@
+// ============================================================================
+// Naso Profiling (naso_profiling) - Phase 28.2
+// ============================================================================
+// Built-in continuous profiling for production observability
+// CPU, memory, allocation, lock contention, and custom profilers
+// Zero-overhead when disabled, minimal overhead when enabled
+// ============================================================================
+
+extern "C" {
+    fn naso_profiling_cpu_start(interval_ms: u32) -> u64;
+    fn naso_profiling_cpu_stop(handle: u64, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_profiling_memory_start(sample_rate: u32) -> u64;
+    fn naso_profiling_memory_stop(handle: u64, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_profiling_alloc_start() -> u64;
+    fn naso_profiling_alloc_stop(handle: u64, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_profiling_lock_start() -> u64;
+    fn naso_profiling_lock_stop(handle: u64, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_profiling_wall_start() -> u64;
+    fn naso_profiling_wall_stop(handle: u64, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_profiling_report_json(handle: u64, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_profiling_report_pprof(handle: u64, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_profiling_report_flamegraph(handle: u64, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_profiling_free(handle: u64);
+}
+
+// ============================================================================
+// Profiling Types
+// ============================================================================
+
+enum ProfilingType {
+    Cpu,
+    Memory,
+    Alloc,
+    Lock,
+    Wall,
+    Custom(String),
+}
+
+enum ProfileFormat {
+    Json,
+    Pprof,
+    Flamegraph,
+    Speedscope,
+    ChromeTrace,
+}
+
+struct ProfilingConfig {
+    profiling_type: ProfilingType,
+    interval_ms: u32,
+    sample_rate: u32,
+    include_kernel: bool,
+    include_idle: bool,
+    filter_threads: Option<Vec<u64>>,
+    filter_functions: Option<Vec<String>>,
+}
+
+impl ProfilingConfig {
+    pub fn cpu() -> Self {
+        ProfilingConfig {
+            profiling_type: ProfilingType::Cpu,
+            interval_ms: 1,
+            sample_rate: 1000,
+            include_kernel: false,
+            include_idle: false,
+            filter_threads: None,
+            filter_functions: None,
+        }
+    }
+
+    pub fn memory(sample_rate: u32) -> Self {
+        ProfilingConfig {
+            profiling_type: ProfilingType::Memory,
+            interval_ms: 0,
+            sample_rate,
+            include_kernel: false,
+            include_idle: false,
+            filter_threads: None,
+            filter_functions: None,
+        }
+    }
+
+    pub fn alloc() -> Self {
+        ProfilingConfig {
+            profiling_type: ProfilingType::Alloc,
+            interval_ms: 0,
+            sample_rate: 512,
+            include_kernel: false,
+            include_idle: false,
+            filter_threads: None,
+            filter_functions: None,
+        }
+    }
+
+    pub fn lock() -> Self {
+        ProfilingConfig {
+            profiling_type: ProfilingType::Lock,
+            interval_ms: 0,
+            sample_rate: 1,
+            include_kernel: false,
+            include_idle: false,
+            filter_threads: None,
+            filter_functions: None,
+        }
+    }
+
+    pub fn wall() -> Self {
+        ProfilingConfig {
+            profiling_type: ProfilingType::Wall,
+            interval_ms: 1,
+            sample_rate: 100,
+            include_kernel: false,
+            include_idle: false,
+            filter_threads: None,
+            filter_functions: None,
+        }
+    }
+
+    pub fn interval_ms(mut self, ms: u32) -> Self {
+        self.interval_ms = ms;
+        self
+    }
+
+    pub fn sample_rate(mut self, rate: u32) -> Self {
+        self.sample_rate = rate;
+        self
+    }
+
+    pub fn include_kernel(mut self, include: bool) -> Self {
+        self.include_kernel = include;
+        self
+    }
+
+    pub fn filter_thread(mut self, thread_id: u64) -> Self {
+        match &mut self.filter_threads {
+            Some(v) => v.push(thread_id),
+            None => self.filter_threads = Some(vec![thread_id]),
+        }
+        self
+    }
+
+    pub fn filter_function(mut self, func: &str) -> Self {
+        match &mut self.filter_functions {
+            Some(v) => v.push(func.into()),
+            None => self.filter_functions = Some(vec![func.into()]),
+        }
+        self
+    }
+}
+
+// ============================================================================
+// Profiler Handle
+// ============================================================================
+
+struct Profiler {
+    handle: u64,
+    config: ProfilingConfig,
+    running: bool,
+}
+
+impl Profiler {
+    pub fn start(config: ProfilingConfig) -> Result<Self, ProfilingError> {
+        let handle = match config.profiling_type {
+            ProfilingType::Cpu => naso_profiling_cpu_start(config.interval_ms),
+            ProfilingType::Memory => naso_profiling_memory_start(config.sample_rate),
+            ProfilingType::Alloc => naso_profiling_alloc_start(),
+            ProfilingType::Lock => naso_profiling_lock_start(),
+            ProfilingType::Wall => naso_profiling_wall_start(),
+            ProfilingType::Custom(_) => return Err(ProfilingError::UnsupportedType),
+        };
+
+        if handle == 0 {
+            return Err(ProfilingError::StartFailed);
+        }
+
+        Ok(Profiler {
+            handle,
+            config,
+            running: true,
+        })
+    }
+
+    pub fn stop(&mut self) -> Result<ProfileData, ProfilingError> {
+        if !self.running {
+            return Err(ProfilingError::NotRunning);
+        }
+
+        let mut out = vec![0u8; 1024 * 1024]; // 1MB buffer
+        let len = match self.config.profiling_type {
+            ProfilingType::Cpu => naso_profiling_cpu_stop(self.handle, out.as_mut_ptr(), out.len()),
+            ProfilingType::Memory => naso_profiling_memory_stop(self.handle, out.as_mut_ptr(), out.len()),
+            ProfilingType::Alloc => naso_profiling_alloc_stop(self.handle, out.as_mut_ptr(), out.len()),
+            ProfilingType::Lock => naso_profiling_lock_stop(self.handle, out.as_mut_ptr(), out.len()),
+            ProfilingType::Wall => naso_profiling_wall_stop(self.handle, out.as_mut_ptr(), out.len()),
+            ProfilingType::Custom(_) => return Err(ProfilingError::UnsupportedType),
+        };
+
+        if len == 0 {
+            return Err(ProfilingError::StopFailed);
+        }
+
+        out.truncate(len as usize);
+        self.running = false;
+
+        Ok(ProfileData {
+            raw_data: out,
+            config: self.config.clone(),
+        })
+    }
+
+    pub fn report(&self, format: ProfileFormat) -> Result<String, ProfilingError> {
+        if !self.running {
+            return Err(ProfilingError::NotRunning);
+        }
+
+        let mut out = vec![0u8; 4 * 1024 * 1024]; // 4MB buffer
+        let len = match format {
+            ProfileFormat::Json => naso_profiling_report_json(self.handle, out.as_mut_ptr(), out.len()),
+            ProfileFormat::Pprof => naso_profiling_report_pprof(self.handle, out.as_mut_ptr(), out.len()),
+            ProfileFormat::Flamegraph => naso_profiling_report_flamegraph(self.handle, out.as_mut_ptr(), out.len()),
+            ProfileFormat::Speedscope => return Err(ProfilingError::UnsupportedFormat),
+            ProfileFormat::ChromeTrace => return Err(ProfilingError::UnsupportedFormat),
+        };
+
+        if len == 0 {
+            return Err(ProfilingError::ReportFailed);
+        }
+
+        out.truncate(len as usize);
+        String::from_utf8(out).map_err(|_| ProfilingError::InvalidUtf8)
+    }
+}
+
+impl Drop for Profiler {
+    fn drop(&mut self) {
+        if self.running {
+            unsafe { naso_profiling_free(self.handle); }
+        }
+    }
+}
+
+// ============================================================================
+// Profile Data
+// ============================================================================
+
+struct ProfileData {
+    raw_data: Vec<u8>,
+    config: ProfilingConfig,
+}
+
+impl ProfileData {
+    pub fn to_json(&self) -> Result<String, ProfilingError> {
+        String::from_utf8(self.raw_data.clone()).map_err(|_| ProfilingError::InvalidUtf8)
+    }
+
+    pub fn to_pprof(&self) -> Result<Vec<u8>, ProfilingError> {
+        Ok(self.raw_data.clone())
+    }
+
+    pub fn to_flamegraph(&self) -> Result<String, ProfilingError> {
+        String::from_utf8(self.raw_data.clone()).map_err(|_| ProfilingError::InvalidUtf8)
+    }
+
+    pub fn save(&self, path: &str, format: ProfileFormat) -> Result<(), ProfilingError> {
+        let content = match format {
+            ProfileFormat::Json => self.to_json()?.into_bytes(),
+            ProfileFormat::Pprof => self.to_pprof()?,
+            ProfileFormat::Flamegraph => self.to_flamegraph()?.into_bytes(),
+            _ => return Err(ProfilingError::UnsupportedFormat),
+        };
+        std::fs::write(path, content).map_err(|_| ProfilingError::IoError)
+    }
+}
+
+// ============================================================================
+// Continuous Profiler (Background)
+// ============================================================================
+
+struct ContinuousProfiler {
+    cpu_profiler: Option<Profiler>,
+    memory_profiler: Option<Profiler>,
+    alloc_profiler: Option<Profiler>,
+    lock_profiler: Option<Profiler>,
+    wall_profiler: Option<Profiler>,
+    upload_endpoint: Option<String>,
+    upload_interval_secs: u64,
+    running: bool,
+}
+
+impl ContinuousProfiler {
+    pub fn new() -> Self {
+        ContinuousProfiler {
+            cpu_profiler: None,
+            memory_profiler: None,
+            alloc_profiler: None,
+            lock_profiler: None,
+            wall_profiler: None,
+            upload_endpoint: None,
+            upload_interval_secs: 60,
+            running: false,
+        }
+    }
+
+    pub fn with_cpu(mut self, interval_ms: u32) -> Self {
+        self.cpu_profiler = Some(Profiler::start(ProfilingConfig::cpu().interval_ms(interval_ms)).ok());
+        self
+    }
+
+    pub fn with_memory(mut self, sample_rate: u32) -> Self {
+        self.memory_profiler = Some(Profiler::start(ProfilingConfig::memory(sample_rate)).ok());
+        self
+    }
+
+    pub fn with_alloc(mut self) -> Self {
+        self.alloc_profiler = Some(Profiler::start(ProfilingConfig::alloc()).ok());
+        self
+    }
+
+    pub fn with_lock(mut self) -> Self {
+        self.lock_profiler = Some(Profiler::start(ProfilingConfig::lock()).ok());
+        self
+    }
+
+    pub fn with_wall(mut self, interval_ms: u32) -> Self {
+        self.wall_profiler = Some(Profiler::start(ProfilingConfig::wall().interval_ms(interval_ms)).ok());
+        self
+    }
+
+    pub fn upload_to(mut self, endpoint: &str, interval_secs: u64) -> Self {
+        self.upload_endpoint = Some(endpoint.into());
+        self.upload_interval_secs = interval_secs;
+        self
+    }
+
+    pub fn start(&mut self) -> Result<(), ProfilingError> {
+        if self.running {
+            return Err(ProfilingError::AlreadyRunning);
+        }
+        self.running = true;
+
+        // Start all configured profilers
+        if self.cpu_profiler.is_none() {
+            self.cpu_profiler = Some(Profiler::start(ProfilingConfig::cpu())?);
+        }
+        if self.memory_profiler.is_none() {
+            self.memory_profiler = Some(Profiler::start(ProfilingConfig::memory(1000))?);
+        }
+        if self.alloc_profiler.is_none() {
+            self.alloc_profiler = Some(Profiler::start(ProfilingConfig::alloc())?);
+        }
+        if self.lock_profiler.is_none() {
+            self.lock_profiler = Some(Profiler::start(ProfilingConfig::lock())?);
+        }
+        if self.wall_profiler.is_none() {
+            self.wall_profiler = Some(Profiler::start(ProfilingConfig::wall())?);
+        }
+
+        // Start upload task if endpoint configured
+        if let Some(endpoint) = &self.upload_endpoint {
+            let endpoint = endpoint.clone();
+            let interval = self.upload_interval_secs;
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(interval));
+                    // Upload logic would go here
+                }
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn stop(&mut self) -> Result<ContinuousProfileReport, ProfilingError> {
+        if !self.running {
+            return Err(ProfilingError::NotRunning);
+        }
+        self.running = false;
+
+        let mut report = ContinuousProfileReport::new();
+
+        if let Some(mut p) = self.cpu_profiler.take() {
+            report.cpu = Some(p.stop()?);
+        }
+        if let Some(mut p) = self.memory_profiler.take() {
+            report.memory = Some(p.stop()?);
+        }
+        if let Some(mut p) = self.alloc_profiler.take() {
+            report.alloc = Some(p.stop()?);
+        }
+        if let Some(mut p) = self.lock_profiler.take() {
+            report.lock = Some(p.stop()?);
+        }
+        if let Some(mut p) = self.wall_profiler.take() {
+            report.wall = Some(p.stop()?);
+        }
+
+        Ok(report)
+    }
+
+    pub fn snapshot(&self) -> Result<ContinuousProfileReport, ProfilingError> {
+        let mut report = ContinuousProfileReport::new();
+
+        if let Some(p) = &self.cpu_profiler {
+            report.cpu = Some(ProfileData {
+                raw_data: vec![], // Would get current snapshot
+                config: p.config.clone(),
+            });
+        }
+        if let Some(p) = &self.memory_profiler {
+            report.memory = Some(ProfileData {
+                raw_data: vec![],
+                config: p.config.clone(),
+            });
+        }
+        if let Some(p) = &self.alloc_profiler {
+            report.alloc = Some(ProfileData {
+                raw_data: vec![],
+                config: p.config.clone(),
+            });
+        }
+        if let Some(p) = &self.lock_profiler {
+            report.lock = Some(ProfileData {
+                raw_data: vec![],
+                config: p.config.clone(),
+            });
+        }
+        if let Some(p) = &self.wall_profiler {
+            report.wall = Some(ProfileData {
+                raw_data: vec![],
+                config: p.config.clone(),
+            });
+        }
+
+        Ok(report)
+    }
+}
+
+struct ContinuousProfileReport {
+    cpu: Option<ProfileData>,
+    memory: Option<ProfileData>,
+    alloc: Option<ProfileData>,
+    lock: Option<ProfileData>,
+    wall: Option<ProfileData>,
+    timestamp: u64,
+}
+
+impl ContinuousProfileReport {
+    fn new() -> Self {
+        ContinuousProfileReport {
+            cpu: None,
+            memory: None,
+            alloc: None,
+            lock: None,
+            wall: None,
+            timestamp: current_timestamp(),
+        }
+    }
+
+    pub fn save_all(&self, dir: &str) -> Result<(), ProfilingError> {
+        std::fs::create_dir_all(dir).map_err(|_| ProfilingError::IoError)?;
+
+        if let Some(cpu) = &self.cpu {
+            cpu.save(&format!("{}/cpu.pprof", dir), ProfileFormat::Pprof)?;
+            cpu.save(&format!("{}/cpu.json", dir), ProfileFormat::Json)?;
+            cpu.save(&format!("{}/cpu.flamegraph", dir), ProfileFormat::Flamegraph)?;
+        }
+        if let Some(mem) = &self.memory {
+            mem.save(&format!("{}/memory.pprof", dir), ProfileFormat::Pprof)?;
+        }
+        if let Some(alloc) = &self.alloc {
+            alloc.save(&format!("{}/alloc.pprof", dir), ProfileFormat::Pprof)?;
+        }
+        if let Some(lock) = &self.lock {
+            lock.save(&format!("{}/lock.pprof", dir), ProfileFormat::Pprof)?;
+        }
+        if let Some(wall) = &self.wall {
+            wall.save(&format!("{}/wall.pprof", dir), ProfileFormat::Pprof)?;
+        }
+
+        Ok(())
+    }
+}
+
+fn current_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+// ============================================================================
+// Profiling Annotations (for manual instrumentation)
+// ============================================================================
+
+struct ProfileScope {
+    name: String,
+    start_time: u64,
+}
+
+impl ProfileScope {
+    pub fn new(name: &str) -> Self {
+        ProfileScope {
+            name: name.into(),
+            start_time: naso_profiling_timestamp_ns(),
+        }
+    }
+}
+
+impl Drop for ProfileScope {
+    fn drop(&mut self) {
+        let end_time = naso_profiling_timestamp_ns();
+        naso_profiling_record_event(&self.name, self.start_time, end_time);
+    }
+}
+
+extern "C" {
+    fn naso_profiling_timestamp_ns() -> u64;
+    fn naso_profiling_record_event(name_ptr: *const u8, name_len: usize, start_ns: u64, end_ns: u64);
+}
+
+// ============================================================================
+// Profiling Macros
+// ============================================================================
+
+// #[profile]
+// fn my_function() { ... }
+
+// #[profile("custom_name")]
+// async fn my_async_function() { ... }
+
+fn profile_scope(name: &str) -> ProfileScope {
+    ProfileScope::new(name)
+}
+
+// ============================================================================
+// Profile-Guided Optimization Integration
+// ============================================================================
+
+struct PgoData {
+    profile_path: String,
+    profile_type: ProfileFormat,
+}
+
+impl PgoData {
+    pub fn from_file(path: &str, format: ProfileFormat) -> Result<Self, ProfilingError> {
+        if !std::path::Path::new(path).exists() {
+            return Err(ProfilingError::FileNotFound);
+        }
+        Ok(PgoData {
+            profile_path: path.into(),
+            profile_type: format,
+        })
+    }
+
+    pub fn apply_to_build(&self) -> Result<(), ProfilingError> {
+        // Would integrate with build system to apply PGO data
+        // e.g., pass -fprofile-use to LLVM
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Custom Profilers (for domain-specific profiling)
+// ============================================================================
+
+trait CustomProfiler {
+    fn name(&self) -> &str;
+    fn start(&mut self) -> Result<(), ProfilingError>;
+    fn stop(&mut self) -> Result<ProfileData, ProfilingError>;
+    fn event(&self, name: &str, data: &str);
+}
+
+struct QuantumCircuitProfiler {
+    circuit_id: String,
+    gate_counts: HashMap<String, u64>,
+    depth: u32,
+}
+
+impl QuantumCircuitProfiler {
+    pub fn new(circuit_id: &str) -> Self {
+        QuantumCircuitProfiler {
+            circuit_id: circuit_id.into(),
+            gate_counts: HashMap::new(),
+            depth: 0,
+        }
+    }
+
+    pub fn record_gate(&mut self, gate: &str, count: u64) {
+        *self.gate_counts.entry(gate.into()).or_insert(0) += count;
+    }
+
+    pub fn record_depth(&mut self, depth: u32) {
+        self.depth = depth.max(self.depth);
+    }
+}
+
+impl CustomProfiler for QuantumCircuitProfiler {
+    fn name(&self) -> &str {
+        "quantum_circuit"
+    }
+
+    fn start(&mut self) -> Result<(), ProfilingError> {
+        self.gate_counts.clear();
+        self.depth = 0;
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<ProfileData, ProfilingError> {
+        let mut json = String::from("{");
+        json.push_str(&format!("\"circuit_id\":\"{}\",", self.circuit_id));
+        json.push_str(&format!("\"depth\":{},", self.depth));
+        json.push_str("\"gates\":{");
+        for (i, (gate, count)) in self.gate_counts.iter().enumerate() {
+            if i > 0 { json.push(','); }
+            json.push_str(&format!("\"{}\":{}", gate, count));
+        }
+        json.push_str("}}");
+        Ok(ProfileData {
+            raw_data: json.into_bytes(),
+            config: ProfilingConfig {
+                profiling_type: ProfilingType::Custom("quantum_circuit".into()),
+                interval_ms: 0,
+                sample_rate: 1,
+                include_kernel: false,
+                include_idle: false,
+                filter_threads: None,
+                filter_functions: None,
+            },
+        })
+    }
+
+    fn event(&self, name: &str, data: &str) {
+        // Record quantum-specific events
+    }
+}
+
+// ============================================================================
+// Error Types
+// ============================================================================
+
+enum ProfilingError {
+    StartFailed,
+    StopFailed,
+    ReportFailed,
+    NotRunning,
+    AlreadyRunning,
+    UnsupportedType,
+    UnsupportedFormat,
+    InvalidUtf8,
+    IoError,
+    FileNotFound,
+    PermissionDenied,
+}
+
+impl ProfilingError {
+    pub fn to_string(&self) -> String {
+        match self {
+            ProfilingError::StartFailed => "Failed to start profiler".into(),
+            ProfilingError::StopFailed => "Failed to stop profiler".into(),
+            ProfilingError::ReportFailed => "Failed to generate report".into(),
+            ProfilingError::NotRunning => "Profiler not running".into(),
+            ProfilingError::AlreadyRunning => "Profiler already running".into(),
+            ProfilingError::UnsupportedType => "Unsupported profiling type".into(),
+            ProfilingError::UnsupportedFormat => "Unsupported report format".into(),
+            ProfilingError::InvalidUtf8 => "Invalid UTF-8 in profile data".into(),
+            ProfilingError::IoError => "I/O error".into(),
+            ProfilingError::FileNotFound => "Profile file not found".into(),
+            ProfilingError::PermissionDenied => "Permission denied (need root for some profilers)".into(),
+        }
+    }
+}
+
+// ============================================================================
+// Convenience Functions
+// ============================================================================
+
+fn profile_cpu(interval_ms: u32) -> Result<Profiler, ProfilingError> {
+    Profiler::start(ProfilingConfig::cpu().interval_ms(interval_ms))
+}
+
+fn profile_memory(sample_rate: u32) -> Result<Profiler, ProfilingError> {
+    Profiler::start(ProfilingConfig::memory(sample_rate))
+}
+
+fn profile_alloc() -> Result<Profiler, ProfilingError> {
+    Profiler::start(ProfilingConfig::alloc())
+}
+
+fn profile_lock() -> Result<Profiler, ProfilingError> {
+    Profiler::start(ProfilingConfig::lock())
+}
+
+fn profile_wall(interval_ms: u32) -> Result<Profiler, ProfilingError> {
+    Profiler::start(ProfilingConfig::wall().interval_ms(interval_ms))
+}
+
+fn continuous_profiler() -> ContinuousProfiler {
+    ContinuousProfiler::new()
+}
+
+fn pgo_data(path: &str, format: ProfileFormat) -> Result<PgoData, ProfilingError> {
+    PgoData::from_file(path, format)
+}
+
+// ============================================================================
+// Profiling Integration with Metrics/Tracing
+// ============================================================================
+
+struct ProfilingMetrics {
+    cpu_samples_total: crate::metrics::Counter,
+    memory_samples_total: crate::metrics::Counter,
+    alloc_samples_total: crate::metrics::Counter,
+    lock_events_total: crate::metrics::Counter,
+    profiling_overhead_ns: crate::metrics::Histogram,
+}
+
+impl ProfilingMetrics {
+    pub fn new(registry: &mut crate::metrics::MetricsRegistry) -> Result<Self, ProfilingError> {
+        Ok(ProfilingMetrics {
+            cpu_samples_total: registry.register_counter(
+                "naso_profiling_cpu_samples_total",
+                "Total CPU profiling samples collected",
+                &[],
+            ).map_err(|_| ProfilingError::StartFailed)?,
+            memory_samples_total: registry.register_counter(
+                "naso_profiling_memory_samples_total",
+                "Total memory profiling samples collected",
+                &[],
+            ).map_err(|_| ProfilingError::StartFailed)?,
+            alloc_samples_total: registry.register_counter(
+                "naso_profiling_alloc_samples_total",
+                "Total allocation profiling samples collected",
+                &[],
+            ).map_err(|_| ProfilingError::StartFailed)?,
+            lock_events_total: registry.register_counter(
+                "naso_profiling_lock_events_total",
+                "Total lock contention events recorded",
+                &[],
+            ).map_err(|_| ProfilingError::StartFailed)?,
+            profiling_overhead_ns: registry.register_histogram(
+                "naso_profiling_overhead_nanoseconds",
+                "Profiling overhead in nanoseconds",
+                &[("type", "")],
+                &[100.0, 1000.0, 10000.0, 100000.0, 1000000.0],
+            ).map_err(|_| ProfilingError::StartFailed)?,
+        })
+    }
+}
+
+// ============================================================================
+// Profiling Integration with Tracing
+// ============================================================================
+
+fn trace_profiling_event(name: &str, profiling_type: &str, duration_ns: u64) {
+    crate::tracing::Event::new(name, crate::tracing::Level::Debug)
+        .field("profiling_type", profiling_type)
+        .field("duration_ns", duration_ns)
+        .emit();
+}

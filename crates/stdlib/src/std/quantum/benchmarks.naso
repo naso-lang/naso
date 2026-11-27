@@ -1,0 +1,1369 @@
+// Quantum Benchmark Suite
+//
+// Standardized quantum advantage metrics:
+// - Quantum Volume (QV)
+// - Quantum Economic Value (QEV)
+// - Algorithmic benchmarks (VQE, QAOA, QEC, QML)
+// - Error rates, coherence times, gate fidelities
+// - Cross-platform comparison framework
+
+use crate::std::prelude::*;
+use crate::std::quantum::primitives::*;
+use crate::std::quantum::variational::*;
+use crate::std::quantum::qec::*;
+use crate::std::quantum::hybrid::*;
+use crate::std::quantum::hardware_vqe::*;
+use crate::std::quantum::hardware_qaoa::*;
+use crate::std::quantum::hardware_qec::*;
+use crate::std::tensor::Tensor;
+use crate::std::math::{sin, cos, sqrt, pi, exp, log, random_f32};
+
+// ============================================================
+// Benchmark Configuration
+// ============================================================
+
+/// Complete benchmark suite configuration.
+pub struct BenchmarkSuiteConfig {
+    pub providers: [BenchmarkProviderConfig; N_PROVIDERS>,
+    pub benchmarks: [BenchmarkType; N_BENCHMARKS>,
+    pub output: BenchmarkOutputConfig,
+    pub statistical: StatisticalConfig,
+}
+
+pub struct BenchmarkProviderConfig {
+    pub name: str,
+    pub provider: str,  // "ibm", "ionq", "rigetti", "quantinuum", "google"
+    pub backend: str,
+    pub api_token: str,
+    pub max_qubits: usize,
+    pub dedicated: bool,
+}
+
+pub enum BenchmarkType {
+    QuantumVolume { max_qubits: usize, trials_per_qubit: usize },
+    QuantumEconomicValue { workloads: [QEVWorkload; N> },
+    VQEBenchmark { molecules: [VQEMolecule; N> },
+    QAOABenchmark { problems: [QAOAProblemType; N> },
+    QECBenchmark { codes: [QECCodeType; N>, distances: [usize; M> },
+    QMLBenchmark { datasets: [QMLDataset; N> },
+    GateFidelity { gates: [GateType; N>, qubit_pairs: [(usize, usize); M> },
+    CoherenceTime { qubits: [usize; N> },
+    Crosstalk { qubit_groups: [[usize; 4]; N> },
+    MidCircuitMeasurement { qubits: [usize; N> },
+    DynamicCircuits { depth: usize, qubits: [usize; N> },
+}
+
+pub struct QEVWorkload {
+    pub name: str,
+    pub problem_size: usize,
+    pub classical_baseline_flops: u64,
+    pub classical_baseline_time_secs: f32,
+    pub quantum_algorithm: str,  // "vqe", "qaoa", "qml", "qpe"
+    pub quantum_params: QuantumAlgorithmParams,
+}
+
+pub struct QuantumAlgorithmParams {
+    pub qubits: usize,
+    pub depth: usize,
+    pub shots: usize,
+    pub error_mitigation: str,
+}
+
+pub struct VQEMolecule {
+    pub name: str,
+    pub n_qubits: usize,
+    pub n_terms: usize,
+    pub expected_energy: f32,
+    pub basis_set: str,
+    pub geometry: str,
+}
+
+pub struct QAOAProblemType {
+    pub name: str,
+    pub n_qubits: usize,
+    pub problem_class: str,  // "maxcut", "mis", "coloring", "tsp", "portfolio"
+    pub graph_params: str,
+    pub optimal_value: f32,
+}
+
+pub struct QECCodeType {
+    pub name: str,  // "surface", "repetition", "steane", "shor", "color"
+    pub logical_qubits: usize,
+}
+
+pub struct QMLDataset {
+    pub name: str,
+    pub n_samples: usize,
+    pub n_features: usize,
+    pub n_classes: usize,
+    pub task: str,  // "classification", "regression", "generative"
+}
+
+pub enum GateType {
+    SingleQubit { gate: str },  // "x", "y", "z", "h", "s", "t", "rx", "ry", "rz"
+    TwoQubit { gate: str },     // "cx", "cz", "ecr", "ms", "iswap", "sqrt_iswap"
+}
+
+pub struct BenchmarkOutputConfig {
+    pub format: OutputFormat,
+    pub path: str,
+    pub include_raw_data: bool,
+    pub generate_plots: bool,
+}
+
+pub enum OutputFormat {
+    JSON,
+    CSV,
+    HDF5,
+    Parquet,
+    All,
+}
+
+pub struct StatisticalConfig {
+    pub confidence_level: f32,  // 0.95
+    pub min_trials: usize,
+    pub max_trials: usize,
+    pub convergence_threshold: f32,
+    pub outlier_removal: bool,
+}
+
+// ============================================================
+// Benchmark Results
+// ============================================================
+
+/// Complete benchmark suite results.
+pub struct BenchmarkSuiteResults {
+    pub timestamp: u64,
+    pub providers: [ProviderResults; N_PROVIDERS>,
+    pub comparison: CrossProviderComparison,
+    pub summary: BenchmarkSummary,
+}
+
+pub struct ProviderResults {
+    pub provider: str,
+    pub backend: str,
+    pub quantum_volume: Option<QuantumVolumeResult>,
+    pub qev: Option<QEVResult>,
+    pub vqe: Option<VQEBenchmarkResult>,
+    pub qaoa: Option<QAOABenchmarkResult>,
+    pub qec: Option<QECBenchmarkResult>,
+    pub qml: Option<QMLBenchmarkResult>,
+    pub gate_fidelity: Option<GateFidelityResult>,
+    pub coherence: Option<CoherenceResult>,
+    pub crosstalk: Option<CrosstalkResult>,
+    pub mid_circuit: Option<MidCircuitResult>,
+    pub dynamic: Option<DynamicCircuitResult>,
+    pub metadata: ProviderMetadata,
+}
+
+pub struct ProviderMetadata {
+    pub calibration_timestamp: u64,
+    pub backend_version: str,
+    pub queue_time_avg_secs: f32,
+    pub total_execution_time_secs: f32,
+    pub total_shots: usize,
+    pub errors: [str; N_ERRORS>,
+}
+
+/// Cross-provider comparison.
+pub struct CrossProviderComparison {
+    pub qv_ranking: [ProviderQV; N_PROVIDERS>,
+    pub qev_ranking: [ProviderQEV; N_PROVIDERS>,
+    pub vqe_ranking: [ProviderVQE; N_PROVIDERS>,
+    pub qaoa_ranking: [ProviderQAOA; N_PROVIDERS>,
+    pub qec_ranking: [ProviderQEC; N_PROVIDERS>,
+    pub best_overall: str,
+}
+
+pub struct ProviderQV { pub provider: str, pub qv: usize, pub qubits: usize }
+pub struct ProviderQEV { pub provider: str, pub qev: f32 }
+pub struct ProviderVQE { pub provider: str, pub avg_error: f32, pub success_rate: f32 }
+pub struct ProviderQAOA { pub provider: str, pub avg_approx_ratio: f32, pub success_rate: f32 }
+pub struct ProviderQEC { pub provider: str, pub best_logical_error_rate: f32, pub distance: usize }
+
+/// Benchmark summary.
+pub struct BenchmarkSummary {
+    pub total_benchmarks: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub total_time_secs: f32,
+    pub key_findings: [str; N_FINDINGS>,
+}
+
+// ============================================================
+// Individual Benchmark Results
+// ============================================================
+
+pub struct QuantumVolumeResult {
+    pub qv: usize,
+    pub max_qubits_tested: usize,
+    pub heavy_output_probability: f32,
+    pub confidence: f32,
+    pub circuits_tested: usize,
+    pub per_qubit: [QVPerQubit; N_QUBITS>,
+}
+
+pub struct QVPerQubit {
+    pub n_qubits: usize,
+    pub heavy_output_prob: f32,
+    pub std_dev: f32,
+    pub passed: bool,
+    pub circuits: usize,
+    pub depth: usize,
+}
+
+pub struct QEVResult {
+    pub qev: f32,  // Quantum Economic Value in USD/hour
+    pub workloads: [QEVWorkloadResult; N_WORKLOADS>,
+    pub classical_cost_per_hour: f32,
+    pub quantum_cost_per_hour: f32,
+}
+
+pub struct QEVWorkloadResult {
+    pub workload: str,
+    pub quantum_time_secs: f32,
+    pub classical_time_secs: f32,
+    pub speedup: f32,
+    pub quality_ratio: f32,  // quantum_quality / classical_quality
+    pub cost_ratio: f32,     // quantum_cost / classical_cost
+    pub qev_contribution: f32,
+}
+
+pub struct VQEBenchmarkResult {
+    pub molecules: [VQEMoleculeResult; N_MOLECULES>,
+    pub avg_energy_error: f32,
+    pub success_rate: f32,
+    pub avg_time_secs: f32,
+}
+
+pub struct VQEMoleculeResult {
+    pub molecule: str,
+    pub computed_energy: f32,
+    pub exact_energy: f32,
+    pub error: f32,
+    pub converged: bool,
+    pub iterations: usize,
+    pub time_secs: f32,
+    pub shots: usize,
+    pub error_mitigation: str,
+}
+
+pub struct QAOABenchmarkResult {
+    pub problems: [QAOAProblemResult; N_PROBLEMS>,
+    pub avg_approx_ratio: f32,
+    pub success_rate: f32,
+    pub avg_time_secs: f32,
+}
+
+pub struct QAOAProblemResult {
+    pub problem: str,
+    pub optimal_value: f32,
+    pub quantum_value: f32,
+    pub approx_ratio: f32,
+    pub converged: bool,
+    pub iterations: usize,
+    pub time_secs: f32,
+    pub shots: usize,
+    pub p_layers: usize,
+}
+
+pub struct QECBenchmarkResult {
+    pub codes: [QECCodeResult; N_CODES>,
+    pub best_logical_error_rate: f32,
+    pub threshold_estimate: f32,
+}
+
+pub struct QECCodeResult {
+    pub code: str,
+    pub distance: usize,
+    pub physical_error_rate: f32,
+    pub logical_error_rate: f32,
+    pub cycles: usize,
+    pub decoder: str,
+    pub threshold: f32,
+}
+
+pub struct QMLBenchmarkResult {
+    pub datasets: [QMLDatasetResult; N_DATASETS>,
+    pub avg_accuracy: f32,
+    pub quantum_advantage: bool,
+}
+
+pub struct QMLDatasetResult {
+    pub dataset: str,
+    pub quantum_accuracy: f32,
+    pub classical_accuracy: f32,
+    pub advantage: f32,
+    pub training_time_secs: f32,
+    pub n_qubits: usize,
+}
+
+pub struct GateFidelityResult {
+    pub single_qubit: [SingleQubitFidelity; N_GATES>,
+    pub two_qubit: [TwoQubitFidelity; N_GATES>,
+    pub avg_single_qubit_fidelity: f32,
+    pub avg_two_qubit_fidelity: f32,
+    pub worst_qubit: usize,
+    pub worst_pair: (usize, usize),
+}
+
+pub struct SingleQubitFidelity {
+    pub gate: str,
+    pub qubit: usize,
+    pub fidelity: f32,
+    pub std_dev: f32,
+}
+
+pub struct TwoQubitFidelity {
+    pub gate: str,
+    pub qubit1: usize,
+    pub qubit2: usize,
+    pub fidelity: f32,
+    pub std_dev: f32,
+}
+
+pub struct CoherenceResult {
+    pub t1_times: [T1Time; N_QUBITS>,
+    pub t2_times: [T2Time; N_QUBITS>,
+    pub avg_t1_us: f32,
+    pub avg_t2_us: f32,
+}
+
+pub struct T1Time { pub qubit: usize, pub t1_us: f32, pub std_dev: f32 }
+pub struct T2Time { pub qubit: usize, pub t2_us: f32, pub std_dev: f32 }
+
+pub struct CrosstalkResult {
+    pub pairs: [CrosstalkPair; N_PAIRS>,
+    pub max_crosstalk: f32,
+    pub avg_crosstalk: f32,
+}
+
+pub struct CrosstalkPair {
+    pub qubit1: usize,
+    pub qubit2: usize,
+    pub crosstalk_rate: f32,
+}
+
+pub struct MidCircuitResult {
+    pub qubits: [MidCircuitQubit; N_QUBITS>,
+    pub success_rate: f32,
+    pub reset_fidelity: f32,
+}
+
+pub struct MidCircuitQubit {
+    pub qubit: usize,
+    pub measure_fidelity: f32,
+    pub reset_fidelity: f32,
+    pub conditional_fidelity: f32,
+}
+
+pub struct DynamicCircuitResult {
+    pub max_depth_tested: usize,
+    pub success_rate: f32,
+    pub feedforward_latency_ns: f32,
+}
+
+// ============================================================
+// Benchmark Execution
+// ============================================================
+
+/// Run complete benchmark suite.
+pub fn run_benchmark_suite(config: BenchmarkSuiteConfig) -> BenchmarkSuiteResults {
+    let start_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    
+    var provider_results: [ProviderResults; N_PROVIDERS> = [];
+    
+    for provider_config in config.providers {
+        let backend = init_benchmark_backend(provider_config);
+        let calibration = backend.calibrate().await;
+        
+        let mut results = ProviderResults {
+            provider: provider_config.name,
+            backend: provider_config.backend,
+            quantum_volume: None,
+            qev: None,
+            vqe: None,
+            qaoa: None,
+            qec: None,
+            qml: None,
+            gate_fidelity: None,
+            coherence: None,
+            crosstalk: None,
+            mid_circuit: None,
+            dynamic: None,
+            metadata: ProviderMetadata {
+                calibration_timestamp: calibration.timestamp,
+                backend_version: "1.0",
+                queue_time_avg_secs: 0.0,
+                total_execution_time_secs: 0.0,
+                total_shots: 0,
+                errors: [],
+            },
+        };
+        
+        for benchmark in config.benchmarks {
+            match benchmark {
+                BenchmarkType::QuantumVolume { max_qubits, trials_per_qubit } => {
+                    results.quantum_volume = Some(run_quantum_volume(backend, max_qubits, trials_per_qubit, config.statistical));
+                }
+                BenchmarkType::QuantumEconomicValue { workloads } => {
+                    results.qev = Some(run_qev_benchmark(backend, workloads, config.statistical));
+                }
+                BenchmarkType::VQEBenchmark { molecules } => {
+                    results.vqe = Some(run_vqe_benchmark(backend, molecules, config.statistical));
+                }
+                BenchmarkType::QAOABenchmark { problems } => {
+                    results.qaoa = Some(run_qaoa_benchmark(backend, problems, config.statistical));
+                }
+                BenchmarkType::QECBenchmark { codes, distances } => {
+                    results.qec = Some(run_qec_benchmark(backend, codes, distances, config.statistical));
+                }
+                BenchmarkType::QMLBenchmark { datasets } => {
+                    results.qml = Some(run_qml_benchmark(backend, datasets, config.statistical));
+                }
+                BenchmarkType::GateFidelity { gates, qubit_pairs } => {
+                    results.gate_fidelity = Some(run_gate_fidelity_benchmark(backend, gates, qubit_pairs, config.statistical));
+                }
+                BenchmarkType::CoherenceTime { qubits } => {
+                    results.coherence = Some(run_coherence_benchmark(backend, qubits, config.statistical));
+                }
+                BenchmarkType::Crosstalk { qubit_groups } => {
+                    results.crosstalk = Some(run_crosstalk_benchmark(backend, qubit_groups, config.statistical));
+                }
+                BenchmarkType::MidCircuitMeasurement { qubits } => {
+                    results.mid_circuit = Some(run_mid_circuit_benchmark(backend, qubits, config.statistical));
+                }
+                BenchmarkType::DynamicCircuits { depth, qubits } => {
+                    results.dynamic = Some(run_dynamic_circuit_benchmark(backend, depth, qubits, config.statistical));
+                }
+            }
+        }
+        
+        provider_results.push(results);
+    }
+    
+    // Compute cross-provider comparison
+    let comparison = compute_cross_provider_comparison(provider_results);
+    
+    // Generate summary
+    let summary = generate_benchmark_summary(provider_results);
+    
+    let total_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() - start_time;
+    
+    BenchmarkSuiteResults {
+        timestamp: start_time,
+        providers: provider_results,
+        comparison,
+        summary: BenchmarkSummary {
+            total_benchmarks: config.benchmarks.len() * config.providers.len(),
+            completed: 0, // Would count completed
+            failed: 0,
+            total_time_secs: total_time as f32,
+            key_findings: extract_key_findings(comparison),
+        },
+    }
+}
+
+// ============================================================
+// Quantum Volume Benchmark
+// ============================================================
+
+/// Run Quantum Volume benchmark.
+/// 
+/// QV = max(2^n) where n = max qubits with heavy output prob > 2/3
+/// at depth = n, with confidence > 0.977
+pub fn run_quantum_volume(
+    backend: QuantumBackend,
+    max_qubits: usize,
+    trials_per_qubit: usize,
+    stats: StatisticalConfig
+) -> QuantumVolumeResult {
+    var per_qubit: [QVPerQubit; N_QUBITS> = [];
+    var max_passed_qubits = 0;
+    
+    for n in 1..=max_qubits {
+        // Generate QV circuits: random SU(4) on qubit pairs, depth = n
+        let circuits = generate_qv_circuits(n, trials_per_qubit);
+        
+        var heavy_output_count = 0;
+        var total_circuits = 0;
+        
+        for circuit in circuits {
+            // Run on hardware
+            let result = backend.execute(&circuit, ExecutionConfig { 
+                shots: 1000, 
+                ..Default::default() 
+            }).await;
+            
+            // Compute ideal heavy outputs via simulation
+            let ideal_heavy = compute_ideal_heavy_outputs(circuit);
+            let measured_heavy = compute_measured_heavy_outputs(result.counts);
+            
+            // Heavy output probability
+            let heavy_prob = measured_heavy / 1000.0;
+            
+            if heavy_prob > 2.0/3.0 {
+                heavy_output_count += 1;
+            }
+            total_circuits += 1;
+        }
+        
+        let heavy_output_prob = heavy_output_count as f32 / total_circuits as f32;
+        let passed = heavy_output_prob > 2.0/3.0;
+        
+        if passed {
+            max_passed_qubits = n;
+        }
+        
+        per_qubit[n-1] = QVPerQubit {
+            n_qubits: n,
+            heavy_output_prob,
+            std_dev: sqrt(heavy_output_prob * (1.0 - heavy_output_prob) / total_circuits as f32),
+            passed,
+            circuits: total_circuits,
+            depth: n,
+        };
+    }
+    
+    let qv = if max_passed_qubits > 0 { 1 << max_passed_qubits } else { 1 };
+    
+    QuantumVolumeResult {
+        qv,
+        max_qubits_tested: max_qubits,
+        heavy_output_probability: per_qubit[max_passed_qubits-1].heavy_output_prob,
+        confidence: 0.977,
+        circuits_tested: trials_per_qubit * max_qubits,
+        per_qubit,
+    }
+}
+
+fn generate_qv_circuits(n_qubits: usize, trials: usize) -> [QuantumCircuit; N> {
+    // QV circuits: layers of random SU(4) on random qubit pairs
+    var circuits: [QuantumCircuit; N> = [];
+    
+    for _ in 0..trials {
+        let mut circuit = QuantumCircuit::new(n_qubits);
+        
+        for _ in 0..n_qubits { // depth = n_qubits
+            // Random pairing
+            let pairs = random_pairing(n_qubits);
+            for (a, b) in pairs {
+                // Random SU(4) decomposed to native gates
+                apply_random_su4(&mut circuit, a, b);
+            }
+        }
+        
+        // Measure all qubits
+        for i in 0..n_qubits {
+            circuit.measure(i, i);
+        }
+        
+        circuits.push(circuit);
+    }
+    
+    circuits
+}
+
+fn random_pairing(n: usize) -> [(usize, usize); N/2] {
+    // Random perfect matching
+    unimplemented!()
+}
+
+fn apply_random_su4(circuit: &mut QuantumCircuit, a: usize, b: usize) {
+    // Decompose random SU(4) to native gates
+    // KAK decomposition: CNOT + single qubit rotations
+    unimplemented!()
+}
+
+fn compute_ideal_heavy_outputs(circuit: QuantumCircuit) -> HashMap<String, f32> {
+    // Simulate circuit to get ideal probabilities
+    unimplemented!()
+}
+
+fn compute_measured_heavy_outputs(counts: HashMap<String, usize>) -> usize {
+    // Count heavy outputs in measured data
+    unimplemented!()
+}
+
+// ============================================================
+// Quantum Economic Value Benchmark
+// ============================================================
+
+/// Run QEV benchmark.
+/// QEV = (classical_cost - quantum_cost) * quality_ratio / time
+pub fn run_qev_benchmark(
+    backend: QuantumBackend,
+    workloads: [QEVWorkload; N>,
+    stats: StatisticalConfig
+) -> QEVResult {
+    var workload_results: [QEVWorkloadResult; N> = [];
+    var total_qev = 0.0;
+    
+    for workload in workloads {
+        // Run quantum algorithm
+        let quantum_result = run_quantum_workload(backend, workload);
+        
+        // Classical baseline
+        let classical_time = workload.classical_baseline_time_secs;
+        let classical_cost = classical_time / 3600.0 * 100.0; // $100/hr for HPC
+        
+        // Quantum cost
+        let quantum_time = quantum_result.time_secs;
+        let quantum_cost = quantum_time / 3600.0 * get_quantum_hourly_rate(workload.quantum_algorithm);
+        
+        let speedup = classical_time / quantum_time;
+        let quality_ratio = quantum_result.quality / workload.classical_baseline_quality;
+        let cost_ratio = quantum_cost / classical_cost;
+        
+        // QEV contribution
+        let qev_contribution = (classical_cost - quantum_cost) * quality_ratio;
+        total_qev += qev_contribution;
+        
+        workload_results.push(QEVWorkloadResult {
+            workload: workload.name,
+            quantum_time_secs: quantum_time,
+            classical_time_secs: classical_time,
+            speedup,
+            quality_ratio,
+            cost_ratio,
+            qev_contribution,
+        });
+    }
+    
+    QEVResult {
+        qev: total_qev,
+        workloads: workload_results,
+        classical_cost_per_hour: 100.0,
+        quantum_cost_per_hour: get_quantum_hourly_rate("vqe"),
+    }
+}
+
+fn run_quantum_workload(backend: QuantumBackend, workload: QEVWorkload) -> QuantumWorkloadResult {
+    match workload.quantum_algorithm {
+        "vqe" => run_vqe_workload(backend, workload),
+        "qaoa" => run_qaoa_workload(backend, workload),
+        "qml" => run_qml_workload(backend, workload),
+        "qpe" => run_qpe_workload(backend, workload),
+        _ => unimplemented!(),
+    }
+}
+
+pub struct QuantumWorkloadResult {
+    pub time_secs: f32,
+    pub quality: f32,
+    pub shots: usize,
+}
+
+fn run_vqe_workload(backend: QuantumBackend, workload: QEVWorkload) -> QuantumWorkloadResult {
+    unimplemented!()
+}
+
+fn run_qaoa_workload(backend: QuantumBackend, workload: QEVWorkload) -> QuantumWorkloadResult {
+    unimplemented!()
+}
+
+fn run_qml_workload(backend: QuantumBackend, workload: QEVWorkload) -> QuantumWorkloadResult {
+    unimplemented!()
+}
+
+fn run_qpe_workload(backend: QuantumBackend, workload: QEVWorkload) -> QuantumWorkloadResult {
+    unimplemented!()
+}
+
+fn get_quantum_hourly_rate(algorithm: str) -> f32 {
+    match algorithm {
+        "vqe" => 5000.0,  // $5000/hr for quantum compute
+        "qaoa" => 3000.0,
+        "qml" => 4000.0,
+        "qpe" => 6000.0,
+        _ => 5000.0,
+    }
+}
+
+// ============================================================
+// VQE Benchmark
+// ============================================================
+
+/// Run VQE benchmark on standard molecules.
+pub fn run_vqe_benchmark(
+    backend: QuantumBackend,
+    molecules: [VQEMolecule; N>,
+    stats: StatisticalConfig
+) -> VQEBenchmarkResult {
+    var molecule_results: [VQEMoleculeResult; N> = [];
+    var total_error = 0.0;
+    var success_count = 0;
+    var total_time = 0.0;
+    
+    for molecule in molecules {
+        // Build Hamiltonian
+        let hamiltonian = build_molecule_hamiltonian(molecule);
+        
+        // Run VQE with hardware error mitigation
+        let config = VQEHardwareConfig {
+            shots: 10000,
+            error_mitigation: ErrorMitigationStrategy::ZNE { scales: [1.0, 1.5, 2.0], shots_per_scale: 5000 },
+            ..Default::default()
+        };
+        
+        let ansatz = HardwareEfficientAnsatz::<molecule.n_qubits, 2>;
+        var initial_params: Tensor[f32, 16> = tensor_zeros();
+        
+        let start = std::time::Instant::now();
+        let result = vqe_on_ibm_hardware(hamiltonian, ansatz, initial_params, config);
+        let elapsed = start.elapsed().as_secs_f32();
+        
+        let error = (result.result.ground_state_energy - molecule.expected_energy).abs();
+        let converged = result.result.converged && error < 0.01; // 10 mHa threshold
+        
+        if converged { success_count += 1; }
+        total_error += error;
+        total_time += elapsed;
+        
+        molecule_results.push(VQEMoleculeResult {
+            molecule: molecule.name,
+            computed_energy: result.result.ground_state_energy,
+            exact_energy: molecule.expected_energy,
+            error,
+            converged,
+            iterations: result.result.iterations,
+            time_secs: elapsed,
+            shots: config.shots,
+            error_mitigation: "ZNE",
+        });
+    }
+    
+    VQEBenchmarkResult {
+        molecules: molecule_results,
+        avg_energy_error: total_error / molecules.len() as f32,
+        success_rate: success_count as f32 / molecules.len() as f32,
+        avg_time_secs: total_time / molecules.len() as f32,
+    }
+}
+
+fn build_molecule_hamiltonian(molecule: VQEMolecule) -> PauliHamiltonian<N_QUBITS, N_TERMS> {
+    // Build from pre-computed integrals
+    match molecule.name {
+        "H2" => h2_hamiltonian_sto3g(),
+        "LiH" => lih_hamiltonian_sto3g(),
+        "HeH+" => heh_hamiltonian_sto3g(),
+        _ => unimplemented!(),
+    }
+}
+
+// ============================================================
+// QAOA Benchmark
+// ============================================================
+
+/// Run QAOA benchmark on standard problems.
+pub fn run_qaoa_benchmark(
+    backend: QuantumBackend,
+    problems: [QAOAProblemType; N>,
+    stats: StatisticalConfig
+) -> QAOABenchmarkResult {
+    var problem_results: [QAOAProblemResult; N> = [];
+    var total_ratio = 0.0;
+    var success_count = 0;
+    var total_time = 0.0;
+    
+    for problem in problems {
+        let qaoa_problem = build_qaoa_problem(problem);
+        
+        var initial_params: QAOAParams<3> = tensor_zeros();
+        
+        let config = QAOAHardwareConfig {
+            shots: 10000,
+            error_mitigation: QAOAErrorMitigation::ZNE { scales: [1.0, 1.5, 2.0], shots_per_scale: 5000 },
+            ..Default::default()
+        };
+        
+        let start = std::time::Instant::now();
+        let result = qaoa_on_ionq_hardware(qaoa_problem, initial_params, config);
+        let elapsed = start.elapsed().as_secs_f32();
+        
+        let approx_ratio = result.result.best_value / problem.optimal_value;
+        let converged = approx_ratio > 0.95;
+        
+        if converged { success_count += 1; }
+        total_ratio += approx_ratio;
+        total_time += elapsed;
+        
+        problem_results.push(QAOAProblemResult {
+            problem: problem.name,
+            optimal_value: problem.optimal_value,
+            quantum_value: result.result.best_value,
+            approx_ratio,
+            converged,
+            iterations: result.result.iterations,
+            time_secs: elapsed,
+            shots: config.shots,
+            p_layers: 3,
+        });
+    }
+    
+    QAOABenchmarkResult {
+        problems: problem_results,
+        avg_approx_ratio: total_ratio / problems.len() as f32,
+        success_rate: success_count as f32 / problems.len() as f32,
+        avg_time_secs: total_time / problems.len() as f32,
+    }
+}
+
+fn build_qaoa_problem(problem: QAOAProblemType) -> MaxCutProblem {
+    match problem.problem_class {
+        "maxcut" => MaxCutProblem { edges: parse_maxcut_edges(problem.graph_params) },
+        _ => unimplemented!(),
+    }
+}
+
+fn parse_maxcut_edges(params: str) -> [(usize, usize); N_EDGES] {
+    unimplemented!()
+}
+
+// ============================================================
+// QEC Benchmark
+// ============================================================
+
+/// Run QEC benchmark on standard codes.
+pub fn run_qec_benchmark(
+    backend: QuantumBackend,
+    codes: [QECCodeType; N>,
+    distances: [usize; M>,
+    stats: StatisticalConfig
+) -> QECBenchmarkResult {
+    var code_results: [QECCodeResult; N> = [];
+    var best_logical_error = f32::INFINITY;
+    var best_threshold = 0.0;
+    
+    for code in codes {
+        for &distance in distances {
+            let config = QECHardwareConfig {
+                code: match code.name {
+                    "surface" => QECCodeType::SurfaceCode { 
+                        data_qubits: allocate_surface_data(distance), 
+                        ancilla_qubits: allocate_surface_ancilla(distance) 
+                    },
+                    "repetition" => QECCodeType::RepetitionCode { 
+                        data_qubits: allocate_repetition_data(distance), 
+                        ancilla_qubits: allocate_repetition_ancilla(distance) 
+                    },
+                    _ => continue,
+                },
+                distance,
+                cycles: 10,
+                shots_per_cycle: 1000,
+                decoder: DecoderType::MWPM,
+                ..Default::default()
+            };
+            
+            let result = match code.name {
+                "surface" => surface_code_on_ibm_hardware(config),
+                "repetition" => repetition_code_on_ionq_hardware(config),
+                _ => continue,
+            };
+            
+            if result.logical_error_rate < best_logical_error {
+                best_logical_error = result.logical_error_rate;
+            }
+            if result.threshold_estimate > best_threshold {
+                best_threshold = result.threshold_estimate;
+            }
+            
+            code_results.push(QECCodeResult {
+                code: code.name,
+                distance,
+                physical_error_rate: result.physical_error_rate,
+                logical_error_rate: result.logical_error_rate,
+                cycles: config.cycles,
+                decoder: "MWPM",
+                threshold: result.threshold_estimate,
+            });
+        }
+    }
+    
+    QECBenchmarkResult {
+        codes: code_results,
+        best_logical_error_rate: best_logical_error,
+        threshold_estimate: best_threshold,
+    }
+}
+
+fn allocate_surface_data(d: usize) -> [usize; N] {
+    // Allocate d^2 data qubits in grid
+    unimplemented!()
+}
+
+fn allocate_surface_ancilla(d: usize) -> [usize; M] {
+    unimplemented!()
+}
+
+fn allocate_repetition_data(d: usize) -> [usize; N] {
+    unimplemented!()
+}
+
+fn allocate_repetition_ancilla(d: usize) -> [usize; M] {
+    unimplemented!()
+}
+
+// ============================================================
+// QML Benchmark
+// ============================================================
+
+/// Run QML benchmark on standard datasets.
+pub fn run_qml_benchmark(
+    backend: QuantumBackend,
+    datasets: [QMLDataset; N>,
+    stats: StatisticalConfig
+) -> QMLBenchmarkResult {
+    var dataset_results: [QMLDatasetResult; N> = [];
+    var total_accuracy = 0.0;
+    var quantum_advantage_count = 0;
+    
+    for dataset in datasets {
+        // Run quantum kernel SVM
+        let (quantum_acc, classical_acc) = run_qsvm_benchmark(backend, dataset);
+        
+        let advantage = quantum_acc - classical_acc;
+        if advantage > 0.0 { quantum_advantage_count += 1; }
+        total_accuracy += quantum_acc;
+        
+        dataset_results.push(QMLDatasetResult {
+            dataset: dataset.name,
+            quantum_accuracy: quantum_acc,
+            classical_accuracy: classical_acc,
+            advantage,
+            training_time_secs: 0.0,
+            n_qubits: dataset.n_features.min(32),
+        });
+    }
+    
+    QMLBenchmarkResult {
+        datasets: dataset_results,
+        avg_accuracy: total_accuracy / datasets.len() as f32,
+        quantum_advantage: quantum_advantage_count > 0,
+    }
+}
+
+fn run_qsvm_benchmark(backend: QuantumBackend, dataset: QMLDataset) -> (f32, f32) {
+    // Quantum kernel SVM vs classical SVM
+    unimplemented!()
+}
+
+// ============================================================
+// Gate Fidelity Benchmark
+// ============================================================
+
+/// Run gate fidelity benchmark (RB, GST, XEB).
+pub fn run_gate_fidelity_benchmark(
+    backend: QuantumBackend,
+    gates: [GateType; N>,
+    qubit_pairs: [(usize, usize); M>,
+    stats: StatisticalConfig
+) -> GateFidelityResult {
+    var single_qubit: [SingleQubitFidelity; N> = [];
+    var two_qubit: [TwoQubitFidelity; N> = [];
+    
+    // Single-qubit gates: Clifford RB
+    for gate in gates {
+        match gate {
+            GateType::SingleQubit { gate: g } => {
+                for qubit in 0..backend.capabilities().max_qubits {
+                    let fidelity = run_clifford_rb(backend, g, qubit, stats);
+                    single_qubit.push(SingleQubitFidelity { gate: g, qubit, fidelity, std_dev: 0.0 });
+                }
+            }
+            GateType::TwoQubit { gate: g } => {
+                for (a, b) in qubit_pairs {
+                    let fidelity = run_two_qubit_rb(backend, g, a, b, stats);
+                    two_qubit.push(TwoQubitFidelity { gate: g, qubit1: a, qubit2: b, fidelity, std_dev: 0.0 });
+                }
+            }
+        }
+    }
+    
+    // Compute averages
+    let avg_single = single_qubit.iter().map(|f| f.fidelity).sum::<f32>() / single_qubit.len() as f32;
+    let avg_two = two_qubit.iter().map(|f| f.fidelity).sum::<f32>() / two_qubit.len() as f32;
+    
+    GateFidelityResult {
+        single_qubit,
+        two_qubit,
+        avg_single_qubit_fidelity: avg_single,
+        avg_two_qubit_fidelity: avg_two,
+        worst_qubit: single_qubit.iter().min_by(|a, b| a.fidelity.partial_cmp(&b.fidelity).unwrap()).map(|f| f.qubit).unwrap_or(0),
+        worst_pair: two_qubit.iter().min_by(|a, b| a.fidelity.partial_cmp(&b.fidelity).unwrap()).map(|f| (f.qubit1, f.qubit2)).unwrap_or((0, 0)),
+    }
+}
+
+fn run_clifford_rb(backend: QuantumBackend, gate: str, qubit: usize, stats: StatisticalConfig) -> f32 {
+    // Clifford randomized benchmarking
+    unimplemented!()
+}
+
+fn run_two_qubit_rb(backend: QuantumBackend, gate: str, a: usize, b: usize, stats: StatisticalConfig) -> f32 {
+    // Two-qubit RB
+    unimplemented!()
+}
+
+// ============================================================
+// Coherence Time Benchmark
+// ============================================================
+
+/// Run T1/T2 coherence time benchmark.
+pub fn run_coherence_benchmark(
+    backend: QuantumBackend,
+    qubits: [usize; N>,
+    stats: StatisticalConfig
+) -> CoherenceResult {
+    var t1_times: [T1Time; N> = [];
+    var t2_times: [T2Time; N> = [];
+    
+    for &qubit in qubits {
+        // T1: relaxation time
+        let t1 = measure_t1(backend, qubit, stats);
+        t1_times.push(T1Time { qubit, t1_us: t1, std_dev: 0.0 });
+        
+        // T2: dephasing time (Hahn echo)
+        let t2 = measure_t2_echo(backend, qubit, stats);
+        t2_times.push(T2Time { qubit, t2_us: t2, std_dev: 0.0 });
+    }
+    
+    let avg_t1 = t1_times.iter().map(|t| t.t1_us).sum::<f32>() / t1_times.len() as f32;
+    let avg_t2 = t2_times.iter().map(|t| t.t2_us).sum::<f32>() / t2_times.len() as f32;
+    
+    CoherenceResult {
+        t1_times,
+        t2_times,
+        avg_t1_us: avg_t1,
+        avg_t2_us: avg_t2,
+    }
+}
+
+fn measure_t1(backend: QuantumBackend, qubit: usize, stats: StatisticalConfig) -> f32 {
+    // T1 measurement: prepare |1>, wait varying times, measure
+    unimplemented!()
+}
+
+fn measure_t2_echo(backend: QuantumBackend, qubit: usize, stats: StatisticalConfig) -> f32 {
+    // T2 Hahn echo: X - wait/2 - Y - wait/2 - measure
+    unimplemented!()
+}
+
+// ============================================================
+// Crosstalk Benchmark
+// ============================================================
+
+/// Run crosstalk benchmark (simultaneous RB).
+pub fn run_crosstalk_benchmark(
+    backend: QuantumBackend,
+    qubit_groups: [[usize; 4]; N>,
+    stats: StatisticalConfig
+) -> CrosstalkResult {
+    var pairs: [CrosstalkPair; N> = [];
+    
+    for group in qubit_groups {
+        // Simultaneous RB on group vs individual
+        let individual_fidelity = run_individual_rb(backend, group, stats);
+        let simultaneous_fidelity = run_simultaneous_rb(backend, group, stats);
+        
+        // Crosstalk = 1 - (simultaneous / individual)
+        for i in 0..4 {
+            for j in (i+1)..4 {
+                let crosstalk = 1.0 - simultaneous_fidelity / individual_fidelity;
+                pairs.push(CrosstalkPair {
+                    qubit1: group[i],
+                    qubit2: group[j],
+                    crosstalk_rate: crosstalk.max(0.0),
+                });
+            }
+        }
+    }
+    
+    let max_crosstalk = pairs.iter().map(|p| p.crosstalk_rate).fold(0.0, f32::max);
+    let avg_crosstalk = pairs.iter().map(|p| p.crosstalk_rate).sum::<f32>() / pairs.len() as f32;
+    
+    CrosstalkResult {
+        pairs,
+        max_crosstalk,
+        avg_crosstalk,
+    }
+}
+
+fn run_individual_rb(backend: QuantumBackend, group: [usize; 4], stats: StatisticalConfig) -> f32 {
+    unimplemented!()
+}
+
+fn run_simultaneous_rb(backend: QuantumBackend, group: [usize; 4], stats: StatisticalConfig) -> f32 {
+    unimplemented!()
+}
+
+// ============================================================
+// Mid-Circuit Measurement Benchmark
+// ============================================================
+
+/// Run mid-circuit measurement benchmark.
+pub fn run_mid_circuit_benchmark(
+    backend: QuantumBackend,
+    qubits: [usize; N>,
+    stats: StatisticalConfig
+) -> MidCircuitResult {
+    var qubit_results: [MidCircuitQubit; N> = [];
+    
+    for &qubit in qubits {
+        let measure_fid = measure_fidelity(backend, qubit, stats);
+        let reset_fid = reset_fidelity(backend, qubit, stats);
+        let conditional_fid = conditional_fidelity(backend, qubit, stats);
+        
+        qubit_results.push(MidCircuitQubit {
+            qubit,
+            measure_fidelity: measure_fid,
+            reset_fidelity: reset_fid,
+            conditional_fidelity: conditional_fid,
+        });
+    }
+    
+    let success_rate = qubit_results.iter().map(|q| q.measure_fidelity).sum::<f32>() / qubit_results.len() as f32;
+    let avg_reset = qubit_results.iter().map(|q| q.reset_fidelity).sum::<f32>() / qubit_results.len() as f32;
+    
+    MidCircuitResult {
+        qubits: qubit_results,
+        success_rate,
+        reset_fidelity: avg_reset,
+    }
+}
+
+fn measure_fidelity(backend: QuantumBackend, qubit: usize, stats: StatisticalConfig) -> f32 {
+    unimplemented!()
+}
+
+fn reset_fidelity(backend: QuantumBackend, qubit: usize, stats: StatisticalConfig) -> f32 {
+    unimplemented!()
+}
+
+fn conditional_fidelity(backend: QuantumBackend, qubit: usize, stats: StatisticalConfig) -> f32 {
+    unimplemented!()
+}
+
+// ============================================================
+// Dynamic Circuits Benchmark
+// ============================================================
+
+/// Run dynamic circuits benchmark (feedforward, real-time).
+pub fn run_dynamic_circuit_benchmark(
+    backend: QuantumBackend,
+    depth: usize,
+    qubits: [usize; N>,
+    stats: StatisticalConfig
+) -> DynamicCircuitResult {
+    // Build dynamic circuit with mid-circuit measurement and feedforward
+    let circuit = build_dynamic_circuit(depth, qubits);
+    
+    // Measure feedforward latency
+    let start = std::time::Instant::now();
+    let result = backend.execute(&circuit, ExecutionConfig { shots: 1000, ..Default::default() }).await;
+    let latency = start.elapsed().as_nanos() as f32;
+    
+    // Verify correct feedforward behavior
+    let success_rate = verify_dynamic_circuit(result.counts);
+    
+    DynamicCircuitResult {
+        max_depth_tested: depth,
+        success_rate,
+        feedforward_latency_ns: latency,
+    }
+}
+
+fn build_dynamic_circuit(depth: usize, qubits: [usize; N>) -> QuantumCircuit {
+    // Circuit with measure -> classically process -> conditional gate
+    unimplemented!()
+}
+
+fn verify_dynamic_circuit(counts: HashMap<String, usize>) -> f32 {
+    unimplemented!()
+}
+
+// ============================================================
+// Cross-Provider Comparison
+// ============================================================
+
+fn compute_cross_provider_comparison(results: [ProviderResults; N>) -> CrossProviderComparison {
+    // Rank providers on each benchmark
+    unimplemented!()
+}
+
+fn generate_benchmark_summary(results: [ProviderResults; N>) -> BenchmarkSummary {
+    unimplemented!()
+}
+
+fn extract_key_findings(comparison: CrossProviderComparison) -> [str; N_FINDINGS> {
+    unimplemented!()
+}
+
+// ============================================================
+// Pre-built Benchmark Configurations
+// ============================================================
+
+/// Standard benchmark suite for IBM Quantum.
+pub fn demo_ibm_benchmark_suite() -> BenchmarkSuiteConfig {
+    BenchmarkSuiteConfig {
+        providers: [
+            BenchmarkProviderConfig {
+                name: "IBM Brisbane",
+                provider: "ibm",
+                backend: "ibm_brisbane",
+                api_token: "",
+                max_qubits: 127,
+                dedicated: false,
+            }
+        ],
+        benchmarks: [
+            BenchmarkType::QuantumVolume { max_qubits: 20, trials_per_qubit: 100 },
+            BenchmarkType::VQEBenchmark { molecules: [
+                VQEMolecule { name: "H2", n_qubits: 4, n_terms: 15, expected_energy: -1.137, basis_set: "STO-3G", geometry: "H 0 0 0; H 0 0 0.74" },
+                VQEMolecule { name: "LiH", n_qubits: 10, n_terms: 100, expected_energy: -7.88, basis_set: "STO-3G", geometry: "Li 0 0 0; H 0 0 1.6" },
+            ]},
+            BenchmarkType::QECBenchmark { codes: [
+                QECCodeType { name: "surface", logical_qubits: 1 },
+            ], distances: [3, 5] },
+            BenchmarkType::GateFidelity { gates: [
+                GateType::SingleQubit { gate: "sx" },
+                GateType::SingleQubit { gate: "rz" },
+                GateType::TwoQubit { gate: "ecr" },
+            ], qubit_pairs: [] },
+            BenchmarkType::CoherenceTime { qubits: [] },
+        ],
+        output: BenchmarkOutputConfig {
+            format: OutputFormat::JSON,
+            path: "benchmark_results/ibm_brisbane.json",
+            include_raw_data: true,
+            generate_plots: true,
+        },
+        statistical: StatisticalConfig {
+            confidence_level: 0.95,
+            min_trials: 30,
+            max_trials: 100,
+            convergence_threshold: 0.01,
+            outlier_removal: true,
+        },
+    }
+}
+
+/// Standard benchmark suite for IonQ.
+pub fn demo_ionq_benchmark_suite() -> BenchmarkSuiteConfig {
+    BenchmarkSuiteConfig {
+        providers: [
+            BenchmarkProviderConfig {
+                name: "IonQ Forte",
+                provider: "ionq",
+                backend: "ionq_forte",
+                api_key: "",
+                max_qubits: 32,
+                dedicated: false,
+            }
+        ],
+        benchmarks: [
+            BenchmarkType::QuantumVolume { max_qubits: 20, trials_per_qubit: 100 },
+            BenchmarkType::QAOABenchmark { problems: [
+                QAOAProblemType { name: "MaxCut-20", n_qubits: 20, problem_class: "maxcut", graph_params: "3-regular", optimal_value: 15.0 },
+                QAOAProblemType { name: "MaxCut-30", n_qubits: 30, problem_class: "maxcut", graph_params: "3-regular", optimal_value: 22.0 },
+            ]},
+            BenchmarkType::QECBenchmark { codes: [
+                QECCodeType { name: "repetition", logical_qubits: 1 },
+            ], distances: [3, 5, 7] },
+            BenchmarkType::GateFidelity { gates: [
+                GateType::SingleQubit { gate: "gpi" },
+                GateType::SingleQubit { gate: "gpi2" },
+                GateType::TwoQubit { gate: "ms" },
+            ], qubit_pairs: [] },
+            BenchmarkType::MidCircuitMeasurement { qubits: [] },
+        ],
+        output: BenchmarkOutputConfig {
+            format: OutputFormat::JSON,
+            path: "benchmark_results/ionq_forte.json",
+            include_raw_data: true,
+            generate_plots: true,
+        },
+        statistical: StatisticalConfig {
+            confidence_level: 0.95,
+            min_trials: 30,
+            max_trials: 100,
+            convergence_threshold: 0.01,
+            outlier_removal: true,
+        },
+    }
+}
+
+/// Cross-platform comparison benchmark.
+pub fn demo_cross_platform_benchmark() -> BenchmarkSuiteConfig {
+    BenchmarkSuiteConfig {
+        providers: [
+            BenchmarkProviderConfig { name: "IBM Brisbane", provider: "ibm", backend: "ibm_brisbane", api_token: "", max_qubits: 127, dedicated: false },
+            BenchmarkProviderConfig { name: "IonQ Forte", provider: "ionq", backend: "ionq_forte", api_key: "", max_qubits: 32, dedicated: false },
+            BenchmarkProviderConfig { name: "Rigetti Aspen", provider: "rigetti", backend: "aspen-m-3", api_token: "", max_qubits: 80, dedicated: false },
+        ],
+        benchmarks: [
+            BenchmarkType::QuantumVolume { max_qubits: 20, trials_per_qubit: 50 },
+            BenchmarkType::VQEBenchmark { molecules: [
+                VQEMolecule { name: "H2", n_qubits: 4, n_terms: 15, expected_energy: -1.137, basis_set: "STO-3G", geometry: "H 0 0 0; H 0 0 0.74" },
+            ]},
+            BenchmarkType::QAOABenchmark { problems: [
+                QAOAProblemType { name: "MaxCut-16", n_qubits: 16, problem_class: "maxcut", graph_params: "3-regular", optimal_value: 12.0 },
+            ]},
+            BenchmarkType::GateFidelity { gates: [
+                GateType::SingleQubit { gate: "x" },
+                GateType::TwoQubit { gate: "cx" },
+            ], qubit_pairs: [] },
+        ],
+        output: BenchmarkOutputConfig {
+            format: OutputFormat::All,
+            path: "benchmark_results/cross_platform.json",
+            include_raw_data: true,
+            generate_plots: true,
+        },
+        statistical: StatisticalConfig {
+            confidence_level: 0.95,
+            min_trials: 20,
+            max_trials: 50,
+            convergence_threshold: 0.02,
+            outlier_removal: true,
+        },
+    }
+}
+
+/// Run all standard benchmarks and generate report.
+pub fn run_standard_benchmarks() -> BenchmarkSuiteResults {
+    let ibm_results = run_benchmark_suite(demo_ibm_benchmark_suite());
+    let ionq_results = run_benchmark_suite(demo_ionq_benchmark_suite());
+    let cross_results = run_benchmark_suite(demo_cross_platform_benchmark());
+    
+    // Merge and compare
+    cross_results
+}
+
+// Helper types
+pub struct QuantumBackend;
+impl QuantumBackend {
+    fn capabilities(&self) -> BackendCapabilities { unimplemented!() }
+    async fn execute(&self, circuit: &QuantumCircuit, config: ExecutionConfig) -> ExecutionResult { unimplemented!() }
+    async fn calibrate(&self) -> CalibrationData { unimplemented!() }
+}
+pub struct BackendCapabilities { pub max_qubits: usize }
+pub struct ExecutionConfig { pub shots: usize }
+pub struct ExecutionResult { pub counts: HashMap<String, usize> }
+pub struct CalibrationData { pub timestamp: u64 }
+pub struct HashMap<K, V> { }
+impl<K, V> HashMap<K, V> {
+    fn len(&self) -> usize { 0 }
+    fn is_empty(&self) -> bool { true }
+}
+pub struct QuantumCircuit;
+impl QuantumCircuit {
+    fn new(n: usize) -> Self { unimplemented!() }
+    fn measure(&mut self, q: usize, c: usize) { unimplemented!() }
+}

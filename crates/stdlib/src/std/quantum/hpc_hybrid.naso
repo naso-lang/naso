@@ -1,0 +1,628 @@
+// Hybrid HPC Workflows: Classical + Quantum Unified
+//
+// Single-language exascale + quantum workflows for scientific computing.
+// Demonstrates Naso as the unified language for hybrid classical-quantum HPC.
+//
+// Hardware targets: Exascale classical (Frontier, Aurora, LUMI) + 
+//                   Quantum (IBM, IonQ, Rigetti, Quantinuum, Google)
+
+use crate::std::prelude::*;
+use crate::std::quantum::primitives::*;
+use crate::std::quantum::variational::*;
+use crate::std::quantum::qec::*;
+use crate::std::quantum::hybrid::*;
+use crate::std::tensor::Tensor;
+use crate::std::math::{sin, cos, sqrt, pi, exp, log, random_f32};
+use crate::std::async_io::*;
+use crate::std::mpi::*;  // MPI for classical HPC communication
+
+// ============================================================
+// Hybrid HPC Configuration
+// ============================================================
+
+/// Hybrid HPC execution configuration.
+pub struct HybridHPCConfig {
+    /// Classical HPC partition
+    pub classical: ClassicalHPCConfig,
+    /// Quantum hardware partition
+    pub quantum: QuantumHPCConfig,
+    /// Coupling strategy
+    pub coupling: CouplingStrategy,
+    /// Resource allocation
+    pub allocation: ResourceAllocation,
+}
+
+pub struct ClassicalHPCConfig {
+    pub mpi_ranks: usize,
+    pub gpus_per_rank: usize,
+    pub memory_per_rank_gb: usize,
+    pub walltime_hours: f32,
+    pub partition: str,  // e.g., "frontier", "aurora", "lumi"
+}
+
+pub struct QuantumHPCConfig {
+    pub providers: [QuantumProviderConfig; N_PROVIDERS>,
+    pub job_priority: JobPriority,
+    pub max_queue_time_hours: f32,
+    pub dedicated_access: bool,
+}
+
+pub struct QuantumProviderConfig {
+    pub provider: str,  // "ibm", "ionq", "rigetti", "quantinuum", "google"
+    pub backend: str,
+    pub api_token: str,
+    pub max_qubits: usize,
+    pub max_shots: usize,
+}
+
+pub enum JobPriority {
+    BestEffort,
+    Standard,
+    High,
+    Dedicated,
+}
+
+pub enum CouplingStrategy {
+    /// Classical pre/post-processing, quantum in middle
+    Sequential { 
+        classical_pre: ClassicalKernel, 
+        quantum: QuantumKernel, 
+        classical_post: ClassicalKernel 
+    },
+    /// Iterative classical-quantum loop
+    Iterative { 
+        classical_step: ClassicalKernel, 
+        quantum_step: QuantumKernel,
+        convergence: ConvergenceCriterion 
+    },
+    /// Concurrent classical and quantum with async communication
+    Concurrent { 
+        classical_stream: ClassicalStream, 
+        quantum_stream: QuantumStream 
+    },
+    /// Quantum kernel as MPI-accelerated subroutine
+    MPIOffload { 
+        mpi_communicator: MPIComm, 
+        quantum_subroutine: QuantumKernel 
+    },
+}
+
+pub struct ResourceAllocation {
+    pub classical_nodes: usize,
+    pub quantum_backends: [QuantumBackendAllocation; N_BACKENDS>,
+    pub data_transfer: DataTransferConfig,
+}
+
+pub struct QuantumBackendAllocation {
+    pub provider: str,
+    pub backend: str,
+    pub time_slots: [TimeSlot; N_SLOTS>,
+    pub qubit_partition: [QubitPartition; N_PARTITIONS>,
+}
+
+pub struct TimeSlot {
+    pub start: u64,      // Unix timestamp
+    pub duration_secs: u64,
+}
+
+pub struct QubitPartition {
+    pub qubit_indices: [usize; N_QUBITS>,
+    pub reserved_for: str,  // "vqe", "qaoa", "qec", "simulation"
+}
+
+pub struct DataTransferConfig {
+    pub protocol: TransferProtocol,
+    pub bandwidth_gbps: f32,
+    pub compression: bool,
+}
+
+pub enum TransferProtocol {
+    MPI,
+    UCX,
+    NVLink,
+    PCIe,
+    Network,  // HTTP/gRPC to quantum cloud
+}
+
+/// Convergence criterion for iterative loops.
+pub struct ConvergenceCriterion {
+    pub max_iterations: usize,
+    pub energy_tolerance: f32,
+    pub gradient_tolerance: f32,
+    pub walltime_limit_secs: u64,
+}
+
+// ============================================================
+// Kernel Definitions
+// ============================================================
+
+/// Classical HPC kernel (runs on CPU/GPU).
+pub trait ClassicalKernel {
+    type Input;
+    type Output;
+    
+    fn execute(&self, input: Self::Input, mpi: MPIContext) -> Self::Output;
+    fn flops(&self) -> u64;
+    fn memory_bytes(&self) -> usize;
+}
+
+/// Quantum kernel (runs on QPU).
+pub trait QuantumKernel {
+    type Input;
+    type Output;
+    
+    fn execute(&self, input: Self::Input, backend: QuantumBackend) -> Self::Output;
+    fn qubits(&self) -> usize;
+    fn depth(&self) -> usize;
+    fn shots(&self) -> usize;
+}
+
+/// Classical streaming kernel (continuous data flow).
+pub trait ClassicalStream {
+    type Item;
+    
+    fn next(&mut self, mpi: MPIContext) -> Option<Self::Item>;
+    fn has_next(&self) -> bool;
+}
+
+/// Quantum streaming kernel.
+pub trait QuantumStream {
+    type Item;
+    
+    fn next(&mut self, backend: QuantumBackend) -> Option<Self::Item>;
+    fn has_next(&self) -> bool;
+}
+
+// ============================================================
+// Hybrid HPC Runtime
+// ============================================================
+
+/// Main entry point for hybrid HPC workflows.
+///
+/// Orchestrates classical HPC (MPI+GPU) and quantum computing
+/// as a single unified computation.
+pub fn run_hybrid_hpc_workflow<
+    COUPLING: CouplingStrategy
+>(
+    config: HybridHPCConfig,
+    coupling: COUPLING
+) -> HybridHPCResult {
+    // Initialize MPI
+    let mpi = MPIContext::init(config.classical.mpi_ranks).unwrap();
+    
+    // Initialize quantum backends
+    let quantum_backends = init_quantum_backends(config.quantum);
+    
+    // Execute based on coupling strategy
+    let result = match coupling {
+        CouplingStrategy::Sequential { classical_pre, quantum, classical_post } => {
+            run_sequential_hybrid(mpi, quantum_backends, classical_pre, quantum, classical_post, config)
+        }
+        CouplingStrategy::Iterative { classical_step, quantum_step, convergence } => {
+            run_iterative_hybrid(mpi, quantum_backends, classical_step, quantum_step, convergence, config)
+        }
+        CouplingStrategy::Concurrent { classical_stream, quantum_stream } => {
+            run_concurrent_hybrid(mpi, quantum_backends, classical_stream, quantum_stream, config)
+        }
+        CouplingStrategy::MPIOffload { mpi_communicator, quantum_subroutine } => {
+            run_mpi_offload_hybrid(mpi, quantum_backends, mpi_communicator, quantum_subroutine, config)
+        }
+    };
+    
+    // Finalize
+    mpi.finalize();
+    
+    result
+}
+
+/// Sequential hybrid: classical -> quantum -> classical.
+fn run_sequential_hybrid<
+    PRE: ClassicalKernel,
+    Q: QuantumKernel,
+    POST: ClassicalKernel
+>(
+    mpi: MPIContext,
+    backends: [QuantumBackend; N_PROVIDERS>,
+    classical_pre: PRE,
+    quantum: Q,
+    classical_post: POST,
+    config: HybridHPCConfig
+) -> HybridHPCResult {
+    // 1. Classical pre-processing (distributed)
+    let pre_input = prepare_pre_input(config);
+    let pre_output = mpi.broadcast_and_execute(classical_pre, pre_input);
+    
+    // 2. Quantum execution (may be batched across backends)
+    let quantum_input = convert_pre_to_quantum(pre_output);
+    let quantum_output = execute_quantum_batched(backends, quantum, quantum_input, config);
+    
+    // 3. Classical post-processing (distributed)
+    let post_input = convert_quantum_to_post(quantum_output);
+    let final_output = mpi.broadcast_and_execute(classical_post, post_input);
+    
+    HybridHPCResult {
+        final_output,
+        metrics: collect_metrics(),
+    }
+}
+
+/// Iterative hybrid: classical <-> quantum loop.
+fn run_iterative_hybrid<
+    C_STEP: ClassicalKernel,
+    Q_STEP: QuantumKernel
+>(
+    mpi: MPIContext,
+    backends: [QuantumBackend; N_PROVIDERS>,
+    classical_step: C_STEP,
+    quantum_step: Q_STEP,
+    convergence: ConvergenceCriterion,
+    config: HybridHPCConfig
+) -> HybridHPCResult {
+    var iteration = 0;
+    var converged = false;
+    var quantum_input = prepare_initial_quantum_input(config);
+    
+    while iteration < convergence.max_iterations && !converged {
+        // Classical step
+        let classical_output = mpi.broadcast_and_execute(classical_step, quantum_input);
+        
+        // Check classical convergence
+        let (energy, gradient) = extract_convergence_metrics(classical_output);
+        if energy.abs() < convergence.energy_tolerance && 
+           gradient.norm() < convergence.gradient_tolerance {
+            converged = true;
+            break;
+        }
+        
+        // Quantum step
+        let quantum_output = execute_quantum_batched(backends, quantum_step, classical_output, config);
+        
+        // Prepare next iteration
+        quantum_input = convert_quantum_to_classical(quantum_output);
+        
+        iteration += 1;
+    }
+    
+    HybridHPCResult { final_output: quantum_input, metrics: collect_metrics() }
+}
+
+/// Concurrent hybrid: async classical and quantum streams.
+fn run_concurrent_hybrid<
+    C_STREAM: ClassicalStream,
+    Q_STREAM: QuantumStream
+>(
+    mpi: MPIContext,
+    backends: [QuantumBackend; N_PROVIDERS>,
+    mut classical_stream: C_STREAM,
+    mut quantum_stream: Q_STREAM,
+    config: HybridHPCConfig
+) -> HybridHPCResult {
+    // Spawn async tasks for classical and quantum streams
+    // Use async runtime with MPI + quantum async
+    
+    unimplemented!()
+}
+
+/// MPI offload hybrid: quantum as MPI subroutine.
+fn run_mpi_offload_hybrid<
+    Q: QuantumKernel
+>(
+    mpi: MPIContext,
+    backends: [QuantumBackend; N_PROVIDERS>,
+    mpi_communicator: MPIComm,
+    quantum_subroutine: Q,
+    config: HybridHPCConfig
+) -> HybridHPCResult {
+    // Quantum computation offloaded to dedicated MPI ranks
+    // that act as quantum clients
+    
+    if mpi.rank() == 0 {
+        // Coordinator: distributes work to quantum workers
+        coordinate_quantum_workers(mpi, quantum_subroutine, config)
+    } else if mpi.is_quantum_worker() {
+        // Quantum worker: executes quantum kernels
+        execute_quantum_worker(mpi, backends, quantum_subroutine, config)
+    } else {
+        // Classical worker: does classical computation
+        execute_classical_worker(mpi, config)
+    }
+    
+    HybridHPCResult { final_output: (), metrics: collect_metrics() }
+}
+
+// ============================================================
+// Pre-built Hybrid HPC Demonstrations
+// ============================================================
+
+/// VQE + DMRG for quantum chemistry on exascale + quantum.
+///
+/// Classical: DMRG (Density Matrix Renormalization Group) on Frontier/Aurora
+/// Quantum: VQE for active space on IBM/IonQ
+/// Coupling: Iterative - DMRG provides initial params, VQE refines, DMRG updates
+pub fn demo_vqe_dmrg_hybrid<const N_QUBITS: usize, const N_SITES: usize>() -> HybridHPCResult {
+    let config = HybridHPCConfig {
+        classical: ClassicalHPCConfig {
+            mpi_ranks: 1024,
+            gpus_per_rank: 4,
+            memory_per_rank_gb: 256,
+            walltime_hours: 24.0,
+            partition: "frontier",
+        },
+        quantum: QuantumHPCConfig {
+            providers: [
+                QuantumProviderConfig { provider: "ibm", backend: "ibm_brisbane", api_token: "", max_qubits: 127, max_shots: 20000 },
+                QuantumProviderConfig { provider: "ionq", backend: "ionq_forte", api_token: "", max_qubits: 32, max_shots: 10000 },
+            ],
+            job_priority: JobPriority::High,
+            max_queue_time_hours: 2.0,
+            dedicated_access: false,
+        },
+        coupling: CouplingStrategy::Iterative {
+            classical_step: DMRGKernel { n_sites: N_SITES, bond_dim: 256 },
+            quantum_step: VQEQuantumKernel { n_qubits: N_QUBITS },
+            convergence: ConvergenceCriterion { max_iterations: 50, energy_tolerance: 1e-6, gradient_tolerance: 1e-4, walltime_limit_secs: 86400 },
+        },
+        allocation: ResourceAllocation {
+            classical_nodes: 256,
+            quantum_backends: [],
+            data_transfer: DataTransferConfig { protocol: TransferProtocol::Network, bandwidth_gbps: 100.0, compression: true },
+        },
+    };
+    
+    run_hybrid_hpc_workflow(config, config.coupling)
+}
+
+/// QAOA + Classical Heuristics for combinatorial optimization.
+///
+/// Classical: Branch-and-bound, local search on LUMI
+/// Quantum: QAOA on IonQ/Quantinuum
+/// Coupling: Sequential - classical finds good initial params, QAOA refines
+pub fn demo_qaoa_hybrid_optimization<const N_QUBITS: usize>() -> HybridHPCResult {
+    unimplemented!()
+}
+
+/// Quantum-enhanced Monte Carlo for financial risk.
+///
+/// Classical: Monte Carlo simulation on Aurora
+/// Quantum: Amplitude estimation for rare events on Google/IBM
+/// Coupling: Concurrent - classical generates samples, quantum estimates tails
+pub fn demo_quantum_monte_carlo_financial<const N_ASSETS: usize, const N_SCENARIOS: usize>() -> HybridHPCResult {
+    unimplemented!()
+}
+
+/// Hybrid Quantum-Classical Molecular Dynamics.
+///
+/// Classical: MD with ML force fields on Frontier
+/// Quantum: VQE for reactive force field training on Rigetti
+/// Coupling: Iterative - MD generates configurations, VQE computes energies
+pub fn demo_hybrid_molecular_dynamics<const N_ATOMS: usize>() -> HybridHPCResult {
+    unimplemented!()
+}
+
+/// Quantum error correction + classical decoding on exascale.
+///
+/// Classical: MWPM/Union-Find decoder on 1000+ GPUs (Aurora)
+/// Quantum: Surface code syndrome extraction on IBM/Google
+/// Coupling: MPIOffload - syndrome data streamed to classical decoders
+pub fn demo_qec_hybrid_decoding<const DISTANCE: usize, const CYCLES: usize>() -> HybridHPCResult {
+    let config = HybridHPCConfig {
+        classical: ClassicalHPCConfig {
+            mpi_ranks: 4096,
+            gpus_per_rank: 4,
+            memory_per_rank_gb: 128,
+            walltime_hours: 4.0,
+            partition: "aurora",
+        },
+        quantum: QuantumHPCConfig {
+            providers: [
+                QuantumProviderConfig { provider: "ibm", backend: "ibm_brisbane", api_token: "", max_qubits: 127, max_shots: 20000 },
+                QuantumProviderConfig { provider: "google", backend: "sycomore", api_token: "", max_qubits: 70, max_shots: 100000 },
+            ],
+            job_priority: JobPriority::Dedicated,
+            max_queue_time_hours: 0.5,
+            dedicated_access: true,
+        },
+        coupling: CouplingStrategy::MPIOffload {
+            mpi_communicator: MPIComm::WORLD,
+            quantum_subroutine: SurfaceCodeSyndromeKernel { distance: DISTANCE },
+        },
+        allocation: ResourceAllocation {
+            classical_nodes: 1024,
+            quantum_backends: [],
+            data_transfer: DataTransferConfig { protocol: TransferProtocol::MPI, bandwidth_gbps: 200.0, compression: false },
+        },
+    };
+    
+    run_hybrid_hpc_workflow(config, config.coupling)
+}
+
+/// Quantum kernel methods + classical SVM training.
+///
+/// Classical: SVM training on kernel matrix (distributed on LUMI)
+/// Quantum: Kernel matrix computation on IonQ/Quantinuum
+/// Coupling: Sequential - quantum computes kernel, classical trains
+pub fn demo_quantum_svm_hybrid<const N_SAMPLES: usize, const N_QUBITS: usize>() -> HybridHPCResult {
+    unimplemented!()
+}
+
+/// Hybrid quantum-classical PDE solver.
+///
+/// Classical: Finite element solver on Frontier
+/// Quantum: Variational quantum linear solver (VQLS) on IBM
+/// Coupling: Iterative - classical provides boundary conditions, quantum solves subproblems
+pub fn demo_hybrid_pde_solver<const GRID_SIZE: usize>() -> HybridHPCResult {
+    unimplemented!()
+}
+
+// ============================================================
+// Kernel Implementations
+// ============================================================
+
+/// DMRG kernel for classical pre-processing.
+pub struct DMRGKernel<const N_SITES: usize, const BOND_DIM: usize> {
+    pub n_sites: usize,
+    pub bond_dim: usize,
+}
+
+impl<const N_SITES: usize, const BOND_DIM: usize> ClassicalKernel for DMRGKernel<N_SITES, BOND_DIM> {
+    type Input = DMRGInput;
+    type Output = DMRGOutput;
+    
+    fn execute(&self, input: Self::Input, mpi: MPIContext) -> Self::Output {
+        // Distributed DMRG using MPI
+        // 1. Distribute MPS tensors across ranks
+        // 2. Sweep left-to-right, right-to-left
+        // 3. Truncate to bond dimension
+        // 4. Return ground state energy and MPS
+        
+        unimplemented!()
+    }
+    
+    fn flops(&self) -> u64 { (N_SITES * BOND_DIM * BOND_DIM * BOND_DIM) as u64 }
+    fn memory_bytes(&self) -> usize { N_SITES * BOND_DIM * BOND_DIM * 8 }
+}
+
+pub struct DMRGInput {
+    pub hamiltonian: Tensor[f32, N_SITES, N_SITES>,
+    pub initial_mps: Option<Tensor[f32, N_SITES, BOND_DIM, BOND_DIM>>,
+}
+
+pub struct DMRGOutput {
+    pub energy: f32,
+    pub mps_tensors: Tensor[f32, N_SITES, BOND_DIM, BOND_DIM>,
+    pub entanglement_entropy: Tensor[f32, N_SITES-1>,
+}
+
+/// VQE kernel for quantum execution.
+pub struct VQEQuantumKernel<const N_QUBITS: usize> {
+    pub n_qubits: usize,
+}
+
+impl<const N_QUBITS: usize> QuantumKernel for VQEQuantumKernel<N_QUBITS> {
+    type Input = VQEQuantumInput;
+    type Output = VQEQuantumOutput;
+    
+    fn execute(&self, input: Self::Input, backend: QuantumBackend) -> Self::Output {
+        // Execute VQE on quantum hardware
+        // Use error mitigation from hardware_vqe.naso
+        unimplemented!()
+    }
+    
+    fn qubits(&self) -> usize { N_QUBITS }
+    fn depth(&self) -> usize { 100 }
+    fn shots(&self) -> usize { 10000 }
+}
+
+pub struct VQEQuantumInput {
+    pub hamiltonian: PauliHamiltonian<N_QUBITS, N_TERMS>,
+    pub ansatz_type: str,
+    pub initial_params: [1] Tensor[f32, N_PARAMS>,
+}
+
+pub struct VQEQuantumOutput {
+    pub optimal_params: [1] Tensor[f32, N_PARAMS>,
+    pub energy: f32,
+    pub variance: f32,
+}
+
+/// Surface code syndrome extraction kernel.
+pub struct SurfaceCodeSyndromeKernel<const DISTANCE: usize> {
+    pub distance: usize,
+}
+
+impl<const DISTANCE: usize> QuantumKernel for SurfaceCodeSyndromeKernel<DISTANCE> {
+    type Input = QECSyndromeInput;
+    type Output = QECSyndromeOutput;
+    
+    fn execute(&self, input: Self::Input, backend: QuantumBackend) -> Self::Output {
+        // Extract syndromes for surface code
+        // Return raw measurement counts for classical decoding
+        unimplemented!()
+    }
+    
+    fn qubits(&self) -> usize { DISTANCE * DISTANCE + (DISTANCE - 1) * (DISTANCE - 1) }
+    fn depth(&self) -> usize { 50 }
+    fn shots(&self) -> usize { 1000 }
+}
+
+pub struct QECSyndromeInput {
+    pub cycle: usize,
+    pub previous_syndrome: Option<[Syndrome; N_ANCILLA>>,
+}
+
+pub struct QECSyndromeOutput {
+    pub syndrome_counts: HashMap<String, usize>,
+    pub cycle: usize,
+}
+
+// ============================================================
+// MPI Context and Utilities
+// ============================================================
+
+pub struct MPIContext {
+    pub rank: usize,
+    pub size: usize,
+    pub comm: MPIComm,
+}
+
+impl MPIContext {
+    pub fn init(size: usize) -> Result<Self> {
+        // Initialize MPI
+        unimplemented!()
+    }
+    
+    pub fn rank(&self) -> usize { self.rank }
+    pub fn size(&self) -> usize { self.size }
+    pub fn is_quantum_worker(&self) -> bool { false }
+    
+    pub fn broadcast_and_execute<K: ClassicalKernel>(
+        &self, 
+        kernel: K, 
+        input: K::Input
+    ) -> K::Output {
+        // Broadcast input to all ranks, execute kernel, gather output
+        unimplemented!()
+    }
+    
+    pub fn finalize(&self) { unimplemented!() }
+}
+
+pub struct MPIComm {
+    pub world: bool,
+}
+
+impl MPIComm {
+    pub const WORLD: MPIComm = MPIComm { world: true };
+}
+
+pub struct QuantumBackend; // Placeholder for actual backend type
+
+fn init_quantum_backends(config: QuantumHPCConfig) -> [QuantumBackend; N_PROVIDERS> {
+    unimplemented!()
+}
+
+fn prepare_pre_input(config: HybridHPCConfig) -> DMRGInput { unimplemented!() }
+fn convert_pre_to_quantum(output: DMRGOutput) -> VQEQuantumInput { unimplemented!() }
+fn execute_quantum_batched(backends: [QuantumBackend; N>, kernel: VQEQuantumKernel, input: VQEQuantumInput, config: HybridHPCConfig) -> VQEQuantumOutput { unimplemented!() }
+fn convert_quantum_to_post(output: VQEQuantumOutput) -> Tensor[f32, N> { unimplemented!() }
+fn prepare_initial_quantum_input(config: HybridHPCConfig) -> Tensor[f32, N> { unimplemented!() }
+fn extract_convergence_metrics(output: DMRGOutput) -> (f32, Tensor[f32, N>) { (output.energy, tensor_zeros()) }
+fn convert_quantum_to_classical(output: VQEQuantumOutput) -> Tensor[f32, N> { unimplemented!() }
+fn coordinate_quantum_workers(mpi: MPIContext, kernel: VQEQuantumKernel, config: HybridHPCConfig) -> HybridHPCResult { unimplemented!() }
+fn execute_quantum_worker(mpi: MPIContext, backends: [QuantumBackend; N>, kernel: VQEQuantumKernel, config: HybridHPCConfig) { unimplemented!() }
+fn execute_classical_worker(mpi: MPIContext, config: HybridHPCConfig) { unimplemented!() }
+fn collect_metrics() -> HybridHPCMetrics { unimplemented!() }
+
+pub struct HybridHPCResult {
+    pub final_output: (),
+    pub metrics: HybridHPCMetrics,
+}
+
+pub struct HybridHPCMetrics {
+    pub classical_time_secs: f32,
+    pub quantum_time_secs: f32,
+    pub total_flops: u64,
+    pub total_quantum_shots: usize,
+    pub data_transfer_gb: f32,
+    pub energy_to_solution: f32,  // Joules
+}

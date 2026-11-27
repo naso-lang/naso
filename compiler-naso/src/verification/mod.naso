@@ -1,0 +1,313 @@
+//! Verification Integration (Naso implementation)
+//!
+//! Integrates `naso-verify` as a compiler phase, invoked as a subprocess
+//! after type checking. This mirrors the Rust compiler's approach of calling
+//! the `naso-verify` binary.
+
+use crate::ast::{Program, Span, Ident};
+use crate::parser::parse_program;
+use std::vec::Vec;
+use std::string::String;
+use std::option::Option;
+use std::result::Result;
+use std::path::PathBuf;
+
+/// Verification mode selection
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VerifyMode {
+    /// Run all provers (uncomputation + linearity + obligations)
+    #[default]
+    All,
+    /// Run only quantum uncomputation prover
+    Uncomputation,
+    /// Run only [1]-quantity linearity prover
+    Linearity,
+    /// Run only the proof-obligation prover
+    Obligations,
+}
+
+impl VerifyMode {
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s.to_lowercase().as_str() {
+            "all" => Ok(VerifyMode::All),
+            "uncomputation" => Ok(VerifyMode::Uncomputation),
+            "linearity" => Ok(VerifyMode::Linearity),
+            "obligations" | "proof" => Ok(VerifyMode::Obligations),
+            other => Err(format!(
+                "Unknown verification mode: {}. Use all, uncomputation, linearity, or obligations",
+                other
+            )),
+        }
+    }
+}
+
+/// Verification output format
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputFormat {
+    #[default]
+    Human,
+    Json,
+    Sarif,
+}
+
+/// Verification solver configuration
+#[derive(Debug, Clone)]
+pub struct SolverConfig {
+    pub logic: Logic,
+    pub timeout_ms: u64,
+    pub threads: usize,
+    pub incremental: bool,
+}
+
+impl Default for SolverConfig {
+    fn default() -> Self {
+        Self {
+            logic: Logic::QF_UFLIA,
+            timeout_ms: 30000,
+            threads: 0,
+            incremental: true,
+        }
+    }
+}
+
+/// SMT logic selection
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Logic {
+    #[default]
+    QF_UFLIA,
+    AUFLIA,
+    QF_BV,
+}
+
+impl Logic {
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s.to_uppercase().as_str() {
+            "QF_UFLIA" => Ok(Logic::QF_UFLIA),
+            "AUFLIA" => Ok(Logic::AUFLIA),
+            "QF_BV" => Ok(Logic::QF_BV),
+            other => Err(format!("Unknown SMT logic: {}. Use QF_UFLIA, AUFLIA, or QF_BV", other)),
+        }
+    }
+}
+
+/// CLI configuration for verification
+#[derive(Debug, Clone)]
+pub struct VerifyConfig {
+    pub mode: VerifyMode,
+    pub format: OutputFormat,
+    pub solver_config: SolverConfig,
+    pub require_obligations: bool,
+    pub use_cache: bool,
+    pub cache_dir: Option<PathBuf>,
+    pub jobs: usize,
+    pub verbose: bool,
+    pub quiet: bool,
+    pub list_codes: bool,
+}
+
+impl Default for VerifyConfig {
+    fn default() -> Self {
+        Self {
+            mode: VerifyMode::All,
+            format: OutputFormat::Human,
+            solver_config: SolverConfig::default(),
+            require_obligations: false,
+            use_cache: true,
+            cache_dir: None,
+            jobs: 0,
+            verbose: false,
+            quiet: false,
+            list_codes: false,
+        }
+    }
+}
+
+/// Diagnostic severity
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticSeverity {
+    Error,
+    Warning,
+    Info,
+    Hint,
+}
+
+/// Verification diagnostic
+#[derive(Debug, Clone)]
+pub struct VerifyDiagnostic {
+    pub code: String,
+    pub severity: DiagnosticSeverity,
+    pub message: String,
+    pub span: Span,
+}
+
+/// Verification exit codes
+pub const EXIT_DISCHARGED: u8 = 0;
+pub const EXIT_REFUTED: u8 = 1;
+pub const EXIT_UNDECIDED: u8 = 2;
+pub const EXIT_USAGE: u8 = 3;
+pub const EXIT_INPUT: u8 = 4;
+pub const EXIT_INTERNAL: u8 = 5;
+pub const EXIT_NO_OBLIGATIONS: u8 = 6;
+
+/// Run formal verification on a program
+pub fn verify_program(
+    program: &Program,
+    config: &VerifyConfig,
+) -> Result<Vec<VerifyDiagnostic>, String> {
+    // Find naso-verify binary (in same directory as this executable)
+    let naso_verify_bin = find_naso_verify_binary()?;
+    
+    // Write program to temporary file
+    let temp_file = write_program_to_temp(program)?;
+    
+    // Build naso-verify command
+    let mut cmd = std::process::Command::new(naso_verify_bin);
+    cmd.arg("--mode").arg(mode_to_str(config.mode));
+    cmd.arg("--format").arg(format_to_str(config.format));
+    cmd.arg("--timeout").arg(config.solver_config.timeout_ms.to_string());
+    cmd.arg("--logic").arg(logic_to_str(config.solver_config.logic));
+    
+    if config.require_obligations {
+        cmd.arg("--require-obligations");
+    }
+    if !config.use_cache {
+        cmd.arg("--no-cache");
+    }
+    if let Some(cache_dir) = &config.cache_dir {
+        cmd.arg("--cache-dir").arg(cache_dir);
+    }
+    if config.jobs > 0 {
+        cmd.arg("--jobs").arg(config.jobs.to_string());
+    }
+    if config.verbose {
+        cmd.arg("--verbose");
+    }
+    if config.quiet {
+        cmd.arg("--quiet");
+    }
+    if config.list_codes {
+        cmd.arg("--list-codes");
+    }
+    
+    cmd.arg(&temp_file);
+    
+    // Run verification
+    let output = cmd.output().map_err(|e| format!("Failed to run naso-verify: {}", e))?;
+    
+    // Parse output
+    parse_verification_output(&output, config.format)
+}
+
+/// Parse verification mode to string
+fn mode_to_str(mode: VerifyMode) -> &'static str {
+    match mode {
+        VerifyMode::All => "all",
+        VerifyMode::Uncomputation => "uncomputation",
+        VerifyMode::Linearity => "linearity",
+        VerifyMode::Obligations => "obligations",
+    }
+}
+
+/// Parse format to string
+fn format_to_str(format: OutputFormat) -> &'static str {
+    match format {
+        OutputFormat::Human => "human",
+        OutputFormat::Json => "json",
+        OutputFormat::Sarif => "sarif",
+    }
+}
+
+/// Parse logic to string
+fn logic_to_str(logic: Logic) -> &'static str {
+    match logic {
+        Logic::QF_UFLIA => "QF_UFLIA",
+        Logic::AUFLIA => "AUFLIA",
+        Logic::QF_BV => "QF_BV",
+    }
+}
+
+/// Find naso-verify binary
+fn find_naso_verify_binary() -> Result<PathBuf, String> {
+    let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let bin_path = current_exe.parent().unwrap().join("naso-verify");
+    if bin_path.exists() {
+        Ok(bin_path)
+    } else {
+        // Try common locations
+        for path in ["/usr/local/bin/naso-verify", "/usr/bin/naso-verify"] {
+            let p = PathBuf::from(path);
+            if p.exists() {
+                return Ok(p);
+            }
+        }
+        Err("naso-verify binary not found. Please install Naso toolchain.".to_string())
+    }
+}
+
+/// Write program to temporary file for verification
+fn write_program_to_temp(program: &Program) -> Result<PathBuf, String> {
+    use std::fs;
+    use std::io::Write;
+    
+    // Serialize program to Naso source (simplified)
+    let mut source = String::new();
+    for item in &program.items {
+        source.push_str(&item_to_string(item));
+        source.push('\n');
+    }
+    
+    let temp_path = std::env::temp_dir().join(format!("naso_verify_{}.naso", std::process::id()));
+    let mut file = fs::File::create(&temp_path).map_err(|e| e.to_string())?;
+    file.write_all(source.as_bytes()).map_err(|e| e.to_string())?;
+    
+    Ok(temp_path)
+}
+
+/// Convert AST item to Naso source string (simplified)
+fn item_to_string(item: &crate::ast::Item) -> String {
+    // Simplified - would need full pretty printer
+    format!("// Item: {:?}", item)
+}
+
+/// Parse verification output
+fn parse_verification_output(
+    output: &std::process::Output,
+    format: OutputFormat,
+) -> Result<Vec<crate::verification::VerifyDiagnostic>, String> {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    
+    let mut diagnostics = Vec::new();
+    
+    match format {
+        OutputFormat::Json => {
+            // Parse JSON output
+            // Would need JSON parsing
+        }
+        OutputFormat::Sarif => {
+            // Parse SARIF
+        }
+        OutputFormat::Human => {
+            // Parse human-readable output for diagnostics
+            for line in stdout.lines() {
+                if line.contains(':') && (line.contains("error") || line.contains("warning") || line.contains("note")) {
+                    // Parse diagnostic line
+                }
+            }
+        }
+    }
+    
+    // Check exit code for summary
+    match output.status.code() {
+        Some(0) => {} // All discharged
+        Some(1) => return Err("At least one obligation was refuted".to_string()),
+        Some(2) => return Err("At least one obligation was left undecided".to_string()),
+        Some(4) => return Err("Input error".to_string()),
+        Some(5) => return Err("Internal verifier failure".to_string()),
+        Some(6) => return Err("No obligations found".to_string()),
+        Some(code) => return Err(format!("Verification failed with exit code {}", code)),
+        None => return Err("Verification process terminated by signal".to_string()),
+    }
+    
+    Ok(diagnostics)
+}

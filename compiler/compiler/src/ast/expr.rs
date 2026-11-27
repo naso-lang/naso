@@ -66,6 +66,8 @@ pub enum ExprKind {
     Tuple(Vec<Expr>),
     /// Array/list construction
     Array(Vec<Expr>),
+    /// Array repeat: [value; count]
+    ArrayRepeat(Box<Expr>, Box<Expr>),
     /// Block expression
     Block(Box<crate::ast::Block>),
     /// If expression
@@ -100,6 +102,8 @@ pub enum ExprKind {
     Quantified(Box<ForallLoop>),
     /// While loop
     While(Box<Expr>, Box<Expr>),
+    /// Infinite loop: `loop { ... }`
+    Loop(Box<crate::ast::Block>),
     /// Return expression
     Return(Option<Box<Expr>>),
     /// Break expression
@@ -116,6 +120,10 @@ pub enum ExprKind {
     Ascribe(Box<Expr>, crate::ast::ty::Type),
     /// Range expression `start..end` (exclusive)
     Range(Box<Expr>, Box<Expr>),
+    /// Async block: `async { ... }` - creates a future
+    Async(Box<crate::ast::Block>),
+    /// Await expression: `await future` - suspends until future completes
+    Await(Box<Expr>),
     /// Error placeholder
     Error,
 }
@@ -314,6 +322,8 @@ pub enum UnOp {
     InOut,
     /// Consume move
     Consume,
+    /// Address-of operator for function pointers
+    AddrOf,
 }
 
 impl fmt::Display for UnOp {
@@ -325,6 +335,7 @@ impl fmt::Display for UnOp {
             UnOp::Deref => write!(f, "*"),
             UnOp::InOut => write!(f, "&mut"),
             UnOp::Consume => write!(f, "consume"),
+            UnOp::AddrOf => write!(f, "&"),
         }
     }
 }

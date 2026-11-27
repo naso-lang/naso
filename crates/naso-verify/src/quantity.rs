@@ -290,12 +290,12 @@ pub fn encode_quantity_expr(
         }
         // A literal cannot hold or consume a linear resource.
         ExprKind::Literal(_) => {}
-        ExprKind::Call(func, args, _) => {
+        ExprKind::Call(func, args) => {
             if let ExprKind::Var(fname) = &func.kind {
                 match fname.name.as_str() {
                     "qalloc" | "linear_alloc" | "alloc" => {
                         for (_i, arg) in args.iter().enumerate() {
-                            if let ExprKind::Literal(naso_compiler::ast::Literal::Int(_n, _)) =
+                            if let ExprKind::Literal(naso_compiler::ast::Literal::Int(_n)) =
                                 &arg.kind
                             {
                                 let resource_id = tracker.allocate_linear(

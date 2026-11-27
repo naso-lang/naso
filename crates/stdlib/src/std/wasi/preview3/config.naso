@@ -1,0 +1,88 @@
+//! WASI Preview 3: Config Interface
+//!
+//! Provides configuration management.
+
+extern "C" {
+    fn wasi_config_get(key: *const u8, key_len: usize, buf: *mut u8, buf_len: usize) -> i32;
+    fn wasi_config_set(key: *const u8, key_len: usize, value: *const u8, value_len: usize) -> i32;
+    fn wasi_config_delete(key: *const u8, key_len: usize) -> i32;
+    fn wasi_config_keys(buf: *mut u64, buf_len: usize) -> i32;
+    fn wasi_config_store_get(store: *const u8, store_len: usize, key: *const u8, key_len: usize, buf: *mut u8, buf_len: usize) -> i32;
+    fn wasi_config_store_set(store: *const u8, store_len: usize, key: *const u8, key_len: usize, value: *const u8, value_len: usize) -> i32;
+    fn wasi_config_store_delete(store: *const u8, store_len: usize, key: *const u8, key_len: usize) -> i32;
+}
+
+pub struct Config;
+
+impl Config {
+    pub fn get(key: &str) -> Option<String> {
+        let key_str = crate::web::dom::DomString::new(key);
+        let mut buf = vec![0u8; 4096];
+        let result = unsafe { wasi_config_get(key_str.as_ptr(), key_str.len(), buf.as_mut_ptr(), buf.len()) };
+        if result < 0 { None } else { Some(String::from_utf8_lossy(&buf[..result as usize]).to_string()) }
+    }
+    
+    pub fn set(key: &str, value: &str) -> Result<(), std::io::Error> {
+        let key_str = crate::web::dom::DomString::new(key);
+        let value_str = crate::web::dom::DomString::new(value);
+        let result = unsafe { wasi_config_set(key_str.as_ptr(), key_str.len(), value_str.as_ptr(), value_str.len()) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(())
+        }
+    }
+    
+    pub fn delete(key: &str) -> Result<(), std::io::Error> {
+        let key_str = crate::web::dom::DomString::new(key);
+        let result = unsafe { wasi_config_delete(key_str.as_ptr(), key_str.len()) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(())
+        }
+    }
+    
+    pub fn keys() -> Vec<String> {
+        let mut buf = vec![0u64; 128];
+        let result = unsafe { wasi_config_keys(buf.as_mut_ptr(), buf.len()) };
+        if result < 0 { return Vec::new(); }
+        // Would parse the keys from buf
+        Vec::new()
+    }
+}
+
+pub struct ConfigStore;
+
+impl ConfigStore {
+    pub fn get(store: &str, key: &str) -> Option<String> {
+        let store_str = crate::web::dom::DomString::new(store);
+        let key_str = crate::web::dom::DomString::new(key);
+        let mut buf = vec![0u8; 4096];
+        let result = unsafe { wasi_config_store_get(store_str.as_ptr(), store_str.len(), key_str.as_ptr(), key_str.len(), buf.as_mut_ptr(), buf.len()) };
+        if result < 0 { None } else { Some(String::from_utf8_lossy(&buf[..result as usize]).to_string()) }
+    }
+    
+    pub fn set(store: &str, key: &str, value: &str) -> Result<(), std::io::Error> {
+        let store_str = crate::web::dom::DomString::new(store);
+        let key_str = crate::web::dom::DomString::new(key);
+        let value_str = crate::web::dom::DomString::new(value);
+        let result = unsafe { wasi_config_store_set(store_str.as_ptr(), store_str.len(), key_str.as_ptr(), key_str.len(), value_str.as_ptr(), value_str.len()) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(())
+        }
+    }
+    
+    pub fn delete(store: &str, key: &str) -> Result<(), std::io::Error> {
+        let store_str = crate::web::dom::DomString::new(store);
+        let key_str = crate::web::dom::DomString::new(key);
+        let result = unsafe { wasi_config_store_delete(store_str.as_ptr(), store_str.len(), key_str.as_ptr(), key_str.len()) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(())
+        }
+    }
+}

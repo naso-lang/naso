@@ -1,0 +1,13 @@
+// Test array returns from functions
+fn create_array() -> [u8; 4] {
+    [1, 2, 3, 4]
+}
+
+fn create_large_array() -> [u64; 10] {
+    [42; 10]
+}
+
+fn main() -> () {
+    let arr1 = create_array();
+    let arr2 = create_large_array();
+}

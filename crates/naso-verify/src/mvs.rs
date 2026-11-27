@@ -276,7 +276,7 @@ pub fn encode_mvs_expr(
     let mut constraints = Vec::new();
 
     match &expr.kind {
-        ExprKind::Call(func, args, _) => {
+        ExprKind::Call(func, args) => {
             // Check if calling a function with inout params
             if let ExprKind::Var(_fname) = &func.kind {
                 // Would need to look up callee's frame and check disjointness

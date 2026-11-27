@@ -1,0 +1,256 @@
+//! Event Types and Handling
+//!
+//! Zero-cost bindings for DOM events.
+
+extern "C" {
+    fn event_get_type(event: u64) -> u64; // Returns string pointer
+    fn event_get_target(event: u64) -> u64; // Returns EventTarget
+    fn event_get_current_target(event: u64) -> u64; // Returns EventTarget
+    fn event_get_event_phase(event: u64) -> i32;
+    fn event_get_bubbles(event: u64) -> bool;
+    fn event_get_cancelable(event: u64) -> bool;
+    fn event_get_default_prevented(event: u64) -> bool;
+    fn event_get_composed(event: u64) -> bool;
+    fn event_get_is_trusted(event: u64) -> bool;
+    fn event_get_time_stamp(event: u64) -> f64;
+    fn event_prevent_default(event: u64);
+    fn event_stop_propagation(event: u64);
+    fn event_stop_immediate_propagation(event: u64);
+    fn event_init_event(event: u64, type_: *const u8, type_len: usize, bubbles: bool, cancelable: bool);
+    
+    // MouseEvent
+    fn mouse_event_get_screen_x(event: u64) -> i32;
+    fn mouse_event_get_screen_y(event: u64) -> i32;
+    fn mouse_event_get_client_x(event: u64) -> i32;
+    fn mouse_event_get_client_y(event: u64) -> i32;
+    fn mouse_event_get_offset_x(event: u64) -> i32;
+    fn mouse_event_get_offset_y(event: u64) -> i32;
+    fn mouse_event_get_button(event: u64) -> i32;
+    fn mouse_event_get_buttons(event: u64) -> i32;
+    fn mouse_event_get_related_target(event: u64) -> u64; // Returns EventTarget
+    fn mouse_event_get_ctrl_key(event: u64) -> bool;
+    fn mouse_event_get_shift_key(event: u64) -> bool;
+    fn mouse_event_get_alt_key(event: u64) -> bool;
+    fn mouse_event_get_meta_key(event: u64) -> bool;
+    
+    // KeyboardEvent
+    fn keyboard_event_get_key(event: u64) -> u64; // Returns string pointer
+    fn keyboard_event_get_code(event: u64) -> u64; // Returns string pointer
+    fn keyboard_event_get_key_code(event: u64) -> i32;
+    fn keyboard_event_get_which(event: u64) -> i32;
+    fn keyboard_event_get_ctrl_key(event: u64) -> bool;
+    fn keyboard_event_get_shift_key(event: u64) -> bool;
+    fn keyboard_event_get_alt_key(event: u64) -> bool;
+    fn keyboard_event_get_meta_key(event: u64) -> bool;
+    fn keyboard_event_get_repeat(event: u64) -> bool;
+    
+    // InputEvent
+    fn input_event_get_data(event: u64) -> u64; // Returns string pointer
+    fn input_event_get_input_type(event: u64) -> u64; // Returns string pointer
+    fn input_event_is_composing(event: u64) -> bool;
+}
+
+use crate::web::dom::{DomString, EventTarget, Node};
+
+pub struct Event {
+    ptr: u64,
+}
+
+impl Event {
+    pub fn new(ptr: u64) -> Self {
+        Self { ptr }
+    }
+    
+    pub fn event_type(&self) -> String {
+        let ptr = unsafe { event_get_type(self.ptr) };
+        DomString::from_ptr(ptr).to_string()
+    }
+    
+    pub fn target(&self) -> EventTarget {
+        let ptr = unsafe { event_get_target(self.ptr) };
+        EventTarget::new(ptr)
+    }
+    
+    pub fn current_target(&self) -> EventTarget {
+        let ptr = unsafe { event_get_current_target(self.ptr) };
+        EventTarget::new(ptr)
+    }
+    
+    pub fn event_phase(&self) -> i32 {
+        unsafe { event_get_event_phase(self.ptr) }
+    }
+    
+    pub fn bubbles(&self) -> bool {
+        unsafe { event_get_bubbles(self.ptr) }
+    }
+    
+    pub fn cancelable(&self) -> bool {
+        unsafe { event_get_cancelable(self.ptr) }
+    }
+    
+    pub fn default_prevented(&self) -> bool {
+        unsafe { event_get_default_prevented(self.ptr) }
+    }
+    
+    pub fn composed(&self) -> bool {
+        unsafe { event_get_composed(self.ptr) }
+    }
+    
+    pub fn is_trusted(&self) -> bool {
+        unsafe { event_get_is_trusted(self.ptr) }
+    }
+    
+    pub fn time_stamp(&self) -> f64 {
+        unsafe { event_get_time_stamp(self.ptr) }
+    }
+    
+    pub fn prevent_default(&self) {
+        unsafe { event_prevent_default(self.ptr) }
+    }
+    
+    pub fn stop_propagation(&self) {
+        unsafe { event_stop_propagation(self.ptr) }
+    }
+    
+    pub fn stop_immediate_propagation(&self) {
+        unsafe { event_stop_immediate_propagation(self.ptr) }
+    }
+}
+
+pub struct MouseEvent {
+    ptr: u64,
+}
+
+impl MouseEvent {
+    pub fn new(ptr: u64) -> Self {
+        Self { ptr }
+    }
+    
+    pub fn screen_x(&self) -> i32 {
+        unsafe { mouse_event_get_screen_x(self.ptr) }
+    }
+    
+    pub fn screen_y(&self) -> i32 {
+        unsafe { mouse_event_get_screen_y(self.ptr) }
+    }
+    
+    pub fn client_x(&self) -> i32 {
+        unsafe { mouse_event_get_client_x(self.ptr) }
+    }
+    
+    pub fn client_y(&self) -> i32 {
+        unsafe { mouse_event_get_client_y(self.ptr) }
+    }
+    
+    pub fn offset_x(&self) -> i32 {
+        unsafe { mouse_event_get_offset_x(self.ptr) }
+    }
+    
+    pub fn offset_y(&self) -> i32 {
+        unsafe { mouse_event_get_offset_y(self.ptr) }
+    }
+    
+    pub fn button(&self) -> i32 {
+        unsafe { mouse_event_get_button(self.ptr) }
+    }
+    
+    pub fn buttons(&self) -> i32 {
+        unsafe { mouse_event_get_buttons(self.ptr) }
+    }
+    
+    pub fn related_target(&self) -> Option<EventTarget> {
+        let ptr = unsafe { mouse_event_get_related_target(self.ptr) };
+        if ptr == 0 { None } else { Some(EventTarget::new(ptr)) }
+    }
+    
+    pub fn ctrl_key(&self) -> bool {
+        unsafe { mouse_event_get_ctrl_key(self.ptr) }
+    }
+    
+    pub fn shift_key(&self) -> bool {
+        unsafe { mouse_event_get_shift_key(self.ptr) }
+    }
+    
+    pub fn alt_key(&self) -> bool {
+        unsafe { mouse_event_get_alt_key(self.ptr) }
+    }
+    
+    pub fn meta_key(&self) -> bool {
+        unsafe { mouse_event_get_meta_key(self.ptr) }
+    }
+}
+
+pub struct KeyboardEvent {
+    ptr: u64,
+}
+
+impl KeyboardEvent {
+    pub fn new(ptr: u64) -> Self {
+        Self { ptr }
+    }
+    
+    pub fn key(&self) -> String {
+        let ptr = unsafe { keyboard_event_get_key(self.ptr) };
+        DomString::from_ptr(ptr).to_string()
+    }
+    
+    pub fn code(&self) -> String {
+        let ptr = unsafe { keyboard_event_get_code(self.ptr) };
+        DomString::from_ptr(ptr).to_string()
+    }
+    
+    pub fn key_code(&self) -> i32 {
+        unsafe { keyboard_event_get_key_code(self.ptr) }
+    }
+    
+    pub fn which(&self) -> i32 {
+        unsafe { keyboard_event_get_which(self.ptr) }
+    }
+    
+    pub fn ctrl_key(&self) -> bool {
+        unsafe { keyboard_event_get_ctrl_key(self.ptr) }
+    }
+    
+    pub fn shift_key(&self) -> bool {
+        unsafe { keyboard_event_get_shift_key(self.ptr) }
+    }
+    
+    pub fn alt_key(&self) -> bool {
+        unsafe { keyboard_event_get_alt_key(self.ptr) }
+    }
+    
+    pub fn meta_key(&self) -> bool {
+        unsafe { keyboard_event_get_meta_key(self.ptr) }
+    }
+    
+    pub fn repeat(&self) -> bool {
+        unsafe { keyboard_event_get_repeat(self.ptr) }
+    }
+}
+
+pub struct InputEvent {
+    ptr: u64,
+}
+
+impl InputEvent {
+    pub fn new(ptr: u64) -> Self {
+        Self { ptr }
+    }
+    
+    pub fn data(&self) -> Option<String> {
+        let ptr = unsafe { input_event_get_data(self.ptr) };
+        if ptr == 0 { None } else { Some(DomString::from_ptr(ptr).to_string()) }
+    }
+    
+    pub fn input_type(&self) -> String {
+        let ptr = unsafe { input_event_get_input_type(self.ptr) };
+        DomString::from_ptr(ptr).to_string()
+    }
+    
+    pub fn is_composing(&self) -> bool {
+        unsafe { input_event_is_composing(self.ptr) }
+    }
+}
+
+/// Event listener callback type
+pub type EventListener = fn(&Event);

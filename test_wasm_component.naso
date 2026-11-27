@@ -1,0 +1,15 @@
+// Test file for WASM Component Model backend
+// Run with: naso build --target wasm-component --triple wasm32-wasip1 test_wasm_component.naso
+
+fn greet(name: String) -> String {
+    "Hello, " + name
+}
+
+fn add(a: Int, b: Int) -> Int {
+    a + b
+}
+
+fn main() -> Int {
+    let result = add(10, 20);
+    result
+}

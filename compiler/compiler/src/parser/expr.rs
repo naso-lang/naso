@@ -22,7 +22,10 @@ pub(crate) fn is_control_flow_stmt(kind: &ExprKind) -> bool {
             | ExprKind::Match(..)
             | ExprKind::For(..)
             | ExprKind::While(..)
+            | ExprKind::Loop(..)
             | ExprKind::Forall(..)
+            | ExprKind::Async(..)
+            | ExprKind::Await(..)
             // `return` is control flow, not a value.
             //
             // Without this, a trailing `return 2;` inside a block -- written without
@@ -62,7 +65,7 @@ fn binop_prec(op: BinOp) -> u8 {
 impl<'a> Parser<'a> {
     // ===== Expressions =====
 
-    /// Parse a full expression, handling right-associative assignment.
+    /// Parse a full expression, handling right-associative assignment and compound assignment.
     pub fn parse_expr(&mut self) -> Expr {
         let mut lhs = self.parse_expr_precedence(0);
         if self.at(TK::Assign) {
@@ -74,8 +77,43 @@ impl<'a> Parser<'a> {
                 span,
                 next_id(),
             );
+        } else if let Some((op, _)) = self.peek_compound_assign() {
+            let (op, op_token) = self.peek_compound_assign().unwrap();
+            self.bump(); // consume the compound assignment token
+            let rhs = self.parse_expr();
+            let span = lhs.span.merge(rhs.span);
+            // Desugar: x += y  =>  x = x + y
+            let binop = match op_token {
+                TK::PlusEq => BinOp::Add,
+                TK::MinusEq => BinOp::Sub,
+                TK::StarEq => BinOp::Mul,
+                TK::SlashEq => BinOp::Div,
+                TK::PercentEq => BinOp::Rem,
+                _ => unreachable!(),
+            };
+            let binary = Expr::new(
+                ExprKind::Binary(binop, Box::new(lhs.clone()), Box::new(rhs)),
+                span,
+                next_id(),
+            );
+            lhs = Expr::new(
+                ExprKind::Assign(Box::new(lhs), Box::new(binary)),
+                span,
+                next_id(),
+            );
         }
         lhs
+    }
+
+    fn peek_compound_assign(&self) -> Option<(BinOp, TK)> {
+        match self.peek() {
+            Some(TK::PlusEq) => Some((BinOp::Add, TK::PlusEq)),
+            Some(TK::MinusEq) => Some((BinOp::Sub, TK::MinusEq)),
+            Some(TK::StarEq) => Some((BinOp::Mul, TK::StarEq)),
+            Some(TK::SlashEq) => Some((BinOp::Div, TK::SlashEq)),
+            Some(TK::PercentEq) => Some((BinOp::Rem, TK::PercentEq)),
+            _ => None,
+        }
     }
 
     /// Parse an expression using precedence climbing (left-associative).
@@ -142,62 +180,204 @@ impl<'a> Parser<'a> {
             let span = e.span;
             return Expr::new(ExprKind::Unary(UnOp::Deref, Box::new(e)), span, next_id());
         }
+        // Address-of operator: &expr or @expr for function pointers
+        if self.eat(TK::Amp) {
+            let e = self.parse_unary();
+            let span = e.span;
+            return Expr::new(ExprKind::Unary(UnOp::AddrOf, Box::new(e)), span, next_id());
+        }
+        if self.eat(TK::At) {
+            let e = self.parse_unary();
+            let span = e.span;
+            return Expr::new(ExprKind::Unary(UnOp::AddrOf, Box::new(e)), span, next_id());
+        }
         self.parse_postfix()
     }
 
     fn parse_postfix(&mut self) -> Expr {
         let mut expr = self.parse_primary();
-        while !self.loop_should_stop() {
-            if self.at(TK::LParen) {
-                self.bump();
-                let args = self.parse_args_until(TK::RParen);
-                self.expect(TK::RParen);
-                let span = expr.span;
-                expr = Expr::new(ExprKind::Call(Box::new(expr), args), span, next_id());
-            } else if self.at(TK::Dot) {
-                self.bump();
-                let name = self.parse_ident();
+        // Control flow expressions (if, while, for, etc.) cannot be called.
+        // Prevents `while cond { ... }()` from being parsed as a call.
+        let is_control_flow = matches!(
+            &expr.kind,
+            ExprKind::If(..)
+                | ExprKind::Match(..)
+                | ExprKind::For(..)
+                | ExprKind::While(..)
+                | ExprKind::Forall(..)
+                | ExprKind::Async(..)
+                | ExprKind::Await(..)
+                | ExprKind::Quantified(..)
+                | ExprKind::Break(..)
+                | ExprKind::Continue
+                | ExprKind::Return(..)
+                | ExprKind::Reversible(..)
+                | ExprKind::QuantumOp(..)
+        );
+        if !is_control_flow {
+            while !self.loop_should_stop() {
                 if self.at(TK::LParen) {
                     self.bump();
                     let args = self.parse_args_until(TK::RParen);
                     self.expect(TK::RParen);
                     let span = expr.span;
+                    expr = Expr::new(ExprKind::Call(Box::new(expr), args), span, next_id());
+                } else if self.at(TK::Dot) {
+                    self.bump();
+                    let name = self.parse_ident();
+                    if self.at(TK::LParen) {
+                        self.bump();
+                        let args = self.parse_args_until(TK::RParen);
+                        self.expect(TK::RParen);
+                        let span = expr.span;
+                        expr = Expr::new(
+                            ExprKind::MethodCall(Box::new(expr), name, args),
+                            span,
+                            next_id(),
+                        );
+                    } else {
+                        let span = expr.span;
+                        expr = Expr::new(ExprKind::Field(Box::new(expr), name), span, next_id());
+                    }
+                } else if self.at(TK::ColonColon) {
+                    // Qualified path: Type::Variant or Module::function
+                    self.bump();
+                    let name = self.parse_ident();
+                    // Clone name.name early to avoid move issues
+                    let type_name = name.name.clone();
+                    if self.at(TK::LParen) {
+                        // Call: Type::method() or Module::function()
+                        self.bump();
+                        let args = self.parse_args_until(TK::RParen);
+                        self.expect(TK::RParen);
+                        let span = expr.span;
+                        // Treat as a Call with qualified name
+                        let _qualified_name = match &expr.kind {
+                            ExprKind::Var(v) => format!("{}::{}", v, type_name),
+                            _ => type_name.clone(),
+                        };
+                        expr = Expr::new(
+                            ExprKind::Call(
+                                Box::new(Expr::new(
+                                    ExprKind::Var(Ident::new(_qualified_name, expr.span)),
+                                    expr.span,
+                                    next_id(),
+                                )),
+                                args,
+                            ),
+                            span,
+                            next_id(),
+                        );
+                    } else {
+                        // Variant construction: Type::Variant { ... } or Type::Variant(...)
+                        if self.at(TK::LBrace) {
+                            // Struct-like variant: Result::Ok { value }
+                            self.bump();
+                            let mut fields = Vec::new();
+                            while !self.loop_should_stop() {
+                                if self.at(TK::RBrace) {
+                                    break;
+                                }
+                                fields.push(self.parse_field_expr());
+                                if self.at(TK::RBrace) {
+                                    break;
+                                }
+                                self.expect(TK::Comma);
+                                if self.at(TK::RBrace) {
+                                    break;
+                                }
+                            }
+                            self.expect(TK::RBrace);
+                            let span = expr.span;
+                            let _qualified_name = match &expr.kind {
+                                ExprKind::Var(v) => format!("{}::{}", v, type_name),
+                                _ => type_name.clone(),
+                            };
+                            expr = Expr::new(
+                                ExprKind::Struct(Ident::new(_qualified_name, expr.span), fields),
+                                span,
+                                next_id(),
+                            );
+                        } else if self.at(TK::LParen) {
+                            // Tuple-like variant: Result::Ok(value)
+                            self.bump();
+                            let mut args = Vec::new();
+                            while !self.loop_should_stop() {
+                                if self.at(TK::RParen) {
+                                    break;
+                                }
+                                args.push(self.parse_expr());
+                                if self.at(TK::RParen) {
+                                    break;
+                                }
+                                self.expect(TK::Comma);
+                                if self.at(TK::RParen) {
+                                    break;
+                                }
+                            }
+                            self.expect(TK::RParen);
+                            let span = expr.span;
+                            let _qualified_name = match &expr.kind {
+                                ExprKind::Var(v) => format!("{}::{}", v, type_name),
+                                _ => type_name.clone(),
+                            };
+                            expr = Expr::new(
+                                ExprKind::Variant(
+                                    Ident::new(
+                                        match &expr.kind {
+                                            ExprKind::Var(v) => v.name.clone(),
+                                            _ => "unknown".to_string(),
+                                        },
+                                        expr.span,
+                                    ),
+                                    Ident::new(name.name.clone(), span),
+                                    args,
+                                ),
+                                span,
+                                next_id(),
+                            );
+                        } else {
+                            // Just a reference to the variant (like a constant)
+                            let _qualified_name = match &expr.kind {
+                                ExprKind::Var(v) => format!("{}::{}", v, type_name),
+                                _ => type_name,
+                            };
+                            let span = expr.span;
+                            expr = Expr::new(
+                                ExprKind::Var(Ident::new(_qualified_name, expr.span)),
+                                span,
+                                next_id(),
+                            );
+                        }
+                    }
+                } else if self.at(TK::LBracket) {
+                    self.bump();
+                    // Parse comma-separated indices (supporting multi-dimensional indexing)
+                    let indices = self.parse_args_until(TK::RBracket);
+                    self.expect(TK::RBracket);
+                    let span = expr.span;
+                    // If multiple indices, wrap in a tuple
+                    let idx_expr = if indices.len() == 1 {
+                        indices.into_iter().next().unwrap()
+                    } else {
+                        Expr::new(ExprKind::Tuple(indices), span, next_id())
+                    };
                     expr = Expr::new(
-                        ExprKind::MethodCall(Box::new(expr), name, args),
+                        ExprKind::Index(Box::new(expr), Box::new(idx_expr)),
                         span,
                         next_id(),
                     );
-                } else {
+                } else if self.at(TK::As) {
+                    // Numeric cast: `expr as i8`. Reuses ExprKind::Ascribe, which
+                    // already existed in the AST and was wired into visiting and
+                    // inference but never parsed.
+                    self.bump();
+                    let ty = self.parse_type();
                     let span = expr.span;
-                    expr = Expr::new(ExprKind::Field(Box::new(expr), name), span, next_id());
-                }
-            } else if self.at(TK::LBracket) {
-                self.bump();
-                // Parse comma-separated indices (supporting multi-dimensional indexing)
-                let indices = self.parse_args_until(TK::RBracket);
-                self.expect(TK::RBracket);
-                let span = expr.span;
-                // If multiple indices, wrap in a tuple
-                let idx_expr = if indices.len() == 1 {
-                    indices.into_iter().next().unwrap()
+                    expr = Expr::new(ExprKind::Ascribe(Box::new(expr), ty), span, next_id());
                 } else {
-                    Expr::new(ExprKind::Tuple(indices), span, next_id())
-                };
-                expr = Expr::new(
-                    ExprKind::Index(Box::new(expr), Box::new(idx_expr)),
-                    span,
-                    next_id(),
-                );
-            } else if self.at(TK::As) {
-                // Numeric cast: `expr as i8`. Reuses ExprKind::Ascribe, which
-                // already existed in the AST and was wired into visiting and
-                // inference but never parsed.
-                self.bump();
-                let ty = self.parse_type();
-                let span = expr.span;
-                expr = Expr::new(ExprKind::Ascribe(Box::new(expr), ty), span, next_id());
-            } else {
-                break;
+                    break;
+                }
             }
         }
         expr
@@ -231,10 +411,13 @@ impl<'a> Parser<'a> {
             Some(TK::For) => self.parse_for(),
             Some(TK::Forall) => self.parse_quantified(),
             Some(TK::While) => self.parse_while(),
+            Some(TK::Loop) => self.parse_loop(),
             Some(TK::Break) => self.parse_break(),
             Some(TK::Continue) => self.parse_continue(),
             Some(TK::Return) => self.parse_return(),
             Some(TK::Reversible) => self.parse_reversible_expr(),
+            Some(TK::Async) => self.parse_async_expr(),
+            Some(TK::Await) => self.parse_await_expr(),
             Some(TK::Measure) => self.parse_measure(),
             Some(TK::Entangle) => self.parse_entangle(),
             Some(TK::QAlloc) => self.parse_qalloc(),
@@ -274,6 +457,18 @@ impl<'a> Parser<'a> {
             }
         };
         Expr::new(ExprKind::Literal(lit), span, next_id())
+    }
+
+    /// Parse a string literal token and return the string value.
+    pub fn parse_string_literal(&mut self) -> Option<String> {
+        let tok = self.bump()?;
+        match &tok.kind {
+            TK::Str(s) => Some(s.clone()),
+            _ => {
+                self.pos -= 1;
+                None
+            }
+        }
     }
 
     fn parse_var(&mut self) -> Expr {
@@ -685,29 +880,77 @@ impl<'a> Parser<'a> {
     fn parse_array(&mut self) -> Expr {
         let start = self.pos;
         self.expect(TK::LBracket);
-        let mut items = Vec::new();
-        while !self.loop_should_stop() {
-            if self.at(TK::RBracket) {
-                break;
-            }
-            items.push(self.parse_expr());
-            if self.at(TK::RBracket) {
-                break;
-            }
-            self.expect(TK::Comma);
-            if self.at(TK::RBracket) {
-                break;
+        
+        // Check for repeat syntax: [value; count]
+        // First, try to parse an expression
+        if !self.at(TK::RBracket) {
+            let first = self.parse_expr();
+            if self.at(TK::Semicolon) {
+                // Repeat syntax: [value; count]
+                self.bump(); // consume ';'
+                let count = self.parse_expr();
+                self.expect(TK::RBracket);
+                let span = self.span_from(start);
+                return Expr::new(
+                    ExprKind::ArrayRepeat(Box::new(first), Box::new(count)),
+                    span,
+                    next_id(),
+                );
+            } else {
+                // Regular array: [elem1, elem2, ...]
+                let mut items = vec![first];
+                while !self.loop_should_stop() {
+                    if self.at(TK::RBracket) {
+                        break;
+                    }
+                    self.expect(TK::Comma);
+                    if self.at(TK::RBracket) {
+                        break;
+                    }
+                    items.push(self.parse_expr());
+                    if self.at(TK::RBracket) {
+                        break;
+                    }
+                }
+                self.expect(TK::RBracket);
+                let span = self.span_from(start);
+                return Expr::new(ExprKind::Array(items), span, next_id());
             }
         }
+        
+        // Empty array
         self.expect(TK::RBracket);
         let span = self.span_from(start);
-        Expr::new(ExprKind::Array(items), span, next_id())
+        Expr::new(ExprKind::Array(Vec::new()), span, next_id())
     }
 
     fn parse_block_expr(&mut self) -> Expr {
         let b = self.parse_block();
         let span = b.span;
         Expr::new(ExprKind::Block(Box::new(b)), span, next_id())
+    }
+
+    // ===== Async/Await =====
+
+    fn parse_async_expr(&mut self) -> Expr {
+        let start = self.pos;
+        self.expect(TK::Async);
+        let body = self.parse_block_expr(); // parse_block_expr returns ExprKind::Block
+        // Extract the inner Block from the Block expression
+        let block = match body.kind {
+            ExprKind::Block(b) => b,
+            _ => unreachable!("parse_block_expr always returns Block"),
+        };
+        let span = self.span_from(start);
+        Expr::new(ExprKind::Async(block), span, next_id())
+    }
+
+    fn parse_await_expr(&mut self) -> Expr {
+        let start = self.pos;
+        self.expect(TK::Await);
+        let future = self.parse_unary(); // await has higher precedence than most operators
+        let span = self.span_from(start);
+        Expr::new(ExprKind::Await(Box::new(future)), span, next_id())
     }
 
     // ===== Control flow =====
@@ -956,6 +1199,23 @@ impl<'a> Parser<'a> {
         let span = self.span_from(start);
         Expr::new(
             ExprKind::While(Box::new(cond), Box::new(body)),
+            span,
+            next_id(),
+        )
+    }
+
+    fn parse_loop(&mut self) -> Expr {
+        let start = self.pos;
+        self.expect(TK::Loop);
+        let body = self.parse_block_expr();
+        // Extract the inner Block from the Block expression
+        let block = match body.kind {
+            ExprKind::Block(b) => b,
+            _ => unreachable!("parse_block_expr always returns Block"),
+        };
+        let span = self.span_from(start);
+        Expr::new(
+            ExprKind::Loop(block),
             span,
             next_id(),
         )

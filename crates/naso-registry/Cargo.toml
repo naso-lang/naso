@@ -1,0 +1,56 @@
+[package]
+name = "naso-registry"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/naso-lang/naso"
+description = "Naso package registry server - scales to 10k+ packages with trust and supply chain security"
+
+[dependencies]
+naso-compiler = { path = "../../compiler" }
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.35", features = ["full"], optional = true }
+axum = { version = "0.7", optional = true }
+tower = { version = "0.4", optional = true }
+tower-http = { version = "0.5", features = ["cors", "trace"], optional = true }
+sqlx = { version = "0.7", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json"], optional = true }
+uuid = { version = "1.0", features = ["serde", "v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+blake3 = "1.5"
+semver = "1.0"
+clap = { version = "4.5", features = ["derive"], optional = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+anyhow = "1.0"
+base64 = "0.21"
+mime = "0.3"
+mime_guess = "2.0"
+tar = "0.4"
+flate2 = "1.0"
+walkdir = "2.0"
+toml = "0.8"
+indexmap = "2.0"
+dashmap = "6.1"
+parking_lot = "0.12"
+lru = "0.10"
+metrics = "0.21"
+metrics-exporter-prometheus = "0.13"
+axum-prometheus = { version = "0.2", optional = true }
+
+[features]
+default = []
+server = ["axum", "tower", "tower-http", "sqlx", "tokio", "axum-prometheus"]
+cli = ["clap"]
+
+[[bin]]
+name = "naso-registry"
+path = "src/bin/server.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "naso-pkg"
+path = "src/bin/cli.rs"
+required-features = ["cli"]

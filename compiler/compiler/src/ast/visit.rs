@@ -136,6 +136,7 @@ pub mod walk {
             Item::Module(m) => visitor.visit_module(m),
             Item::Import(_) => Ok(VisitOutcome::Continue),
             Item::Const(c) => visitor.visit_const(c),
+            Item::Extern(_) => Ok(VisitOutcome::Continue),
         }
     }
 
@@ -323,6 +324,12 @@ pub mod walk {
                 }
                 Ok(VisitOutcome::Continue)
             }
+            ExprKind::ArrayRepeat(value, count) => {
+                if visitor.visit_expr(value)? == VisitOutcome::Stop {
+                    return Ok(VisitOutcome::Stop);
+                }
+                visitor.visit_expr(count)
+            }
             ExprKind::Block(b) => walk_block(visitor, b),
             ExprKind::If(cond, then, else_) => {
                 if visitor.visit_expr(cond)? == VisitOutcome::Stop {
@@ -409,6 +416,9 @@ pub mod walk {
                 }
                 visitor.visit_expr(body)
             }
+            ExprKind::Loop(body) => {
+                walk_block(visitor, body)
+            }
             ExprKind::Return(e) | ExprKind::Break(e) => {
                 if let Some(inner) = e {
                     visitor.visit_expr(inner)
@@ -459,6 +469,8 @@ pub mod walk {
                 Ok(VisitOutcome::Continue)
             }
             ExprKind::Ascribe(e, _) => visitor.visit_expr(e),
+            ExprKind::Async(block) => walk_block(visitor, block),
+            ExprKind::Await(e) => visitor.visit_expr(e),
         }
     }
 
@@ -529,6 +541,7 @@ pub mod walk {
             | TypeKind::Nat
             | TypeKind::Quint8
             | TypeKind::Qubit
+            | TypeKind::Pointer(_)
             | TypeKind::Universe(_)
             | TypeKind::Var(_)
             | TypeKind::Meta(_)

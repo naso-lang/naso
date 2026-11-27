@@ -8,6 +8,8 @@ use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::Waker;
 
+use super::ensure_uring_background_thread;
+
 /// Buffer pool for zero-copy I/O
 pub struct BufferPool {
     buffers: Vec<Vec<u8>>,
@@ -61,24 +63,21 @@ pub enum UringOp {
 }
 
 /// Pending io_uring operation
-pub struct PendingOp {
-    pub op_type: UringOp,
-    pub fd: u64,
-    pub buf_idx: Option<usize>,
-    pub offset: usize,
-    pub len: usize,
-    pub callback: usize,
-    pub waker: Option<Waker>,
-    pub out_ptr: usize, // For accept: *mut u64 to write [listener_fd, conn_fd]
-    // Completion result for synchronous use
-    pub completed: bool,
-    pub result: i32,
+struct PendingOp {
+    op_type: UringOp,
+    fd: u64,
+    buf_idx: Option<usize>,
+    offset: usize,
+    len: usize,
+    callback: usize,
+    waker: Option<Waker>,
+    out_ptr: usize, // For accept: *mut u64 to write [listener_fd, conn_fd]
 }
 
 /// io_uring-based async poller
 pub struct UringPoller {
     ring: IoUring,
-    pub pending: HashMap<u64, PendingOp>, // keyed by user_data
+    pending: HashMap<u64, PendingOp>, // keyed by user_data
     buffer_pool: BufferPool,
     next_user_data: u64,
     listener_fds: HashMap<u64, u64>, // token -> listener_fd
@@ -127,8 +126,6 @@ impl UringPoller {
             callback,
             waker: None,
             out_ptr: out_ptr as usize,
-            completed: false,
-            result: 0,
         });
         
         self.listener_fds.insert(user_data, listener_fd);
@@ -180,8 +177,6 @@ impl UringPoller {
             callback,
             waker: None,
             out_ptr: 0,
-            completed: false,
-            result: 0,
         });
         
         Ok(user_data)
@@ -219,8 +214,6 @@ impl UringPoller {
             callback,
             waker: None,
             out_ptr: 0,
-            completed: false,
-            result: 0,
         });
         
         Ok(user_data)
@@ -297,10 +290,6 @@ impl UringPoller {
                     if let Some(idx) = op.buf_idx {
                         self.buffer_pool.release(idx);
                     }
-                    
-                    // Store completion result for synchronous use
-                    op.completed = true;
-                    op.result = result;
                 }
                 
                 UringOp::Write => {
@@ -310,10 +299,6 @@ impl UringPoller {
                         let callback: extern "C" fn(*mut u8) = unsafe { std::mem::transmute(op.callback) };
                         callback(std::ptr::null_mut());
                     }
-                    
-                    // Store completion result for synchronous use
-                    op.completed = true;
-                    op.result = result;
                 }
                 
                 UringOp::Connect => {
@@ -340,10 +325,24 @@ impl UringPoller {
 }
 
 /// Global io_uring poller instance
-static URING_POLLER: OnceLock<Mutex<Option<UringPoller>>> = OnceLock::new();
+pub static URING_POLLER: OnceLock<Mutex<UringPoller>> = OnceLock::new();
 
-pub fn uring_poller() -> &'static Mutex<Option<UringPoller>> {
-    URING_POLLER.get_or_init(|| Mutex::new(UringPoller::new(4096).ok()))
+pub fn uring_poller() -> &'static Mutex<UringPoller> {
+    URING_POLLER.get_or_init(|| {
+        Mutex::new(UringPoller::new(4096).expect("Failed to create io_uring"))
+    })
+}
+
+/// FFI: Initialize io_uring backend
+#[unsafe(no_mangle)]
+pub extern "C" fn naso_uring_init() -> u64 {
+    match UringPoller::new(4096) {
+        Ok(poller) => {
+            let _ = URING_POLLER.set(Mutex::new(poller));
+            1
+        }
+        Err(_) => 0,
+    }
 }
 
 /// FFI: Submit async accept with io_uring
@@ -353,14 +352,11 @@ pub extern "C" fn naso_tcp_accept_uring(
     out_ptr: *mut u64,
     callback: *const u8,
 ) -> u64 {
-    let mut poller_guard = uring_poller().lock().unwrap();
-    if let Some(ref mut poller) = *poller_guard {
-        match poller.submit_accept(listener_fd, out_ptr, callback as usize) {
-            Ok(user_data) => user_data,
-            Err(_) => 0,
-        }
-    } else {
-        0 // io_uring not available
+    ensure_uring_background_thread();
+    let mut poller = uring_poller().lock().unwrap();
+    match poller.submit_accept(listener_fd, out_ptr, callback as usize) {
+        Ok(user_data) => user_data,
+        Err(_) => 0,
     }
 }
 
@@ -372,14 +368,11 @@ pub extern "C" fn naso_read_uring(
     len: usize,
     callback: *const u8,
 ) -> u64 {
-    let mut poller_guard = uring_poller().lock().unwrap();
-    if let Some(ref mut poller) = *poller_guard {
-        match poller.submit_read(fd, buf_ptr, len, callback as usize) {
-            Ok(user_data) => user_data,
-            Err(_) => 0,
-        }
-    } else {
-        0 // io_uring not available
+    ensure_uring_background_thread();
+    let mut poller = uring_poller().lock().unwrap();
+    match poller.submit_read(fd, buf_ptr, len, callback as usize) {
+        Ok(user_data) => user_data,
+        Err(_) => 0,
     }
 }
 
@@ -391,56 +384,41 @@ pub extern "C" fn naso_write_uring(
     len: usize,
     callback: *const u8,
 ) -> u64 {
-    let mut poller_guard = uring_poller().lock().unwrap();
-    if let Some(ref mut poller) = *poller_guard {
-        match poller.submit_write(fd, buf_ptr, len, callback as usize) {
-            Ok(user_data) => user_data,
-            Err(_) => 0,
-        }
-    } else {
-        0 // io_uring not available
+    ensure_uring_background_thread();
+    let mut poller = uring_poller().lock().unwrap();
+    match poller.submit_write(fd, buf_ptr, len, callback as usize) {
+        Ok(user_data) => user_data,
+        Err(_) => 0,
     }
 }
 
 /// FFI: Batch submit all pending operations
 #[unsafe(no_mangle)]
 pub extern "C" fn naso_uring_submit() -> u64 {
-    let mut poller_guard = uring_poller().lock().unwrap();
-    if let Some(ref mut poller) = *poller_guard {
-        match poller.submit_batch() {
-            Ok(count) => count as u64,
-            Err(_) => 0,
-        }
-    } else {
-        0 // io_uring not available
+    let mut poller = uring_poller().lock().unwrap();
+    match poller.submit_batch() {
+        Ok(count) => count as u64,
+        Err(_) => 0,
     }
 }
 
 /// FFI: Wait for and process completions
 #[unsafe(no_mangle)]
 pub extern "C" fn naso_uring_wait(min_completions: u64) -> u64 {
-    let mut poller_guard = uring_poller().lock().unwrap();
-    if let Some(ref mut poller) = *poller_guard {
-        match poller.wait_and_process(min_completions as u32) {
-            Ok(count) => count as u64,
-            Err(_) => 0,
-        }
-    } else {
-        0 // io_uring not available
+    let mut poller = uring_poller().lock().unwrap();
+    match poller.wait_and_process(min_completions as u32) {
+        Ok(count) => count as u64,
+        Err(_) => 0,
     }
 }
 
 /// FFI: Poll completions non-blocking
 #[unsafe(no_mangle)]
 pub extern "C" fn naso_uring_poll() -> u64 {
-    let mut poller_guard = uring_poller().lock().unwrap();
-    if let Some(ref mut poller) = *poller_guard {
-        match poller.poll_completions() {
-            Ok(count) => count as u64,
-            Err(_) => 0,
-        }
-    } else {
-        0 // io_uring not available
+    let mut poller = uring_poller().lock().unwrap();
+    match poller.poll_completions() {
+        Ok(count) => count as u64,
+        Err(_) => 0,
     }
 }
 

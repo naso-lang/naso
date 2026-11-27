@@ -8,7 +8,7 @@
 use super::access_relation::AccessRelations;
 use super::affine_domain::AffineDomain;
 use super::schedule_tree::{ScheduleTree, StmtId};
-use crate::ast::{Mutability, Quantity};
+use crate::ast::{Mutability, Quantity, TypeDef};
 use crate::ir::schedule_tree::ScheduleNode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -20,6 +20,8 @@ pub enum PirExpr {
     IntLit(i64),
     /// Float literal (uses string to avoid Eq issue with f64)
     FloatLit(String),
+    /// String literal
+    StringLit(String),
     /// Boolean literal
     BoolLit(bool),
     /// Variable reference
@@ -41,6 +43,10 @@ pub enum PirExpr {
     },
     /// Struct field access
     Field { base: Box<PirExpr>, field: String },
+    /// Struct literal - tuple of fields
+    Struct { fields: Vec<PirExpr> },
+    /// Array literal
+    Array { items: Vec<PirExpr> },
     /// Let binding (for SSA form)
     Let {
         name: String,
@@ -175,6 +181,12 @@ pub enum PirExpr {
     /// No value: there is nowhere for a value to go, since the loop has not finished.
     Continue,
 
+    /// Async block: `async { ... }` - creates a future
+    Async(Box<PirExpr>),
+
+    /// Await expression: `await future` - suspends until future completes
+    Await(Box<PirExpr>),
+
     /// A `while` loop: evaluate `cond`, and while it is true run `body`.
     ///
     /// This is NOT sugar for `Forall`. A `forall` has a statically known,
@@ -233,6 +245,8 @@ pub enum BinaryOp {
 pub enum UnaryOp {
     Neg,
     Not,
+    Deref,
+    AddrOf,
 }
 
 /// The element type of a tensor or scalar, as the LLVM ABI needs it.
@@ -349,7 +363,7 @@ pub enum ParamKind {
 }
 
 /// One function parameter, with everything an ABI needs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FunctionParam {
     pub name: String,
     pub kind: ParamKind,
@@ -358,7 +372,7 @@ pub struct FunctionParam {
 }
 
 /// PIR Statement: a computational unit with iteration domain
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PirStatement {
     pub id: StmtId,
     /// Iteration domain for this statement
@@ -382,7 +396,7 @@ pub type QuantityMap = HashMap<String, Quantity>;
 /// difference is exactly what a call site needs to know: whether the call yields a
 /// value or not. Carrying it is what lets a backend emit a typed `ret` and refuse a
 /// call that uses a void result as a value.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum FnReturn {
     /// No return type declared. The function yields nothing.
     Void,
@@ -421,7 +435,7 @@ pub enum FnReturn {
 /// across a flattened module that is three uses of one name and PIR validation rejects
 /// the file. Scoping the count to the function is not a loosening -- it is the same
 /// rule applied at the right granularity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PirFunction {
     /// The name as written in the source.
     pub name: String,
@@ -480,7 +494,7 @@ pub struct PirFunction {
     /// `Block::expr` -- the trailing expression the PARSER folded off the end of the
     /// body -- and only when its kind yields a value. `let mut y = x * 3.0;` is NOT a
     /// trailing expression: the parser routes every `let` to `Block::stmts`, so that
-    /// program has no `Block::expr` at all and therefore no tail value, even though
+    /// body has no `Block::expr` at all and therefore no tail value, even though
     /// lowering does emit a statement for the binding. "A statement exists in PIR" and
     /// "the body ends in an expression whose value is the function's result" are
     /// different facts, and only the second one may be returned. Lowering checks the
@@ -497,7 +511,7 @@ pub struct PirFunction {
 }
 
 /// Complete PIR Module
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PirModule {
     /// All statements in the module
     pub statements: Vec<PirStatement>,
@@ -527,6 +541,8 @@ pub struct PirModule {
     pub function_params: Vec<FunctionParam>,
     /// Function signatures for external calls
     pub extern_functions: Vec<ExternFunction>,
+    /// Type definitions (structs, enums, aliases) from the source program
+    pub type_definitions: Vec<TypeDef>,
     /// The program's functions, each with its own scope.
     ///
     /// # Relationship to the flat fields above
@@ -564,20 +580,21 @@ impl Default for PirModule {
             parameters: Vec::new(),
             function_params: Vec::new(),
             extern_functions: Vec::new(),
+            type_definitions: Vec::new(),
             functions: Vec::new(),
         }
     }
 }
 
 /// External function declaration
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExternFunction {
     pub name: String,
     pub params: Vec<ExternParam>,
     pub return_type: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExternParam {
     pub name: String,
     pub ty: String,
@@ -603,6 +620,7 @@ impl PirModule {
             // hand-constructed module genuinely has no function parameters.
             function_params: Vec::new(),
             extern_functions: Vec::new(),
+            type_definitions: Vec::new(),
             // Likewise: a hand-constructed module (every `.pir` fixture, and every
             // test that builds one by hand) has one implicit entry body and no
             // function structure. Populating this is the lowering pass's job.
@@ -717,6 +735,7 @@ impl PirModule {
                     || indices.iter().any(|i| self.expr_contains_var(i, var))
             }
             PirExpr::Field { base, .. } => self.expr_contains_var(base, var),
+            PirExpr::StringLit(_) => false,
             // A sequence's contents must be searched. Returning `false` here would
             // make every statement inside a loop body invisible to linearity
             // checking, so a linear value used only inside a loop would pass -- a
@@ -754,6 +773,10 @@ impl PirModule {
                 args.iter().any(|a| self.expr_contains_var(a, var))
                     || qubits.iter().any(|q| self.expr_contains_var(q, var))
             }
+            PirExpr::Array { items } => items.iter().any(|a| self.expr_contains_var(a, var)),
+            PirExpr::Struct { fields } => fields.iter().any(|f| self.expr_contains_var(f, var)),
+            PirExpr::Async(inner) => self.expr_contains_var(inner, var),
+            PirExpr::Await(inner) => self.expr_contains_var(inner, var),
             PirExpr::IntLit(_) | PirExpr::FloatLit(_) | PirExpr::BoolLit(_) => false,
         }
     }
@@ -952,6 +975,7 @@ fn pir_expr_to_string(expr: &PirExpr, _indent: usize) -> String {
         PirExpr::IntLit(v) => format!("{}", v),
         PirExpr::FloatLit(v) => format!("{}", v),
         PirExpr::BoolLit(v) => format!("{}", v),
+        PirExpr::StringLit(s) => format!("\"{}\"", s),
         PirExpr::Var(v) => v.clone(),
         // The `Stmts` arm flattens the body into the same expression, because a
         // `while` produces no value and dropping the body here would make a printed
@@ -1026,6 +1050,14 @@ fn pir_expr_to_string(expr: &PirExpr, _indent: usize) -> String {
                     .join(", ")
             )
         }
+        PirExpr::Array { items } => {
+            let inner: Vec<String> = items.iter().map(|a| pir_expr_to_string(a, 0)).collect();
+            format!("[{}]", inner.join(", "))
+        }
+        PirExpr::Struct { fields } => {
+            let inner: Vec<String> = fields.iter().map(|f| pir_expr_to_string(f, 0)).collect();
+            format!("{{{}}}", inner.join(", "))
+        }
         PirExpr::Index { base, indices } => {
             format!(
                 "{}[{}]",
@@ -1090,6 +1122,8 @@ fn pir_expr_to_string(expr: &PirExpr, _indent: usize) -> String {
                     .join(", ")
             )
         }
+        PirExpr::Async(inner) => format!("async {}", pir_expr_to_string(inner, 0)),
+        PirExpr::Await(inner) => format!("await {}", pir_expr_to_string(inner, 0)),
     }
 }
 
@@ -1118,6 +1152,8 @@ fn unary_op_to_str(op: UnaryOp) -> &'static str {
     match op {
         UnaryOp::Neg => "-",
         UnaryOp::Not => "!",
+        UnaryOp::Deref => "*",
+        UnaryOp::AddrOf => "&",
     }
 }
 

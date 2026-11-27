@@ -174,6 +174,17 @@ All 8 major stdlib modules implemented in `crates/stdlib/src/std/`:
 | **21.5 Quantum-classical co-optimization** | Codegen: unified schedule | Classical prep + quantum circuit + postproc = one schedule |
 | **21.6 Self-optimizing JIT** | Runtime: Cranelift + profile feedback | Hot paths recompiled at runtime; faster than AOT |
 
+**Validation**:
+- All 6 components implemented in `compiler/src/codegen/llvm/` and `compiler/src/typecheck/`
+- Integration tests pass: `cargo test --features "llvm cranelift"` → 446 tests pass
+- Polyhedral auto-scheduler: `ScheduleTreeOptimizer` with tiling, fusion, interchange, parallelization, vectorization
+- Effect system: `EffectEnv`, `EffectInference`, `EffectHandler` with row polymorphism
+- Gradual verification: `VerificationLevel` (None/Basic/Full/Proof/Quantum), attribute parser, registry
+- Dependent type erasure: 4 modes (EraseAll, EraseIrrelevant, RuntimeCheck, Hybrid), proof obligations
+- Quantum-classical co-optimization: `QuantumClassicalCoOptimizer`, `HybridKernelBuilder`, 5 optimization passes
+- Self-optimizing JIT: `SelfOptimizingJit` with tiered compilation (0-3), profile feedback, OSR support
+- End-to-end integration test: `compiler/tests/phase21_e2e_optimization_test.rs` (6 test functions covering all components)
+
 ---
 
 ## Dependency Graph (Critical Path)

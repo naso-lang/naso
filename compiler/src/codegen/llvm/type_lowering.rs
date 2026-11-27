@@ -21,8 +21,6 @@ pub struct LlvmTypeLowering<'ctx> {
     context: &'ctx Context,
     /// Cache of named struct types
     struct_cache: HashMap<String, StructType<'ctx>>,
-    /// Field name to index mapping for struct types
-    struct_field_indices: HashMap<String, HashMap<String, u32>>,
     /// Qubit type (opaque pointer)
     qubit_type: PointerType<'ctx>,
     /// Result type (i1)
@@ -38,7 +36,6 @@ impl<'ctx> LlvmTypeLowering<'ctx> {
         Self {
             context,
             struct_cache: HashMap::new(),
-            struct_field_indices: HashMap::new(),
             qubit_type,
             result_type,
         }
@@ -57,8 +54,8 @@ impl<'ctx> LlvmTypeLowering<'ctx> {
     ) -> PointerType<'ctx> {
         let _ = pointee;
         let addr_space = AddressSpace::try_from(address_space).unwrap_or(AddressSpace::default());
-        // With LLVM 15+ opaque pointers, ptr_type only takes address space
-        context.ptr_type(addr_space)
+        // With typed-pointers, use a type's ptr_type method
+        context.i8_type().ptr_type(addr_space)
     }
 
     /// Get the qubit type (opaque pointer)
@@ -131,23 +128,23 @@ impl<'ctx> LlvmTypeLowering<'ctx> {
 
     /// Lower an aggregate type
     fn lower_aggregate(&mut self, agg: &LlvmAggregateType) -> CodegenResult<BasicTypeEnum<'ctx>> {
-        match *agg {
-            LlvmAggregateType::Int(width) => Ok(self.int_type(width).into()),
-            LlvmAggregateType::Float(width) => Ok(self.float_type(width).into()),
-            LlvmAggregateType::Struct(ref fields) => {
+        match agg {
+            LlvmAggregateType::Int(width) => Ok(self.int_type(*width).into()),
+            LlvmAggregateType::Float(width) => Ok(self.float_type(*width).into()),
+            LlvmAggregateType::Struct(fields) => {
                 let field_types: CodegenResult<Vec<_>> = fields
                     .iter()
-                    .map(|f| self.lower_quantity_aware(f))
+                    .map(|f| self.lower_quantity_aware(&f.ty))
                     .collect();
                 let struct_type = self.context.struct_type(&field_types?, false);
                 Ok(struct_type.into())
             }
-            LlvmAggregateType::Array(ref elem, size) => {
+            LlvmAggregateType::Array(elem, size) => {
                 let elem_type = self.lower_quantity_aware(elem)?;
-                let array_type = elem_type.array_type(size as u32);
+                let array_type = elem_type.array_type(*size as u32);
                 Ok(array_type.into())
             }
-            LlvmAggregateType::Tuple(ref elems) => {
+            LlvmAggregateType::Tuple(elems) => {
                 let elem_types: CodegenResult<Vec<_>> =
                     elems.iter().map(|e| self.lower_quantity_aware(e)).collect();
                 let struct_type = self.context.struct_type(&elem_types?, false);
@@ -167,7 +164,7 @@ impl<'ctx> LlvmTypeLowering<'ctx> {
         // erase it in the resulting type.
         let pointee_type = self.lower_quantity_aware(&ptr.pointee)?;
         let addr_space = self.address_space(ptr.address_space)?;
-        Ok(self.context.ptr_type(addr_space).into())
+        Ok(self.ptr_type(pointee_type, addr_space).into())
     }
 
     /// Convert a raw address space id into an inkwell `AddressSpace`.
@@ -196,9 +193,11 @@ impl<'ctx> LlvmTypeLowering<'ctx> {
         pointee: BasicTypeEnum<'ctx>,
         address_space: AddressSpace,
     ) -> PointerType<'ctx> {
-        // With LLVM 15+ opaque pointers, ptr_type only takes address space
+        // Keep the pointee meaningful: opaque pointers erase it in the IR, but
+        // dropping it entirely would lose the caller's intent silently.
         let _ = pointee;
-        self.context.ptr_type(address_space)
+        // With typed-pointers, use a type's ptr_type method
+        self.context.i8_type().ptr_type(address_space)
     }
 
     /// Get function type

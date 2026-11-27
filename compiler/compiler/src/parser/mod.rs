@@ -268,6 +268,11 @@ impl<'a> Parser<'a> {
         self.tokens.get(self.pos).map(|t| &t.kind)
     }
 
+    /// Look ahead n tokens.
+    pub fn peek_n(&self, n: usize) -> Option<&TK> {
+        self.tokens.get(self.pos + n).map(|t| &t.kind)
+    }
+
     /// Look at the current token without consuming it.
     fn peek_token(&self) -> Option<&Token> {
         self.tokens.get(self.pos)
@@ -425,6 +430,19 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse mutability keyword (`mut`, `inout`, `consume`) if present
+    fn parse_mutability(&mut self) -> Option<Mutability> {
+        if self.eat(TK::InOut) {
+            Some(Mutability::InOut)
+        } else if self.eat(TK::Consume) {
+            Some(Mutability::Consume)
+        } else if self.eat(TK::Mut) {
+            Some(Mutability::Mut)
+        } else {
+            None
+        }
+    }
+
     // ===== Identifiers =====
 
     /// Parse an identifier or type-name token into an [`Ident`].
@@ -466,21 +484,24 @@ impl<'a> Parser<'a> {
     pub fn parse_item(&mut self) -> Item {
         match self.peek() {
             Some(TK::Fn) => Item::Function(self.parse_fn()),
+            Some(TK::Async) if self.peek_n(1) == Some(&TK::Fn) => Item::Function(self.parse_fn()),
             Some(TK::Struct) => Item::TypeDef(self.parse_struct()),
             Some(TK::Enum) => Item::TypeDef(self.parse_enum()),
             Some(TK::Type) => Item::TypeDef(self.parse_type_alias()),
             Some(TK::Const) => Item::Const(self.parse_const()),
             Some(TK::Import) => Item::Import(self.parse_import()),
             Some(TK::Mod) => Item::Module(self.parse_module()),
+            Some(TK::Extern) => Item::Extern(self.parse_extern_block()),
             _ => self.unexpected("a top-level item"),
         }
     }
 
     // ===== Functions =====
 
-    /// Parse a `fn` item.
+    /// Parse a `fn` item (optionally preceded by `async`).
     pub fn parse_fn(&mut self) -> Function {
         let start = self.pos;
+        let is_async = self.eat(TK::Async);
         self.expect(TK::Fn);
 
         // Check for reversible modifier
@@ -541,6 +562,7 @@ impl<'a> Parser<'a> {
             span,
             attributes: Vec::new(),
             is_reversible,
+            is_async,
             quantity,
             requires,
         }
@@ -880,6 +902,104 @@ impl<'a> Parser<'a> {
         Module {
             name,
             items,
+            span: self.span_from(start),
+        }
+    }
+
+    fn parse_extern_block(&mut self) -> ExternBlock {
+        let start = self.pos;
+        self.expect(TK::Extern);
+        let abi = if matches!(self.peek(), Some(TK::Str(_))) {
+            let s = self.parse_string_literal();
+            s.unwrap_or_else(|| "C".to_string())
+        } else {
+            "C".to_string()
+        };
+        self.expect(TK::LBrace);
+        let mut functions = Vec::new();
+        while !self.is_eof() && !self.at(TK::RBrace) {
+            functions.push(self.parse_extern_fn());
+        }
+        self.expect(TK::RBrace);
+        ExternBlock {
+            abi,
+            functions,
+            span: self.span_from(start),
+        }
+    }
+
+    fn parse_extern_fn(&mut self) -> ExternFn {
+        let start = self.pos;
+        let link_name = if self.at(TK::Hash) {
+            self.bump(); // consume '#'
+            self.expect(TK::LBracket);
+            if self.at_ident("link_name") {
+                self.bump(); // consume the ident
+                self.expect(TK::Assign);
+                let name = self.parse_string_literal().unwrap_or_default();
+                self.expect(TK::RBracket);
+                Some(name)
+            } else {
+                self.expect(TK::RBracket);
+                None
+            }
+        } else {
+            None
+        };
+        let is_async = self.eat(TK::Async);
+        self.expect(TK::Fn);
+        let name = self.parse_ident();
+        self.expect(TK::LParen);
+        let params = if self.at(TK::RParen) {
+            Vec::new()
+        } else {
+            self.parse_extern_params()
+        };
+        self.expect(TK::RParen);
+        let ret_ty = if self.at(TK::Arrow) {
+            self.bump();
+            Some(self.parse_type())
+        } else {
+            None
+        };
+        self.expect(TK::Semicolon);
+        ExternFn {
+            name,
+            params,
+            ret_ty,
+            link_name,
+            span: self.span_from(start),
+            is_async,
+        }
+    }
+
+    fn parse_extern_params(&mut self) -> Vec<ExternParam> {
+        let mut params = Vec::new();
+        while !self.loop_should_stop() {
+            params.push(self.parse_extern_param());
+            if self.at(TK::RParen) {
+                break;
+            }
+            self.expect(TK::Comma);
+            if self.at(TK::RParen) {
+                break;
+            }
+        }
+        params
+    }
+
+    fn parse_extern_param(&mut self) -> ExternParam {
+        let start = self.pos;
+        let quantity = self.parse_quantity().unwrap_or(Quantity::Many);
+        let mutability = self.parse_mutability().unwrap_or(Mutability::Immutable);
+        let name = self.parse_ident();
+        self.expect(TK::Colon);
+        let ty = self.parse_type();
+        ExternParam {
+            name,
+            ty,
+            quantity,
+            mutability,
             span: self.span_from(start),
         }
     }

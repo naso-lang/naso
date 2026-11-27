@@ -1,0 +1,478 @@
+//! Fetch API Bindings
+//!
+//! Zero-cost bindings for the Fetch API.
+
+extern "C" {
+    // Request
+    fn request_new(url: *const u8, url_len: usize, init: u64) -> u64;
+    fn request_get_method(request: u64) -> u64; // Returns string pointer
+    fn request_get_url(request: u64) -> u64; // Returns string pointer
+    fn request_get_headers(request: u64) -> u64; // Returns Headers
+    fn request_get_body(request: u64) -> u64; // Returns Body
+    fn request_get_body_used(request: u64) -> bool;
+    fn request_get_cache(request: u64) -> u64; // Returns string pointer
+    fn request_get_credentials(request: u64) -> u64; // Returns string pointer
+    fn request_get_destination(request: u64) -> u64; // Returns string pointer
+    fn request_get_integrity(request: u64) -> u64; // Returns string pointer
+    fn request_get_keepalive(request: u64) -> bool;
+    fn request_get_mode(request: u64) -> u64; // Returns string pointer
+    fn request_get_redirect(request: u64) -> u64; // Returns string pointer
+    fn request_get_referrer(request: u64) -> u64; // Returns string pointer
+    fn request_get_referrer_policy(request: u64) -> u64; // Returns string pointer
+    fn request_clone(request: u64) -> u64;
+    
+    // Response
+    fn response_new(body: u64, init: u64) -> u64;
+    fn response_get_type(response: u64) -> u64; // Returns string pointer
+    fn response_get_url(response: u64) -> u64; // Returns string pointer
+    fn response_get_status(response: u64) -> i32;
+    fn response_get_status_text(response: u64) -> u64; // Returns string pointer
+    fn response_get_ok(response: u64) -> bool;
+    fn response_get_redirected(response: u64) -> bool;
+    fn response_get_headers(response: u64) -> u64; // Returns Headers
+    fn response_get_body(response: u64) -> u64; // Returns Body
+    fn response_get_body_used(response: u64) -> bool;
+    fn response_clone(response: u64) -> u64;
+    fn response_error() -> u64;
+    fn response_redirect(url: *const u8, url_len: usize, status: i32) -> u64;
+    
+    // Headers
+    fn headers_new() -> u64;
+    fn headers_append(headers: u64, name: *const u8, name_len: usize, value: *const u8, value_len: usize);
+    fn headers_delete(headers: u64, name: *const u8, name_len: usize);
+    fn headers_get(headers: u64, name: *const u8, name_len: usize) -> u64; // Returns string pointer
+    fn headers_has(headers: u64, name: *const u8, name_len: usize) -> bool;
+    fn headers_set(headers: u64, name: *const u8, name_len: usize, value: *const u8, value_len: usize);
+    fn headers_for_each(headers: u64, callback: u64);
+    
+    // Body
+    fn body_get_body_used(body: u64) -> bool;
+    fn body_array_buffer(body: u64) -> u64; // Returns Promise<ArrayBuffer>
+    fn body_blob(body: u64) -> u64; // Returns Promise<Blob>
+    fn body_form_data(body: u64) -> u64; // Returns Promise<FormData>
+    fn body_json(body: u64) -> u64; // Returns Promise<any>
+    fn body_text(body: u64) -> u64; // Returns Promise<string>
+    
+    // Fetch
+    fn fetch_request(request: u64) -> u64; // Returns Promise<Response>
+    fn fetch_url(url: *const u8, url_len: usize, init: u64) -> u64; // Returns Promise<Response>
+    
+    // Promise (simplified)
+    fn promise_then(promise: u64, on_fulfilled: u64, on_rejected: u64) -> u64;
+    fn promise_catch(promise: u64, on_rejected: u64) -> u64;
+    fn promise_finally(promise: u64, on_finally: u64) -> u64;
+}
+
+use crate::web::dom::DomString;
+
+pub struct Request {
+    ptr: u64,
+}
+
+impl Request {
+    pub fn new(url: &str) -> Self {
+        let url_str = DomString::new(url);
+        let ptr = unsafe { request_new(url_str.as_ptr(), url_str.len(), 0) };
+        Self { ptr }
+    }
+    
+    pub fn new_with_init(url: &str, init: RequestInit) -> Self {
+        let url_str = DomString::new(url);
+        let ptr = unsafe { request_new(url_str.as_ptr(), url_str.len(), init.ptr) };
+        Self { ptr }
+    }
+    
+    pub fn method(&self) -> String {
+        let ptr = unsafe { request_get_method(self.ptr) };
+        DomString::from_ptr(ptr).to_string()
+    }
+    
+    pub fn url(&self) -> String {
+        let ptr = unsafe { request_get_url(self.ptr) };
+        DomString::from_ptr(ptr).to_string()
+    }
+    
+    pub fn headers(&self) -> Headers {
+        let ptr = unsafe { request_get_headers(self.ptr) };
+        Headers::new(ptr)
+    }
+    
+    pub fn body(&self) -> Body {
+        let ptr = unsafe { request_get_body(self.ptr) };
+        Body::new(ptr)
+    }
+    
+    pub fn body_used(&self) -> bool {
+        unsafe { request_get_body_used(self.ptr) }
+    }
+    
+    pub fn cache(&self) -> String {
+        let ptr = unsafe { request_get_cache(self.ptr) };
+        DomString::from_ptr(ptr).to_string()
+    }
+    
+    pub fn credentials(&self) -> String {
+        let ptr = unsafe { request_get_credentials(self.ptr) };
+        DomString::from_ptr(ptr).to_string()
+    }
+    
+    pub fn destination(&self) -> String {
+        let ptr = unsafe { request_get_destination(self.ptr) };
+        DomString::from_ptr(ptr).to_string()
+    }
+    
+    pub fn integrity(&self) -> String {
+        let ptr = unsafe { request_get_integrity(self.ptr) };
+        DomString::from_ptr(ptr).to_string()
+    }
+    
+    pub fn keepalive(&self) -> bool {
+        unsafe { request_get_keepalive(self.ptr) }
+    }
+    
+    pub fn mode(&self) -> String {
+        let ptr = unsafe { request_get_mode(self.ptr) };
+        DomString::from_ptr(ptr).to_string()
+    }
+    
+    pub fn redirect(&self) -> String {
+        let ptr = unsafe { request_get_redirect(self.ptr) };
+        DomString::from_ptr(ptr).to_string()
+    }
+    
+    pub fn referrer(&self) -> String {
+        let ptr = unsafe { request_get_referrer(self.ptr) };
+        DomString::from_ptr(ptr).to_string()
+    }
+    
+    pub fn referrer_policy(&self) -> String {
+        let ptr = unsafe { request_get_referrer_policy(self.ptr) };
+        DomString::from_ptr(ptr).to_string()
+    }
+    
+    pub fn clone(&self) -> Request {
+        let ptr = unsafe { request_clone(self.ptr) };
+        Request::new_from_ptr(ptr)
+    }
+    
+    fn new_from_ptr(ptr: u64) -> Self {
+        Self { ptr }
+    }
+}
+
+pub struct RequestInit {
+    ptr: u64,
+}
+
+impl RequestInit {
+    pub fn new() -> Self {
+        Self { ptr: 0 }
+    }
+    
+    pub fn method(mut self, method: &str) -> Self {
+        // Would set method in init
+        self
+    }
+    
+    pub fn headers(mut self, headers: Headers) -> Self {
+        self
+    }
+    
+    pub fn body(mut self, body: &str) -> Self {
+        self
+    }
+    
+    pub fn mode(mut self, mode: &str) -> Self {
+        self
+    }
+    
+    pub fn credentials(mut self, credentials: &str) -> Self {
+        self
+    }
+    
+    pub fn cache(mut self, cache: &str) -> Self {
+        self
+    }
+    
+    pub fn redirect(mut self, redirect: &str) -> Self {
+        self
+    }
+    
+    pub fn referrer(mut self, referrer: &str) -> Self {
+        self
+    }
+    
+    pub fn integrity(mut self, integrity: &str) -> Self {
+        self
+    }
+    
+    pub fn keepalive(mut self, keepalive: bool) -> Self {
+        self
+    }
+}
+
+pub struct Response {
+    ptr: u64,
+}
+
+impl Response {
+    pub fn new(body: Body, init: ResponseInit) -> Self {
+        let ptr = unsafe { response_new(body.ptr, init.ptr) };
+        Self { ptr }
+    }
+    
+    pub fn error() -> Self {
+        let ptr = unsafe { response_error() };
+        Self { ptr }
+    }
+    
+    pub fn redirect(url: &str, status: i32) -> Self {
+        let url_str = DomString::new(url);
+        let ptr = unsafe { response_redirect(url_str.as_ptr(), url_str.len(), status) };
+        Self { ptr }
+    }
+    
+    pub fn response_type(&self) -> String {
+        let ptr = unsafe { response_get_type(self.ptr) };
+        DomString::from_ptr(ptr).to_string()
+    }
+    
+    pub fn url(&self) -> String {
+        let ptr = unsafe { response_get_url(self.ptr) };
+        DomString::from_ptr(ptr).to_string()
+    }
+    
+    pub fn status(&self) -> i32 {
+        unsafe { response_get_status(self.ptr) }
+    }
+    
+    pub fn status_text(&self) -> String {
+        let ptr = unsafe { response_get_status_text(self.ptr) };
+        DomString::from_ptr(ptr).to_string()
+    }
+    
+    pub fn ok(&self) -> bool {
+        unsafe { response_get_ok(self.ptr) }
+    }
+    
+    pub fn redirected(&self) -> bool {
+        unsafe { response_get_redirected(self.ptr) }
+    }
+    
+    pub fn headers(&self) -> Headers {
+        let ptr = unsafe { response_get_headers(self.ptr) };
+        Headers::new(ptr)
+    }
+    
+    pub fn body(&self) -> Body {
+        let ptr = unsafe { response_get_body(self.ptr) };
+        Body::new(ptr)
+    }
+    
+    pub fn body_used(&self) -> bool {
+        unsafe { response_get_body_used(self.ptr) }
+    }
+    
+    pub fn clone(&self) -> Response {
+        let ptr = unsafe { response_clone(self.ptr) };
+        Response::new_from_ptr(ptr)
+    }
+    
+    fn new_from_ptr(ptr: u64) -> Self {
+        Self { ptr }
+    }
+}
+
+pub struct ResponseInit {
+    ptr: u64,
+}
+
+impl ResponseInit {
+    pub fn new() -> Self {
+        Self { ptr: 0 }
+    }
+    
+    pub fn status(mut self, status: i32) -> Self {
+        self
+    }
+    
+    pub fn status_text(mut self, status_text: &str) -> Self {
+        self
+    }
+    
+    pub fn headers(mut self, headers: Headers) -> Self {
+        self
+    }
+}
+
+pub struct Headers {
+    ptr: u64,
+}
+
+impl Headers {
+    pub fn new() -> Self {
+        let ptr = unsafe { headers_new() };
+        Self { ptr }
+    }
+    
+    pub fn new_from_ptr(ptr: u64) -> Self {
+        Self { ptr }
+    }
+    
+    pub fn append(&self, name: &str, value: &str) {
+        let name_str = DomString::new(name);
+        let value_str = DomString::new(value);
+        unsafe { headers_append(self.ptr, name_str.as_ptr(), name_str.len(), value_str.as_ptr(), value_str.len()) }
+    }
+    
+    pub fn delete(&self, name: &str) {
+        let name_str = DomString::new(name);
+        unsafe { headers_delete(self.ptr, name_str.as_ptr(), name_str.len()) }
+    }
+    
+    pub fn get(&self, name: &str) -> Option<String> {
+        let name_str = DomString::new(name);
+        let ptr = unsafe { headers_get(self.ptr, name_str.as_ptr(), name_str.len()) };
+        if ptr == 0 { None } else { Some(DomString::from_ptr(ptr).to_string()) }
+    }
+    
+    pub fn has(&self, name: &str) -> bool {
+        let name_str = DomString::new(name);
+        unsafe { headers_has(self.ptr, name_str.as_ptr(), name_str.len()) }
+    }
+    
+    pub fn set(&self, name: &str, value: &str) {
+        let name_str = DomString::new(name);
+        let value_str = DomString::new(value);
+        unsafe { headers_set(self.ptr, name_str.as_ptr(), name_str.len(), value_str.as_ptr(), value_str.len()) }
+    }
+}
+
+pub struct Body {
+    ptr: u64,
+}
+
+impl Body {
+    pub fn new(ptr: u64) -> Self {
+        Self { ptr }
+    }
+    
+    pub fn body_used(&self) -> bool {
+        unsafe { body_get_body_used(self.ptr) }
+    }
+    
+    pub fn array_buffer(&self) -> Promise<ArrayBuffer> {
+        let ptr = unsafe { body_array_buffer(self.ptr) };
+        Promise::new(ptr)
+    }
+    
+    pub fn blob(&self) -> Promise<Blob> {
+        let ptr = unsafe { body_blob(self.ptr) };
+        Promise::new(ptr)
+    }
+    
+    pub fn form_data(&self) -> Promise<FormData> {
+        let ptr = unsafe { body_form_data(self.ptr) };
+        Promise::new(ptr)
+    }
+    
+    pub fn json(&self) -> Promise<serde_json::Value> {
+        let ptr = unsafe { body_json(self.ptr) };
+        Promise::new(ptr)
+    }
+    
+    pub fn text(&self) -> Promise<String> {
+        let ptr = unsafe { body_text(self.ptr) };
+        Promise::new(ptr)
+    }
+}
+
+/// Promise type for async operations
+pub struct Promise<T> {
+    ptr: u64,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl<T> Promise<T> {
+    pub fn new(ptr: u64) -> Self {
+        Self { ptr, _phantom: std::marker::PhantomData }
+    }
+    
+    pub fn then<F, U>(self, on_fulfilled: F) -> Promise<U>
+    where
+        F: FnOnce(T) -> U + 'static,
+    {
+        // Simplified - would need actual callback registration
+        let ptr = unsafe { promise_then(self.ptr, 0, 0) };
+        Promise::new(ptr)
+    }
+    
+    pub fn catch<F>(self, on_rejected: F) -> Promise<T>
+    where
+        F: FnOnce(Error) -> T + 'static,
+    {
+        let ptr = unsafe { promise_catch(self.ptr, 0) };
+        Promise::new(ptr)
+    }
+    
+    pub fn finally<F>(self, on_finally: F) -> Promise<T>
+    where
+        F: FnOnce() + 'static,
+    {
+        let ptr = unsafe { promise_finally(self.ptr, 0) };
+        Promise::new(ptr)
+    }
+}
+
+pub struct ArrayBuffer {
+    ptr: u64,
+}
+
+impl ArrayBuffer {
+    pub fn new(ptr: u64) -> Self {
+        Self { ptr }
+    }
+}
+
+pub struct Blob {
+    ptr: u64,
+}
+
+impl Blob {
+    pub fn new(ptr: u64) -> Self {
+        Self { ptr }
+    }
+}
+
+pub struct FormData {
+    ptr: u64,
+}
+
+impl FormData {
+    pub fn new(ptr: u64) -> Self {
+        Self { ptr }
+    }
+}
+
+pub struct Error {
+    ptr: u64,
+}
+
+impl Error {
+    pub fn new(ptr: u64) -> Self {
+        Self { ptr }
+    }
+}
+
+/// Fetch a URL
+pub fn fetch(url: &str) -> Promise<Response> {
+    let url_str = DomString::new(url);
+    let ptr = unsafe { fetch_url(url_str.as_ptr(), url_str.len(), 0) };
+    Promise::new(ptr)
+}
+
+/// Fetch a Request
+pub fn fetch_request(request: Request) -> Promise<Response> {
+    let ptr = unsafe { fetch_request(request.ptr) };
+    Promise::new(ptr)
+}

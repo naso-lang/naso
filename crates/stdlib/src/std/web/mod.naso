@@ -1,0 +1,33 @@
+//! Web Platform Bindings
+//!
+//! Zero-cost abstractions for DOM, WebIDL, and Web APIs.
+//! Direct access without web-sys/js-sys overhead.
+
+// Core DOM types
+pub mod dom;
+pub mod events;
+pub mod html;
+pub mod css;
+pub mod fetch;
+pub mod storage;
+pub mod workers;
+pub mod webgl;
+pub mod websocket;
+pub mod crypto;
+pub mod encoding;
+pub mod url;
+pub mod console;
+
+// Re-export commonly used types
+pub use dom::{Document, Element, Node, EventTarget, Window};
+pub use events::{Event, EventListener, MouseEvent, KeyboardEvent, InputEvent};
+pub use html::{HtmlElement, HtmlDocument, HtmlCollection};
+pub use fetch::{Request, Response, Headers, Body};
+pub use storage::{Storage, LocalStorage, SessionStorage};
+pub use workers::{Worker, MessagePort, MessageEvent};
+pub use webgl::{WebGLRenderingContext, WebGL2RenderingContext};
+pub use websocket::{WebSocket, BinaryType};
+pub use crypto::{Crypto, SubtleCrypto};
+pub use encoding::{TextEncoder, TextDecoder};
+pub use url::{Url, UrlSearchParams};
+pub use console::Console;

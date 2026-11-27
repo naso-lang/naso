@@ -32,16 +32,24 @@ fn infer_cast(
     let is_numeric = |k: &TypeKind| {
         matches!(
             k,
-            TypeKind::Int | TypeKind::UInt | TypeKind::Float | TypeKind::Nat | TypeKind::Quint8
+            TypeKind::Int | TypeKind::UInt | TypeKind::Float | TypeKind::Nat | TypeKind::Quint8 | TypeKind::Quint4 | TypeKind::Pointer(_) | TypeKind::Function(_, _)
         )
     };
+    /// Also allow String -> Pointer casts (for C string literals)
+    let is_string_to_ptr = matches!((&from.kind, &target.kind), (TypeKind::String, TypeKind::Pointer(_)));
+    // Also allow Array -> Pointer casts (for buffer passing to C)
+    let is_array_to_ptr = matches!((&from.kind, &target.kind), (TypeKind::Array(_, _), TypeKind::Pointer(_)));
+    // Allow Function -> Pointer casts (for FFI callbacks)
+    let is_fn_to_ptr = matches!((&from.kind, &target.kind), (TypeKind::Function(_, _), TypeKind::Pointer(_)));
 
     if !is_numeric(&from.kind) || !is_numeric(&target.kind) {
-        return Err(TypeError::InvalidCast {
-            from,
-            to: target.clone(),
-            span,
-        });
+        if !is_string_to_ptr && !is_array_to_ptr && !is_fn_to_ptr {
+            return Err(TypeError::InvalidCast {
+                from,
+                to: target.clone(),
+                span,
+            });
+        }
     }
 
     Ok(Type::new(target.kind.clone(), target.quantity, span))
@@ -66,6 +74,7 @@ pub fn infer_expr(checker: &mut TypeChecker, expr: &Expr) -> Result<Type, TypeEr
         }
         ExprKind::Tuple(elems) => infer_tuple(checker, elems, expr.span),
         ExprKind::Array(elems) => infer_array(checker, elems, expr.span),
+        ExprKind::ArrayRepeat(value, count) => infer_array_repeat(checker, value, count, expr.span),
         ExprKind::Block(block) => infer_block(checker, block, expr.span),
         ExprKind::If(cond, then_branch, else_branch) => infer_if(
             checker,
@@ -84,6 +93,7 @@ pub fn infer_expr(checker: &mut TypeChecker, expr: &Expr) -> Result<Type, TypeEr
         ExprKind::Forall(forall_loop) => infer_forall(checker, forall_loop, expr.span),
         ExprKind::Quantified(quant) => infer_quantified(checker, quant, expr.span),
         ExprKind::While(cond, body) => infer_while(checker, cond, body, expr.span),
+        ExprKind::Loop(body) => infer_loop(checker, body, expr.span),
         ExprKind::Return(opt_expr) => infer_return(checker, opt_expr.as_deref(), expr.span),
         ExprKind::Assign(lhs, rhs) => infer_assign(checker, lhs, rhs, expr.span),
         ExprKind::Projection(base) => infer_projection(checker, base, expr.span),
@@ -97,6 +107,22 @@ pub fn infer_expr(checker: &mut TypeChecker, expr: &Expr) -> Result<Type, TypeEr
         }
         ExprKind::Break(opt_expr) => infer_break(checker, opt_expr.as_deref(), expr.span),
         ExprKind::Continue => infer_continue(expr.span),
+        ExprKind::Async(block) => {
+            // async { ... } creates a future
+            let _block_ty = infer_block(checker, block, expr.span)?;
+            // The result is a Future pointer (i8*), as expected by FFI functions
+            // Return a pointer type to u8 (future handle is a raw pointer to u8)
+            let mut u8_type = Type::new(TypeKind::UInt, Quantity::Many, Span::default());
+            u8_type.int_width = Some(8);
+            Ok(Type::new(TypeKind::Pointer(Box::new(u8_type)), Quantity::Many, expr.span))
+        }
+        ExprKind::Await(future) => {
+            // await future - extracts the value from the future
+            let future_ty = infer_expr(checker, future)?;
+            // Await unwraps the future - return the inner type
+            // For now, return the future type with quantity One (consumed by await)
+            Ok(future_ty.with_quantity(Quantity::One))
+        }
         ExprKind::Error => Ok(Type::new(TypeKind::Error, Quantity::Many, expr.span)),
     }
 }
@@ -239,7 +265,7 @@ fn numeric_common(lhs: &Type, rhs: &Type) -> Option<Type> {
     let is_int = |t: &Type| {
         matches!(
             t.kind,
-            TypeKind::Int | TypeKind::UInt | TypeKind::Nat | TypeKind::Quint8
+            TypeKind::Int | TypeKind::UInt | TypeKind::Nat | TypeKind::Quint8 | TypeKind::Quint4
         )
     };
     if matches!(lhs.kind, TypeKind::Float) && is_int(rhs) {
@@ -362,6 +388,21 @@ fn infer_unary(
             checker.env.move_var(&operand_ty.to_ident(), span)?;
             operand_ty
         }
+        UnOp::AddrOf => {
+            // Address-of operator: for function pointers, returns a pointer to the function
+            // For arrays, returns a pointer to the element type (u8 for byte arrays)
+            // For now, return a pointer to the operand type
+            let pointee = if let TypeKind::Array(elem_ty, _) = &operand_ty.kind {
+                *elem_ty.clone()
+            } else {
+                operand_ty
+            };
+            Type::new(
+                TypeKind::Pointer(Box::new(pointee)),
+                Quantity::Many,
+                span,
+            )
+        }
     };
     Ok(result_ty)
 }
@@ -403,6 +444,54 @@ fn infer_call(
 
     let callee_ty = infer_expr(checker, callee)?;
 
+    // If callee is a variable, try to look up its function signature with generics
+    // This handles generic functions like Result::Ok, Option::Some
+    if let ExprKind::Var(ident) = &callee.kind {
+        // Clone the signature to avoid borrowing conflicts
+        let sig = checker.env.lookup_function(ident).cloned();
+        if let Some(sig) = sig {
+            // Instantiate generics with fresh metavariables
+            let mut subst = std::collections::HashMap::new();
+            for generic in &sig.generics {
+                let mv = fresh_meta_var();
+                checker.register_meta(mv, None);
+                subst.insert(generic.name.clone(), Type::new(TypeKind::Meta(mv), Quantity::Many, span));
+            }
+            
+            // Substitute metavariables in parameter types
+            let inst_params: Vec<Type> = sig.params.iter().map(|p| {
+                substitute_type(&p.ty, &subst)
+            }).collect();
+            
+            // Substitute in return type
+            let inst_ret = sig.ret_ty.as_ref().map(|r| substitute_type(r, &subst)).unwrap_or(Type::unit(span));
+            
+            // Check argument count
+            if inst_params.len() != args.len() {
+                return Err(TypeError::ArgumentCountMismatch {
+                    expected: inst_params.len(),
+                    found: args.len(),
+                    span,
+                });
+            }
+            
+            // Check each argument against instantiated parameter type
+            for (param, arg) in inst_params.iter().zip(args) {
+                let arg_ty = infer_expr(checker, arg)?;
+                unify::unify_types(checker, &arg_ty, param)?;
+                if !crate::typecheck::unify::qty_subtype(param.quantity, arg_ty.quantity) {
+                    return Err(crate::typecheck::error::TypeError::QuantityMismatch {
+                        expected: param.quantity,
+                        found: arg_ty.quantity,
+                        span: arg.span,
+                    });
+                }
+            }
+            
+            return Ok(inst_ret);
+        }
+    }
+
     // Expect callee to be a function type
     match &callee_ty.kind {
         TypeKind::Function(params, ret) => {
@@ -416,8 +505,28 @@ fn infer_call(
             }
 
             // Check each argument against parameter type
+            // Function parameters are contravariant: we need arg_type >= param_type
+            // i.e., param_type <= arg_type (param is subtype of arg)
             for (param, arg) in params.iter().zip(args) {
-                checker.check_expr(arg, param)?;
+                let arg_ty = infer_expr(checker, arg)?;
+                
+                // Unify type kinds (covariant - structure must match)
+                unify::unify_kinds(checker, &arg_ty.kind, &param.kind)?;
+                
+                // Check quantities contravariantly: param_qty <= arg_qty
+                // This allows passing Many where One is expected (consuming a Many value linearly)
+                if !crate::typecheck::unify::qty_subtype(param.quantity, arg_ty.quantity) {
+                    return Err(crate::typecheck::error::TypeError::QuantityMismatch {
+                        expected: param.quantity,
+                        found: arg_ty.quantity,
+                        span: arg.span,
+                    });
+                }
+                
+                // Record the use of the argument (for linear checking)
+                // The argument is consumed by the call - for now we rely on the
+                // existing use tracking in infer_expr/check_expr
+                let _ = arg_ty;
             }
 
             Ok(*ret.clone())
@@ -451,11 +560,33 @@ fn infer_call(
 fn infer_method_call(
     checker: &mut TypeChecker,
     receiver: &Expr,
-    _method: &Ident,
+    method: &Ident,
     _args: &[Expr],
     span: Span,
 ) -> Result<Type, TypeError> {
-    let _receiver_ty = infer_expr(checker, receiver)?;
+    let receiver_ty = infer_expr(checker, receiver)?;
+
+    // Special case: .unwrap() on Result<T> returns T
+    if method.name == "unwrap" {
+        if let TypeKind::Named(name, args) = &receiver_ty.kind {
+            if name.name == "Result" {
+                if let Some(TypeArg::Type(inner_ty)) = args.first() {
+                    return Ok(Type::new(
+                        inner_ty.kind.clone(),
+                        inner_ty.quantity,
+                        span,
+                    ));
+                }
+            }
+        }
+    }
+
+    // Special case: .len() on arrays returns Int
+    if method.name == "len" {
+        if let TypeKind::Array(_, _) = &receiver_ty.kind {
+            return Ok(Type::new(TypeKind::Int, Quantity::Many, span));
+        }
+    }
 
     // Look up method on receiver type
     // For now, stub - would need type class / trait system
@@ -471,8 +602,14 @@ fn infer_field(
 ) -> Result<Type, TypeError> {
     let base_ty = infer_expr(checker, base)?;
 
+    // Handle pointer-to-struct: dereference the pointer first
+    let deref_ty = match &base_ty.kind {
+        TypeKind::Pointer(inner) => *inner.clone(),
+        _ => base_ty.clone(),
+    };
+
     // Look up field in struct type
-    match &base_ty.kind {
+    match &deref_ty.kind {
         TypeKind::Named(name, _) => {
             if let Some(type_def) = checker.env.lookup_type(name) {
                 if let TypeDefKind::Struct(fields) = &type_def.kind {
@@ -508,6 +645,7 @@ fn infer_index(
     match &base_ty.kind {
         TypeKind::Array(elem, _) => Ok(*elem.clone()),
         TypeKind::Tensor(dims) if !dims.is_empty() => Ok(dims[0].clone()),
+        TypeKind::Pointer(elem) => Ok(*elem.clone()), // Pointer arithmetic: ptr[i] -> *elem
         _ => Err(TypeError::NotIndexable { ty: base_ty, span }),
     }
 }
@@ -640,8 +778,33 @@ fn infer_array(checker: &mut TypeChecker, elems: &[Expr], span: Span) -> Result<
         unify::unify_types(checker, &first_ty, &elem_ty)?;
     }
 
+    // For array literals with known size, include the size as a NatExpr literal
+    let size = Some(crate::ast::ty::NatExpr::Lit(elems.len() as u64));
+
     Ok(Type::new(
-        TypeKind::Array(Box::new(first_ty), None),
+        TypeKind::Array(Box::new(first_ty), size),
+        Quantity::Many,
+        span,
+    ))
+}
+
+/// Infer array repeat type: [value; count]
+fn infer_array_repeat(
+    checker: &mut TypeChecker,
+    value: &Expr,
+    count: &Expr,
+    span: Span,
+) -> Result<Type, TypeError> {
+    let value_ty = infer_expr(checker, value)?;
+    let count_ty = infer_expr(checker, count)?;
+    
+    // Count should be an integer type
+    let int_ty = Type::new(TypeKind::Int, Quantity::Many, span);
+    unify::unify_types(checker, &count_ty, &int_ty)?;
+    
+    // Return array type with the value's element type
+    Ok(Type::new(
+        TypeKind::Array(Box::new(value_ty), None),
         Quantity::Many,
         span,
     ))
@@ -1012,7 +1175,7 @@ fn infer_for(checker: &mut TypeChecker, for_loop: &ForLoop, span: Span) -> Resul
         Mutability::Immutable,
     );
 
-    check_block(checker, &for_loop.body)?;
+    check_block(checker, &for_loop.body, None)?;
     checker.env.exit_scope(guard)?;
 
     Ok(Type::unit(span))
@@ -1042,7 +1205,7 @@ fn infer_forall(
             .bind_var(var.clone(), bound_ty, Quantity::Many, Mutability::Immutable);
     }
 
-    check_block(checker, &forall_loop.body)?;
+    check_block(checker, &forall_loop.body, None)?;
     checker.env.exit_scope(guard)?;
 
     Ok(Type::unit(span))
@@ -1113,6 +1276,16 @@ fn infer_while(
 
     infer_expr(checker, body)?;
     Ok(Type::unit(span))
+}
+
+/// Infer infinite loop type
+fn infer_loop(
+    checker: &mut TypeChecker,
+    body: &crate::ast::Block,
+    span: Span,
+) -> Result<Type, TypeError> {
+    infer_block(checker, body, span)?;
+    Ok(Type::never(span)) // loop never returns normally
 }
 
 /// Infer return expression type
@@ -1332,4 +1505,151 @@ fn infer_break(
 fn infer_continue(span: Span) -> Result<Type, TypeError> {
     // Continue is a diverging expression - returns Never type
     Ok(Type::never(span))
+}
+
+/// Substitute type variables in a type using a substitution map
+fn substitute_type(ty: &Type, subst: &std::collections::HashMap<Ident, Type>) -> Type {
+    match &ty.kind {
+        TypeKind::Meta(_mv) => {
+            // Metavariables are not substituted here - they're solved via unification
+            ty.clone()
+        }
+        TypeKind::Var(tv) => {
+            // TypeVar represents rigid type variables (from user annotations or generics)
+            // These should be substituted if they appear in the substitution map
+            // The Ident for a TypeVar is not directly available here, so we need
+            // to look it up. For now, return as-is since we can't map TypeVar to Ident
+            // The actual substitution of generic parameters happens through the Named case
+            // when the generic name is used in TypeKind::Named
+            ty.clone()
+        }
+        TypeKind::Named(name, args) => {
+            // Check if the name itself is a generic parameter to substitute
+            if let Some(replacement) = subst.get(name) {
+                // If the name is in our substitution map, use the replacement
+                // but we still need to apply type arguments if the replacement is a named type
+                let mut replaced = replacement.clone();
+                if !args.is_empty() {
+                    // Apply type arguments to the replacement
+                    // For now, we just return the replacement as-is
+                    // A full implementation would apply the arguments
+                }
+                replaced
+            } else {
+                // Substitute type arguments
+                let mut new_args = Vec::new();
+                for arg in args {
+                    new_args.push(substitute_type_arg(arg, subst));
+                }
+                Type::new(TypeKind::Named(name.clone(), new_args), ty.quantity, ty.span)
+            }
+        }
+        TypeKind::Function(params, ret) => {
+            let new_params: Vec<Type> = params.iter().map(|p| substitute_type(p, subst)).collect();
+            let new_ret = substitute_type(ret, subst);
+            Type::new(TypeKind::Function(new_params, Box::new(new_ret)), ty.quantity, ty.span)
+        }
+        TypeKind::Tuple(elems) => {
+            let new_elems: Vec<Type> = elems.iter().map(|e| substitute_type(e, subst)).collect();
+            Type::new(TypeKind::Tuple(new_elems), ty.quantity, ty.span)
+        }
+        TypeKind::Array(elem, size) => {
+            let new_elem = substitute_type(elem, subst);
+            let new_size = substitute_nat_expr(size, subst);
+            Type::new(TypeKind::Array(Box::new(new_elem), new_size), ty.quantity, ty.span)
+        }
+        TypeKind::Projection(inner) => {
+            let new_inner = substitute_type(inner, subst);
+            Type::new(TypeKind::Projection(Box::new(new_inner)), ty.quantity, ty.span)
+        }
+        TypeKind::Reversible(inner) => {
+            let new_inner = substitute_type(inner, subst);
+            Type::new(TypeKind::Reversible(Box::new(new_inner)), ty.quantity, ty.span)
+        }
+        TypeKind::Pi(name, domain, codomain) => {
+            let new_domain = substitute_type(domain, subst);
+            let new_codomain = substitute_type(codomain, subst);
+            Type::new(TypeKind::Pi(name.clone(), Box::new(new_domain), Box::new(new_codomain)), ty.quantity, ty.span)
+        }
+        TypeKind::Sigma(name, fst, snd) => {
+            let new_fst = substitute_type(fst, subst);
+            let new_snd = substitute_type(snd, subst);
+            Type::new(TypeKind::Sigma(name.clone(), Box::new(new_fst), Box::new(new_snd)), ty.quantity, ty.span)
+        }
+        TypeKind::Lambda(param, body) => {
+            let new_body = substitute_type(body, subst);
+            Type::new(TypeKind::Lambda(param.clone(), Box::new(new_body)), ty.quantity, ty.span)
+        }
+        TypeKind::App(fun, arg) => {
+            let new_fun = substitute_type(fun, subst);
+            let new_arg = substitute_type(arg, subst);
+            Type::new(TypeKind::App(Box::new(new_fun), Box::new(new_arg)), ty.quantity, ty.span)
+        }
+        TypeKind::QRegister(dims) | TypeKind::Tensor(dims) => {
+            let new_dims: Vec<Type> = dims.iter().map(|d| substitute_type(d, subst)).collect();
+            if matches!(ty.kind, TypeKind::QRegister(_)) {
+                Type::new(TypeKind::QRegister(new_dims), ty.quantity, ty.span)
+            } else {
+                Type::new(TypeKind::Tensor(new_dims), ty.quantity, ty.span)
+            }
+        }
+        _ => ty.clone(),
+    }
+}
+
+/// Substitute type variables in a NatExpr
+fn substitute_nat_expr(nat_expr: &Option<crate::ast::ty::NatExpr>, subst: &std::collections::HashMap<Ident, Type>) -> Option<crate::ast::ty::NatExpr> {
+    nat_expr.as_ref().map(|ne| substitute_nat_expr_inner(ne, subst))
+}
+
+fn substitute_nat_expr_inner(ne: &crate::ast::ty::NatExpr, subst: &std::collections::HashMap<Ident, Type>) -> crate::ast::ty::NatExpr {
+    use crate::ast::ty::NatExpr;
+    match ne {
+        NatExpr::Var(ident) => {
+            // Check if this variable is in our substitution map
+            if let Some(replacement_type) = subst.get(ident) {
+                // If the replacement is a Nat literal, extract its value
+                if let TypeKind::Nat = &replacement_type.kind {
+                    // We can't easily extract the value from a Nat type here
+                    // For now, return as-is and let unification handle it
+                    ne.clone()
+                } else if let TypeKind::Named(name, args) = &replacement_type.kind {
+                    if name.name == "Int" || name.name == "UInt" || name.name == "Nat" {
+                        // Could be a literal - try to extract
+                        ne.clone()
+                    } else {
+                        ne.clone()
+                    }
+                } else {
+                    ne.clone()
+                }
+            } else {
+                ne.clone()
+            }
+        }
+        NatExpr::Lit(_) | NatExpr::Zero => ne.clone(),
+        NatExpr::Succ(inner) => NatExpr::Succ(Box::new(substitute_nat_expr_inner(inner, subst))),
+        NatExpr::Add(a, b) => NatExpr::Add(
+            Box::new(substitute_nat_expr_inner(a, subst)),
+            Box::new(substitute_nat_expr_inner(b, subst))
+        ),
+        NatExpr::Mul(a, b) => NatExpr::Mul(
+            Box::new(substitute_nat_expr_inner(a, subst)),
+            Box::new(substitute_nat_expr_inner(b, subst))
+        ),
+        NatExpr::If(cond, t, e) => NatExpr::If(
+            Box::new(substitute_type(cond, subst)),
+            Box::new(substitute_nat_expr_inner(t, subst)),
+            Box::new(substitute_nat_expr_inner(e, subst))
+        ),
+    }
+}
+
+/// Substitute type variables in a type argument
+fn substitute_type_arg(arg: &TypeArg, subst: &std::collections::HashMap<Ident, Type>) -> TypeArg {
+    match arg {
+        TypeArg::Type(ty) => TypeArg::Type(substitute_type(ty, subst)),
+        TypeArg::Nat(n) => TypeArg::Nat(n.clone()),
+        TypeArg::Quantity(q) => TypeArg::Quantity(*q),
+    }
 }

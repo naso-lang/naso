@@ -449,10 +449,10 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                     }
                 }
                 // Regular variable lookup
-                if let Some((ptr, _ty)) = self.value_builder.variable(name) {
+                if let Some((ptr, ty)) = self.value_builder.variable(name) {
                     let load = self
                         .value_builder
-                        .build_load(ptr, name)
+                        .build_load(ty, ptr, name)
                         .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
                     Ok(load)
                 } else {
@@ -1383,7 +1383,7 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                     base_val.get_type().into_struct_type()
                 } else {
                     // For pointer, look up pointee type from tracking
-                    let pointee = self.value_builder.ptr_pointee_types.get(&base_ptr).copied();
+                    let pointee = self.value_builder.ptr_pointee_type(base_ptr);
                     match pointee {
                         Some(BasicTypeEnum::StructType(st)) => st,
                         _ => return Err(CodegenError::UnsupportedFeature("Field access on pointer to non-struct type".to_string())),
@@ -1395,11 +1395,18 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 let field_idx = self.get_field_index(&struct_type, field)?;
                 
                 // Get pointer to field using struct GEP
-                let field_ptr = self.value_builder.build_struct_gep(struct_type, base_ptr, field_idx, &format!("field_{}", field)).map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                                let field_ptr = self.value_builder.build_struct_gep(struct_type, base_ptr, field_idx, &format!("field_{}", field)).map_err(|e| CodegenError::InstructionError(e.to_string()))?;
                 
-                // Load the field value
-                let field_val = self.value_builder.build_load(field_ptr, &format!("field_{}", field)).map_err(|e| CodegenError::InstructionError(e.to_string()))?;
-                Ok(field_val)
+                                // Get the field type from the struct type
+                                let field_type = struct_type.get_field_types().get(field_idx as usize).copied();
+                
+                                // Load the field value
+                                let field_val = if let Some(field_type) = field_type {
+                                    self.value_builder.build_load(field_type, field_ptr, &format!("field_{}", field)).map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                                } else {
+                                    return Err(CodegenError::UnsupportedFeature("Field index out of bounds".to_string()));
+                                };
+                                Ok(field_val)
             }
             PirExpr::Array { items } => {
                             // Array literals: allocate memory, store elements, return tensor struct { ptr, len }
@@ -1489,7 +1496,124 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
 
                                             Ok(BasicValueEnum::StructValue(struct_val))
                                         }
-            PirExpr::Struct { name: _, fields } => {
+                                        PirExpr::ArrayRepeat { value, count } => {
+                                                                                    // Array repeat: [value; count]
+                                                                                    // Evaluate the value and count expressions
+                                                                                    let val = self.build_expr(value, quantities)?;
+                                                                                    let cnt = self.build_expr(count, quantities)?;
+
+                                                                                    let builder = self.value_builder.builder();
+
+                                                                                    // Extract count as u64 - it should be a compile-time constant
+                                                                                    let count_val = match cnt {
+                                                                                        BasicValueEnum::IntValue(v) => {
+                                                                                            // Get the constant value
+                                                                                            if v.is_const() {
+                                                                                                v.get_zero_extended_constant()
+                                                                                                    .map(|c| c as u64)
+                                                                                                    .ok_or_else(|| CodegenError::InstructionError("count must be a compile-time constant".to_string()))?
+                                                                                            } else {
+                                                                                                return Err(CodegenError::InstructionError("count must be a compile-time constant".to_string()));
+                                                                                            }
+                                                                                        }
+                                                                                        _ => {
+                                                                                            return Err(CodegenError::InstructionError("count must be an integer".to_string()));
+                                                                                        }
+                                                                                    };
+
+                                                                                    if count_val == 0 {
+                                                                                        // Empty array - return empty tensor
+                                                                                        let context = self.value_builder.type_lowering().context();
+                                                                                        let int_type = self.value_builder.type_lowering().int_type(crate::codegen::abi::IntWidth::I64);
+                                                                                        let struct_type = context.struct_type(&[int_type.into(), int_type.into()], false);
+                                                                                        let undef = struct_type.get_undef();
+                                                                                        let zero_ptr = int_type.const_int(0, false);
+                                                                                        let zero_len = int_type.const_int(0, false);
+                                                                                        let struct_with_ptr = builder
+                                                                                            .build_insert_value(undef, zero_ptr, 0, "empty_tensor_ptr")
+                                                                                            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                                                                                        let struct_val = builder
+                                                                                            .build_insert_value(struct_with_ptr, zero_len, 1, "empty_tensor")
+                                                                                            .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                                                                                            .into_struct_value();
+                                                                                        return Ok(BasicValueEnum::StructValue(struct_val));
+                                                                                    }
+                                            
+                                            // Use i8 for byte arrays
+                                            let i8_type = self
+                                                .value_builder
+                                                .type_lowering()
+                                                .int_type(crate::codegen::abi::IntWidth::I8);
+                                            let int_type = self
+                                                .value_builder
+                                                .type_lowering()
+                                                .int_type(crate::codegen::abi::IntWidth::I64);
+                                            
+                                            // Allocate array on stack
+                                            let array_type = i8_type.array_type(count_val as u32);
+                                            let array_ptr = builder
+                                                .build_alloca(array_type, "array_repeat")
+                                                .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                                            
+                                            // Truncate value to i8
+                                            let val_i8 = match val {
+                                                BasicValueEnum::IntValue(v) => builder
+                                                    .build_int_truncate(v, i8_type, "repeat_val_trunc")
+                                                    .map(BasicValueEnum::IntValue)
+                                                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?,
+                                                _ => val,
+                                            };
+                                            
+                                            // Store repeated value
+                                            for i in 0..count_val {
+                                                let idx = int_type.const_int(i, false);
+                                                let gep = unsafe {
+                                                    builder
+                                                        .build_gep(
+                                                            array_type,
+                                                            array_ptr,
+                                                            &[int_type.const_int(0, false).into(), idx.into()],
+                                                            &format!("repeat_elem_{i}"),
+                                                        )
+                                                        .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                                                };
+                                                builder
+                                                    .build_store(gep, val_i8)
+                                                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                                            }
+                                            
+                                            // Return tensor struct { ptr: i64, len: i64 }
+                                            let elem_ptr = unsafe {
+                                                builder
+                                                    .build_gep(
+                                                        array_type,
+                                                        array_ptr,
+                                                        &[int_type.const_int(0, false).into(), int_type.const_int(0, false).into()],
+                                                        "repeat_elem_ptr",
+                                                    )
+                                                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                                            };
+                                            
+                                            let ptr_i64 = builder
+                                                .build_ptr_to_int(elem_ptr, int_type, "repeat_ptr_i64")
+                                                .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                                            
+                                            let len_val = int_type.const_int(count_val, false);
+                                            
+                                            let context = self.value_builder.type_lowering().context();
+                                            let struct_type = context.struct_type(&[int_type.into(), int_type.into()], false);
+                                            let undef = struct_type.get_undef();
+                                            let struct_with_ptr = builder
+                                                .build_insert_value(undef, ptr_i64, 0, "tensor_with_ptr")
+                                                .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                                            let struct_val = builder
+                                                .build_insert_value(struct_with_ptr, len_val, 1, "tensor_complete")
+                                                .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                                                .into_struct_value();
+                                            
+                                            Ok(BasicValueEnum::StructValue(struct_val))
+                                        }
+                                        PirExpr::Struct { fields } => {
                 // Struct literals: allocate memory, store fields, return struct value
                 // For Stream { fd: Int }, this creates a struct with one i64 field
                 let context = self.value_builder.type_lowering().context();
@@ -1535,7 +1659,7 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 // Load the struct value and return it
                 let struct_val = self
                     .value_builder
-                    .build_load(struct_ptr, "struct_val")
+                    .build_load(struct_type.into(), struct_ptr, "struct_val")
                     .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
                 Ok(struct_val)
             }
@@ -1555,7 +1679,6 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 width,
                 signed,
                 float_target,
-                pointer_target,
             } => {
                 let v = self.build_expr(expr, quantities)?;
 
@@ -1580,30 +1703,6 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                             .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
                         return Ok(ptr.into());
                     }
-                }
-                // Handle Integer -> Pointer cast (e.g., `0 as *u8`)
-                if let Some(pointee_elem) = pointer_target {
-                    // Integer to pointer cast: use inttoptr
-                    let int_val = v.into_int_value();
-                    let pointee_ty = self
-                        .value_builder
-                        .type_lowering()
-                        .int_type(match pointee_elem {
-                            crate::ir::pir_types::ElemType::I8 => crate::codegen::abi::IntWidth::I8,
-                            crate::ir::pir_types::ElemType::I16 => crate::codegen::abi::IntWidth::I16,
-                            crate::ir::pir_types::ElemType::I32 => crate::codegen::abi::IntWidth::I32,
-                            crate::ir::pir_types::ElemType::I64 => crate::codegen::abi::IntWidth::I64,
-                            crate::ir::pir_types::ElemType::F64 => crate::codegen::abi::IntWidth::I64, // fallback
-                            crate::ir::pir_types::ElemType::Bool => crate::codegen::abi::IntWidth::I1,
-                            crate::ir::pir_types::ElemType::I4 => crate::codegen::abi::IntWidth::I8, // stored as i8
-                        });
-                    let ptr_type = self.value_builder.type_lowering().context().ptr_type(AddressSpace::default());
-                    let ptr = self.value_builder.builder().build_int_to_ptr(
-                        int_val,
-                        ptr_type,
-                        "int_to_ptr_cast",
-                    ).map_err(|e| CodegenError::InstructionError(e.to_string()))?;
-                    return Ok(ptr.into());
                 }
 
                 // A FLOAT TARGET: `sitofp`/`uitofp`.
@@ -2165,7 +2264,7 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
         }
 
         self.value_builder
-            .build_load(gep, "elem")
+            .build_load(tensor.elem, gep, "elem")
             .map_err(|e| CodegenError::InstructionError(e.to_string()))
     }
 
@@ -2184,9 +2283,10 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
         byte_ptr: inkwell::values::PointerValue<'ctx>,
         flat: IntValue<'ctx>,
     ) -> CodegenResult<BasicValueEnum<'ctx>> {
+        let i8_ty = self.value_builder.type_lowering().int_type(IntWidth::I8);
         let byte = self
             .value_builder
-            .build_load(byte_ptr, "i4_byte")?
+            .build_load(i8_ty.into(), byte_ptr, "i4_byte")?
             .into_int_value();
 
         // shift = (flat & 1) * 4 -- 0 for the low nibble, 4 for the high one.
@@ -2293,7 +2393,7 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
 
         let byte = self
             .value_builder
-            .build_load(byte_ptr, "i4s_byte")?
+            .build_load(i8_ty.into(), byte_ptr, "i4s_byte")?
             .into_int_value();
         let kept = self.value_builder.build_and(byte, clear, "i4s_kept")?;
         let merged = self.value_builder.build_or(kept, placed, "i4s_merged")?;

@@ -8,7 +8,7 @@
 use super::access_relation::AccessRelations;
 use super::affine_domain::AffineDomain;
 use super::schedule_tree::{ScheduleTree, StmtId};
-use crate::ast::{Ident, Mutability, Quantity};
+use crate::ast::{Mutability, Quantity, TypeDef};
 use crate::ir::schedule_tree::ScheduleNode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -43,10 +43,15 @@ pub enum PirExpr {
     },
     /// Struct field access
     Field { base: Box<PirExpr>, field: String },
-    /// Struct literal with type name
-    Struct { name: Ident, fields: Vec<PirExpr> },
+    /// Struct literal - tuple of fields
+    Struct { fields: Vec<PirExpr> },
     /// Array literal
     Array { items: Vec<PirExpr> },
+    /// Array repeat: `[value; count]`
+    ArrayRepeat {
+        value: Box<PirExpr>,
+        count: Box<PirExpr>,
+    },
     /// Let binding (for SSA form)
     Let {
         name: String,
@@ -92,45 +97,40 @@ pub enum PirExpr {
     /// the conversion must say so instead of dropping it, because a dropped cast
     /// stores the wrong type into the slot.
     Cast {
-            expr: Box<PirExpr>,
-            /// Declared bit width of the cast target, when the target is an integer.
-            ///
-            /// Only the width is carried, not the whole `ast::Type`, because `PirExpr`
-            /// derives `Eq` and `Type` does not. The width is what a backend needs to
-            /// build the right LLVM integer type or WGSL constructor, and it is what was
-            /// being lost: `q[..] as i8` lowered with the `i8` simply absent.
-            width: Option<u8>,
-            /// Whether the TARGET is a signed integer.
-            ///
-            /// Carried explicitly because LLVM integer types are SIGNLESS -- `i32` is the
-            /// same type whether it holds a signed or an unsigned value, and the difference
-            /// is entirely in whether you emit `sext` or `zext`. Nothing downstream can
-            /// recover it, so guessing here is a wrong answer rather than a default: `zext`
-            /// of a negative value wraps, and `sext` of a large unsigned value goes negative.
-            signed: bool,
-            /// The cast target is a FLOAT, not an integer.
-            ///
-            /// `width` alone cannot express `x as f32`: a float target has no bit width in
-            /// the integer sense, and `width` is `None` for it, which previously read as
-            /// "an i32" -- so `input[i] as f32` on an `i8` buffer emitted a SIGN-EXTENDING
-            /// INTEGER conversion and then multiplied an `i32` by a `double`. That is a
-            /// silent wrong answer: the program compiles, verifies, and computes nonsense.
-            ///
-            /// So the target's SORT is recorded explicitly rather than inferred from a
-            /// `None` width. `None` keeps the original integer behaviour byte for byte;
-            /// `Some(_)` means `sitofp`/`uitofp`, with the sign flag still carried because
-            /// LLVM integer types are signless and nothing downstream can recover it.
-            ///
-            /// No float WIDTH is carried, because this backend has one: `f32` and `f64` are
-            /// already the same type in the IR (`ElemType` documents why), so recording a
-            /// width would record a distinction that does not exist.
-            float_target: Option<ElemType>,
-            /// The cast target is a POINTER, carrying the pointee element type.
-            ///
-            /// Used for casts like `0 as *u8` where an integer is converted to a pointer.
-            /// The pointee type tells the backend what LLVM pointer type to create.
-            pointer_target: Option<ElemType>,
-        },
+        expr: Box<PirExpr>,
+        /// Declared bit width of the cast target, when the target is an integer.
+        ///
+        /// Only the width is carried, not the whole `ast::Type`, because `PirExpr`
+        /// derives `Eq` and `Type` does not. The width is what a backend needs to
+        /// build the right LLVM integer type or WGSL constructor, and it is what was
+        /// being lost: `q[..] as i8` lowered with the `i8` simply absent.
+        width: Option<u8>,
+        /// Whether the TARGET is a signed integer.
+        ///
+        /// Carried explicitly because LLVM integer types are SIGNLESS -- `i32` is the
+        /// same type whether it holds a signed or an unsigned value, and the difference
+        /// is entirely in whether you emit `sext` or `zext`. Nothing downstream can
+        /// recover it, so guessing here is a wrong answer rather than a default: `zext`
+        /// of a negative value wraps, and `sext` of a large unsigned value goes negative.
+        signed: bool,
+        /// The cast target is a FLOAT, not an integer.
+        ///
+        /// `width` alone cannot express `x as f32`: a float target has no bit width in
+        /// the integer sense, and `width` is `None` for it, which previously read as
+        /// "an i32" -- so `input[i] as f32` on an `i8` buffer emitted a SIGN-EXTENDING
+        /// INTEGER conversion and then multiplied an `i32` by a `double`. That is a
+        /// silent wrong answer: the program compiles, verifies, and computes nonsense.
+        ///
+        /// So the target's SORT is recorded explicitly rather than inferred from a
+        /// `None` width. `None` keeps the original integer behaviour byte for byte;
+        /// `Some(_)` means `sitofp`/`uitofp`, with the sign flag still carried because
+        /// LLVM integer types are signless and nothing downstream can recover it.
+        ///
+        /// No float WIDTH is carried, because this backend has one: `f32` and `f64` are
+        /// already the same type in the IR (`ElemType` documents why), so recording a
+        /// width would record a distinction that does not exist.
+        float_target: Option<ElemType>,
+    },
     /// A sequence of statements evaluated for effect, yielding no value.
     ///
     /// This exists because a loop body is usually statements and no tail
@@ -360,7 +360,7 @@ pub enum ParamKind {
     /// A quantum register: a caller-owned pointer, like a tensor but with no
     /// element type the LLVM backend indexes.
     QRegister,
-    /// A struct parameter containing arrays: passed by pointer (caller-allocated).
+    /// A struct parameter, passed by value (aggregate).
     Struct,
     /// A parameter whose type no ABI rule covers.
     ///
@@ -370,7 +370,7 @@ pub enum ParamKind {
 }
 
 /// One function parameter, with everything an ABI needs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FunctionParam {
     pub name: String,
     pub kind: ParamKind,
@@ -379,7 +379,7 @@ pub struct FunctionParam {
 }
 
 /// PIR Statement: a computational unit with iteration domain
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PirStatement {
     pub id: StmtId,
     /// Iteration domain for this statement
@@ -403,27 +403,21 @@ pub type QuantityMap = HashMap<String, Quantity>;
 /// difference is exactly what a call site needs to know: whether the call yields a
 /// value or not. Carrying it is what lets a backend emit a typed `ret` and refuse a
 /// call that uses a void result as a value.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum FnReturn {
     /// No return type declared. The function yields nothing.
     Void,
     /// A scalar, returned by value.
     Scalar(ElemType),
-    /// A tensor return: pointer to caller-allocated buffer + optional shape.
-    /// Uses LLVM sret convention: caller allocates, passes hidden first argument.
+    /// A tensor, returned by pointer + length.
     Tensor {
         elem: ElemType,
         shape: Option<Vec<u64>>,
     },
-    /// A struct return containing arrays: uses LLVM sret convention.
-    /// Caller allocates, passes hidden first argument.
+    /// A struct, returned by value (aggregate).
     Struct,
-    /// A fixed-size array return: uses LLVM sret convention.
-    /// Caller allocates, passes hidden first argument.
-    Array {
-        elem: ElemType,
-        size: u64,
-    },
+    /// An array, returned by value (aggregate).
+    Array { elem: ElemType, size: u64 },
     /// A declared return type with no slot in this ABI.
     ///
     /// Recorded rather than dropped, so a backend refuses it NAMING the type instead
@@ -457,7 +451,7 @@ pub enum FnReturn {
 /// across a flattened module that is three uses of one name and PIR validation rejects
 /// the file. Scoping the count to the function is not a loosening -- it is the same
 /// rule applied at the right granularity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PirFunction {
     /// The name as written in the source.
     pub name: String,
@@ -516,7 +510,7 @@ pub struct PirFunction {
     /// `Block::expr` -- the trailing expression the PARSER folded off the end of the
     /// body -- and only when its kind yields a value. `let mut y = x * 3.0;` is NOT a
     /// trailing expression: the parser routes every `let` to `Block::stmts`, so that
-    /// program has no `Block::expr` at all and therefore no tail value, even though
+    /// body has no `Block::expr` at all and therefore no tail value, even though
     /// lowering does emit a statement for the binding. "A statement exists in PIR" and
     /// "the body ends in an expression whose value is the function's result" are
     /// different facts, and only the second one may be returned. Lowering checks the
@@ -533,7 +527,7 @@ pub struct PirFunction {
 }
 
 /// Complete PIR Module
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PirModule {
     /// All statements in the module
     pub statements: Vec<PirStatement>,
@@ -563,6 +557,8 @@ pub struct PirModule {
     pub function_params: Vec<FunctionParam>,
     /// Function signatures for external calls
     pub extern_functions: Vec<ExternFunction>,
+    /// Type definitions (structs, enums, aliases) from the source program
+    pub type_definitions: Vec<TypeDef>,
     /// The program's functions, each with its own scope.
     ///
     /// # Relationship to the flat fields above
@@ -600,20 +596,21 @@ impl Default for PirModule {
             parameters: Vec::new(),
             function_params: Vec::new(),
             extern_functions: Vec::new(),
+            type_definitions: Vec::new(),
             functions: Vec::new(),
         }
     }
 }
 
 /// External function declaration
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExternFunction {
     pub name: String,
     pub params: Vec<ExternParam>,
     pub return_type: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExternParam {
     pub name: String,
     pub ty: String,
@@ -639,6 +636,7 @@ impl PirModule {
             // hand-constructed module genuinely has no function parameters.
             function_params: Vec::new(),
             extern_functions: Vec::new(),
+            type_definitions: Vec::new(),
             // Likewise: a hand-constructed module (every `.pir` fixture, and every
             // test that builds one by hand) has one implicit entry body and no
             // function structure. Populating this is the lowering pass's job.
@@ -792,7 +790,10 @@ impl PirModule {
                     || qubits.iter().any(|q| self.expr_contains_var(q, var))
             }
             PirExpr::Array { items } => items.iter().any(|a| self.expr_contains_var(a, var)),
-            PirExpr::Struct { name: _, fields } => fields.iter().any(|f| self.expr_contains_var(f, var)),
+            PirExpr::ArrayRepeat { value, count } => {
+                self.expr_contains_var(value, var) || self.expr_contains_var(count, var)
+            }
+            PirExpr::Struct { fields } => fields.iter().any(|f| self.expr_contains_var(f, var)),
             PirExpr::Async(inner) => self.expr_contains_var(inner, var),
             PirExpr::Await(inner) => self.expr_contains_var(inner, var),
             PirExpr::IntLit(_) | PirExpr::FloatLit(_) | PirExpr::BoolLit(_) => false,
@@ -909,6 +910,9 @@ impl PirModule {
                     } else {
                         0
                     }
+            }
+            PirExpr::ArrayRepeat { value, count } => {
+                self.count_in_expr(value, var) + self.count_in_expr(count, var)
             }
             _ => 0,
         }
@@ -1028,7 +1032,6 @@ fn pir_expr_to_string(expr: &PirExpr, _indent: usize) -> String {
             width,
             signed,
             float_target,
-            pointer_target: _,
         } => match float_target {
             // A float target is printed as a float. Printing it as `i{width}` would be
             // a lie about the conversion the dump claims to be showing.
@@ -1073,7 +1076,10 @@ fn pir_expr_to_string(expr: &PirExpr, _indent: usize) -> String {
             let inner: Vec<String> = items.iter().map(|a| pir_expr_to_string(a, 0)).collect();
             format!("[{}]", inner.join(", "))
         }
-        PirExpr::Struct { name: _, fields } => {
+        PirExpr::ArrayRepeat { value, count } => {
+            format!("[{}; {}]", pir_expr_to_string(value, 0), pir_expr_to_string(count, 0))
+        }
+        PirExpr::Struct { fields } => {
             let inner: Vec<String> = fields.iter().map(|f| pir_expr_to_string(f, 0)).collect();
             format!("{{{}}}", inner.join(", "))
         }

@@ -4,6 +4,7 @@
 //! and automatic parallelization.
 
 use crate::codegen::error::{CodegenError, CodegenResult};
+use crate::codegen::llvm::module_builder::LLVMModuleBuilder;
 use crate::codegen::llvm::value_builder::LlvmValueBuilder;
 use crate::ir::affine_map::AffineMap;
 use inkwell::IntPredicate;
@@ -132,7 +133,7 @@ impl<'ctx> ParallelEmitter<'ctx> {
 
         // Load current induction variable value
         let iv_val = value_builder
-            .build_load(iv_alloca, "iv_val")?
+            .build_load(int_type.into(), iv_alloca, "iv_val")?
             .into_int_value();
 
         // Compare with upper bound.
@@ -309,7 +310,7 @@ impl<'ctx> ParallelEmitter<'ctx> {
         phi.add_incoming(&[(&init_val as &dyn BasicValue<'ctx>, preheader)]);
 
         let iv_val = value_builder
-            .build_load(iv_alloca, "iv_val")?
+            .build_load(int_type.into(), iv_alloca, "iv_val")?
             .into_int_value();
         let upper_val = bounds.upper.into_int_value();
         let cond =
@@ -390,6 +391,9 @@ pub struct LoopBounds<'ctx> {
 /// Trait for schedule lowering to allow mocking
 pub trait ScheduleLoweringLike<'ctx> {
     fn value_builder(&mut self) -> &mut LlvmValueBuilder<'ctx>;
+    fn module_builder(&mut self) -> Option<&mut LLVMModuleBuilder<'ctx>> {
+        None
+    }
 }
 
 struct MockLowering<'ctx, 'a> {

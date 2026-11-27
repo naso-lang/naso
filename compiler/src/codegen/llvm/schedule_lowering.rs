@@ -12,7 +12,7 @@
 
 use crate::codegen::context::CodegenContext;
 use crate::codegen::error::{CodegenError, CodegenResult};
-use crate::codegen::llvm::module_builder::{EntryParam, LLVMModuleBuilder, ReturnSource, build_entry_signature};
+use crate::codegen::llvm::module_builder::{CalleeInfo, EntryParam, LLVMModuleBuilder, ReturnSource, build_entry_signature};
 use crate::codegen::llvm::value_builder::TensorBinding;
 use crate::codegen::llvm::{
     access_emission::AccessEmitter,
@@ -23,7 +23,8 @@ use crate::codegen::llvm::{
     type_lowering::LlvmTypeLowering,
     value_builder::LlvmValueBuilder,
 };
-use crate::ir::pir_types::{ElemType, FnReturn, ParamKind};
+use crate::ir::pir_types::ElemType;
+use crate::ir::pir_types::ParamKind;
 use crate::ir::{
     access_relation::AccessRelations,
     affine_domain::AffineDomain,
@@ -60,7 +61,7 @@ pub fn lower_schedule_tree<'ctx>(
     let type_lowering = LlvmTypeLowering::new(llvm_context);
     let mut value_builder = LlvmValueBuilder::new(builder, type_lowering);
 
-    let abi = build_entry_signature(&mut LlvmTypeLowering::new(llvm_context), pir_module, None)?;
+    let abi = build_entry_signature(&mut LlvmTypeLowering::new(llvm_context), pir_module)?;
     lower_schedule_tree_into(
         ctx,
         function,
@@ -70,7 +71,6 @@ pub fn lower_schedule_tree<'ctx>(
         quantities,
         access_relations,
         abi.as_slice(),
-        None,
         None,
         None,
         None,
@@ -111,9 +111,8 @@ pub fn lower_schedule_tree_into<'ctx>(
     abi: &[EntryParam<'ctx>],
     return_value: Option<&PirExpr>,
     return_source: Option<ReturnSource>,
-    callee_params: Option<&HashMap<String, crate::codegen::llvm::module_builder::CalleeInfo>>,
+    callee_params: Option<&HashMap<String, CalleeInfo>>,
     mut module_builder: Option<&mut LLVMModuleBuilder<'ctx>>,
-    return_type: Option<&FnReturn>,
 ) -> CodegenResult<()> {
     let llvm_context = ctx.llvm_context();
     
@@ -203,27 +202,44 @@ pub fn lower_schedule_tree_into<'ctx>(
             // A quantum register binds as a pointer like a tensor, but with no element
             // type, because nothing here indexes one. A read stays a diagnostic.
             ParamKind::QRegister => {
-                value_builder.bind_tensor(
-                    &entry.name,
-                    TensorBinding {
-                        base: arg.into_pointer_value(),
-                        // The element type is recorded but never used for indexing: a
-                        // `QRegister` subscript has no lowering and reports that. Using
-                        // `i8` is a placeholder that must never be mistaken for a
-                        // working one.
-                        elem: value_builder
-                            .type_lowering()
-                            .int_type(crate::codegen::abi::IntWidth::I8)
-                            .into(),
-                        shape: None,
-                        // A `QRegister` occupies ONE argument, not the `(ptr, len)`
-                        // pair a tensor does, so there is no length to forward.
-                        len: None,
-                        sub_byte: false,
-                    },
-                );
-            }
-            // A scalar is stored into an alloca so the body reads it through the same
+                            value_builder.bind_tensor(
+                                &entry.name,
+                                TensorBinding {
+                                    base: arg.into_pointer_value(),
+                                    // The element type is recorded but never used for indexing: a
+                                    // `QRegister` subscript has no lowering and reports that. Using
+                                    // `i8` is a placeholder that must never be mistaken for a
+                                    // working one.
+                                    elem: value_builder
+                                        .type_lowering()
+                                        .int_type(crate::codegen::abi::IntWidth::I8)
+                                        .into(),
+                                    shape: None,
+                                    // A `QRegister` occupies ONE argument, not the `(ptr, len)` pair
+                                    // a tensor does, so there is no length to forward.
+                                    len: None,
+                                    sub_byte: false,
+                                },
+                            );
+                        }
+                        ParamKind::Struct => {
+                            // Struct: passed by value as aggregate (pointer to struct)
+                            // For now, treat similarly to a tensor but with no element type
+                            value_builder.bind_tensor(
+                                &entry.name,
+                                TensorBinding {
+                                    base: arg.into_pointer_value(),
+                                    elem: value_builder
+                                        .type_lowering()
+                                        .int_type(crate::codegen::abi::IntWidth::I8)
+                                        .into(),
+                                    shape: None,
+                                    len: None,
+                                    sub_byte: false,
+                                },
+                            );
+                        }
+                        // A scalar is stored into an alloca so the body reads it through the same
             // name-resolution path as every other binding; a loop bound lowers as a
             // load of exactly this slot.
             // `Unsupported` has no slot to bind to. `build_entry_signature` refuses
@@ -235,11 +251,6 @@ pub fn lower_schedule_tree_into<'ctx>(
                     "parameter `{}` has no bindable ABI slot: {reason}",
                     entry.name
                 )));
-            }
-            ParamKind::Struct => {
-                // Struct parameter: bind as a pointer (opaque pointer to caller-allocated struct)
-                // Use bind_argument to create an alloca and store the pointer, so the body can read it by name
-                value_builder.bind_argument(&entry.name, arg)?;
             }
             ParamKind::Scalar(_) => {
                 value_builder.bind_argument(&entry.name, arg)?;
@@ -323,17 +334,8 @@ pub fn lower_schedule_tree_into<'ctx>(
     // Use module from lowering context (already extracted)
     let module = lowering.module;
     
-    // Check if this function uses sret (structure return) convention
-    // sret is indicated by the first ABI entry being named "sret"
-    let uses_sret = abi.first().map(|e| e.name == "sret").unwrap_or(false);
-    let sret_ptr = if uses_sret {
-        Some(function.get_first_param().unwrap().into_pointer_value())
-    } else {
-        None
-    };
-    
-    let llvm_return_type = function.get_type().get_return_type();
-    let returned = match (llvm_return_type, return_value) {
+    let return_type = function.get_type().get_return_type();
+    let returned = match (return_type, return_value) {
         (None, _) => None,
         (Some(ty), Some(expr)) => {
             let mut lowerer = PirExprLowerer {
@@ -377,51 +379,7 @@ pub fn lower_schedule_tree_into<'ctx>(
         // path cannot get here: `emit_one_function` refuses first.
         (Some(ty), None) => Some(lowering.value_builder.build_zero(ty)),
     };
-    
-    // Handle return based on calling convention
-    if uses_sret {
-        // sret convention: store value to caller-allocated pointer, then ret void
-        if let (Some(sret_ptr), Some(val)) = (sret_ptr, returned) {
-            // Check if this is an Array return - need to copy array data from tensor struct
-            match return_type {
-                Some(crate::ir::pir_types::FnReturn::Array { elem: _, size }) => {
-                    // val is a tensor struct { ptr: i64, len: i64 }
-                    // Extract the ptr and copy array data to sret buffer
-                    let struct_val = val.into_struct_value();
-                    let int_type = lowering.value_builder.type_lowering().int_type(crate::codegen::abi::IntWidth::I64);
-                    let ptr_val = lowering.value_builder.builder().build_extract_value(struct_val, 0, "array_ptr").map_err(|e| CodegenError::InstructionError(e.to_string()))?.into_int_value();
-                    let len_val = lowering.value_builder.builder().build_extract_value(struct_val, 1, "array_len").map_err(|e| CodegenError::InstructionError(e.to_string()))?.into_int_value();
-                    
-                    // Convert ptr to i8*
-                    let i8_type = lowering.value_builder.type_lowering().int_type(crate::codegen::abi::IntWidth::I8);
-                    let i8_ptr_type = lowering.value_builder.type_lowering().ptr_type(i8_type.into(), inkwell::AddressSpace::default());
-                    let src_ptr = lowering.value_builder.builder().build_int_to_ptr(ptr_val, i8_ptr_type, "array_src").map_err(|e| CodegenError::InstructionError(e.to_string()))?;
-                    
-                    // sret_ptr is already the correct type (pointer to array)
-                    // Copy elements one by one
-                    for i in 0..*size {
-                        let idx = int_type.const_int(i, false);
-                        let src_elem_ptr = unsafe {
-                            lowering.value_builder.builder().build_gep(i8_type, src_ptr, &[idx], &format!("src_elem_{i}")).map_err(|e| CodegenError::InstructionError(e.to_string()))?
-                        };
-                        let dst_elem_ptr = unsafe {
-                            lowering.value_builder.builder().build_gep(i8_type, sret_ptr, &[int_type.const_int(0, false), idx], &format!("dst_elem_{i}")).map_err(|e| CodegenError::InstructionError(e.to_string()))?
-                        };
-                        let elem = lowering.value_builder.builder().build_load(i8_type, src_elem_ptr, &format!("elem_{i}")).map_err(|e| CodegenError::InstructionError(e.to_string()))?;
-                        lowering.value_builder.builder().build_store(dst_elem_ptr, elem).map_err(|e| CodegenError::InstructionError(e.to_string()))?;
-                    }
-                }
-                _ => {
-                    // For Tensor and Struct returns, store directly
-                    lowering.value_builder.builder().build_store(sret_ptr, val).map_err(|e| CodegenError::InstructionError(e.to_string()))?;
-                }
-            }
-        }
-        lowering.value_builder.build_return(None)?;
-    } else {
-        // Normal return convention
-        lowering.value_builder.build_return(returned)?;
-    }
+    lowering.value_builder.build_return(returned)?;
 
     // Verify function. inkwell 0.10's `verify` returns a `bool` rather than a
     // `Result`, printing diagnostics to stderr when `print` is true; on failure
@@ -539,13 +497,13 @@ pub struct ScheduleLowering<'ctx, 'a> {
     pir_module: &'a PirModule,
     quantities: &'a QuantityMap,
     access_relations: &'a AccessRelations,
-    /// Each Naso function's declared parameter kinds and return type, so a `Call` inside a loop body
+    /// Each Naso function's declared parameter kinds, so a `Call` inside a loop body
     /// marshals its arguments the same way one at statement level does.
     ///
     /// Taken from the whole program rather than from this function alone: a loop body
     /// can call any function in the module, not only a sibling. `None` for a
     /// hand-built module with no `functions`, where every callee is an `extern`.
-    callee_params: Option<&'a HashMap<String, crate::codegen::llvm::module_builder::CalleeInfo>>,
+    callee_params: Option<&'a HashMap<String, CalleeInfo>>,
     /// Module builder reference for async lowering (stored for async lowering, not for module access)
     module_builder: Option<&'a mut LLVMModuleBuilder<'ctx>>,
 
@@ -573,7 +531,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
         pir_module: &'a PirModule,
         quantities: &'a QuantityMap,
         access_relations: &'a AccessRelations,
-        callee_params: Option<&'a HashMap<String, crate::codegen::llvm::module_builder::CalleeInfo>>,
+        callee_params: Option<&'a HashMap<String, CalleeInfo>>,
         module_builder: Option<&'a mut LLVMModuleBuilder<'ctx>>,
     ) -> CodegenResult<Self> {
         let loop_emitter = LoopEmitter::new(value_builder.type_lowering().context())?;
@@ -972,7 +930,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
         // conversion this backend must not insert.
         match ty {
             inkwell::types::BasicTypeEnum::IntType(t) if t.get_bit_width() == 64 => {
-                Ok(self.value_builder.build_load(ptr, name)?.into_int_value())
+                Ok(self.value_builder.build_load(t.into(), ptr, name)?.into_int_value())
             }
             other => Err(CodegenError::UnsupportedFeature(format!(
                 "symbolic constant `{name}` is bound to {other:?}, but loop bounds are \

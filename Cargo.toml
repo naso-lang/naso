@@ -15,6 +15,10 @@ members = [
     "crates/naso-gcc-backend",
     "crates/naso-msvc-backend",
     "crates/naso-edition",
+    "crates/naso-registry",
+    "crates/naso-web-framework",
+    "crates/naso-ml-framework",
+    "crates/naso-embedded-framework",
     "bench_runner",
     "tck",
 ]

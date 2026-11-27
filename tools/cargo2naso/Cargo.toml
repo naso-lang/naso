@@ -1,0 +1,21 @@
+[package]
+name = "cargo2naso"
+version = "0.1.0"
+edition = "2021"
+description = "Migrate Rust/Cargo projects to Naso"
+authors = ["Naso Language Team <team@nasolang.org>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/naso-lang/naso"
+homepage = "https://nasolang.org"
+keywords = ["migration", "cargo", "rust", "naso"]
+categories = ["development-tools", "build-tools"]
+
+[dependencies]
+toml = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+walkdir = "2.5"
+
+[build-dependencies]
+
+[features]
+default = []

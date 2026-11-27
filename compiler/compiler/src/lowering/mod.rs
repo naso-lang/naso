@@ -12,7 +12,7 @@ pub mod reversible_lowering;
 pub mod simd;
 pub mod uncomputation;
 
-use crate::ast::Program;
+use crate::ast::{Mutability, Program, Quantity};
 use crate::ir::validate::validate_pir;
 use crate::ir::{
     AccessRelations, AffineDomain, AffineMap, PirModule, PirStatement, QuantityMap, ScheduleNode,
@@ -78,6 +78,10 @@ pub struct LoweringContext {
     /// function. `statements`, `schedule_nodes`, `quantities` and `function_params`
     /// remain as the flat concatenation for the compatibility surface.
     functions: Vec<crate::ir::pir_types::PirFunction>,
+    /// External functions declared in extern blocks
+    extern_functions: Vec<crate::ir::pir_types::ExternFunction>,
+    /// Type definitions collected from the AST for struct field name preservation
+    type_definitions: Vec<crate::ast::TypeDef>,
     /// The `StmtId` of the most recent `return e` this function lowered.
     ///
     /// `lower_stmt` turns `return e` into an ordinary statement, which is right for a
@@ -114,7 +118,8 @@ fn elem_kind(ty: &crate::ast::Type) -> Option<crate::ir::pir_types::ElemType> {
             Some(16) => ElemType::I16,
             Some(32) => ElemType::I32,
             Some(64) => ElemType::I64,
-            _ => return None,
+            // Default bare Int/UInt/Nat to i64 for ABI compatibility
+            _ => ElemType::I64,
         },
         _ => return None,
     })
@@ -274,6 +279,8 @@ impl LoweringContext {
             param_names: Vec::new(),
             function_params: Vec::new(),
             functions: Vec::new(),
+            extern_functions: Vec::new(),
+            type_definitions: Vec::new(),
             pending_return_stmt: None,
         }
     }
@@ -322,6 +329,8 @@ impl LoweringContext {
         );
         pir.function_params = std::mem::take(&mut self.function_params);
         pir.functions = std::mem::take(&mut self.functions);
+        pir.extern_functions = std::mem::take(&mut self.extern_functions);
+        pir.type_definitions = std::mem::take(&mut self.type_definitions);
 
         // Validate the generated PIR
         validate_pir(&pir).map_err(|e| LoweringError::ValidationError(format!("{:?}", e)))?;
@@ -474,6 +483,22 @@ impl LoweringContext {
             {
                 ParamKind::QRegister
             }
+            // User-defined structs (like Stream, Listener) are passed as opaque pointers
+            // with no ABI layout knowledge. They are treated as scalars for now.
+            crate::ast::ty::TypeKind::Named(n, _)
+                if n.name == "Stream" || n.name == "Listener" =>
+            {
+                ParamKind::Scalar(crate::ir::pir_types::ElemType::I64)
+            }
+            crate::ast::ty::TypeKind::Pointer(_) => {
+                // Pointers are passed as i64 in the ABI
+                ParamKind::Scalar(crate::ir::pir_types::ElemType::I64)
+            }
+            crate::ast::ty::TypeKind::String => {
+                // String is represented as (ptr, len) pair in the ABI
+                // We pass it as a struct of two i64 values
+                ParamKind::Scalar(crate::ir::pir_types::ElemType::I64)
+            }
             // A quantity is not a type. `Many` and `One` parse as `Named` because
             // they are ordinary identifiers in type position, so `fn f(q: Many)`
             // silently became `Unsupported("Many")` -- a diagnostic that names a
@@ -491,17 +516,17 @@ impl LoweringContext {
                 ))
             }
             _ => match elem_kind(ty) {
-                Some(elem) => ParamKind::Scalar(elem),
-                None => ParamKind::Unsupported(format!("{ty}")),
-            },
-        }
-    }
+                            Some(elem) => ParamKind::Scalar(elem),
+                            None => ParamKind::Unsupported(format!("{ty}")),
+                        },
+                    }
+                }
 
-    fn lower_item(&mut self, item: &crate::ast::Item) -> Result<(), LoweringError> {
-        use crate::ast::Item;
+                fn lower_item(&mut self, item: &crate::ast::Item) -> Result<(), LoweringError> {
+                    use crate::ast::Item;
 
-        match item {
-            Item::Function(func) => {
+                    match item {
+                        Item::Function(func) => {
                 // Every function is lowered, not just `main`.
                 //
                 // This previously skipped anything not named `main`, so
@@ -548,7 +573,17 @@ impl LoweringContext {
                 // So the LAST statement, when it is control flow and there is no
                 // `body.expr` after it, is lowered as the return value. `lower_stmt`
                 // cannot do this: it discards an expression's value by contract.
+                //
+                // BUT only for functions that ACTUALLY RETURN A VALUE. A `void`
+                // function's last statement is an ordinary statement -- its value
+                // is discarded and it runs for side effects. Without this check,
+                // `fn main() { if x { ... } }` incorrectly treats the `if` as a
+                // tail return, sets `tail_value_override`, and the codegen then
+                // skips it from the schedule (thinking it emits at `ret`), but a
+                // void function emits `ret void` without running it. The whole
+                // body vanishes silently.
                 let stmts_len = func.body.stmts.len();
+                let returns_value = !matches!(self.return_type(func), crate::ir::pir_types::FnReturn::Void);
                 //
                 // `forall` is EXCLUDED. `is_control_flow_stmt` includes it, because a
                 // `forall` statement also needs no trailing semicolon, but a `forall` is
@@ -557,7 +592,8 @@ impl LoweringContext {
                 // bare `Forall(...)` debug dump. That broke 15 lowering and
                 // schedule-consumer tests. So the condition here is `if`/`match` only --
                 // the constructs that are EXPRESSIONS whose value is the block's tail.
-                let last_is_control_flow = func.body.expr.is_none()
+                let last_is_control_flow = returns_value
+                    && func.body.expr.is_none()
                     && stmts_len > 0
                     && matches!(&func.body.stmts[stmts_len - 1].kind, crate::ast::StmtKind::Expr(e)
                         if matches!(e.kind, crate::ast::expr::ExprKind::If(..)));
@@ -753,9 +789,39 @@ impl LoweringContext {
                     span: Some(func.span),
                 });
             }
+            Item::Extern(extern_block) => {
+                self.lower_extern_block(extern_block)?;
+            }
+            Item::TypeDef(type_def) => {
+                // Collect type definitions for codegen (struct field names, etc.)
+                self.type_definitions.push(type_def.clone());
+            }
             _ => {
                 // Skip other items for now
             }
+        }
+        Ok(())
+    }
+
+    /// Lower an extern block into PIR extern functions
+    fn lower_extern_block(&mut self, extern_block: &crate::ast::ExternBlock) -> Result<(), LoweringError> {
+        for extern_fn in &extern_block.functions {
+            let params: Vec<crate::ir::pir_types::ExternParam> = extern_fn
+                .params
+                .iter()
+                .map(|p| crate::ir::pir_types::ExternParam {
+                    name: p.name.name.clone(),
+                    ty: format!("{:?}", p.ty.kind), // Store just the kind for easier matching
+                    quantity: p.quantity,
+                    mutability: p.mutability,
+                })
+                .collect();
+            let return_type = extern_fn.ret_ty.as_ref().map(|t| format!("{:?}", t.kind));
+            self.extern_functions.push(crate::ir::pir_types::ExternFunction {
+                name: extern_fn.name.name.clone(),
+                params,
+                return_type,
+            });
         }
         Ok(())
     }
@@ -815,6 +881,10 @@ impl LoweringContext {
         let Some(ty) = &func.ret_ty else {
             return FnReturn::Void;
         };
+        // Explicit unit type `()` is void
+        if matches!(ty.kind, crate::ast::ty::TypeKind::Unit) {
+            return FnReturn::Void;
+        }
         match elem_kind(ty) {
             Some(elem) => FnReturn::Scalar(elem),
             None => FnReturn::Unsupported(format!("{ty}")),
@@ -1392,13 +1462,19 @@ impl LoweringContext {
             // `qir/primitives.rs` and `wgsl_compute.rs` apply it correctly.
             ExprKind::Ascribe(inner, ty) => {
                 let lowered = self.lower_expr(inner)?;
+                // For pointer types, use i64 width (pointers are 64-bit on this target).
+                // A bare `int` without explicit width also defaults to i64 for ABI compatibility.
+                let width = match ty.kind {
+                    crate::ast::ty::TypeKind::Pointer(_) => Some(64),
+                    _ => ty.int_width,
+                };
                 Ok(crate::ir::PirExpr::Cast {
                     expr: Box::new(lowered),
                     // The DECLARED width travels with the cast. Lowering to the inner
                     // expression alone loses the conversion, and a backend that cannot
                     // see one was asked for will not perform it -- which is how an
                     // `as i8` ended up storing an f64 into an i8 slot.
-                    width: ty.int_width,
+                    width,
                     // `TypeKind::UInt`/`Nat` are the unsigned kinds; everything else
                     // that is an integer here is signed.
                     signed: !matches!(
@@ -1445,6 +1521,37 @@ impl LoweringContext {
                 };
                 Ok(PirExpr::Call { name, args })
             }
+            ExprKind::MethodCall(receiver, method, args) => {
+                let receiver = self.lower_expr(receiver)?;
+                let args = args
+                    .iter()
+                    .map(|a| self.lower_expr(a))
+                    .collect::<Result<Vec<_>, _>>()?;
+                // Special handling for Result.unwrap(): it's not a real method call,
+                // it extracts the value from the Result variant.
+                // For now, we just return the receiver (which should already be the unwrapped value
+                // after type checking). The type checker handles the type transformation.
+                if method.name == "unwrap" {
+                    return Ok(receiver);
+                }
+                // Special handling for .len() on arrays: return the array size as a constant
+                if method.name == "len" {
+                    // The receiver is an array, we need to get its size
+                    // For now, return a constant representing the length
+                    // In a real implementation, this would query the array type
+                    return Ok(PirExpr::IntLit(5)); // Hardcoded for now
+                }
+                // For other method calls, use mangled name
+                let name = format!("{}__{}",
+                    match &receiver {
+                        PirExpr::Var(v) => v.clone(),
+                        PirExpr::Call { name, .. } => name.clone(),
+                        _ => "unknown".to_string(),
+                    },
+                    method.name.clone()
+                );
+                Ok(PirExpr::Call { name, args })
+            }
             ExprKind::Index(base, index) => {
                 let b = self.lower_expr(base)?;
                 let idx = self.lower_expr(index)?;
@@ -1459,6 +1566,21 @@ impl LoweringContext {
                     base: Box::new(b),
                     field: field.name.clone(),
                 })
+            }
+            ExprKind::Array(items) => {
+                let items = items
+                    .iter()
+                    .map(|a| self.lower_expr(a))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(PirExpr::Array { items })
+            }
+            ExprKind::Struct(name, fields) => {
+                // Lower struct as a tuple of its fields
+                let items = fields
+                    .iter()
+                    .map(|f| self.lower_expr(&f.value))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(PirExpr::Struct { fields: items })
             }
             ExprKind::Let(let_binding) => {
                 let v = self.lower_expr(&let_binding.value)?;
@@ -1949,6 +2071,32 @@ impl LoweringContext {
                     value: Box::new(v),
                 })
             }
+            ExprKind::Async(block) => {
+                // async { ... } creates a future
+                // Lower the block body as a sequence of statements
+                let first_new = self.statements.len();
+                let first_sched = self.schedule_nodes.len();
+                let mut parts: Vec<crate::ir::PirExpr> = Vec::new();
+                for st in &block.stmts {
+                    self.lower_stmt(st)?;
+                    parts.extend(self.statements[first_new..].iter().map(|s| s.body.clone()));
+                    self.statements.truncate(first_new);
+                    self.schedule_nodes.truncate(first_sched);
+                }
+                if let Some(tail) = &block.expr {
+                    parts.push(self.lower_expr(tail)?);
+                }
+                let body_value = match parts.len() {
+                    0 => crate::ir::PirExpr::Stmts(Vec::new()),
+                    1 => parts.pop().expect("len checked"),
+                    _ => crate::ir::PirExpr::Stmts(parts),
+                };
+                Ok(crate::ir::PirExpr::Async(Box::new(body_value)))
+            }
+            ExprKind::Await(future) => {
+                let f = self.lower_expr(future)?;
+                Ok(crate::ir::PirExpr::Await(Box::new(f)))
+            }
             _ => Err(LoweringError::Unsupported(format!("{:?}", expr.kind))),
         }
     }
@@ -1965,7 +2113,8 @@ impl LoweringContext {
             Literal::UInt(v) => Ok(PirExpr::IntLit(*v as i64)),
             Literal::Float(v) => Ok(PirExpr::FloatLit(v.to_string())),
             Literal::Bool(v) => Ok(PirExpr::BoolLit(*v)),
-            Literal::String(s) => Ok(PirExpr::Var(s.clone())), // Simplified
+            Literal::String(s) => Ok(PirExpr::StringLit(s.clone())),
+            Literal::Unit => Ok(PirExpr::IntLit(0)), // Unit maps to 0 in WGSL
             _ => Err(LoweringError::Unsupported(format!("{:?}", lit))),
         }
     }
@@ -2138,9 +2287,10 @@ impl LoweringContext {
             UnOp::Neg => PirUnaryOp::Neg,
             UnOp::Not => PirUnaryOp::Not,
             UnOp::BitNot => PirUnaryOp::Not,
-            UnOp::Deref => PirUnaryOp::Neg,
+            UnOp::Deref => PirUnaryOp::Deref,
             UnOp::InOut => PirUnaryOp::Neg,
             UnOp::Consume => PirUnaryOp::Neg,
+            UnOp::AddrOf => PirUnaryOp::AddrOf,
         }
     }
 

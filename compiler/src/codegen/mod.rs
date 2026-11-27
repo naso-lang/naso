@@ -28,6 +28,12 @@ pub mod llvm;
 pub mod qir;
 #[cfg(feature = "llvm")]
 pub mod ffi_integration;
+#[cfg(feature = "llvm")]
+pub mod wasm_gc;
+#[cfg(feature = "llvm")]
+pub mod wasm_component;
+#[cfg(feature = "llvm")]
+pub mod distributed;
 
 use crate::ir::pir_types::PirModule;
 
@@ -73,43 +79,71 @@ impl CodegenPipeline {
     }
 
     /// Generate QIR from a PIR module.
-        /// 
-        /// Linearity is checked BEFORE emission.
-        /// 
-        /// This backend had no check at all, and that is not a stylistic gap. A QIR
-        /// program whose linear values are used twice is not a slower program -- it is a
-        /// program whose quantum state has been destroyed and then reused, and no
-        /// downstream consumer can detect it. LLVM's module verifier accepts such a
-        /// module, so the invalid circuit left this backend looking healthy:
-        /// 
-        /// ```text
-        ///     emit_qir(uses [1] twice) == Ok(1461 chars of valid QIR)
-        /// ```
-        /// 
-        /// The check used here is the same one the WGSL backend exposes.
-        /// 
-        /// SCOPE, stated precisely so this is not oversold: the typechecker already
-        /// rejects a doubled `[1]` value, and the CLI runs it before selecting a target,
-        /// so no source program can reach here with this violation. What this closes is
-        /// the library path -- `CodegenPipeline::emit_qir` is public API, and a PIR
-        /// module built by hand, by a lowering pass, or by a fixture can carry a
-        /// violation that no typechecker ever saw. Emitting a QIR circuit from such a
-        /// module destroys and reuses quantum state, and nothing downstream can detect
-        /// it, so the check belongs at the emission boundary rather than only upstream.
-        pub fn emit_qir(&self, module: &PirModule) -> CodegenResult<String> {
-            verify_wgsl_linearity(module)?;
-            let mut builder = qir::QIRModuleBuilder::new(&self.context)?;
-            builder.build_module(module)?;
-            Ok(builder.module_to_string())
-        }
+    ///
+    /// Linearity is checked BEFORE emission.
+    ///
+    /// This backend had no check at all, and that is not a stylistic gap. A QIR
+    /// program whose linear values are used twice is not a slower program -- it is a
+    /// program whose quantum state has been destroyed and then reused, and no
+    /// downstream consumer can detect it. LLVM's module verifier accepts such a
+    /// module, so the invalid circuit left this backend looking healthy:
+    ///
+    /// ```text
+    ///     emit_qir(uses [1] twice) == Ok(1461 chars of valid QIR)
+    /// ```
+    ///
+    /// The check used here is the same one the WGSL backend exposes.
+    ///
+    /// SCOPE, stated precisely so this is not oversold: the typechecker already
+    /// rejects a doubled `[1]` value, and the CLI runs it before selecting a target,
+    /// so no source program can reach here with this violation. What this closes is
+    /// the library path -- `CodegenPipeline::emit_qir` is public API, and a PIR
+    /// module built by hand, by a lowering pass, or by a fixture can carry a
+    /// violation that no typechecker ever saw. Emitting a QIR circuit from such a
+    /// module destroys and reuses quantum state, and nothing downstream can detect
+    /// it, so the check belongs at the emission boundary rather than only upstream.
+    pub fn emit_qir(&self, module: &PirModule) -> CodegenResult<String> {
+        verify_wgsl_linearity(module)?;
+        let mut builder = qir::QIRModuleBuilder::new(&self.context)?;
+        builder.build_module(module)?;
+        Ok(builder.module_to_string())
+    }
 
-        /// Generate QIR in portable JSON format for quantum runtime execution
-        pub fn emit_qir_json(&self, module: &PirModule) -> CodegenResult<String> {
-            verify_wgsl_linearity(module)?;
-            let mut builder = qir::QIRModuleBuilder::new(&self.context)?;
-            builder.build_module(module)?;
-            builder.emit_qir_json()
+    /// Generate WASM GC IR from a PIR module.
+    ///
+    /// Emits LLVM IR targeting the wasm32-unknown-unknown-gc triple with
+    /// WASM GC intrinsics (struct.new, struct.get, struct.set, array.new, etc.)
+    /// for managed memory without wasm-bindgen glue.
+    pub fn emit_wasm_gc(&self, module: &PirModule) -> CodegenResult<String> {
+        if !self.context.is_wasm_gc() {
+            return Err(CodegenError::TargetError(
+                "WASM GC backend requires wasm32-gc target. Use --triple wasm32-gc.".to_string(),
+            ));
         }
+        wasm_gc::emit_wasm_gc(module, &self.context)
+    }
+
+    /// Generate WASM Component Model IR from a PIR module.
+    ///
+    /// Emits LLVM IR targeting the wasm32-wasip1/2/3 triples with
+    /// Component Model metadata for cross-language composition.
+    pub fn emit_wasm_component(&self, module: &PirModule) -> CodegenResult<String> {
+        if !self.context.is_wasi() {
+            return Err(CodegenError::TargetError(
+                "WASM Component backend requires WASI target. Use --triple wasm32-wasip1/2/3.".to_string(),
+            ));
+        }
+        wasm_component::emit_wasm_component(module, &self.context)
+    }
+
+    /// Execute distributed build across a build farm.
+    ///
+    /// Submits compilation jobs to a distributed build farm for parallel execution
+    /// with hermetic caching and incremental remote compilation.
+    pub async fn emit_distributed(&self, module: &PirModule) -> CodegenResult<String> {
+        let config = distributed::DistributedBuildConfig::default();
+        distributed::emit_distributed(module, &self.context, config).await
+    }
 
     #[cfg(feature = "cranelift")]
     /// Compile and execute via Cranelift JIT (stub)
@@ -170,6 +204,12 @@ pub enum Backend {
     /// available in a default build. It is currently the straight-line backend
     /// only -- see `wgsl_straight`.
     Wgsl,
+    /// WASM GC backend for wasm32-gc target
+    WasmGc,
+    /// WASM Component Model backend for wasm32-wasip1/2/3 targets
+    WasmComponent,
+    /// Distributed build backend
+    Distributed,
 }
 
 /// Configuration for code generation
@@ -180,18 +220,6 @@ pub struct CodegenConfig {
     pub opt_level: OptLevel,
     pub output_path: Option<std::path::PathBuf>,
     pub emit_debug: bool,
-    /// Output format for QIR backend (llvm-ir or json)
-    pub qir_output_format: QirOutputFormat,
-    /// Run formal verification after type checking
-    pub verify: bool,
-}
-
-/// Output format for QIR
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum QirOutputFormat {
-    #[default]
-    LlvmIr,
-    Json,
 }
 
 impl Default for CodegenConfig {
@@ -202,8 +230,6 @@ impl Default for CodegenConfig {
             opt_level: OptLevel::Default,
             output_path: None,
             emit_debug: false,
-            qir_output_format: QirOutputFormat::default(),
-            verify: false,
         }
     }
 }

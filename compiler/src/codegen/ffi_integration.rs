@@ -40,11 +40,11 @@ pub static FFI_SYMBOLS: &[(&str, &str)] = &[
     ("naso_epoll_create", "naso_epoll_create"),
     ("naso_epoll_ctl", "naso_epoll_ctl"),
     ("naso_epoll_wait", "naso_epoll_wait"),
-    // Async I/O FFI
-    ("naso_tcp_accept_async", "naso_tcp_accept_async"),
+    // Async I/O FFI (using io_uring)
+    ("naso_tcp_accept_uring", "naso_tcp_accept_uring"),
     ("naso_tcp_connect_async", "naso_tcp_connect_async"),
-    ("naso_read_async", "naso_read_async"),
-    ("naso_write_async", "naso_write_async"),
+    ("naso_read_uring", "naso_read_uring"),
+    ("naso_write_uring", "naso_write_uring"),
     ("naso_timer_sleep_async", "naso_timer_sleep_async"),
     // io_uring FFI
     ("naso_uring_init", "naso_uring_init"),

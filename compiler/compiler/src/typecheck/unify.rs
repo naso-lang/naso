@@ -30,6 +30,40 @@ pub fn unify_types(checker: &mut TypeChecker, ty1: &Type, ty2: &Type) -> Result<
         return unify_meta_var(checker, *mv, ty1);
     }
 
+    // Special handling for Nat types with known values
+    if matches!(&ty1.kind, TypeKind::Nat) && matches!(&ty2.kind, TypeKind::Nat) {
+        let val1 = ty1.nat_const();
+        let val2 = ty2.nat_const();
+        if let (Some(v1), Some(v2)) = (val1, val2) {
+            if v1 != v2 {
+                return Err(TypeError::TypeMismatch {
+                    expected: Type::nat_lit(v1, ty1.span),
+                    found: Type::nat_lit(v2, ty2.span),
+                    span: ty1.span.merge(ty2.span),
+                });
+            }
+        }
+        // If we reach here, either values match or at least one is unknown
+        // Use the known value if available
+        let nat_value = val1.or(val2);
+        let unified_qty = unify_quantity(ty1.quantity, ty2.quantity, ty1.span.merge(ty2.span))?;
+        let kind = TypeKind::Nat;
+        let span = ty1.span.merge(ty2.span);
+        let mut result = Type::new(kind, unified_qty, span);
+        if let Some(n) = nat_value {
+            result.nat_value = Some(n);
+        }
+        return Ok(result);
+    }
+
+    // Handle metavariables first
+    if let TypeKind::Meta(mv) = &ty1.kind {
+        return unify_meta_var(checker, *mv, ty2);
+    }
+    if let TypeKind::Meta(mv) = &ty2.kind {
+        return unify_meta_var(checker, *mv, ty1);
+    }
+
     // Unify quantities with error reporting for Zero mismatch
     let unified_qty = unify_quantity(ty1.quantity, ty2.quantity, ty1.span.merge(ty2.span))?;
 
@@ -44,7 +78,7 @@ pub fn unify_types(checker: &mut TypeChecker, ty1: &Type, ty2: &Type) -> Result<
 }
 
 /// Unify two type kinds
-fn unify_kinds(
+pub fn unify_kinds(
     checker: &mut TypeChecker,
     k1: &TypeKind,
     k2: &TypeKind,
@@ -56,14 +90,33 @@ fn unify_kinds(
         (TypeKind::Int, TypeKind::Int) => Ok(TypeKind::Int),
         (TypeKind::UInt, TypeKind::UInt) => Ok(TypeKind::UInt),
         (TypeKind::Float, TypeKind::Float) => Ok(TypeKind::Float),
+        // Nat types - must have matching constant values if both are known
         (TypeKind::Nat, TypeKind::Nat) => Ok(TypeKind::Nat),
         (TypeKind::Quint8, TypeKind::Quint8) => Ok(TypeKind::Quint8),
+        (TypeKind::Quint4, TypeKind::Quint4) => Ok(TypeKind::Quint4),
         (TypeKind::Qubit, TypeKind::Qubit) => Ok(TypeKind::Qubit),
         (TypeKind::String, TypeKind::String) => Ok(TypeKind::String),
         (TypeKind::Char, TypeKind::Char) => Ok(TypeKind::Char),
         (TypeKind::Error, _) | (_, TypeKind::Error) => Ok(TypeKind::Error),
 
-        // Named types
+        // Int/UInt coercion: allow small integer literals to coerce to UInt when
+        // the target is explicitly unsigned (e.g., struct field fd: u64 = 1).
+        // We return UInt because that's the "more specific" type - the target
+        // expects unsigned. This is safe for small positive literals.
+        (TypeKind::Int, TypeKind::UInt) => Ok(TypeKind::UInt),
+        (TypeKind::UInt, TypeKind::Int) => Ok(TypeKind::UInt),
+
+                // Array -> Pointer coercion (for buffer passing to C/FFI)
+                (TypeKind::Array(_, _), TypeKind::Pointer(_)) => Ok(TypeKind::Pointer(Box::new(Type::new(TypeKind::UInt, Quantity::Many, Span::default())))),
+                (TypeKind::Pointer(_), TypeKind::Array(_, _)) => Ok(TypeKind::Pointer(Box::new(Type::new(TypeKind::UInt, Quantity::Many, Span::default())))),
+
+                // String -> Pointer coercion (for C string literals)
+                (TypeKind::String, TypeKind::Pointer(_)) => Ok(TypeKind::Pointer(Box::new(Type::new(TypeKind::UInt, Quantity::Many, Span::default())))),
+                (TypeKind::Pointer(_), TypeKind::String) => Ok(TypeKind::Pointer(Box::new(Type::new(TypeKind::UInt, Quantity::Many, Span::default())))),
+
+                // Function -> Pointer coercion (for FFI callbacks)
+                (TypeKind::Function(_, _), TypeKind::Pointer(_)) => Ok(TypeKind::Pointer(Box::new(Type::new(TypeKind::UInt, Quantity::Many, Span::default())))),
+                (TypeKind::Pointer(_), TypeKind::Function(_, _)) => Ok(TypeKind::Pointer(Box::new(Type::new(TypeKind::UInt, Quantity::Many, Span::default())))),
         (TypeKind::Named(name1, args1), TypeKind::Named(name2, args2)) => {
             if name1.name != name2.name {
                 return Err(TypeError::TypeMismatch {
@@ -126,6 +179,11 @@ fn unify_kinds(
             let unified = unify_types(checker, inner1, inner2)?;
             Ok(TypeKind::Projection(Box::new(unified)))
         }
+        // Pointer types
+        (TypeKind::Pointer(inner1), TypeKind::Pointer(inner2)) => {
+            let unified = unify_types(checker, inner1, inner2)?;
+            Ok(TypeKind::Pointer(Box::new(unified)))
+        }
 
         // Reversible types
         (TypeKind::Reversible(inner1), TypeKind::Reversible(inner2)) => {
@@ -161,6 +219,28 @@ fn unify_kinds(
             Ok(TypeKind::Lambda(param1.clone(), Box::new(unified_body)))
         }
 
+        // Array types
+        (TypeKind::Array(elem1, size1), TypeKind::Array(elem2, size2)) => {
+            let unified_elem = unify_types(checker, elem1, elem2)?;
+            // Unify sizes if both are present
+            let unified_size = match (size1, size2) {
+                (Some(s1), Some(s2)) => {
+                    if s1 == s2 {
+                        Some(s1.clone())
+                    } else {
+                        return Err(TypeError::TypeMismatch {
+                            expected: Type::new(TypeKind::Array(elem1.clone(), size1.clone()), Quantity::Many, Span::default()),
+                            found: Type::new(TypeKind::Array(elem2.clone(), size2.clone()), Quantity::Many, Span::default()),
+                            span: Span::default(),
+                        });
+                    }
+                }
+                (Some(s), None) | (None, Some(s)) => Some(s.clone()),
+                (None, None) => None,
+            };
+            Ok(TypeKind::Array(Box::new(unified_elem), unified_size))
+        }
+
         // Type application
         (TypeKind::App(fun1, arg1), TypeKind::App(fun2, arg2)) => {
             let unified_fun = unify_types(checker, fun1, fun2)?;
@@ -181,6 +261,15 @@ fn unify_kinds(
         (TypeKind::Quint8, TypeKind::UInt) => Ok(TypeKind::UInt),
         (TypeKind::Int, TypeKind::Quint8) => Ok(TypeKind::Int),
         (TypeKind::Quint8, TypeKind::Int) => Ok(TypeKind::Int),
+
+        // Quint4 coerces to UInt (it's an unsigned 4-bit value stored in u32 storage).
+        // This lets bitwise shifts and ANDs work when mixing quint4 tensor elements
+        // with integer literals in dequantization.
+        (TypeKind::UInt, TypeKind::Quint4) => Ok(TypeKind::UInt),
+        (TypeKind::Quint4, TypeKind::UInt) => Ok(TypeKind::UInt),
+        (TypeKind::Int, TypeKind::Quint4) => Ok(TypeKind::Int),
+        (TypeKind::Quint4, TypeKind::Int) => Ok(TypeKind::Int),
+
         // Metavariables handled above
 
         // Mismatch

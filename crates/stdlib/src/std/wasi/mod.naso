@@ -1,0 +1,35 @@
+//! WASI (WebAssembly System Interface) Preview 2/3 Bindings
+//!
+//! Full support for WASI Preview 2 (wasi:cli, wasi:io, wasi:filesystem, wasi:clocks, wasi:random)
+//! and Preview 3 (wasi:http, wasi:blob, wasi:config, wasi:logging).
+
+// WASI Preview 2 interfaces
+pub mod preview2 {
+    pub mod cli;
+    pub mod io;
+    pub mod filesystem;
+    pub mod clocks;
+    pub mod random;
+    pub mod sockets;
+}
+
+// WASI Preview 3 interfaces
+pub mod preview3 {
+    pub mod http;
+    pub mod blob;
+    pub mod config;
+    pub mod logging;
+    pub mod keyvalue;
+    pub mod messaging;
+}
+
+// Re-export commonly used types
+pub use preview2::cli::{Environment, ExitCode, Stdin, Stdout, Stderr, TerminalInput, TerminalOutput};
+pub use preview2::io::{InputStream, OutputStream, Pollable};
+pub use preview2::filesystem::{Descriptor, PathFlags, OpenFlags, FileType, FileStats, DirectoryEntry};
+pub use preview2::clocks::{WallClock, MonotonicClock, ClockPrecision};
+pub use preview2::random::{Random, InsecureRandom};
+pub use preview3::http::{HttpClient, Request, Response, Headers, Body, Method, Scheme, Fields};
+pub use preview3::blob::{Blob, BlobReader, BlobWriter};
+pub use preview3::config::{Config, ConfigStore};
+pub use preview3::logging::{Logger, LogLevel, LogRecord};

@@ -100,21 +100,6 @@ fn qir_intrinsic_for(op: &str) -> Option<&'static str> {
         "iswap" => "qir.iswap",
         "ccx" | "toffoli" => "qir.ccx",
 
-        // Controlled rotations
-        "crx" => "qir.crx",
-        "cry" => "qir.cry",
-        "crz" => "qir.crz",
-
-        // Ising couplings
-        "rxx" => "qir.rxx",
-        "ryy" => "qir.ryy",
-        "rzz" => "qir.rzz",
-        "cphase" => "qir.cphase",
-
-        // Three-qubit Fredkin
-        "cswap" => "qir.cswap",
-        "fredkin" => "qir.cswap",
-
         // The dynamic family: a call whose arity is chosen at runtime. QIR takes these
         // through `qir.controlled`, with `qir.adjoint` for a reversed circuit.
         "controlled" => "qir.controlled",
@@ -196,7 +181,7 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
         let builder = llvm_context.create_builder();
 
         // QIR types
-        let qubit_type = llvm_context.ptr_type(AddressSpace::from(0));
+        let qubit_type = llvm_context.i8_type().ptr_type(AddressSpace::from(0));
         let result_type = llvm_context.bool_type();
 
         let profile = QirProfile::new(QirProfileKind::Base);
@@ -232,7 +217,7 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
         let module = llvm_context.create_module("qir_module");
         let builder = llvm_context.create_builder();
 
-        let qubit_type = llvm_context.ptr_type(AddressSpace::from(0));
+        let qubit_type = llvm_context.i8_type().ptr_type(AddressSpace::from(0));
         let result_type = llvm_context.bool_type();
 
         let mut qir_builder = Self {
@@ -477,7 +462,7 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
                     .as_pointer_value();
                 Ok(ptr.into())
             }
-            PirExpr::Struct { name: _, fields } => {
+            PirExpr::Struct { fields } => {
                 // Struct literal: build each field, return as struct
                 // For now, build as a tuple-like struct
                 let field_vals: CodegenResult<Vec<BasicValueEnum<'ctx>>> = fields
@@ -892,6 +877,12 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
                 let _ = items;
                 Ok(self.llvm_context.i64_type().const_zero().into())
             }
+            PirExpr::ArrayRepeat { value, count } => {
+                // QIR has no array repeat - evaluate both and return zero
+                let _ = self.build_expr(value)?;
+                let _ = self.build_expr(count)?;
+                Ok(self.llvm_context.i64_type().const_zero().into())
+            }
             PirExpr::QuantumOp { op, args, qubits } => {
                 // Lower to the corresponding QIR intrinsic call, e.g. "h" ->
                 // "qir.h". Value arguments come first, then the qubits they
@@ -943,6 +934,7 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
                 if qir_intrinsic_returns_qubit(op) {
                     return Ok(self
                         .llvm_context
+                        .i8_type()
                         .ptr_type(AddressSpace::default())
                         .const_null()
                         .into());
@@ -1040,13 +1032,14 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
                 .into(),
             crate::ir::pir_types::UnaryOp::Deref => {
                 // Deref: load from the pointer address
-                let ptr_type = self.llvm_context.ptr_type(AddressSpace::from(0));
+                let i8_type = self.llvm_context.i8_type();
+                let ptr_type = self.llvm_context.i8_type().ptr_type(AddressSpace::from(0));
                 let ptr = self
                     .builder
                     .build_int_to_ptr(int_val, ptr_type, "deref.ptr")
                     .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
                 self.builder
-                    .build_load(self.llvm_context.i8_type(), ptr, "deref.load")
+                    .build_load(i8_type, ptr, "deref.load")
                     .map_err(|e| CodegenError::InstructionError(e.to_string()))?
                     .into()
             }
@@ -1069,22 +1062,6 @@ impl<'ctx> QIRModuleBuilder<'ctx> {
         self.module
             .print_to_file(path)
             .map_err(|e| CodegenError::EmissionError(e.to_string()))
-    }
-
-    /// Emit QIR in portable JSON format for quantum runtime execution
-    /// 
-    /// This extracts the quantum operations from the built module and serializes
-    /// them as a QIRCircuit JSON that can be executed by the naso-quantum-runtime.
-    pub fn emit_qir_json(&self) -> CodegenResult<String> {
-        // For now, return a basic QIR circuit structure
-        // The full implementation would extract qubit indices from the IR
-        let qir_circuit = serde_json::json!({
-            "num_qubits": 0,
-            "operations": [],
-            "measurements": []
-        });
-        
-        Ok(serde_json::to_string_pretty(&qir_circuit).unwrap())
     }
 
     fn current_function(&self) -> Option<FunctionValue<'ctx>> {
@@ -1227,18 +1204,6 @@ mod tests {
             "toffoli",
             "controlled",
             "adjoint",
-            // Controlled rotations
-            "crx",
-            "cry",
-            "crz",
-            // Ising couplings
-            "rxx",
-            "ryy",
-            "rzz",
-            "cphase",
-            // Three-qubit
-            "cswap",
-            "fredkin",
         ];
 
         for op in ops {

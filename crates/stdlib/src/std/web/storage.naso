@@ -1,0 +1,134 @@
+//! Web Storage API Bindings
+//!
+//! Zero-cost bindings for localStorage and sessionStorage.
+
+extern "C" {
+    fn storage_get_length(storage: u64) -> usize;
+    fn storage_get_key(storage: u64, index: usize) -> u64; // Returns string pointer
+    fn storage_get_item(storage: u64, key: *const u8, key_len: usize) -> u64; // Returns string pointer
+    fn storage_set_item(storage: u64, key: *const u8, key_len: usize, value: *const u8, value_len: usize);
+    fn storage_remove_item(storage: u64, key: *const u8, key_len: usize);
+    fn storage_clear(storage: u64);
+}
+
+use crate::web::dom::DomString;
+
+pub struct Storage {
+    ptr: u64,
+}
+
+impl Storage {
+    pub fn new(ptr: u64) -> Self {
+        Self { ptr }
+    }
+    
+    pub fn len(&self) -> usize {
+        unsafe { storage_get_length(self.ptr) }
+    }
+    
+    pub fn key(&self, index: usize) -> Option<String> {
+        let ptr = unsafe { storage_get_key(self.ptr, index) };
+        if ptr == 0 { None } else { Some(DomString::from_ptr(ptr).to_string()) }
+    }
+    
+    pub fn get_item(&self, key: &str) -> Option<String> {
+        let key_str = DomString::new(key);
+        let ptr = unsafe { storage_get_item(self.ptr, key_str.as_ptr(), key_str.len()) };
+        if ptr == 0 { None } else { Some(DomString::from_ptr(ptr).to_string()) }
+    }
+    
+    pub fn set_item(&self, key: &str, value: &str) {
+        let key_str = DomString::new(key);
+        let value_str = DomString::new(value);
+        unsafe { storage_set_item(self.ptr, key_str.as_ptr(), key_str.len(), value_str.as_ptr(), value_str.len()) }
+    }
+    
+    pub fn remove_item(&self, key: &str) {
+        let key_str = DomString::new(key);
+        unsafe { storage_remove_item(self.ptr, key_str.as_ptr(), key_str.len()) }
+    }
+    
+    pub fn clear(&self) {
+        unsafe { storage_clear(self.ptr) }
+    }
+    
+    pub fn get(&self, key: &str) -> Option<String> {
+        self.get_item(key)
+    }
+    
+    pub fn set(&self, key: &str, value: &str) {
+        self.set_item(key, value)
+    }
+    
+    pub fn remove(&self, key: &str) {
+        self.remove_item(key)
+    }
+}
+
+pub struct LocalStorage {
+    storage: Storage,
+}
+
+impl LocalStorage {
+    pub fn new(ptr: u64) -> Self {
+        Self { storage: Storage::new(ptr) }
+    }
+    
+    pub fn len(&self) -> usize {
+        self.storage.len()
+    }
+    
+    pub fn key(&self, index: usize) -> Option<String> {
+        self.storage.key(index)
+    }
+    
+    pub fn get_item(&self, key: &str) -> Option<String> {
+        self.storage.get_item(key)
+    }
+    
+    pub fn set_item(&self, key: &str, value: &str) {
+        self.storage.set_item(key, value)
+    }
+    
+    pub fn remove_item(&self, key: &str) {
+        self.storage.remove_item(key)
+    }
+    
+    pub fn clear(&self) {
+        self.storage.clear()
+    }
+}
+
+pub struct SessionStorage {
+    storage: Storage,
+}
+
+impl SessionStorage {
+    pub fn new(ptr: u64) -> Self {
+        Self { storage: Storage::new(ptr) }
+    }
+    
+    pub fn len(&self) -> usize {
+        self.storage.len()
+    }
+    
+    pub fn key(&self, index: usize) -> Option<String> {
+        self.storage.key(index)
+    }
+    
+    pub fn get_item(&self, key: &str) -> Option<String> {
+        self.storage.get_item(key)
+    }
+    
+    pub fn set_item(&self, key: &str, value: &str) {
+        self.storage.set_item(key, value)
+    }
+    
+    pub fn remove_item(&self, key: &str) {
+        self.storage.remove_item(key)
+    }
+    
+    pub fn clear(&self) {
+        self.storage.clear()
+    }
+}

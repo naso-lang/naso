@@ -12,7 +12,7 @@
 //! - A central switch on state dispatches to the right continuation
 
 use crate::codegen::error::{CodegenError, CodegenResult};
-use crate::codegen::llvm::module_builder::LLVMModuleBuilder;
+use crate::codegen::llvm::module_builder::{LLVMModuleBuilder, CalleeInfo};
 use crate::codegen::llvm::value_builder::LlvmValueBuilder;
 use crate::ir::pir_types::PirExpr;
 use inkwell::values::{BasicValueEnum, FunctionValue, IntValue, PointerValue};
@@ -75,7 +75,7 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
         let context = value_builder.type_lowering().context();
         let trampoline_fn_type = context.void_type().fn_type(
             &[inkwell::types::BasicMetadataTypeEnum::PointerType(
-                context.ptr_type(AddressSpace::default()),
+                context.i8_type().ptr_type(AddressSpace::default()),
             )],
             false,
         );
@@ -135,7 +135,7 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
         value_builder: &mut LlvmValueBuilder<'ctx>,
         module: &inkwell::module::Module<'ctx>,
         current_function: inkwell::values::FunctionValue<'ctx>,
-        callee_params: Option<&HashMap<String, crate::codegen::llvm::module_builder::CalleeInfo>>,
+        callee_params: Option<&HashMap<String, CalleeInfo>>,
         _in_statement_position: bool,
         _loop_stack: &mut Vec<crate::codegen::llvm::expr_lowering::LoopTargets<'ctx>>,
     ) -> CodegenResult<BasicValueEnum<'ctx>> {
@@ -151,7 +151,7 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
         
         let future_new_fn = self.get_or_declare_naso_future_new(value_builder)?;
         
-        let future_val = value_builder
+        let future_ptr = value_builder
             .builder()
             .build_call(future_new_fn, &[], "async.future")
             .map_err(|e| {
@@ -164,18 +164,8 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
                     "naso_future_new returned void".to_string(),
                     crate::ast::Span::default(),
                 )
-            })?;
-        // Convert pointer to integer (i64)
-        let future_ptr = future_val.into_pointer_value();
-        let int_type = value_builder
-            .type_lowering()
-            .int_type(crate::codegen::abi::IntWidth::I64);
-        let future_ptr_int = value_builder
-            .builder()
-            .build_ptr_to_int(future_ptr, int_type, "async.future.ptr")
-            .map_err(|e| {
-                CodegenError::instruction_with_span(e.to_string(), crate::ast::Span::default())
-            })?;
+            })?
+            .into_int_value();
         
         let state_machine_type = self.create_state_machine_type(value_builder)?;
         self.async_struct_types.insert(async_id, state_machine_type);
@@ -186,34 +176,53 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
             .type_lowering()
             .int_type(crate::codegen::abi::IntWidth::I8);
         let state_ptr = value_builder
-            .build_struct_gep(state_machine_type, state_machine_ptr, 0, "state_ptr")
+            .builder()
+            .build_struct_gep(
+                state_machine_type,
+                state_machine_ptr,
+                0,
+                "state_ptr",
+            )
             .map_err(|e| {
                 CodegenError::instruction_with_span(e.to_string(), crate::ast::Span::default())
             })?;
         value_builder
-            .build_store(state_ptr, int_type.const_int(AsyncState::Start as u8 as u64, false).into())
+            .builder()
+            .build_store(
+                state_ptr,
+                int_type.const_int(AsyncState::Start as u8 as u64, false),
+            )
             .map_err(|e| {
                 CodegenError::instruction_with_span(e.to_string(), crate::ast::Span::default())
             })?;
         
         let future_field_ptr = value_builder
-            .build_struct_gep(state_machine_type, state_machine_ptr, 1, "future_field_ptr")
+            .builder()
+            .build_struct_gep(
+                state_machine_type,
+                state_machine_ptr,
+                1,
+                "future_field_ptr",
+            )
             .map_err(|e| {
                 CodegenError::instruction_with_span(e.to_string(), crate::ast::Span::default())
             })?;
-        let ctx = value_builder.type_lowering().context();
         let future_ptr_val = value_builder
             .builder()
             .build_int_to_ptr(
-                future_ptr_int,
-                ctx.ptr_type(AddressSpace::from(0)),
+                future_ptr,
+                value_builder.type_lowering().ptr_type(
+                    value_builder.type_lowering().context().i8_type().into(),
+                    AddressSpace::from(0),
+                ),
                 "future_field_val",
             )
             .map_err(|e| {
                 CodegenError::instruction_with_span(e.to_string(), crate::ast::Span::default())
             })?;
         value_builder
-            .build_store(future_field_ptr, future_ptr_val.into())
+            .builder()
+            .build_store(future_field_ptr, future_ptr_val)
             .map_err(|e| {
                 CodegenError::instruction_with_span(e.to_string(), crate::ast::Span::default())
             })?;
@@ -265,15 +274,17 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
                 CodegenError::instruction_with_span(e.to_string(), crate::ast::Span::default())
             })?;
         
-        self.complete_future(future_ptr_int, body_val, value_builder)?;
+        self.complete_future(future_ptr, body_val, value_builder)?;
         
         let spawn_future_fn = self.get_or_declare_naso_spawn_future(value_builder)?;
-        let ctx = value_builder.type_lowering().context();
         let future_ptr_val = value_builder
             .builder()
             .build_int_to_ptr(
                 future_ptr,
-                ctx.ptr_type(AddressSpace::from(0)),
+                value_builder.type_lowering().ptr_type(
+                    value_builder.type_lowering().context().i8_type().into(),
+                    AddressSpace::from(0),
+                ),
                 "async.spawn.future_ptr",
             )
             .map_err(|e| {
@@ -303,7 +314,7 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
         value_builder: &mut LlvmValueBuilder<'ctx>,
         module: &inkwell::module::Module<'ctx>,
         current_function: inkwell::values::FunctionValue<'ctx>,
-        callee_params: Option<&HashMap<String, crate::codegen::llvm::module_builder::CalleeInfo>>,
+        callee_params: Option<&HashMap<String, CalleeInfo>>,
         _in_statement_position: bool,
         _loop_stack: &mut Vec<crate::codegen::llvm::expr_lowering::LoopTargets<'ctx>>,
     ) -> CodegenResult<BasicValueEnum<'ctx>> {
@@ -322,9 +333,12 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
         let future_ptr = lowerer.build_expr(future, self.quantities)?;
         
         // future_ptr is an i64 holding a pointer value, convert to i8*
-        let ctx = value_builder.type_lowering().context();
-        let i8_type = value_builder.type_lowering().int_type(crate::codegen::abi::IntWidth::I8);
-        let i8_ptr_type = ctx.ptr_type(AddressSpace::from(0));
+        let i8_ptr_type = value_builder
+            .type_lowering()
+            .ptr_type(
+                value_builder.type_lowering().context().i8_type().into(),
+                AddressSpace::from(0),
+            );
         let future_ptr_val = value_builder
             .builder()
             .build_int_to_ptr(
@@ -403,7 +417,7 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
             })?;
         
         let loaded = value_builder
-            .build_load(result_ptr, "await.loaded")
+            .build_load(result_type.into(), result_ptr, "await.loaded")
             .map_err(|e| {
                 CodegenError::instruction_with_span(e.to_string(), crate::ast::Span::default())
             })?;
@@ -422,11 +436,17 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
         &mut self,
         value_builder: &mut LlvmValueBuilder<'ctx>,
     ) -> CodegenResult<StructType<'ctx>> {
-        let ctx = value_builder.type_lowering().context();
-        let int_type = value_builder.type_lowering().int_type(crate::codegen::abi::IntWidth::I8);
-        let ptr_type = ctx.ptr_type(AddressSpace::from(0));
+        let int_type = value_builder
+            .type_lowering()
+            .int_type(crate::codegen::abi::IntWidth::I8);
+        let ptr_type = value_builder
+            .type_lowering()
+            .ptr_type(int_type.into(), AddressSpace::from(0));
         
-        let state_machine_type = ctx.struct_type(&[int_type.into(), ptr_type.into()], false);
+        let state_machine_type = value_builder
+            .type_lowering()
+            .context()
+            .struct_type(&[int_type.into(), ptr_type.into()], false);
         
         Ok(state_machine_type)
     }
@@ -448,16 +468,16 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
 
     /// Complete a future with a value
     fn complete_future(
-            &mut self,
-            future_ptr: IntValue<'ctx>,
-            value: BasicValueEnum<'ctx>,
-            value_builder: &mut LlvmValueBuilder<'ctx>,
-        ) -> CodegenResult<()> {
-            let ctx = value_builder.type_lowering().context();
-            let future_complete_fn = self.get_or_declare_naso_future_complete(value_builder)?;
-            let int_type = value_builder
-                .type_lowering()
-                .int_type(crate::codegen::abi::IntWidth::I64);
+        &mut self,
+        future_ptr: IntValue<'ctx>,
+        value: BasicValueEnum<'ctx>,
+        value_builder: &mut LlvmValueBuilder<'ctx>,
+    ) -> CodegenResult<()> {
+        let future_complete_fn = self.get_or_declare_naso_future_complete(value_builder)?;
+        
+        let int_type: inkwell::types::IntType<'ctx> = value_builder
+            .type_lowering()
+            .int_type(crate::codegen::abi::IntWidth::I64);
         let int_val = match value {
             BasicValueEnum::IntValue(v) => v,
             _ => int_type.const_int(0, false),
@@ -486,7 +506,10 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
                         .builder()
                         .build_int_to_ptr(
                             future_ptr,
-                            ctx.ptr_type(AddressSpace::from(0)),
+                            value_builder.type_lowering().ptr_type(
+                                value_builder.type_lowering().context().i8_type().into(),
+                                AddressSpace::from(0),
+                            ),
                             "future.complete.future_ptr",
                         )
                         .map_err(|e| {
@@ -518,8 +541,7 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
             .int_type(crate::codegen::abi::IntWidth::I64);
         let ptr_type = value_builder
             .type_lowering()
-            .context()
-            .ptr_type(AddressSpace::from(0));
+            .ptr_type(int_type.into(), AddressSpace::from(0));
         let fn_type = ptr_type.fn_type(&[], false);
         self.module_builder
             .get_or_declare_ffi_function("naso_future_new", fn_type)
@@ -534,20 +556,17 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
             .int_type(crate::codegen::abi::IntWidth::I64);
         let ptr_type = value_builder
             .type_lowering()
-            .context()
-            .ptr_type(AddressSpace::from(0));
+            .ptr_type(int_type.into(), AddressSpace::from(0));
         let fn_type = int_type.fn_type(
             &[
                 int_type.into(),           // listener_fd
                 ptr_type.into(),           // out_ptr
-                int_type.into(),           // out_len
                 ptr_type.into(),           // callback (function pointer as *u8)
-                int_type.into(),           // callback_len
             ],
             false,
         );
         self.module_builder
-            .get_or_declare_ffi_function("naso_tcp_accept_async", fn_type)
+            .get_or_declare_ffi_function("naso_tcp_accept_uring", fn_type)
     }
 
     fn get_or_declare_naso_read_async(
@@ -559,20 +578,18 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
             .int_type(crate::codegen::abi::IntWidth::I64);
         let ptr_type = value_builder
             .type_lowering()
-            .context()
-            .ptr_type(AddressSpace::from(0));
+            .ptr_type(int_type.into(), AddressSpace::from(0));
         let fn_type = int_type.fn_type(
             &[
                 int_type.into(),           // fd
                 ptr_type.into(),           // buf_ptr
                 int_type.into(),           // len
                 ptr_type.into(),           // callback (function pointer as *u8)
-                int_type.into(),           // callback_len
             ],
             false,
         );
         self.module_builder
-            .get_or_declare_ffi_function("naso_read_async", fn_type)
+            .get_or_declare_ffi_function("naso_read_uring", fn_type)
     }
 
     fn get_or_declare_naso_write_async(
@@ -584,20 +601,18 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
             .int_type(crate::codegen::abi::IntWidth::I64);
         let ptr_type = value_builder
             .type_lowering()
-            .context()
-            .ptr_type(AddressSpace::from(0));
+            .ptr_type(int_type.into(), AddressSpace::from(0));
         let fn_type = int_type.fn_type(
             &[
                 int_type.into(),           // fd
                 ptr_type.into(),           // buf_ptr
                 int_type.into(),           // len
                 ptr_type.into(),           // callback (function pointer as *u8)
-                int_type.into(),           // callback_len
             ],
             false,
         );
         self.module_builder
-            .get_or_declare_ffi_function("naso_write_async", fn_type)
+            .get_or_declare_ffi_function("naso_write_uring", fn_type)
     }
 
     fn get_or_declare_naso_runtime_new(
@@ -609,8 +624,7 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
             .int_type(crate::codegen::abi::IntWidth::I64);
         let ptr_type = value_builder
             .type_lowering()
-            .context()
-            .ptr_type(AddressSpace::from(0));
+            .ptr_type(int_type.into(), AddressSpace::from(0));
         let fn_type = ptr_type.fn_type(&[int_type.into()], false);
         self.module_builder
             .get_or_declare_ffi_function("naso_runtime_new", fn_type)
@@ -628,8 +642,7 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
             .int_type(crate::codegen::abi::IntWidth::I8);
         let ptr_type = value_builder
             .type_lowering()
-            .context()
-            .ptr_type(AddressSpace::from(0));
+            .ptr_type(i8_type.into(), AddressSpace::from(0));
         let fn_type = int_type.fn_type(&[ptr_type.into()], false);
         self.module_builder
             .get_or_declare_ffi_function("naso_await", fn_type)
@@ -647,8 +660,7 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
             .int_type(crate::codegen::abi::IntWidth::I8);
         let ptr_type = value_builder
             .type_lowering()
-            .context()
-            .ptr_type(AddressSpace::from(0));
+            .ptr_type(i8_type.into(), AddressSpace::from(0));
         let fn_type = int_type.fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false);
         self.module_builder
             .get_or_declare_ffi_function("naso_future_complete", fn_type)
@@ -666,8 +678,7 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
             .int_type(crate::codegen::abi::IntWidth::I8);
         let ptr_type = value_builder
             .type_lowering()
-            .context()
-            .ptr_type(AddressSpace::from(0));
+            .ptr_type(i8_type.into(), AddressSpace::from(0));
         let fn_type = int_type.fn_type(&[ptr_type.into(), ptr_type.into(), int_type.into()], false);
         self.module_builder
             .get_or_declare_ffi_function("naso_future_get_result", fn_type)
@@ -682,8 +693,7 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
             .int_type(crate::codegen::abi::IntWidth::I64);
         let ptr_type = value_builder
             .type_lowering()
-            .context()
-            .ptr_type(AddressSpace::from(0));
+            .ptr_type(int_type.into(), AddressSpace::from(0));
         let fn_type = ptr_type.fn_type(&[ptr_type.into(), ptr_type.into(), int_type.into()], false);
         self.module_builder
             .get_or_declare_ffi_function("naso_spawn", fn_type)
@@ -701,8 +711,7 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
             .int_type(crate::codegen::abi::IntWidth::I8);
         let ptr_type = value_builder
             .type_lowering()
-            .context()
-            .ptr_type(AddressSpace::from(0));
+            .ptr_type(i8_type.into(), AddressSpace::from(0));
         let fn_type = int_type.fn_type(&[ptr_type.into()], false);
         self.module_builder
             .get_or_declare_ffi_function("naso_spawn_future", fn_type)
@@ -728,8 +737,7 @@ impl<'ctx, 'm> AsyncLowerer<'ctx, 'm> {
             .int_type(crate::codegen::abi::IntWidth::I64);
         let ptr_type = value_builder
             .type_lowering()
-            .context()
-            .ptr_type(AddressSpace::from(0));
+            .ptr_type(int_type.into(), AddressSpace::from(0));
         let fn_type = ptr_type.fn_type(&[], false);
         self.module_builder
             .get_or_declare_ffi_function("naso_channel_new", fn_type)

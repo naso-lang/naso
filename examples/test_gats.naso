@@ -1,0 +1,28 @@
+// Test GATs (Generic Associated Types) - using Naso syntax
+trait LendingIterator {
+    type Item[A: nat];  // Generic associated type with nat parameter
+    fn next[A: nat](inout self) -> u64;  // Simplified for testing
+}
+
+struct MyLendingIter {
+    data: [u64; 3],
+    index: u64,
+}
+
+impl LendingIterator for MyLendingIter {
+    type Item[A: nat] = u64;
+    fn next[A: nat](inout self) -> u64 {
+        if self.index < 3 {
+            let val = self.data[self.index];
+            self.index = self.index + 1;
+            val
+        } else {
+            0
+        }
+    }
+}
+
+fn main() -> () {
+    let mut iter = MyLendingIter { data: [1, 2, 3], index: 0 };
+    let _ = iter.next();
+}

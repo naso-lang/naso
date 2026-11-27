@@ -85,7 +85,7 @@ fn contains_quantum_stmt(stmt: &naso_compiler::ast::Stmt) -> bool {
 
 fn contains_quantum_expr(expr: &naso_compiler::ast::Expr) -> bool {
     match &expr.kind {
-        naso_compiler::ast::ExprKind::Call(func, args, _) => {
+        naso_compiler::ast::ExprKind::Call(func, args) => {
             #[allow(clippy::collapsible_if)]
             if let naso_compiler::ast::ExprKind::Var(name) = &func.kind {
                 if is_quantum_gate_name(&name.name) || name.name == "qalloc" || name.name == "qfree"
@@ -234,7 +234,7 @@ fn prove_function_uncomputation(func: &Function) -> Result<Vec<VerifyDiagnostic>
 fn collect_var_names(expr: &naso_compiler::ast::Expr, out: &mut Vec<String>) {
     match &expr.kind {
         naso_compiler::ast::ExprKind::Var(name) => out.push(name.name.clone()),
-        naso_compiler::ast::ExprKind::Call(_, args, _) => {
+        naso_compiler::ast::ExprKind::Call(_, args) => {
             for arg in args {
                 collect_var_names(arg, out);
             }

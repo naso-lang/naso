@@ -1,0 +1,165 @@
+//! WASI Preview 2: IO Interface
+//!
+//! Provides stream-based I/O with pollable streams.
+
+extern "C" {
+    fn wasi_stream_read(stream: u64, buffers: *mut u64, nbuffers: u32) -> i32;
+    fn wasi_stream_write(stream: u64, buffers: *mut u64, nbuffers: u32) -> i32;
+    fn wasi_stream_close(stream: u64) -> i32;
+    fn wasi_stream_flush(stream: u64) -> i32;
+    fn wasi_stream_check_write(stream: u64) -> i32;
+    fn wasi_stream_check_read(stream: u64) -> i32;
+    fn wasi_pollable_new() -> u64;
+    fn wasi_pollable_ready(pollable: u64) -> bool;
+    fn wasi_stream_set_write_ready(stream: u64, pollable: u64) -> i32;
+    fn wasi_stream_set_read_ready(stream: u64, pollable: u64) -> i32;
+    fn wasi_poll(pollables: *mut u64, npollables: u32) -> i32;
+}
+
+pub struct InputStream {
+    stream: u64,
+}
+
+impl InputStream {
+    pub fn new(stream: u64) -> Self {
+        Self { stream }
+    }
+    
+    pub fn read(&self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
+        let mut buffers = [buf.as_mut_ptr() as u64];
+        let result = unsafe { wasi_stream_read(self.stream, buffers.as_mut_ptr(), 1) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(result as usize)
+        }
+    }
+    
+    pub fn read_vectored(&self, bufs: &mut [std::io::IoSliceMut]) -> Result<usize, std::io::Error> {
+        let mut buffers: Vec<u64> = bufs.iter_mut().map(|b| b.as_mut_ptr() as u64).collect();
+        let result = unsafe { wasi_stream_read(self.stream, buffers.as_mut_ptr(), buffers.len() as u32) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(result as usize)
+        }
+    }
+    
+    pub fn close(&self) -> Result<(), std::io::Error> {
+        let result = unsafe { wasi_stream_close(self.stream) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(())
+        }
+    }
+    
+    pub fn check_read(&self) -> Result<u64, std::io::Error> {
+        let result = unsafe { wasi_stream_check_read(self.stream) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(result as u64)
+        }
+    }
+}
+
+pub struct OutputStream {
+    stream: u64,
+}
+
+impl OutputStream {
+    pub fn new(stream: u64) -> Self {
+        Self { stream }
+    }
+    
+    pub fn write(&self, buf: &[u8]) -> Result<usize, std::io::Error> {
+        let mut buffers = [buf.as_ptr() as u64];
+        let result = unsafe { wasi_stream_write(self.stream, buffers.as_mut_ptr(), 1) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(result as usize)
+        }
+    }
+    
+    pub fn write_vectored(&self, bufs: &[std::io::IoSlice]) -> Result<usize, std::io::Error> {
+        let mut buffers: Vec<u64> = bufs.iter().map(|b| b.as_ptr() as u64).collect();
+        let result = unsafe { wasi_stream_write(self.stream, buffers.as_mut_ptr(), buffers.len() as u32) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(result as usize)
+        }
+    }
+    
+    pub fn flush(&self) -> Result<(), std::io::Error> {
+        let result = unsafe { wasi_stream_flush(self.stream) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(())
+        }
+    }
+    
+    pub fn close(&self) -> Result<(), std::io::Error> {
+        let result = unsafe { wasi_stream_close(self.stream) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(())
+        }
+    }
+    
+    pub fn check_write(&self) -> Result<u64, std::io::Error> {
+        let result = unsafe { wasi_stream_check_write(self.stream) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(result as u64)
+        }
+    }
+}
+
+pub struct Pollable {
+    ptr: u64,
+}
+
+impl Pollable {
+    pub fn new() -> Self {
+        Self { ptr: unsafe { wasi_pollable_new() } }
+    }
+    
+    pub fn ready(&self) -> bool {
+        unsafe { wasi_pollable_ready(self.ptr) }
+    }
+    
+    pub fn set_write_ready(&self, stream: &OutputStream) -> Result<(), std::io::Error> {
+        let result = unsafe { wasi_stream_set_write_ready(stream.stream, self.ptr) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(())
+        }
+    }
+    
+    pub fn set_read_ready(&self, stream: &InputStream) -> Result<(), std::io::Error> {
+        let result = unsafe { wasi_stream_set_read_ready(stream.stream, self.ptr) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Poll multiple pollables
+pub fn poll(pollables: &mut [&Pollable]) -> Result<usize, std::io::Error> {
+    let mut ptrs: Vec<u64> = pollables.iter().map(|p| p.ptr).collect();
+    let result = unsafe { wasi_poll(ptrs.as_mut_ptr(), ptrs.len() as u32) };
+    if result < 0 {
+        Err(std::io::Error::from_raw_os_error(-result))
+    } else {
+        Ok(result as usize)
+    }
+}

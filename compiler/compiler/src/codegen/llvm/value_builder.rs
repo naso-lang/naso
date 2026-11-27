@@ -394,20 +394,12 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
     /// Build a load instruction
     pub fn build_load(
         &mut self,
+        ty: BasicTypeEnum<'ctx>,
         ptr: PointerValue<'ctx>,
         name: &str,
     ) -> CodegenResult<BasicValueEnum<'ctx>> {
-        // Opaque pointers: the load needs the pointee type explicitly. Recover
-        // it from the pointers this builder handed out.
-        let pointee = *self.ptr_pointee_types.get(&ptr).ok_or_else(|| {
-            CodegenError::InstructionError(format!(
-                "cannot load from {ptr:?}: unknown pointee type (opaque pointers \
-                 require the pointer to come from build_alloca/build_gep/build_struct_gep \
-                 on this value builder)"
-            ))
-        })?;
         self.builder
-            .build_load(pointee, ptr, name)
+            .build_load(ty, ptr, name)
             .map_err(|e| CodegenError::InstructionError(e.to_string()))
     }
 
@@ -478,14 +470,11 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
         // For runtime values, we need to allocate and store each field
         let alloca = self.build_alloca(struct_ty.into(), "struct_tmp")?;
         for (i, field) in fields.iter().enumerate() {
-            let gep = self
-                .builder
-                .build_struct_gep(struct_ty, alloca, i as u32, "field_gep")
-                .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+            let gep = self.build_struct_gep(struct_ty, alloca, i as u32, "field_gep")?;
             self.ptr_pointee_types.insert(gep, struct_ty.into());
             self.build_store(gep, *field)?;
         }
-        self.build_load(alloca, "struct_val")
+        self.build_load(struct_ty.into(), alloca, "struct_val")
     }
 
     /// Extract a field from a struct value
@@ -587,25 +576,17 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
             .ok_or_else(|| CodegenError::InstructionError("Call returned void".to_string()))
     }
 
-    /// Build an indirect function call
+    /// Build an indirect function call - not available in inkwell 0.10, use build_call with function value
     pub fn build_indirect_call(
         &mut self,
-        fn_ty: FunctionType<'ctx>,
-        func_ptr: PointerValue<'ctx>,
-        args: &[BasicValueEnum<'ctx>],
-        name: &str,
+        _fn_ty: FunctionType<'ctx>,
+        _func_ptr: PointerValue<'ctx>,
+        _args: &[BasicValueEnum<'ctx>],
+        _name: &str,
     ) -> CodegenResult<BasicValueEnum<'ctx>> {
-        let args: Vec<BasicMetadataValueEnum<'ctx>> = args
-            .iter()
-            .map(|a| BasicMetadataValueEnum::from(*a))
-            .collect();
-        let call_site = self
-            .builder
-            .build_indirect_call(fn_ty, func_ptr, &args, name)
-            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
-        call_site.try_as_basic_value().basic().ok_or_else(|| {
-            CodegenError::InstructionError("Indirect call returned void".to_string())
-        })
+        Err(CodegenError::UnsupportedFeature(
+            "Indirect function calls not supported in inkwell 0.10".to_string(),
+        ))
     }
 
     /// Build a return instruction

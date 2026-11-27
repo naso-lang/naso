@@ -1,0 +1,86 @@
+//! WASI Preview 2: Clocks Interface
+//!
+//! Provides access to wall clock and monotonic clock.
+
+extern "C" {
+    fn wasi_clock_time_get(clock_id: i32, precision: u64) -> i32;
+    fn wasi_clock_time_get_resolution(clock_id: i32) -> i32;
+}
+
+#[repr(i32)]
+pub enum ClockId {
+    Realtime = 0,
+    Monotonic = 1,
+    ProcessCpuTime = 2,
+    ThreadCpuTime = 3,
+}
+
+#[repr(u32)]
+pub enum ClockPrecision {
+    Exact = 0,
+    Millisecond = 1_000_000,
+    Microsecond = 1_000,
+    Nanosecond = 1,
+}
+
+pub struct WallClock;
+
+impl WallClock {
+    pub fn now() -> Result<u64, std::io::Error> {
+        let result = unsafe { wasi_clock_time_get(ClockId::Realtime as i32, ClockPrecision::Nanosecond as u64) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(result as u64)
+        }
+    }
+    
+    pub fn now_with_precision(precision: ClockPrecision) -> Result<u64, std::io::Error> {
+        let result = unsafe { wasi_clock_time_get(ClockId::Realtime as i32, precision as u64) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(result as u64)
+        }
+    }
+    
+    pub fn resolution() -> Result<u64, std::io::Error> {
+        let result = unsafe { wasi_clock_time_get_resolution(ClockId::Realtime as i32) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(result as u64)
+        }
+    }
+}
+
+pub struct MonotonicClock;
+
+impl MonotonicClock {
+    pub fn now() -> Result<u64, std::io::Error> {
+        let result = unsafe { wasi_clock_time_get(ClockId::Monotonic as i32, ClockPrecision::Nanosecond as u64) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(result as u64)
+        }
+    }
+    
+    pub fn now_with_precision(precision: ClockPrecision) -> Result<u64, std::io::Error> {
+        let result = unsafe { wasi_clock_time_get(ClockId::Monotonic as i32, precision as u64) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(result as u64)
+        }
+    }
+    
+    pub fn resolution() -> Result<u64, std::io::Error> {
+        let result = unsafe { wasi_clock_time_get_resolution(ClockId::Monotonic as i32) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(result as u64)
+        }
+    }
+}

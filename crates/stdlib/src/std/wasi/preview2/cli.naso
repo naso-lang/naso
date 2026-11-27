@@ -1,0 +1,215 @@
+//! WASI Preview 2: CLI Interface
+//!
+//! Provides access to command-line arguments, environment variables,
+//! standard input/output/error, and process exit.
+
+extern "C" {
+    // Environment
+    fn wasi_environ_get(environ: *mut u64, environ_buf: *mut u8) -> i32;
+    fn wasi_environ_sizes_get(argc: *mut u32, argv_buf_size: *mut u32) -> i32;
+    
+    // Args
+    fn wasi_args_get(argv: *mut u64, argv_buf: *mut u8) -> i32;
+    fn wasi_args_sizes_get(argc: *mut u32, argv_buf_size: *mut u32) -> i32;
+    
+    // Exit
+    fn wasi_proc_exit(code: i32) -> !;
+    
+    // Stdin/Stdout/Stderr
+    fn wasi_stdin_get() -> u64;
+    fn wasi_stdout_get() -> u64;
+    fn wasi_stderr_get() -> u64;
+    
+    // Terminal
+    fn wasi_terminal_input_get() -> u64;
+    fn wasi_terminal_output_get() -> u64;
+    
+    // Stream operations
+    fn wasi_stream_read(stream: u64, buffers: *mut u64, nbuffers: u32) -> i32;
+    fn wasi_stream_write(stream: u64, buffers: *mut u64, nbuffers: u32) -> i32;
+    fn wasi_stream_close(stream: u64) -> i32;
+    fn wasi_stream_flush(stream: u64) -> i32;
+}
+
+pub struct Environment;
+
+impl Environment {
+    /// Get all environment variables as a vector of (key, value) pairs
+    pub fn vars() -> Vec<(String, String)> {
+        let mut argc: u32 = 0;
+        let mut argv_buf_size: u32 = 0;
+        unsafe { wasi_environ_sizes_get(&mut argc, &mut argv_buf_size) };
+        
+        let mut environ = vec![0u64; argc as usize];
+        let mut environ_buf = vec![0u8; argv_buf_size as usize];
+        unsafe { wasi_environ_get(environ.as_mut_ptr(), environ_buf.as_mut_ptr()) };
+        
+        // Parse the environment variables
+        // This is a simplified version - real implementation would parse properly
+        Vec::new()
+    }
+    
+    /// Get a specific environment variable
+    pub fn var(key: &str) -> Option<String> {
+        // Would look up the key in the environment
+        None
+    }
+    
+    /// Set an environment variable
+    pub fn set_var(key: &str, value: &str) {
+        // Not supported in WASI Preview 2
+    }
+    
+    /// Remove an environment variable
+    pub fn remove_var(key: &str) {
+        // Not supported in WASI Preview 2
+    }
+}
+
+pub type ExitCode = i32;
+
+pub struct Stdin {
+    stream: u64,
+}
+
+impl Stdin {
+    pub fn new() -> Self {
+        Self { stream: unsafe { wasi_stdin_get() } }
+    }
+    
+    pub fn read(&self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
+        let mut buffers = [buf.as_mut_ptr() as u64];
+        let result = unsafe { wasi_stream_read(self.stream, buffers.as_mut_ptr(), 1) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(result as usize)
+        }
+    }
+}
+
+pub struct Stdout {
+    stream: u64,
+}
+
+impl Stdout {
+    pub fn new() -> Self {
+        Self { stream: unsafe { wasi_stdout_get() } }
+    }
+    
+    pub fn write(&self, buf: &[u8]) -> Result<usize, std::io::Error> {
+        let mut buffers = [buf.as_ptr() as u64];
+        let result = unsafe { wasi_stream_write(self.stream, buffers.as_mut_ptr(), 1) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(result as usize)
+        }
+    }
+    
+    pub fn flush(&self) -> Result<(), std::io::Error> {
+        let result = unsafe { wasi_stream_flush(self.stream) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+pub struct Stderr {
+    stream: u64,
+}
+
+impl Stderr {
+    pub fn new() -> Self {
+        Self { stream: unsafe { wasi_stderr_get() } }
+    }
+    
+    pub fn write(&self, buf: &[u8]) -> Result<usize, std::io::Error> {
+        let mut buffers = [buf.as_ptr() as u64];
+        let result = unsafe { wasi_stream_write(self.stream, buffers.as_mut_ptr(), 1) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(result as usize)
+        }
+    }
+    
+    pub fn flush(&self) -> Result<(), std::io::Error> {
+        let result = unsafe { wasi_stream_flush(self.stream) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+pub struct TerminalInput {
+    stream: u64,
+}
+
+impl TerminalInput {
+    pub fn new() -> Self {
+        Self { stream: unsafe { wasi_terminal_input_get() } }
+    }
+    
+    pub fn read(&self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
+        let mut buffers = [buf.as_mut_ptr() as u64];
+        let result = unsafe { wasi_stream_read(self.stream, buffers.as_mut_ptr(), 1) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(result as usize)
+        }
+    }
+}
+
+pub struct TerminalOutput {
+    stream: u64,
+}
+
+impl TerminalOutput {
+    pub fn new() -> Self {
+        Self { stream: unsafe { wasi_terminal_output_get() } }
+    }
+    
+    pub fn write(&self, buf: &[u8]) -> Result<usize, std::io::Error> {
+        let mut buffers = [buf.as_ptr() as u64];
+        let result = unsafe { wasi_stream_write(self.stream, buffers.as_mut_ptr(), 1) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(result as usize)
+        }
+    }
+    
+    pub fn flush(&self) -> Result<(), std::io::Error> {
+        let result = unsafe { wasi_stream_flush(self.stream) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Exit the process with the given exit code
+pub fn exit(code: ExitCode) -> ! {
+    unsafe { wasi_proc_exit(code) }
+}
+
+/// Get command-line arguments
+pub fn args() -> Vec<String> {
+    let mut argc: u32 = 0;
+    let mut argv_buf_size: u32 = 0;
+    unsafe { wasi_args_sizes_get(&mut argc, &mut argv_buf_size) };
+    
+    let mut argv = vec![0u64; argc as usize];
+    let mut argv_buf = vec![0u8; argv_buf_size as usize];
+    unsafe { wasi_args_get(argv.as_mut_ptr(), argv_buf.as_mut_ptr()) };
+    
+    // Parse arguments from argv_buf
+    Vec::new()
+}

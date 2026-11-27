@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Type expression in the AST
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Type {
     pub kind: TypeKind,
     pub quantity: Quantity,
@@ -117,6 +117,11 @@ impl Type {
         Self::new(TypeKind::Quint8, Quantity::Many, span)
     }
 
+    /// `quint4` — 4-bit unsigned quantized integer, stored packed as u32 (8 per word).
+    pub fn quint4(span: Span) -> Self {
+        Self::new(TypeKind::Quint4, Quantity::Many, span)
+    }
+
     pub fn qubit(span: Span) -> Self {
         Self::new(TypeKind::Qubit, Quantity::One, span)
     }
@@ -163,7 +168,7 @@ impl Type {
 }
 
 /// Core type kinds
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TypeKind {
     /// Unit type ()
     Unit,
@@ -177,6 +182,10 @@ pub enum TypeKind {
     /// Used for trillion-parameter model compression: 1T params × 1 byte = 1TB raw,
     /// packed as u32 storage gives 4× density, dequantized on-demand to f32.
     Quint8,
+    /// 4-bit unsigned quantized integer (stored as u32, 8 per word)
+    /// Used for extreme model compression: packed as u32 storage gives 8× density,
+    /// dequantized on-demand to f32. Range: 0..15.
+    Quint4,
     /// Float
     Float,
     /// String
@@ -219,20 +228,12 @@ pub enum TypeKind {
     Var(TypeVar),
     /// Metavariable (unsolved during inference)
     Meta(MetaVar),
-    /// Associated type projection: <Type as Trait>::AssocType<Args>
-    AssociatedTypeProjection {
-        self_ty: Box<Type>,
-        trait_path: Vec<Ident>,
-        trait_args: Vec<TypeArg>,
-        assoc_name: Ident,
-        assoc_args: Vec<TypeArg>,
-    },
     /// Error type (for recovery)
     Error,
 }
 
 /// Type arguments for generic instantiation
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TypeArg {
     Type(Type),
     Nat(NatExpr),
@@ -260,7 +261,7 @@ impl fmt::Display for MetaVar {
 }
 
 /// Natural number expressions (for dependent types)
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NatExpr {
     /// A literal constant, carried as its value.
     ///
@@ -272,9 +273,7 @@ pub enum NatExpr {
     Succ(Box<NatExpr>),
     Var(Ident),
     Add(Box<NatExpr>, Box<NatExpr>),
-    Sub(Box<NatExpr>, Box<NatExpr>),
     Mul(Box<NatExpr>, Box<NatExpr>),
-    Div(Box<NatExpr>, Box<NatExpr>),
     /// Type-level if
     If(Box<Type>, Box<NatExpr>, Box<NatExpr>),
 }
@@ -302,9 +301,7 @@ impl fmt::Display for NatExpr {
             NatExpr::Succ(inner) => write!(f, "{} + 1", inner),
             NatExpr::Var(v) => write!(f, "{}", v),
             NatExpr::Add(a, b) => write!(f, "{} + {}", a, b),
-            NatExpr::Sub(a, b) => write!(f, "{} - {}", a, b),
             NatExpr::Mul(a, b) => write!(f, "{} * {}", a, b),
-            NatExpr::Div(a, b) => write!(f, "{} / {}", a, b),
             NatExpr::If(cond, t, e) => write!(f, "if {} then {} else {}", cond, t, e),
         }
     }
@@ -341,6 +338,7 @@ impl fmt::Display for TypeKind {
             TypeKind::Char => write!(f, "Char"),
             TypeKind::Nat => write!(f, "Nat"),
             TypeKind::Quint8 => write!(f, "quint8"),
+            TypeKind::Quint4 => write!(f, "quint4"),
             TypeKind::Qubit => write!(f, "Qubit"),
             TypeKind::QRegister(dims) => write!(
                 f,
@@ -411,23 +409,6 @@ impl fmt::Display for TypeKind {
             TypeKind::Var(v) => write!(f, "{}", v),
             TypeKind::Meta(m) => write!(f, "{}", m),
             TypeKind::Pointer(inner) => write!(f, "*{}", inner),
-            TypeKind::AssociatedTypeProjection { self_ty, trait_path, trait_args, assoc_name, assoc_args } => {
-                write!(f, "<{} as ", self_ty)?;
-                for (i, ident) in trait_path.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, "::")?;
-                    }
-                    write!(f, "{}", ident)?;
-                }
-                if !trait_args.is_empty() {
-                    write!(f, "<{}>", trait_args.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "))?;
-                }
-                write!(f, ">::{}", assoc_name)?;
-                if !assoc_args.is_empty() {
-                    write!(f, "<{}>", assoc_args.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "))?;
-                }
-                Ok(())
-            }
             TypeKind::Error => write!(f, "<error>"),
         }
     }

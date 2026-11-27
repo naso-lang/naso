@@ -1,0 +1,1197 @@
+// ============================================================================
+// Naso Cloud Runtime (naso_cloud) - Phase 28.1
+// ============================================================================
+// Cloud-native runtime for Kubernetes, VMs, and serverless
+// Service discovery, config management, health checks, graceful shutdown
+// ============================================================================
+
+extern "C" {
+    fn naso_cloud_k8s_client_new(config_ptr: *const u8, config_len: usize) -> u64;
+    fn naso_cloud_k8s_client_free(client: u64);
+    fn naso_cloud_k8s_pod_info(client: u64, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_cloud_k8s_service_discover(client: u64, name_ptr: *const u8, name_len: usize, namespace_ptr: *const u8, namespace_len: usize, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_cloud_k8s_configmap_get(client: u64, name_ptr: *const u8, name_len: usize, namespace_ptr: *const u8, namespace_len: usize, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_cloud_k8s_secret_get(client: u64, name_ptr: *const u8, name_len: usize, namespace_ptr: *const u8, namespace_len: usize, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_cloud_k8s_watch_resources(client: u64, resource_ptr: *const u8, resource_len: usize, callback_ptr: *const u8) -> u64;
+    fn naso_cloud_k8s_leader_elect(client: u64, lock_name_ptr: *const u8, lock_name_len: usize, identity_ptr: *const u8, identity_len: usize, ttl_secs: u32) -> u64;
+    fn naso_cloud_k8s_leader_renew(client: u64, lock_name_ptr: *const u8, lock_name_len: usize, identity_ptr: *const u8, identity_len: usize) -> u64;
+    fn naso_cloud_k8s_leader_resign(client: u64, lock_name_ptr: *const u8, lock_name_len: usize, identity_ptr: *const u8, identity_len: usize) -> u64;
+
+    fn naso_cloud_vm_metadata_get(key_ptr: *const u8, key_len: usize, out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_cloud_vm_instance_id(out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_cloud_vm_zone(out_ptr: *mut u8, out_max_len: usize) -> u64;
+    fn naso_cloud_vm_tags(out_ptr: *mut u8, out_max_len: usize) -> u64;
+
+    fn naso_cloud_health_register(endpoint: *const u8, endpoint_len: usize, check_ptr: *const u8, check_len: usize) -> u64;
+    fn naso_cloud_health_unregister(registration: u64);
+    fn naso_cloud_health_check_all(out_ptr: *mut u8, out_max_len: usize) -> u64;
+
+    fn naso_cloud_shutdown_signal_register(callback_ptr: *const u8) -> u64;
+    fn naso_cloud_shutdown_signal_unregister(handle: u64);
+    fn naso_cloud_shutdown_initiated() -> bool;
+    fn naso_cloud_shutdown_deadline_ns() -> u64;
+}
+
+// ============================================================================
+// Cloud Provider Detection
+// ============================================================================
+
+enum CloudProvider {
+    Kubernetes,
+    Aws,
+    Gcp,
+    Azure,
+    DigitalOcean,
+    Hetzner,
+    BareMetal,
+    Unknown,
+}
+
+fn detect_cloud_provider() -> CloudProvider {
+    // Check for Kubernetes first
+    if std::path::Path::new("/var/run/secrets/kubernetes.io/serviceaccount/token").exists() {
+        return CloudProvider::Kubernetes;
+    }
+
+    // Check cloud metadata endpoints
+    if vm_metadata_exists("http://169.254.169.254/latest/meta-data/") {
+        return CloudProvider::Aws;
+    }
+    if vm_metadata_exists("http://metadata.google.internal/computeMetadata/v1/") {
+        return CloudProvider::Gcp;
+    }
+    if vm_metadata_exists("http://169.254.169.254/metadata/instance") {
+        return CloudProvider::Azure;
+    }
+    if vm_metadata_exists("http://169.254.169.254/metadata/v1/") {
+        return CloudProvider::DigitalOcean;
+    }
+    if vm_metadata_exists("http://169.254.169.254/hetzner/v1/") {
+        return CloudProvider::Hetzner;
+    }
+
+    CloudProvider::BareMetal
+}
+
+fn vm_metadata_exists(url: &str) -> bool {
+    // Would do a quick HTTP HEAD request
+    false // Placeholder
+}
+
+// ============================================================================
+// Kubernetes Integration
+// ============================================================================
+
+struct K8sConfig {
+    api_server: Option<String>,
+    token: Option<String>,
+    ca_cert: Option<String>,
+    namespace: Option<String>,
+    qps: f32,
+    burst: u32,
+}
+
+impl K8sConfig {
+    pub fn in_cluster() -> Result<Self, CloudError> {
+        let token = std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/token")
+            .map_err(|_| CloudError::K8sConfigMissing)?;
+        let ca_cert = std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+            .map_err(|_| CloudError::K8sConfigMissing)?;
+        let namespace = std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+            .unwrap_or_else(|_| "default".into());
+
+        Ok(K8sConfig {
+            api_server: Some("https://kubernetes.default.svc".into()),
+            token: Some(token.trim().into()),
+            ca_cert: Some(ca_cert),
+            namespace: Some(namespace.trim().into()),
+            qps: 50.0,
+            burst: 100,
+        })
+    }
+
+    pub fn from_kubeconfig(path: &str) -> Result<Self, CloudError> {
+        // Parse kubeconfig file
+        Err(CloudError::NotImplemented)
+    }
+
+    pub fn api_server(mut self, server: &str) -> Self {
+        self.api_server = Some(server.into());
+        self
+    }
+
+    pub fn namespace(mut self, ns: &str) -> Self {
+        self.namespace = Some(ns.into());
+        self
+    }
+
+    pub fn qps(mut self, qps: f32) -> Self {
+        self.qps = qps;
+        self
+    }
+
+    pub fn burst(mut self, burst: u32) -> Self {
+        self.burst = burst;
+        self
+    }
+
+    fn to_json(&self) -> String {
+        let mut json = String::from("{");
+        if let Some(s) = &self.api_server {
+            json.push_str(&format!("\"api_server\":\"{}\",", s));
+        }
+        if let Some(s) = &self.token {
+            json.push_str(&format!("\"token\":\"{}\",", s));
+        }
+        if let Some(s) = &self.ca_cert {
+            json.push_str(&format!("\"ca_cert\":\"{}\",", s.replace('\n', "\\n")));
+        }
+        if let Some(s) = &self.namespace {
+            json.push_str(&format!("\"namespace\":\"{}\",", s));
+        }
+        json.push_str(&format!("\"qps\":{},\"burst\":{}}}", self.qps, self.burst));
+        json
+    }
+}
+
+struct K8sClient {
+    inner: u64,
+    config: K8sConfig,
+}
+
+impl K8sClient {
+    pub fn new(config: K8sConfig) -> Result<Self, CloudError> {
+        let json = config.to_json();
+        let inner = naso_cloud_k8s_client_new(json.as_ptr(), json.len());
+        if inner == 0 {
+            return Err(CloudError::K8sClientCreationFailed);
+        }
+        Ok(K8sClient { inner, config })
+    }
+
+    pub fn pod_info(&self) -> Result<PodInfo, CloudError> {
+        let mut out = vec![0u8; 8192];
+        let len = naso_cloud_k8s_pod_info(self.inner, out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(CloudError::K8sRequestFailed);
+        }
+        out.truncate(len as usize);
+        PodInfo::from_json(&String::from_utf8(out).map_err(|_| CloudError::InvalidJson)?)
+    }
+
+    pub fn discover_service(&self, name: &str, namespace: Option<&str>) -> Result<ServiceEndpoints, CloudError> {
+        let ns = namespace.unwrap_or(self.config.namespace.as_deref().unwrap_or("default"));
+        let mut out = vec![0u8; 8192];
+        let len = naso_cloud_k8s_service_discover(
+            self.inner,
+            name.as_ptr(), name.len(),
+            ns.as_ptr(), ns.len(),
+            out.as_mut_ptr(), out.len(),
+        );
+        if len == 0 {
+            return Err(CloudError::K8sRequestFailed);
+        }
+        out.truncate(len as usize);
+        ServiceEndpoints::from_json(&String::from_utf8(out).map_err(|_| CloudError::InvalidJson)?)
+    }
+
+    pub fn get_configmap(&self, name: &str, namespace: Option<&str>) -> Result<ConfigMap, CloudError> {
+        let ns = namespace.unwrap_or(self.config.namespace.as_deref().unwrap_or("default"));
+        let mut out = vec![0u8; 65536];
+        let len = naso_cloud_k8s_configmap_get(
+            self.inner,
+            name.as_ptr(), name.len(),
+            ns.as_ptr(), ns.len(),
+            out.as_mut_ptr(), out.len(),
+        );
+        if len == 0 {
+            return Err(CloudError::K8sRequestFailed);
+        }
+        out.truncate(len as usize);
+        ConfigMap::from_json(&String::from_utf8(out).map_err(|_| CloudError::InvalidJson)?)
+    }
+
+    pub fn get_secret(&self, name: &str, namespace: Option<&str>) -> Result<Secret, CloudError> {
+        let ns = namespace.unwrap_or(self.config.namespace.as_deref().unwrap_or("default"));
+        let mut out = vec![0u8; 65536];
+        let len = naso_cloud_k8s_secret_get(
+            self.inner,
+            name.as_ptr(), name.len(),
+            ns.as_ptr(), ns.len(),
+            out.as_mut_ptr(), out.len(),
+        );
+        if len == 0 {
+            return Err(CloudError::K8sRequestFailed);
+        }
+        out.truncate(len as usize);
+        Secret::from_json(&String::from_utf8(out).map_err(|_| CloudError::InvalidJson)?)
+    }
+
+    pub fn watch_resources(&self, resource: &str, callback: impl Fn(String) + Send + 'static) -> Result<WatchHandle, CloudError> {
+        // Would register a watch with callback
+        Err(CloudError::NotImplemented)
+    }
+
+    pub fn leader_election(&self, lock_name: &str, identity: &str, ttl_secs: u32) -> Result<LeaderLock, CloudError> {
+        let handle = naso_cloud_k8s_leader_elect(
+            self.inner,
+            lock_name.as_ptr(), lock_name.len(),
+            identity.as_ptr(), identity.len(),
+            ttl_secs,
+        );
+        if handle == 0 {
+            return Err(CloudError::LeaderElectionFailed);
+        }
+        Ok(LeaderLock {
+            client: self.inner,
+            lock_name: lock_name.into(),
+            identity: identity.into(),
+            handle,
+        })
+    }
+}
+
+impl Drop for K8sClient {
+    fn drop(&mut self) {
+        naso_cloud_k8s_client_free(self.inner);
+    }
+}
+
+// ============================================================================
+// Kubernetes Types
+// ============================================================================
+
+struct PodInfo {
+    name: String,
+    namespace: String,
+    uid: String,
+    node_name: String,
+    pod_ip: String,
+    host_ip: String,
+    phase: String,
+    labels: HashMap<String, String>,
+    annotations: HashMap<String, String>,
+    containers: Vec<ContainerInfo>,
+}
+
+impl PodInfo {
+    fn from_json(json: &str) -> Result<Self, CloudError> {
+        // Parse JSON
+        Ok(PodInfo {
+            name: extract_json_field(json, "name").unwrap_or_default(),
+            namespace: extract_json_field(json, "namespace").unwrap_or_default(),
+            uid: extract_json_field(json, "uid").unwrap_or_default(),
+            node_name: extract_json_field(json, "nodeName").unwrap_or_default(),
+            pod_ip: extract_json_field(json, "podIP").unwrap_or_default(),
+            host_ip: extract_json_field(json, "hostIP").unwrap_or_default(),
+            phase: extract_json_field(json, "phase").unwrap_or_default(),
+            labels: parse_json_object(extract_json_field(json, "labels").unwrap_or("{}".into())),
+            annotations: parse_json_object(extract_json_field(json, "annotations").unwrap_or("{}".into())),
+            containers: vec![],
+        })
+    }
+}
+
+struct ContainerInfo {
+    name: String,
+    image: String,
+    ready: bool,
+    restart_count: u32,
+}
+
+struct ServiceEndpoints {
+    name: String,
+    namespace: String,
+    ports: Vec<ServicePort>,
+    endpoints: Vec<Endpoint>,
+}
+
+impl ServiceEndpoints {
+    fn from_json(json: &str) -> Result<Self, CloudError> {
+        Ok(ServiceEndpoints {
+            name: extract_json_field(json, "name").unwrap_or_default(),
+            namespace: extract_json_field(json, "namespace").unwrap_or_default(),
+            ports: vec![],
+            endpoints: vec![],
+        })
+    }
+}
+
+struct ServicePort {
+    name: String,
+    port: u16,
+    target_port: u16,
+    protocol: String,
+}
+
+struct Endpoint {
+    ip: String,
+    node_name: Option<String>,
+    target_ref: Option<String>,
+    conditions: EndpointConditions,
+}
+
+struct EndpointConditions {
+    ready: bool,
+    serving: bool,
+    terminating: bool,
+}
+
+struct ConfigMap {
+    name: String,
+    namespace: String,
+    data: HashMap<String, String>,
+    binary_data: HashMap<String, Vec<u8>>,
+}
+
+impl ConfigMap {
+    fn from_json(json: &str) -> Result<Self, CloudError> {
+        Ok(ConfigMap {
+            name: extract_json_field(json, "name").unwrap_or_default(),
+            namespace: extract_json_field(json, "namespace").unwrap_or_default(),
+            data: parse_json_object(extract_json_field(json, "data").unwrap_or("{}".into())),
+            binary_data: HashMap::new(),
+        })
+    }
+
+    pub fn get(&self, key: &str) -> Option<&String> {
+        self.data.get(key)
+    }
+
+    pub fn get_string(&self, key: &str) -> Option<String> {
+        self.data.get(key).cloned()
+    }
+}
+
+struct Secret {
+    name: String,
+    namespace: String,
+    data: HashMap<String, Vec<u8>>,
+    string_data: HashMap<String, String>,
+    secret_type: String,
+}
+
+impl Secret {
+    fn from_json(json: &str) -> Result<Self, CloudError> {
+        Ok(Secret {
+            name: extract_json_field(json, "name").unwrap_or_default(),
+            namespace: extract_json_field(json, "namespace").unwrap_or_default(),
+            data: HashMap::new(),
+            string_data: HashMap::new(),
+            secret_type: extract_json_field(json, "type").unwrap_or_default(),
+        })
+    }
+
+    pub fn get(&self, key: &str) -> Option<&Vec<u8>> {
+        self.data.get(key)
+    }
+
+    pub fn get_string(&self, key: &str) -> Option<String> {
+        self.string_data.get(key).cloned()
+    }
+}
+
+struct WatchHandle {
+    inner: u64,
+}
+
+impl Drop for WatchHandle {
+    fn drop(&mut self) {
+        // Stop watching
+    }
+}
+
+struct LeaderLock {
+    client: u64,
+    lock_name: String,
+    identity: String,
+    handle: u64,
+}
+
+impl LeaderLock {
+    pub fn renew(&self) -> Result<(), CloudError> {
+        let result = naso_cloud_k8s_leader_renew(
+            self.client,
+            self.lock_name.as_ptr(), self.lock_name.len(),
+            self.identity.as_ptr(), self.identity.len(),
+        );
+        if result == 0 {
+            return Err(CloudError::LeaderElectionFailed);
+        }
+        Ok(())
+    }
+
+    pub fn resign(&self) -> Result<(), CloudError> {
+        let result = naso_cloud_k8s_leader_resign(
+            self.client,
+            self.lock_name.as_ptr(), self.lock_name.len(),
+            self.identity.as_ptr(), self.identity.len(),
+        );
+        if result == 0 {
+            return Err(CloudError::LeaderElectionFailed);
+        }
+        Ok(())
+    }
+
+    pub fn is_leader(&self) -> bool {
+        // Would check if we hold the lock
+        true // Placeholder
+    }
+}
+
+impl Drop for LeaderLock {
+    fn drop(&mut self) {
+        self.resign().ok();
+    }
+}
+
+// ============================================================================
+// VM Metadata
+// ============================================================================
+
+struct VmMetadata;
+
+impl VmMetadata {
+    pub fn get(key: &str) -> Result<String, CloudError> {
+        let mut out = vec![0u8; 4096];
+        let len = naso_cloud_vm_metadata_get(key.as_ptr(), key.len(), out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(CloudError::VmMetadataNotFound);
+        }
+        out.truncate(len as usize);
+        Ok(String::from_utf8(out).map_err(|_| CloudError::InvalidUtf8)?)
+    }
+
+    pub fn instance_id() -> Result<String, CloudError> {
+        let mut out = vec![0u8; 256];
+        let len = naso_cloud_vm_instance_id(out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(CloudError::VmMetadataNotFound);
+        }
+        out.truncate(len as usize);
+        Ok(String::from_utf8(out).map_err(|_| CloudError::InvalidUtf8)?)
+    }
+
+    pub fn zone() -> Result<String, CloudError> {
+        let mut out = vec![0u8; 256];
+        let len = naso_cloud_vm_zone(out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(CloudError::VmMetadataNotFound);
+        }
+        out.truncate(len as usize);
+        Ok(String::from_utf8(out).map_err(|_| CloudError::InvalidUtf8)?)
+    }
+
+    pub fn tags() -> Result<HashMap<String, String>, CloudError> {
+        let mut out = vec![0u8; 4096];
+        let len = naso_cloud_vm_tags(out.as_mut_ptr(), out.len());
+        if len == 0 {
+            return Err(CloudError::VmMetadataNotFound);
+        }
+        out.truncate(len as usize);
+        let json = String::from_utf8(out).map_err(|_| CloudError::InvalidUtf8)?;
+        Ok(parse_json_object(&json))
+    }
+
+    pub fn provider() -> CloudProvider {
+        detect_cloud_provider()
+    }
+}
+
+// ============================================================================
+// Health Checks
+// ============================================================================
+
+enum HealthStatus {
+    Healthy,
+    Degraded,
+    Unhealthy,
+    Unknown,
+}
+
+struct HealthCheck {
+    name: String,
+    check_fn: Box<dyn Fn() -> HealthCheckResult + Send + Sync>,
+    interval_secs: u64,
+    timeout_secs: u64,
+    critical: bool,
+}
+
+struct HealthCheckResult {
+    status: HealthStatus,
+    message: String,
+    details: HashMap<String, String>,
+    timestamp: u64,
+}
+
+impl HealthCheck {
+    pub fn new(name: &str, check_fn: impl Fn() -> HealthCheckResult + Send + Sync + 'static) -> Self {
+        HealthCheck {
+            name: name.into(),
+            check_fn: Box::new(check_fn),
+            interval_secs: 30,
+            timeout_secs: 5,
+            critical: false,
+        }
+    }
+
+    pub fn interval(mut self, secs: u64) -> Self {
+        self.interval_secs = secs;
+        self
+    }
+
+    pub fn timeout(mut self, secs: u64) -> Self {
+        self.timeout_secs = secs;
+        self
+    }
+
+    pub fn critical(mut self, critical: bool) -> Self {
+        self.critical = critical;
+        self
+    }
+
+    pub fn run(&self) -> HealthCheckResult {
+        (self.check_fn)()
+    }
+}
+
+struct HealthRegistry {
+    checks: Vec<HealthCheck>,
+    http_endpoint: Option<String>,
+}
+
+impl HealthRegistry {
+    pub fn new() -> Self {
+        HealthRegistry {
+            checks: Vec::new(),
+            http_endpoint: None,
+        }
+    }
+
+    pub fn register(&mut self, check: HealthCheck) {
+        self.checks.push(check);
+    }
+
+    pub fn with_http_endpoint(mut self, endpoint: &str) -> Self {
+        self.http_endpoint = Some(endpoint.into());
+        self
+    }
+
+    pub fn run_all(&self) -> HealthReport {
+        let mut results = Vec::new();
+        let mut overall = HealthStatus::Healthy;
+
+        for check in &self.checks {
+            let result = check.run();
+            if check.critical && matches!(result.status, HealthStatus::Unhealthy) {
+                overall = HealthStatus::Unhealthy;
+            } else if matches!(result.status, HealthStatus::Degraded) && overall == HealthStatus::Healthy {
+                overall = HealthStatus::Degraded;
+            }
+            results.push((check.name.clone(), result));
+        }
+
+        HealthReport {
+            overall,
+            checks: results,
+            timestamp: current_timestamp(),
+        }
+    }
+
+    pub fn start_http_server(&self, addr: &str) -> Result<(), CloudError> {
+        // Would start HTTP server for health endpoint
+        Err(CloudError::NotImplemented)
+    }
+}
+
+struct HealthReport {
+    overall: HealthStatus,
+    checks: Vec<(String, HealthCheckResult)>,
+    timestamp: u64,
+}
+
+impl HealthReport {
+    pub fn to_json(&self) -> String {
+        let mut json = String::from("{");
+        json.push_str(&format!("\"status\":\"{}\",", self.overall.as_str()));
+        json.push_str(&format!("\"timestamp\":{},", self.timestamp));
+        json.push_str("\"checks\":{");
+        for (i, (name, result)) in self.checks.iter().enumerate() {
+            if i > 0 { json.push(','); }
+            json.push_str(&format!("\"{}\":{}", name, result.to_json()));
+        }
+        json.push_str("}}");
+        json
+    }
+}
+
+impl HealthStatus {
+    fn as_str(&self) -> &str {
+        match self {
+            HealthStatus::Healthy => "healthy",
+            HealthStatus::Degraded => "degraded",
+            HealthStatus::Unhealthy => "unhealthy",
+            HealthStatus::Unknown => "unknown",
+        }
+    }
+}
+
+impl HealthCheckResult {
+    fn to_json(&self) -> String {
+        let mut json = String::from("{");
+        json.push_str(&format!("\"status\":\"{}\",", self.status.as_str()));
+        json.push_str(&format!("\"message\":\"{}\",", self.message));
+        json.push_str(&format!("\"timestamp\":{},", self.timestamp));
+        json.push_str("\"details\":{");
+        for (i, (k, v)) in self.details.iter().enumerate() {
+            if i > 0 { json.push(','); }
+            json.push_str(&format!("\"{}\":\"{}\"", k, v));
+        }
+        json.push_str("}}");
+        json
+    }
+}
+
+// ============================================================================
+// Graceful Shutdown
+// ============================================================================
+
+struct ShutdownManager {
+    handlers: Vec<Box<dyn FnOnce() + Send>>,
+    signal_registered: bool,
+    deadline_ns: Option<u64>,
+}
+
+impl ShutdownManager {
+    pub fn new() -> Self {
+        ShutdownManager {
+            handlers: Vec::new(),
+            signal_registered: false,
+            deadline_ns: None,
+        }
+    }
+
+    pub fn on_shutdown(&mut self, handler: impl FnOnce() + Send + 'static) {
+        self.handlers.push(Box::new(handler));
+    }
+
+    pub fn register_signals(&mut self) -> Result<(), CloudError> {
+        if self.signal_registered {
+            return Ok(());
+        }
+
+        let handle = naso_cloud_shutdown_signal_register(shutdown_callback as *const u8);
+        if handle == 0 {
+            return Err(CloudError::ShutdownRegistrationFailed);
+        }
+
+        self.signal_registered = true;
+
+        // Store deadline if available
+        if naso_cloud_shutdown_initiated() {
+            self.deadline_ns = Some(naso_cloud_shutdown_deadline_ns());
+        }
+
+        Ok(())
+    }
+
+    pub fn execute(&mut self) {
+        for handler in self.handlers.drain(..) {
+            handler();
+        }
+    }
+
+    pub fn is_initiated(&self) -> bool {
+        naso_cloud_shutdown_initiated()
+    }
+
+    pub fn deadline_ns(&self) -> Option<u64> {
+        if naso_cloud_shutdown_initiated() {
+            Some(naso_cloud_shutdown_deadline_ns())
+        } else {
+            self.deadline_ns
+        }
+    }
+
+    pub fn time_remaining_ns(&self) -> Option<u64> {
+        self.deadline_ns().map(|d| {
+            let now = current_timestamp_ns();
+            if d > now { d - now } else { 0 }
+        })
+    }
+}
+
+fn shutdown_callback() {
+    // Called from C when shutdown signal received
+    // Would trigger Rust shutdown handlers
+}
+
+fn current_timestamp_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
+}
+
+// ============================================================================
+// Service Discovery
+// ============================================================================
+
+enum ServiceDiscoveryBackend {
+    Kubernetes,
+    Consul,
+    Etcd,
+    Dns,
+    Static,
+}
+
+struct ServiceInstance {
+    id: String,
+    name: String,
+    address: String,
+    port: u16,
+    tags: Vec<String>,
+    metadata: HashMap<String, String>,
+    health_check: Option<HealthCheck>,
+}
+
+struct ServiceDiscovery {
+    backend: ServiceDiscoveryBackend,
+    k8s_client: Option<K8sClient>,
+    consul_addr: Option<String>,
+    etcd_endpoints: Vec<String>,
+}
+
+impl ServiceDiscovery {
+    pub fn kubernetes(client: K8sClient) -> Self {
+        ServiceDiscovery {
+            backend: ServiceDiscoveryBackend::Kubernetes,
+            k8s_client: Some(client),
+            consul_addr: None,
+            etcd_endpoints: Vec::new(),
+        }
+    }
+
+    pub fn consul(addr: &str) -> Self {
+        ServiceDiscovery {
+            backend: ServiceDiscoveryBackend::Consul,
+            k8s_client: None,
+            consul_addr: Some(addr.into()),
+            etcd_endpoints: Vec::new(),
+        }
+    }
+
+    pub fn etcd(endpoints: &[&str]) -> Self {
+        ServiceDiscovery {
+            backend: ServiceDiscoveryBackend::Etcd,
+            k8s_client: None,
+            consul_addr: None,
+            etcd_endpoints: endpoints.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    pub fn discover(&self, service: &str) -> Result<Vec<ServiceInstance>, CloudError> {
+        match self.backend {
+            ServiceDiscoveryBackend::Kubernetes => {
+                if let Some(client) = &self.k8s_client {
+                    let endpoints = client.discover_service(service, None)?;
+                    Ok(endpoints.endpoints.into_iter().map(|e| ServiceInstance {
+                        id: e.ip.clone(),
+                        name: service.into(),
+                        address: e.ip,
+                        port: endpoints.ports.first().map(|p| p.port).unwrap_or(80),
+                        tags: vec![],
+                        metadata: HashMap::new(),
+                        health_check: None,
+                    })).collect())
+                } else {
+                    Err(CloudError::NotConfigured)
+                }
+            }
+            _ => Err(CloudError::NotImplemented),
+        }
+    }
+
+    pub fn register(&self, instance: ServiceInstance) -> Result<(), CloudError> {
+        // Register with backend
+        Err(CloudError::NotImplemented)
+    }
+
+    pub fn deregister(&self, instance_id: &str) -> Result<(), CloudError> {
+        Err(CloudError::NotImplemented)
+    }
+}
+
+// ============================================================================
+// Configuration Management
+// ============================================================================
+
+struct ConfigManager {
+    sources: Vec<ConfigSource>,
+    cache: HashMap<String, String>,
+    watch_handles: Vec<WatchHandle>,
+}
+
+enum ConfigSource {
+    Environment,
+    File(String),
+    K8sConfigMap(K8sClient, String, Option<String>),
+    K8sSecret(K8sClient, String, Option<String>),
+    Consul(String),
+    Etcd(Vec<String>),
+    Vault(String),
+}
+
+impl ConfigManager {
+    pub fn new() -> Self {
+        ConfigManager {
+            sources: Vec::new(),
+            cache: HashMap::new(),
+            watch_handles: Vec::new(),
+        }
+    }
+
+    pub fn add_env(mut self) -> Self {
+        self.sources.push(ConfigSource::Environment);
+        self
+    }
+
+    pub fn add_file(mut self, path: &str) -> Self {
+        self.sources.push(ConfigSource::File(path.into()));
+        self
+    }
+
+    pub fn add_k8s_configmap(mut self, client: K8sClient, name: &str, namespace: Option<&str>) -> Self {
+        self.sources.push(ConfigSource::K8sConfigMap(client, name.into(), namespace.map(|s| s.into())));
+        self
+    }
+
+    pub fn add_k8s_secret(mut self, client: K8sClient, name: &str, namespace: Option<&str>) -> Self {
+        self.sources.push(ConfigSource::K8sSecret(client, name.into(), namespace.map(|s| s.into())));
+        self
+    }
+
+    pub fn load(&mut self) -> Result<(), CloudError> {
+        for source in &self.sources {
+            self.load_source(source)?;
+        }
+        Ok(())
+    }
+
+    fn load_source(&mut self, source: &ConfigSource) -> Result<(), CloudError> {
+        match source {
+            ConfigSource::Environment => {
+                for (key, value) in std::env::vars() {
+                    self.cache.insert(key, value);
+                }
+            }
+            ConfigSource::File(path) => {
+                let content = std::fs::read_to_string(path).map_err(|_| CloudError::ConfigFileNotFound)?;
+                // Parse based on extension
+                if path.ends_with(".json") {
+                    self.parse_json(&content)?;
+                } else if path.ends_with(".yaml") || path.ends_with(".yml") {
+                    self.parse_yaml(&content)?;
+                } else if path.ends_with(".toml") {
+                    self.parse_toml(&content)?;
+                }
+            }
+            ConfigSource::K8sConfigMap(client, name, namespace) => {
+                let cm = client.get_configmap(name, namespace.as_deref())?;
+                for (k, v) in cm.data {
+                    self.cache.insert(k, v);
+                }
+            }
+            ConfigSource::K8sSecret(client, name, namespace) => {
+                let secret = client.get_secret(name, namespace.as_deref())?;
+                for (k, v) in secret.string_data {
+                    self.cache.insert(k, v);
+                }
+            }
+            _ => return Err(CloudError::NotImplemented),
+        }
+        Ok(())
+    }
+
+    fn parse_json(&mut self, content: &str) -> Result<(), CloudError> {
+        let obj = parse_json_object(content);
+        for (k, v) in obj {
+            self.cache.insert(k, v);
+        }
+        Ok(())
+    }
+
+    fn parse_yaml(&mut self, _content: &str) -> Result<(), CloudError> {
+        Err(CloudError::NotImplemented)
+    }
+
+    fn parse_toml(&mut self, _content: &str) -> Result<(), CloudError> {
+        Err(CloudError::NotImplemented)
+    }
+
+    pub fn get(&self, key: &str) -> Option<&String> {
+        self.cache.get(key)
+    }
+
+    pub fn get_string(&self, key: &str) -> Option<String> {
+        self.cache.get(key).cloned()
+    }
+
+    pub fn get_int(&self, key: &str) -> Option<i64> {
+        self.cache.get(key).and_then(|v| v.parse().ok())
+    }
+
+    pub fn get_bool(&self, key: &str) -> Option<bool> {
+        self.cache.get(key).and_then(|v| v.parse().ok())
+    }
+
+    pub fn get_float(&self, key: &str) -> Option<f64> {
+        self.cache.get(key).and_then(|v| v.parse().ok())
+    }
+
+    pub fn require(&self, key: &str) -> Result<String, CloudError> {
+        self.cache.get(key).cloned().ok_or(CloudError::ConfigMissing(key.into()))
+    }
+
+    pub fn watch(&mut self, key: &str, callback: impl Fn(String) + Send + 'static) -> Result<(), CloudError> {
+        // Would set up file watch or configmap watch
+        Err(CloudError::NotImplemented)
+    }
+}
+
+// ============================================================================
+// Error Types
+// ============================================================================
+
+enum CloudError {
+    K8sConfigMissing,
+    K8sClientCreationFailed,
+    K8sRequestFailed,
+    InvalidJson,
+    InvalidUtf8,
+    VmMetadataNotFound,
+    ConfigFileNotFound,
+    ConfigMissing(String),
+    NotConfigured,
+    NotImplemented,
+    LeaderElectionFailed,
+    ShutdownRegistrationFailed,
+    HealthCheckFailed,
+    ServiceDiscoveryFailed,
+}
+
+impl CloudError {
+    pub fn to_string(&self) -> String {
+        match self {
+            CloudError::K8sConfigMissing => "Kubernetes in-cluster config not found".into(),
+            CloudError::K8sClientCreationFailed => "Failed to create Kubernetes client".into(),
+            CloudError::K8sRequestFailed => "Kubernetes API request failed".into(),
+            CloudError::InvalidJson => "Invalid JSON response".into(),
+            CloudError::InvalidUtf8 => "Invalid UTF-8".into(),
+            CloudError::VmMetadataNotFound => "VM metadata not found".into(),
+            CloudError::ConfigFileNotFound => "Configuration file not found".into(),
+            CloudError::ConfigMissing(key) => format!("Required config '{}' missing", key),
+            CloudError::NotConfigured => "Client not configured".into(),
+            CloudError::NotImplemented => "Not implemented".into(),
+            CloudError::LeaderElectionFailed => "Leader election failed".into(),
+            CloudError::ShutdownRegistrationFailed => "Failed to register shutdown handler".into(),
+            CloudError::HealthCheckFailed => "Health check failed".into(),
+            CloudError::ServiceDiscoveryFailed => "Service discovery failed".into(),
+        }
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn extract_json_field(json: &str, field: &str) -> Option<String> {
+    // Simple JSON field extraction (would use proper parser)
+    let pattern = format!("\"{}\":", field);
+    if let Some(start) = json.find(&pattern) {
+        let value_start = start + pattern.len();
+        let remaining = &json[value_start..];
+        if remaining.starts_with('"') {
+            if let Some(end) = remaining[1..].find('"') {
+                return Some(remaining[1..end+1].into());
+            }
+        } else if remaining.starts_with('{') || remaining.starts_with('[') {
+            // Object or array - find matching bracket
+            let mut depth = 0;
+            let mut in_string = false;
+            let mut escaped = false;
+            for (i, c) in remaining.char_indices() {
+                if !escaped && c == '"' {
+                    in_string = !in_string;
+                } else if !escaped && c == '\\' {
+                    escaped = true;
+                    continue;
+                } else {
+                    escaped = false;
+                }
+                if !in_string {
+                    match c {
+                        '{' | '[' => depth += 1,
+                        '}' | ']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return Some(remaining[..=i].into());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        } else {
+            // Primitive value
+            let end = remaining.find([',', '}']).unwrap_or(remaining.len());
+            return Some(remaining[..end].trim().into());
+        }
+    }
+    None
+}
+
+fn parse_json_object(json: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let content = json.trim();
+    if content == "{}" { return map; }
+    if !content.starts_with('{') || !content.ends_with('}') { return map; }
+
+    let inner = &content[1..content.len()-1];
+    let mut current = String::new();
+    let mut key = String::new();
+    let mut in_key = true;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for c in inner.chars() {
+        if !escaped && c == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if !escaped && c == '\\' {
+            escaped = true;
+            current.push(c);
+            continue;
+        }
+        escaped = false;
+
+        if !in_string && c == ':' && in_key {
+            key = current.trim().trim_matches('"').into();
+            current.clear();
+            in_key = false;
+            continue;
+        }
+        if !in_string && c == ',' && !in_key {
+            let value = current.trim().trim_matches('"').into();
+            map.insert(key, value);
+            current.clear();
+            in_key = true;
+            continue;
+        }
+        current.push(c);
+    }
+
+    if !current.is_empty() && !in_key {
+        let value = current.trim().trim_matches('"').into();
+        map.insert(key, value);
+    }
+
+    map
+}
+
+// ============================================================================
+// Convenience Functions
+// ============================================================================
+
+fn k8s_in_cluster() -> Result<K8sClient, CloudError> {
+    K8sClient::new(K8sConfig::in_cluster()?)
+}
+
+fn vm_metadata() -> VmMetadata {
+    VmMetadata
+}
+
+fn health_registry() -> HealthRegistry {
+    HealthRegistry::new()
+}
+
+fn shutdown_manager() -> ShutdownManager {
+    ShutdownManager::new()
+}
+
+fn service_discovery_k8s(client: K8sClient) -> ServiceDiscovery {
+    ServiceDiscovery::kubernetes(client)
+}
+
+fn config_manager() -> ConfigManager {
+    ConfigManager::new()
+}
+
+// ============================================================================
+// Cloud Run / Serverless Support
+// ============================================================================
+
+struct ServerlessRuntime {
+    platform: ServerlessPlatform,
+    request_handler: Option<Box<dyn Fn(Request) -> Response + Send + Sync>>,
+}
+
+enum ServerlessPlatform {
+    AwsLambda,
+    GcpCloudRun,
+    AzureFunctions,
+    CloudflareWorkers,
+    Knative,
+    OpenFaaS,
+    Custom,
+}
+
+struct Request {
+    method: String,
+    path: String,
+    headers: HashMap<String, String>,
+    query: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+struct Response {
+    status: u16,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+impl ServerlessRuntime {
+    pub fn new(platform: ServerlessPlatform) -> Self {
+        ServerlessRuntime {
+            platform,
+            request_handler: None,
+        }
+    }
+
+    pub fn handle<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(Request) -> Response + Send + Sync + 'static,
+    {
+        self.request_handler = Some(Box::new(handler));
+        self
+    }
+
+    pub fn run(&self) -> Result<(), CloudError> {
+        match self.platform {
+            ServerlessPlatform::AwsLambda => self.run_lambda(),
+            ServerlessPlatform::GcpCloudRun => self.run_cloud_run(),
+            _ => Err(CloudError::NotImplemented),
+        }
+    }
+
+    fn run_lambda(&self) -> Result<(), CloudError> {
+        // AWS Lambda runtime API loop
+        Err(CloudError::NotImplemented)
+    }
+
+    fn run_cloud_run(&self) -> Result<(), CloudError> {
+        // HTTP server for Cloud Run
+        Err(CloudError::NotImplemented)
+    }
+}

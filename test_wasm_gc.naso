@@ -1,0 +1,11 @@
+// Test file for WASM GC backend
+// Run with: naso build --target wasm-gc --triple wasm32-gc test_wasm_gc.naso
+
+fn add(a: Int, b: Int) -> Int {
+    a + b
+}
+
+fn main() -> Int {
+    let result = add(42, 58);
+    result
+}

@@ -1,15 +1,16 @@
 {
   "name": "vscode-naso",
   "displayName": "Naso Language Support",
-  "description": "Language support for Naso including syntax highlighting, QTT hover tooltips, real-time SMT diagnostics, and more.",
-  "version": "0.0.1",
+  "description": "Language support for Naso including syntax highlighting, QTT hover tooltips, real-time SMT diagnostics, debugging, and quantum circuit visualization.",
+  "version": "0.1.0",
   "publisher": "nasirquant",
   "engines": {
     "vscode": "^1.85.0"
   },
   "categories": [
     "Programming Languages",
-    "Linters"
+    "Linters",
+    "Debuggers"
   ],
   "keywords": [
     "naso",
@@ -17,7 +18,9 @@
     "language",
     "syntax",
     "linter",
-    "diagnostics"
+    "diagnostics",
+    "debugger",
+    "quantum"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -40,12 +43,226 @@
         "scopeName": "source.naso",
         "path": "./syntaxes/naso.tmLanguage.json"
       }
-    ]
+    ],
+    "debuggers": [
+      {
+        "type": "naso",
+        "label": "Naso Debugger",
+        "program": "./dist/debug/debugAdapter.js",
+        "runtime": "node",
+        "configurationAttributes": {
+          "launch": {
+            "required": ["program"],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "Path to the Naso binary to debug"
+              },
+              "args": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Command line arguments passed to the program"
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory of the program"
+              },
+              "env": {
+                "type": "object",
+                "description": "Environment variables"
+              },
+              "stopAtEntry": {
+                "type": "boolean",
+                "default": false,
+                "description": "Stop at program entry point"
+              }
+            }
+          }
+        }
+      }
+    ],
+    "views": {
+      "explorer": [
+        {
+          "id": "nasoQuantumExplorer",
+          "name": "Quantum Circuits",
+          "when": "resourceExtname == .naso"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "naso.build",
+        "title": "Naso: Build"
+      },
+      {
+        "command": "naso.run",
+        "title": "Naso: Run"
+      },
+      {
+        "command": "naso.emitQir",
+        "title": "Naso: Emit QIR"
+      },
+      {
+        "command": "naso.emitLlvm",
+        "title": "Naso: Emit LLVM IR"
+      },
+      {
+        "command": "naso.check",
+        "title": "Naso: Type Check"
+      },
+      {
+        "command": "naso.test",
+        "title": "Naso: Run Tests"
+      },
+      {
+        "command": "naso.fmt",
+        "title": "Naso: Format"
+      },
+      {
+        "command": "naso.clippy",
+        "title": "Naso: Clippy"
+      },
+      {
+        "command": "naso.doc",
+        "title": "Naso: Generate Docs"
+      },
+      {
+        "command": "naso.pkgAdd",
+        "title": "Naso: Add Package"
+      },
+      {
+        "command": "naso.pkgInstall",
+        "title": "Naso: Install Dependencies"
+      },
+      {
+        "command": "naso.pkgPublish",
+        "title": "Naso: Publish Package"
+      },
+      {
+        "command": "naso.quantumVisualize",
+        "title": "Naso: Visualize Quantum Circuit"
+      },
+      {
+        "command": "naso.quantumSimulate",
+        "title": "Naso: Simulate Quantum Circuit"
+      },
+      {
+        "command": "naso.quantumExport",
+        "title": "Naso: Export Quantum Circuit (OpenQASM)"
+      },
+      {
+        "command": "naso.restartLsp",
+        "title": "Naso: Restart Language Server"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "naso.build",
+          "group": "navigation",
+          "when": "resourceLangId == naso"
+        },
+        {
+          "command": "naso.run",
+          "group": "navigation",
+          "when": "resourceLangId == naso"
+        },
+        {
+          "command": "naso.check",
+          "group": "navigation",
+          "when": "resourceLangId == naso"
+        },
+        {
+          "command": "naso.quantumVisualize",
+          "group": "navigation",
+          "when": "resourceLangId == naso"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "naso.build",
+          "group": "navigation",
+          "when": "resourceExtname == .naso"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "naso.build",
+        "key": "ctrl+shift+b",
+        "mac": "cmd+shift+b",
+        "when": "resourceLangId == naso"
+      },
+      {
+        "command": "naso.run",
+        "key": "ctrl+f5",
+        "mac": "cmd+f5",
+        "when": "resourceLangId == naso"
+      },
+      {
+        "command": "naso.check",
+        "key": "ctrl+shift+c",
+        "mac": "cmd+shift+c",
+        "when": "resourceLangId == naso"
+      }
+    ],
+    "configuration": {
+      "type": "object",
+      "title": "Naso",
+      "properties": {
+        "naso.build.target": {
+          "type": "string",
+          "enum": ["llvm", "qir", "jit", "wgsl"],
+          "default": "llvm",
+          "description": "Default build target"
+        },
+        "naso.build.release": {
+          "type": "boolean",
+          "default": true,
+          "description": "Build in release mode by default"
+        },
+        "naso.lsp.enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable Naso Language Server"
+        },
+        "naso.lsp.serverPath": {
+          "type": "string",
+          "default": "naso-lsp",
+          "description": "Path to naso-lsp executable"
+        },
+        "naso.lsp.trace.server": {
+          "type": "string",
+          "enum": ["off", "messages", "verbose"],
+          "default": "off",
+          "description": "Trace level for LSP server"
+        },
+        "naso.debug.gdbPath": {
+          "type": "string",
+          "default": "gdb",
+          "description": "Path to GDB/LLDB for debugging"
+        },
+        "naso.quantum.enableVisualization": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable quantum circuit visualization"
+        },
+        "naso.quantum.simulator": {
+          "type": "string",
+          "enum": ["statevector", "stabilizer", "density_matrix"],
+          "default": "statevector",
+          "description": "Quantum simulator backend"
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "node esbuild.mjs",
     "compile": "node esbuild.mjs",
     "watch": "node -e \"require('esbuild').build({entryPoints:['src/extension.ts'], bundle:true, outfile:'dist/extension.js', external:['vscode'], platform:'node', format:'cjs', sourcemap:true, watch:true}).catch(() => process.exit(1))\"",
+    "compile:debug": "node esbuild-debug.mjs",
+    "watch:debug": "node -e \"require('esbuild').build({entryPoints:['src/debug/debugAdapter.ts'], bundle:true, outfile:'dist/debug/debugAdapter.js', external:['vscode'], platform:'node', format:'cjs', sourcemap:true, watch:true}).catch(() => process.exit(1))\"",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext .ts",
     "test": "node ./test/runTest.js"
@@ -61,6 +278,8 @@
     "vsce": "^2.15.0"
   },
   "dependencies": {
-    "node-fetch": "^3.3.2"
+    "node-fetch": "^3.3.2",
+    "vscode-debugadapter": "^1.45.0",
+    "vscode-debugadapter-testsupport": "^1.45.0"
   }
 }

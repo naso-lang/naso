@@ -25,64 +25,13 @@ pub fn check_expr(
     expr: &Expr,
     expected: &Type,
 ) -> Result<(), TypeError> {
-    // Normalize the expected type first (resolves associated type projections)
-    let normalized_expected = checker.normalize_type(expected)?;
-    
-    // Special handling for if expressions when expected type is an array with known size
-    // This enables context-aware array literal inference in branches
-    if let ExprKind::If(_, _, _) = &expr.kind {
-        if let TypeKind::Array(_, size) = &normalized_expected.kind {
-            if let Some(expected_size) = size.as_ref().and_then(|n| n.to_u64()) {
-                return check_if_against_array(checker, expr, &normalized_expected, expected_size);
-            }
-        }
-    }
-
     // First, synthesize the type of the expression
     let inferred = infer_expr(checker, expr)?;
 
     // Unify with expected type (including quantity)
-    unify::unify_types(checker, &inferred, &normalized_expected)?;
+    unify::unify_types(checker, &inferred, expected)?;
 
     // Additional QTT checks for quantity
-    check_quantity_consumption(checker, expr, &inferred, &normalized_expected)?;
-
-    Ok(())
-}
-
-/// Check if expression against an expected array type with known size
-fn check_if_against_array(
-    checker: &mut TypeChecker,
-    expr: &Expr,
-    expected: &Type,
-    expected_size: u64,
-) -> Result<(), TypeError> {
-    let ExprKind::If(cond, then_branch, else_branch) = &expr.kind else {
-        unreachable!()
-    };
-
-    // Condition must be Bool
-    let cond_ty = infer_expr(checker, cond)?;
-    unify::unify_types(
-        checker,
-        &cond_ty,
-        &Type::new(TypeKind::Bool, Quantity::Many, expr.span),
-    )?;
-
-    // Check each branch against the expected array type
-    // We use check_expr on branches with the expected type to enable
-    // context-aware array literal inference
-    checker.check_expr(then_branch, expected)?;
-
-    if let Some(else_expr) = else_branch {
-        checker.check_expr(else_expr, expected)?;
-    } else {
-        // If without else: unify expected with Unit
-        unify::unify_types(checker, expected, &Type::unit(expr.span))?;
-    }
-
-    // Additional QTT checks for quantity
-    let inferred = infer_expr(checker, expr)?;
     check_quantity_consumption(checker, expr, &inferred, expected)?;
 
     Ok(())
@@ -152,21 +101,8 @@ pub fn check_stmt(checker: &mut TypeChecker, stmt: &Stmt) -> Result<(), TypeErro
     }
 }
 fn check_let(checker: &mut TypeChecker, let_stmt: &LetStmt) -> Result<(), TypeError> {
-    // If explicit type annotation is an array with known size, set expected_array_size
-    // for context-aware array literal inference in the initializer
-    let prev_expected_size = checker.expected_array_size;
-    if let Some(ann_ty) = &let_stmt.ty {
-        checker.expected_array_size = match &ann_ty.kind {
-            TypeKind::Array(_, size) => size.as_ref().and_then(|n| n.to_u64()),
-            _ => None,
-        };
-    }
-
     // Infer the type of the initializer
     let init_ty = infer_expr(checker, &let_stmt.value)?;
-
-    // Restore expected_array_size
-    checker.expected_array_size = prev_expected_size;
 
     // Handle tuple patterns by destructuring the tuple type
     let mut bindings = Vec::new();
@@ -264,16 +200,13 @@ fn check_let(checker: &mut TypeChecker, let_stmt: &LetStmt) -> Result<(), TypeEr
     // String -> Pointer (for C string literals) and Array -> Pointer (for buffer passing).
     // These are handled in `infer_cast` but not in direct unification.
     if let Some(ann_ty) = &let_stmt.ty {
-        // Normalize the annotation type first (resolves associated type projections)
-        let normalized_ann_ty = checker.normalize_type(ann_ty)?;
-        
         // Check if this is a valid implicit cast case (String/Array -> Pointer)
         let is_string_to_ptr = matches!(
-            (&init_ty.kind, &normalized_ann_ty.kind),
+            (&init_ty.kind, &ann_ty.kind),
             (TypeKind::String, TypeKind::Pointer(_))
         );
         let is_array_to_ptr = matches!(
-            (&init_ty.kind, &normalized_ann_ty.kind),
+            (&init_ty.kind, &ann_ty.kind),
             (TypeKind::Array(_, _), TypeKind::Pointer(_))
         );
         
@@ -283,7 +216,7 @@ fn check_let(checker: &mut TypeChecker, let_stmt: &LetStmt) -> Result<(), TypeEr
             // literals), we can safely skip the direct unification and allow the cast.
             // The codegen will emit the proper pointer cast.
         } else {
-            unify::unify_types(checker, &init_ty, &normalized_ann_ty)?;
+            unify::unify_types(checker, &init_ty, ann_ty)?;
         }
     }
 
@@ -435,14 +368,6 @@ fn check_item(checker: &mut TypeChecker, item: &Item) -> Result<(), TypeError> {
             checker.env.insert_type_def(t.clone());
             Ok(())
         }
-        Item::Trait(t) => {
-            checker.env.insert_trait(t.clone());
-            Ok(())
-        }
-        Item::TraitImpl(t) => {
-            checker.env.insert_trait_impl(t.clone());
-            Ok(())
-        }
         Item::Const(c) => {
             checker.env.insert_const(c.clone());
             Ok(())
@@ -473,7 +398,7 @@ fn check_item(checker: &mut TypeChecker, item: &Item) -> Result<(), TypeError> {
                     span: extern_fn.span,
                 };
                 checker.env.functions.insert(extern_fn.name.clone(), sig.clone());
-
+                
                 // Also bind as callable variable
                 let param_tys: Vec<Type> = sig.params.iter().map(|p| p.ty.clone()).collect();
                 let func_ty = Type::new(
@@ -585,7 +510,7 @@ fn check_pure_expr(checker: &mut TypeChecker, expr: &Expr) -> Result<(), TypeErr
             })
         }
         ExprKind::QuantumOp(_) => Ok(()),
-        ExprKind::Call(callee, _, _) => {
+        ExprKind::Call(callee, _) => {
             // Check if callee is impure
             let callee_ty = infer_expr(checker, callee)?;
             if let TypeKind::Function(_, ret) = &callee_ty.kind {
@@ -738,7 +663,7 @@ fn check_precondition_quantifier(
             span: quant.body.span,
         });
     };
-    let ExprKind::Call(_, args, _) = &expr.kind else {
+    let ExprKind::Call(_, args) = &expr.kind else {
         return Err(TypeError::QuantifiedBodyNotBool {
             span: quant.body.span,
         });
@@ -798,14 +723,10 @@ pub fn check_block(checker: &mut TypeChecker, block: &Block, expected_ret: Optio
     }
 
     if let Some(expr) = &block.expr {
-        // If there's an expected return type, check the expression against it
-        // This enables context-aware inference (e.g., array literal sizes in if/else branches)
+        let inferred_ty = infer_expr(checker, expr)?;
+        // If there's an expected return type, validate the tail expression against it
         if let Some(expected) = expected_ret {
-            checker.check_expr(expr, expected)?;
-        } else {
-            let inferred_ty = infer_expr(checker, expr)?;
-            // No expected type, just ensure it's valid
-            let _ = inferred_ty;
+            unify::unify_types(checker, &inferred_ty, expected)?;
         }
     }
 
@@ -944,32 +865,13 @@ pub fn check_pattern(
 /// Get type of a literal
 fn literal_type(lit: &Literal, span: Span) -> Type {
     match lit {
-        Literal::Int(_, Some(ty)) => typed_int_ty(*ty, span),
-        Literal::Int(_, None) => Type::new(TypeKind::Int, Quantity::Many, span),
-        Literal::UInt(_, Some(ty)) => typed_int_ty(*ty, span),
-        Literal::UInt(_, None) => Type::new(TypeKind::UInt, Quantity::Many, span),
+        Literal::Int(_) => Type::new(TypeKind::Int, Quantity::Many, span),
+        Literal::UInt(_) => Type::new(TypeKind::UInt, Quantity::Many, span),
         Literal::Float(_) => Type::new(TypeKind::Float, Quantity::Many, span),
         Literal::Bool(_) => Type::new(TypeKind::Bool, Quantity::Many, span),
         Literal::String(_) => Type::new(TypeKind::String, Quantity::Many, span),
         Literal::Char(_) => Type::new(TypeKind::Char, Quantity::Many, span),
         Literal::Unit => Type::unit(span),
-    }
-}
-
-/// Convert IntTy to Type with appropriate bit width
-fn typed_int_ty(ty: crate::ast::IntTy, span: Span) -> Type {
-    use crate::ast::IntTy;
-    match ty {
-        IntTy::U8 => Type::uint_width(8, span),
-        IntTy::U16 => Type::uint_width(16, span),
-        IntTy::U32 => Type::uint_width(32, span),
-        IntTy::U64 => Type::uint_width(64, span),
-        IntTy::USize => Type::uint_width(64, span),
-        IntTy::I8 => Type::int_width(8, span),
-        IntTy::I16 => Type::int_width(16, span),
-        IntTy::I32 => Type::int_width(32, span),
-        IntTy::I64 => Type::int_width(64, span),
-        IntTy::ISize => Type::int_width(64, span),
     }
 }
 
@@ -1124,362 +1026,5 @@ fn place_to_ident(place: &type_env::Place) -> Ident {
         type_env::Place::Field(base, _) => place_to_ident(base),
         type_env::Place::Index(base, _) => place_to_ident(base),
         type_env::Place::Deref(base) => place_to_ident(base),
-    }
-}
-
-/// Check a trait implementation against its trait definition
-pub fn check_trait_impl(checker: &mut TypeChecker, impl_def: &TraitImpl) -> Result<(), TypeError> {
-    // Look up the trait definition
-    let trait_name = impl_def.trait_path.last().cloned().unwrap_or_else(|| Ident::new("", Span::default()));
-    let trait_def = checker.env.lookup_trait(&trait_name).cloned().ok_or_else(|| TypeError::TraitNotFound {
-        name: trait_name.clone(),
-        span: impl_def.span,
-    })?;
-
-    // Check each impl item against the trait
-    for item in &impl_def.items {
-        match item {
-            ImplItem::Method(func) => {
-                // Find the corresponding method in the trait
-                let trait_method = trait_def.items.iter().find_map(|trait_item| {
-                    if let TraitItem::Method(tm) = trait_item {
-                        if tm.name.name == func.name.name {
-                            Some(tm.clone())
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                });
-
-                if let Some(trait_method) = trait_method {
-                    // Check that the method signature matches
-                    // Check parameters
-                    if trait_method.params.len() != func.params.len() {
-                        return Err(TypeError::TraitImplMethodArityMismatch {
-                            method_name: func.name.clone(),
-                            expected: trait_method.params.len(),
-                            found: func.params.len(),
-                            span: func.span,
-                        });
-                    }
-
-                    // Check parameter types
-                    for (trait_param, impl_param) in trait_method.params.iter().zip(func.params.iter()) {
-                        unify::unify_types(checker, &trait_param.ty, &impl_param.ty)?;
-                    }
-
-                    // Check return type - normalize associated type projections in both trait and impl methods
-                    // using the impl's for_ty and associated type definitions
-                    let trait_ret = trait_method.ret_ty.clone().unwrap_or(Type::unit(trait_method.span));
-                    let impl_ret = func.ret_ty.clone().unwrap_or(Type::unit(func.span));
-                    
-                    // Normalize trait return type with respect to this impl
-                    let normalized_trait_ret = normalize_trait_return_type(checker, &trait_ret, impl_def)?;
-                    
-                    // Also normalize impl return type (it might also use Self::AssocType)
-                    let normalized_impl_ret = normalize_trait_return_type(checker, &impl_ret, impl_def)?;
-                    
-                    unify::unify_types(checker, &normalized_trait_ret, &normalized_impl_ret)?;
-
-                    // Check generic parameters (if any)
-                    if trait_method.generics.len() != func.generics.len() {
-                        return Err(TypeError::TraitImplGenericArityMismatch {
-                            method_name: func.name.clone(),
-                            expected: trait_method.generics.len(),
-                            found: func.generics.len(),
-                            span: func.span,
-                        });
-                    }
-                } else {
-                    // Method not found in trait
-                    return Err(TypeError::TraitImplMethodNotInTrait {
-                        method_name: func.name.clone(),
-                        trait_name: trait_name.clone(),
-                        span: func.span,
-                    });
-                }
-            }
-            ImplItem::AssociatedTypeDef(assoc_ty_def) => {
-                // Find the corresponding associated type in the trait
-                let trait_assoc_ty = trait_def.items.iter().find_map(|trait_item| {
-                    if let TraitItem::AssociatedType(ta) = trait_item {
-                        if ta.name.name == assoc_ty_def.name.name {
-                            Some(ta.clone())
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                });
-
-                if let Some(trait_assoc_ty) = trait_assoc_ty {
-                    // Check generics match
-                    if trait_assoc_ty.generics.len() != assoc_ty_def.generics.len() {
-                        return Err(TypeError::TraitImplAssocTypeGenericArityMismatch {
-                            type_name: assoc_ty_def.name.clone(),
-                            expected: trait_assoc_ty.generics.len(),
-                            found: assoc_ty_def.generics.len(),
-                            span: assoc_ty_def.span,
-                        });
-                    }
-                } else {
-                    return Err(TypeError::TraitImplAssocTypeNotInTrait {
-                        type_name: assoc_ty_def.name.clone(),
-                        trait_name: trait_name.clone(),
-                        span: assoc_ty_def.span,
-                    });
-                }
-            }
-        }
-    }
-
-    // Check that all trait methods are implemented (for non-default methods)
-    // Note: Currently no default_body field in TraitMethod, so all methods are required
-    for trait_item in &trait_def.items {
-        if let TraitItem::Method(tm) = trait_item {
-            // Required method - must be implemented
-            let has_impl = impl_def.items.iter().any(|item| {
-                if let ImplItem::Method(func) = item {
-                    func.name.name == tm.name.name
-                } else {
-                    false
-                }
-            });
-            if !has_impl {
-                return Err(TypeError::TraitImplMissingMethod {
-                    method_name: tm.name.clone(),
-                    trait_name: trait_name.clone(),
-                    span: impl_def.span,
-                });
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Normalize associated type projections in a trait method's return type
-/// using the impl's for_ty and associated type definitions.
-fn normalize_trait_return_type(
-    checker: &mut TypeChecker,
-    ty: &Type,
-    impl_def: &TraitImpl,
-) -> Result<Type, TypeError> {
-    // Build substitution map from impl's associated type definitions
-    // Store both the concrete type and its generic parameters
-    let mut assoc_subst = std::collections::HashMap::new();
-    for item in &impl_def.items {
-        if let ImplItem::AssociatedTypeDef(assoc_def) = item {
-            assoc_subst.insert(
-                assoc_def.name.clone(),
-                (assoc_def.ty.clone(), assoc_def.generics.clone()),
-            );
-        }
-    }
-    
-    // Normalize the type, replacing Self with impl's for_ty and associated types
-    normalize_type_with_subst(ty, &impl_def.for_ty, &impl_def.trait_path, &assoc_subst, &checker.env, ty.span)
-}
-
-/// Normalize a type by replacing Self with for_ty and associated type projections
-fn normalize_type_with_subst(
-    ty: &Type,
-    for_ty: &Type,
-    trait_path: &[Ident],
-    assoc_subst: &std::collections::HashMap<Ident, (Type, Vec<GenericParam>)>,
-    env: &crate::typecheck::type_env::TypeEnv,
-    span: Span,
-) -> Result<Type, TypeError> {
-    match &ty.kind {
-        TypeKind::AssociatedTypeProjection { self_ty, trait_path: proj_trait_path, trait_args, assoc_name, assoc_args } => {
-            // Check if this is Self::AssocType (self_ty is Self)
-            let is_self_proj = match &self_ty.kind {
-                TypeKind::Named(name, _) => name.name == "Self",
-                _ => false,
-            };
-            
-            // If this is a Self projection and we have associated type substitutions,
-            // try to resolve it regardless of the trait path (parser may not know the correct trait)
-            if is_self_proj && !assoc_subst.is_empty() {
-                // This is a Self::AssocType projection in a trait impl context
-                // Try to resolve using the assoc_subst map
-                if let Some((concrete_ty, assoc_generics)) = assoc_subst.get(assoc_name) {
-                    // Substitute assoc type generics with the provided args
-                    let mut result = concrete_ty.clone();
-                    
-                    // For each generic parameter in the associated type definition,
-                    // substitute it with the corresponding argument from assoc_args
-                    for (param, arg) in assoc_generics.iter().zip(assoc_args.iter()) {
-                        if let TypeArg::Type(arg_ty) = arg {
-                            result = substitute_type_param_in_type(result, &param.name, arg_ty);
-                        }
-                    }
-                    
-                    return Ok(result);
-                }
-            }
-            
-            // If self_ty is a metavariable, we can't resolve the projection yet
-            if matches!(&self_ty.kind, TypeKind::Meta(_)) {
-                // Return the projection as-is with normalized args
-                let mut normalized_trait_args = Vec::new();
-                for arg in trait_args {
-                    if let TypeArg::Type(t) = arg {
-                        normalized_trait_args.push(TypeArg::Type(normalize_type_with_subst(t, for_ty, trait_path, assoc_subst, env, span)?));
-                    } else {
-                        normalized_trait_args.push(arg.clone());
-                    }
-                }
-                let mut normalized_assoc_args = Vec::new();
-                for arg in assoc_args {
-                    if let TypeArg::Type(t) = arg {
-                        normalized_assoc_args.push(TypeArg::Type(normalize_type_with_subst(t, for_ty, trait_path, assoc_subst, env, span)?));
-                    } else {
-                        normalized_assoc_args.push(arg.clone());
-                    }
-                }
-                return Ok(Type::new(
-                    TypeKind::AssociatedTypeProjection {
-                        self_ty: self_ty.clone(),
-                        trait_path: proj_trait_path.clone(),
-                        trait_args: normalized_trait_args,
-                        assoc_name: assoc_name.clone(),
-                        assoc_args: normalized_assoc_args,
-                    },
-                    ty.quantity,
-                    ty.span,
-                ));
-            }
-            
-            // Fall back to env normalization
-            env.normalize_assoc_type_projection(self_ty, trait_path, trait_args, assoc_name, assoc_args, span)
-        }
-        TypeKind::Named(name, args) => {
-            // Check if this is Self
-            if name.name == "Self" && args.is_empty() {
-                return Ok(for_ty.clone());
-            }
-            
-            // Recursively normalize type arguments
-            let mut new_args = Vec::new();
-            for arg in args {
-                if let TypeArg::Type(t) = arg {
-                    new_args.push(TypeArg::Type(normalize_type_with_subst(t, for_ty, trait_path, assoc_subst, env, span)?));
-                } else {
-                    new_args.push(arg.clone());
-                }
-            }
-            Ok(Type::new(TypeKind::Named(name.clone(), new_args), ty.quantity, ty.span))
-        }
-        TypeKind::Array(elem, size) => {
-            let new_elem = Box::new(normalize_type_with_subst(elem, for_ty, trait_path, assoc_subst, env, span)?);
-            Ok(Type::new(TypeKind::Array(new_elem, size.clone()), ty.quantity, ty.span))
-        }
-        TypeKind::Tuple(elems) => {
-            let mut new_elems = Vec::new();
-            for elem in elems {
-                new_elems.push(normalize_type_with_subst(elem, for_ty, trait_path, assoc_subst, env, span)?);
-            }
-            Ok(Type::new(TypeKind::Tuple(new_elems), ty.quantity, ty.span))
-        }
-        TypeKind::Function(params, ret) => {
-            let mut new_params = Vec::new();
-            for param in params {
-                new_params.push(normalize_type_with_subst(param, for_ty, trait_path, assoc_subst, env, span)?);
-            }
-            let new_ret = Box::new(normalize_type_with_subst(ret, for_ty, trait_path, assoc_subst, env, span)?);
-            Ok(Type::new(TypeKind::Function(new_params, new_ret), ty.quantity, ty.span))
-        }
-        TypeKind::Pointer(inner) => {
-            let new_inner = Box::new(normalize_type_with_subst(inner, for_ty, trait_path, assoc_subst, env, span)?);
-            Ok(Type::new(TypeKind::Pointer(new_inner), ty.quantity, ty.span))
-        }
-        TypeKind::Projection(inner) => {
-            let new_inner = Box::new(normalize_type_with_subst(inner, for_ty, trait_path, assoc_subst, env, span)?);
-            Ok(Type::new(TypeKind::Projection(new_inner), ty.quantity, ty.span))
-        }
-        _ => Ok(ty.clone()),
-    }
-}
-
-/// Substitute a type parameter with a concrete type in a type
-fn substitute_type_param_in_type(ty: Type, param_name: &Ident, replacement: &Type) -> Type {
-    match ty.kind {
-        TypeKind::Named(name, args) => {
-            // Check if this is the type parameter we're substituting
-            if name.name == param_name.name && args.is_empty() {
-                return replacement.clone();
-            }
-            // Recursively substitute in type arguments
-            let mut new_args = Vec::new();
-            for arg in args {
-                if let TypeArg::Type(t) = arg {
-                    new_args.push(TypeArg::Type(substitute_type_param_in_type(t, param_name, replacement)));
-                } else {
-                    new_args.push(arg);
-                }
-            }
-            Type::new(TypeKind::Named(name, new_args), ty.quantity, ty.span)
-        }
-        TypeKind::Array(elem, size) => {
-            let new_elem = Box::new(substitute_type_param_in_type(*elem, param_name, replacement));
-            Type::new(TypeKind::Array(new_elem, size), ty.quantity, ty.span)
-        }
-        TypeKind::Tuple(elems) => {
-            let mut new_elems = Vec::new();
-            for elem in elems {
-                new_elems.push(substitute_type_param_in_type(elem, param_name, replacement));
-            }
-            Type::new(TypeKind::Tuple(new_elems), ty.quantity, ty.span)
-        }
-        TypeKind::Function(params, ret) => {
-            let mut new_params = Vec::new();
-            for param in params {
-                new_params.push(substitute_type_param_in_type(param, param_name, replacement));
-            }
-            let new_ret = Box::new(substitute_type_param_in_type(*ret, param_name, replacement));
-            Type::new(TypeKind::Function(new_params, new_ret), ty.quantity, ty.span)
-        }
-        TypeKind::Pointer(inner) => {
-            let new_inner = Box::new(substitute_type_param_in_type(*inner, param_name, replacement));
-            Type::new(TypeKind::Pointer(new_inner), ty.quantity, ty.span)
-        }
-        TypeKind::Projection(inner) => {
-            let new_inner = Box::new(substitute_type_param_in_type(*inner, param_name, replacement));
-            Type::new(TypeKind::Projection(new_inner), ty.quantity, ty.span)
-        }
-        TypeKind::AssociatedTypeProjection { self_ty, trait_path, trait_args, assoc_name, assoc_args } => {
-            let mut new_trait_args = Vec::new();
-            for arg in trait_args {
-                if let TypeArg::Type(t) = arg {
-                    new_trait_args.push(TypeArg::Type(substitute_type_param_in_type(t, param_name, replacement)));
-                } else {
-                    new_trait_args.push(arg);
-                }
-            }
-            let mut new_assoc_args = Vec::new();
-            for arg in assoc_args {
-                if let TypeArg::Type(t) = arg {
-                    new_assoc_args.push(TypeArg::Type(substitute_type_param_in_type(t, param_name, replacement)));
-                } else {
-                    new_assoc_args.push(arg);
-                }
-            }
-            Type::new(
-                TypeKind::AssociatedTypeProjection {
-                    self_ty: Box::new(substitute_type_param_in_type(*self_ty, param_name, replacement)),
-                    trait_path,
-                    trait_args: new_trait_args,
-                    assoc_name,
-                    assoc_args: new_assoc_args,
-                },
-                ty.quantity,
-                ty.span,
-            )
-        }
-        _ => ty,
     }
 }

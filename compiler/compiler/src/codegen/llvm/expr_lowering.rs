@@ -33,8 +33,11 @@
 use crate::ast::Quantity;
 use crate::codegen::abi::IntWidth;
 use crate::codegen::error::{CodegenError, CodegenResult};
+use crate::codegen::ffi_integration::resolve_symbol;
+use crate::codegen::llvm::module_builder::LLVMModuleBuilder;
 use crate::codegen::llvm::value_builder::LlvmValueBuilder;
 use crate::ir::pir_types::{BinaryOp, ParamKind, PirExpr, UnaryOp};
+use inkwell::AddressSpace;
 use inkwell::module::Module;
 use inkwell::types::BasicTypeEnum;
 use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue};
@@ -105,6 +108,7 @@ fn describe_index_base(expr: &PirExpr) -> String {
         PirExpr::Var(name) => format!("`{name}`"),
         PirExpr::Index { base, .. } => format!("`{}[..]`", describe_index_base(base)),
         PirExpr::Field { base, field } => format!("`{}.{field}`", describe_index_base(base)),
+        PirExpr::Array { .. } => "`[...]`".to_string(),
         other => format!("{other:?}"),
     }
 }
@@ -159,6 +163,10 @@ pub struct PirExprLowerer<'ctx, 'a> {
     /// the error path -- a `?` between push and pop would leave a stale loop on the
     /// stack and let a later `break` outside any loop jump to a dead block.
     pub loop_stack: Vec<LoopTargets<'ctx>>,
+    /// Module builder reference for async lowering
+    pub module_builder: Option<&'a mut crate::codegen::llvm::module_builder::LLVMModuleBuilder<'ctx>>,
+    /// Quantities map for async lowering
+    pub quantities: Option<&'a HashMap<String, crate::ast::Quantity>>,
 }
 
 /// Where `break` and `continue` go for one enclosing loop.
@@ -381,7 +389,33 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                     .int_type(crate::codegen::abi::IntWidth::I1);
                 Ok(bool_type.const_int(*val as u64, false).into())
             }
+            PirExpr::StringLit(s) => {
+                // String literals: use build_global_string_ptr
+                let ptr = self
+                    .value_builder
+                    .builder()
+                    .build_global_string_ptr(s, "str_lit")
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                    .as_pointer_value();
+                Ok(ptr.into())
+            }
             PirExpr::Var(name) => {
+                // Check if this is an extern function - if so, return its address as integer
+                if let Some(module_builder) = &mut self.module_builder {
+                    if let Some(func) = module_builder.module().get_function(name) {
+                        // Return the function as a pointer value converted to integer
+                        let ptr_val = func.as_global_value().as_pointer_value();
+                        let int_type = self.value_builder.type_lowering().int_type(crate::codegen::abi::IntWidth::I64);
+                        let ptr_type = self.value_builder.type_lowering().ptr_type(
+                            self.value_builder.type_lowering().context().i8_type().into(),
+                            AddressSpace::from(0),
+                        );
+                        let ptr = self.value_builder.builder().build_ptr_to_int(ptr_val, int_type, &format!("fn_ptr_{name}"))
+                            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                        return Ok(ptr.into());
+                    }
+                }
+                // Regular variable lookup
                 if let Some((ptr, ty)) = self.value_builder.variable(name) {
                     let load = self
                         .value_builder
@@ -455,6 +489,40 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                     return Ok(v);
                 }
 
+                // Handle sys.net prelude functions: write, read
+                // These are declared in the prelude with Naso signatures but must call FFI
+                // with C signatures (fd, ptr, len). We marshal here.
+                if matches!(name.as_str(), "write" | "read") {
+                    return self.build_sys_net_call_marshaled(name, &arg_values, quantities);
+                }
+
+                // Resolve the callee.
+                //
+                // A NASO FUNCTION is emitted under `naso_<name>`, so a Naso-to-Naso
+                // call has to be rewritten to that symbol. Resolution goes through
+                // `function_emission::symbol_for` -- the SAME function emission used to
+                // name the definition -- so the two cannot disagree about the
+                // convention. A second guess here, spelled `format!("naso_{name}")`,
+                // would compile cleanly right up until a call landed on a symbol that
+                // happened to exist and meant something else.
+                //
+                // By the time control reaches here the callee is NOT a Naso function in
+                // this module -- those returned above through `build_naso_call`. What is
+                // left is a prelude intrinsic or a declared `extern`, both of which are
+                // emitted under their own name. The prefixed fallback is kept as a
+                // safety net for a callee that IS a generated function but was not in
+                // `callee_params` (a hand-built module with a `functions` list the call
+                // site did not see), so the diagnostic below names both spellings
+                // rather than only the one that was tried.
+                // Check if this is an FFI function that needs symbol resolution
+                let ffi_symbol = resolve_symbol(name);
+                let is_ffi_call = ffi_symbol.is_some();
+                let call_name = if let Some(sym) = ffi_symbol {
+                    sym
+                } else {
+                    name
+                };
+
                 // Resolve the callee.
                 //
                 // A NASO FUNCTION is emitted under `naso_<name>`, so a Naso-to-Naso
@@ -475,10 +543,10 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 // rather than only the one that was tried.
                 let func = self
                     .module
-                    .get_function(name)
+                    .get_function(call_name)
                     .or_else(|| {
                         self.module.get_function(
-                            &crate::codegen::llvm::function_emission::symbol_for(name),
+                            &crate::codegen::llvm::function_emission::symbol_for(call_name),
                         )
                     })
                     .ok_or_else(|| {
@@ -487,13 +555,12 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                              A Naso function is emitted under `naso_<name>`, so a call \
                              to a function that is neither this module's nor a declared \
                              `extern` has no target. Nothing is substituted for it.",
-                            name,
-                            crate::codegen::llvm::function_emission::symbol_for(name),
+                            call_name,
+                            crate::codegen::llvm::function_emission::symbol_for(call_name),
                         ))
                     })?;
 
                 // inkwell 0.10 takes call arguments as `BasicMetadataValueEnum`.
-                //
                 // The operand ORDER is arguments first, callee LAST: operands
                 // `0 .. num_operands - 1` are the arguments and the last one is the
                 // function pointer. `build_call` takes them as a slice in that order and
@@ -501,10 +568,83 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 // passing the callee in the slice -- produces IR that parses, verifies,
                 // and computes the wrong thing. There is no way to catch that by reading
                 // the IR; it is caught by executing the callee and checking the value.
-                let arg_metadata: Vec<BasicMetadataValueEnum<'ctx>> = arg_values
-                    .into_iter()
-                    .map(BasicMetadataValueEnum::from)
-                    .collect();
+                
+                // For FFI extern calls, convert i64 pointer arguments back to ptr type
+                // Different FFI functions have different signatures:
+                // - naso_tcp_bind(ptr, usize): first arg is pointer
+                // - naso_write(u64, ptr, usize): second arg is pointer
+                // - naso_read(u64, ptr, usize): second arg is pointer
+                // - naso_tcp_accept(u64, ptr): second arg is pointer
+                // - naso_close(u64): no pointers
+                let arg_metadata: Vec<BasicMetadataValueEnum<'ctx>> = if is_ffi_call {
+                    arg_values
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, v)| {
+                            let is_pointer_arg = match call_name {
+                                "naso_tcp_bind" => i == 0,
+                                "naso_write" | "naso_read" | "naso_tcp_accept" => i == 1,
+                                "naso_accept_get_client" => i == 0,
+                                "naso_tcp_accept_async" => i == 1 || i == 3,
+                                "naso_read_async" => i == 1 || i == 3,
+                                "naso_write_async" => i == 1 || i == 3,
+                                "naso_tcp_accept_uring" => i == 1 || i == 2,
+                                "naso_read_uring" => i == 1 || i == 3,
+                                "naso_write_uring" => i == 1 || i == 3,
+                                "naso_spawn" => i == 1,
+                                "naso_future_complete" => i == 0,
+                                "naso_await" => i == 0,
+                                "naso_future_get_result" => i == 0,
+                                "naso_spawn_future" => i == 0,
+                                "naso_channel_new" => false,
+                                "naso_future_new" => false,
+                                "naso_runtime_new" => false,
+                                "naso_yield" => false,
+                                "naso_runtime_run" => i == 0,
+                                "naso_pool_create" => false,
+                                "naso_pool_get_connection" => i == 0,
+                                "naso_pool_return_connection" => i == 0,
+                                "naso_pool_close" => i == 0,
+                                "naso_pool_get_stats" => i == 0,
+                                "naso_pool_create_simple" => false,
+                                "naso_pool_get_connection_simple" => i == 0,
+                                "naso_pool_return_connection_simple" => i == 0,
+                                "naso_pool_close_simple" => false,
+                                _ => false,
+                            };
+                            if is_pointer_arg {
+                                if let BasicValueEnum::IntValue(_) = v {
+                                    let builder = self.value_builder.builder();
+                                    let ptr_type = self
+                                        .value_builder
+                                        .type_lowering()
+                                        .ptr_type(
+                                            self.value_builder
+                                                .type_lowering()
+                                                .context()
+                                                .i8_type()
+                                                .into(),
+                                            AddressSpace::from(0),
+                                        );
+                                    match builder.build_int_to_ptr(v.into_int_value(), ptr_type, &format!("ffi_arg_ptr_{i}")) {
+                                        Ok(ptr_val) => BasicMetadataValueEnum::from(ptr_val),
+                                        Err(_) => BasicMetadataValueEnum::from(v),
+                                    }
+                                } else {
+                                    BasicMetadataValueEnum::from(v)
+                                }
+                            } else {
+                                // Other args (fd, len, etc.) stay as-is (i64)
+                                BasicMetadataValueEnum::from(v)
+                            }
+                        })
+                        .collect()
+                } else {
+                    arg_values
+                        .into_iter()
+                        .map(BasicMetadataValueEnum::from)
+                        .collect()
+                };
 
                 // inkwell 0.10 takes call arguments as `BasicMetadataValueEnum`.
                 let call = self
@@ -1053,11 +1193,45 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
             // unreachable, and a mutation restoring the old behaviour survived every
             // other test in the file.
             PirExpr::Reversible { .. } => Err(CodegenError::UnsupportedFeature(
-                "a `Reversible` block reached codegen, and this backend does not \
-                 perform uncomputation. The INVERSE is not optional -- it is the part \
-                 that undoes the computation -- so emitting the body alone would leave \
-                 the state the block existed to erase. Refused rather than half-run."
-                    .to_string(),
+                                        "a `Reversible` block reached codegen, and this backend does not \\\n                 perform uncomputation. The INVERSE is not optional -- it is the part \\\n                 that undoes the computation -- so emitting the body alone would leave \\\n                 the state the block existed to erase. Refused rather than half-run."
+                                            .to_string(),
+                                    )),
+                                    PirExpr::Async(body) => {
+                                        let module_builder = self.module_builder.as_mut().unwrap();
+                                        let quantities = self.quantities.unwrap();
+                                        let mut async_lowerer = crate::codegen::llvm::async_lowering::AsyncLowerer::new(
+                                            module_builder,
+                                            quantities,
+                                        );
+                                        async_lowerer.build_async(
+                                            body,
+                                            self.value_builder,
+                                            self.module,
+                                            self.current_function,
+                                            self.callee_params,
+                                            self.in_statement_position,
+                                            &mut self.loop_stack,
+                                        )
+                                    }
+                                    PirExpr::Await(future) => {
+                                        let module_builder = self.module_builder.as_mut().unwrap();
+                                        let quantities = self.quantities.unwrap();
+                                        let mut async_lowerer = crate::codegen::llvm::async_lowering::AsyncLowerer::new(
+                                            module_builder,
+                                            quantities,
+                                        );
+                                        async_lowerer.build_await(
+                                            future,
+                                            self.value_builder,
+                                            self.module,
+                                            self.current_function,
+                                            self.callee_params,
+                                            self.in_statement_position,
+                                            &mut self.loop_stack,
+                                        )
+                                    }
+            PirExpr::Await { .. } => Err(CodegenError::UnsupportedFeature(
+                "await expression lowering not yet implemented".to_string(),
             )),
             // `base[indices...]`: a real load out of a caller-owned tensor buffer.
             //
@@ -1083,6 +1257,149 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 // Simplified: return base for now
                 Ok(base_val)
             }
+            PirExpr::Array { items } => {
+                            // Array literals: allocate memory, store elements, return tensor struct { ptr, len }
+                            // This is used when passing arrays to FFI functions like naso_write
+                            // Use i8 for byte arrays (u8 in Naso)
+                            let i8_type = self
+                                .value_builder
+                                .type_lowering()
+                                .int_type(crate::codegen::abi::IntWidth::I8);
+                            let int_type = self
+                                .value_builder
+                                .type_lowering()
+                                .int_type(crate::codegen::abi::IntWidth::I64);
+
+                            // Allocate array on stack (array of i8 with size array_size)
+                            let array_size = items.len() as u64;
+                            let array_ptr = {
+                                let builder = self.value_builder.builder();
+                                let array_type = i8_type.array_type(array_size as u32);
+                                builder
+                                    .build_alloca(array_type, "array_literal")
+                                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                            };
+
+                            // Store each element - collect first to avoid borrow issues
+                            let mut elem_values = Vec::with_capacity(items.len());
+                            for item in items.iter() {
+                                elem_values.push(self.build_expr(item, quantities)?);
+                            }
+
+                            let builder = self.value_builder.builder();
+                            for (i, elem_val) in elem_values.into_iter().enumerate() {
+                                let idx = int_type.const_int(i as u64, false);
+                                // Array type for first GEP step (array -> element pointer)
+                                let array_type = i8_type.array_type(array_size as u32);
+                                let gep = unsafe {
+                                    builder
+                                        .build_gep(
+                                            array_type,
+                                            array_ptr,
+                                            &[int_type.const_int(0, false), idx],
+                                            &format!("array_elem_{i}"),
+                                        )
+                                        .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                                };
+                                // Truncate element to i8 before storing
+                                let elem_i8 = match elem_val {
+                                    BasicValueEnum::IntValue(v) => builder
+                                        .build_int_truncate(v, i8_type, &format!("elem_trunc_{i}"))
+                                        .map(BasicValueEnum::IntValue)
+                                        .map_err(|e| CodegenError::InstructionError(e.to_string()))?,
+                                    _ => elem_val, // fallback
+                                };
+                                builder
+                                    .build_store(gep, elem_i8)
+                                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                            }
+
+                            // Return tensor struct { ptr: i64, len: i64 } - both i64 for FFI compatibility
+                            let context = self.value_builder.type_lowering().context();
+                            let int_type = self
+                                .value_builder
+                                .type_lowering()
+                                .int_type(crate::codegen::abi::IntWidth::I64);
+
+                            // Get pointer to first element (not the array aggregate) for FFI
+                            // Use array type for first GEP step
+                            let array_type = i8_type.array_type(array_size as u32);
+                            let elem_ptr = unsafe {
+                                builder
+                                    .build_gep(
+                                        array_type,
+                                        array_ptr,
+                                        &[int_type.const_int(0, false), int_type.const_int(0, false)],
+                                        "array_elem_ptr",
+                                    )
+                                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                            };
+
+                            // Cast element pointer to i64 (integer representation of pointer)
+                            let ptr_i64 = builder
+                                .build_ptr_to_int(elem_ptr, int_type, "array_ptr_i64")
+                                .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+
+                            let len_val = int_type.const_int(array_size, false);
+
+                            // Create struct { ptr: i64, len: i64 } at runtime
+                            let struct_type = context.struct_type(&[int_type.into(), int_type.into()], false);
+                            let undef = struct_type.get_undef();
+                            let struct_with_ptr = builder
+                                .build_insert_value(undef, ptr_i64, 0, "tensor_with_ptr")
+                                .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                            let struct_val = builder
+                                                .build_insert_value(struct_with_ptr, len_val, 1, "tensor_complete")
+                                                .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                                                .into_struct_value();
+
+                                            Ok(BasicValueEnum::StructValue(struct_val))
+                                        }
+            PirExpr::Struct { fields } => {
+                // Struct literals: allocate memory, store fields, return struct value
+                // For Stream { fd: Int }, this creates a struct with one i64 field
+                let context = self.value_builder.type_lowering().context();
+                let int_type = self
+                    .value_builder
+                    .type_lowering()
+                    .int_type(crate::codegen::abi::IntWidth::I64);
+
+                // Allocate struct on stack - create field types array
+                let field_types: Vec<inkwell::types::BasicTypeEnum<'_>> = (0..fields.len())
+                    .map(|_| int_type.into())
+                    .collect();
+                let struct_type = context.struct_type(&field_types, false);
+
+                // First, evaluate all field expressions (need mutable borrow of self)
+                let mut field_vals = Vec::with_capacity(fields.len());
+                for field in fields.iter() {
+                    field_vals.push(self.build_expr(field, quantities)?);
+                }
+
+                // Now get builder and store fields
+                let struct_ptr = {
+                    let builder = self.value_builder.builder();
+                    builder
+                        .build_alloca(struct_type, "struct_literal")
+                        .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                };
+
+                // Store each field
+                for (i, field_val) in field_vals.into_iter().enumerate() {
+                    let gep = self.value_builder.build_struct_gep(struct_type, struct_ptr, i as u32, &format!("struct_field_{i}"))?;
+                    let builder = self.value_builder.builder();
+                    builder
+                        .build_store(gep, field_val)
+                        .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                }
+
+                // Load the struct value and return it
+                let builder = self.value_builder.builder();
+                let struct_val = builder
+                    .build_load(struct_type, struct_ptr, "struct_val")
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                Ok(struct_val)
+            }
             // `expr as iN`: a REAL conversion instruction.
             // The alternatives were both wrong: dropping the cast stored the source
             // type into the target slot, and emitting the bare inner expression is
@@ -1101,6 +1418,28 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 float_target,
             } => {
                 let v = self.build_expr(expr, quantities)?;
+
+                // Special handling: Array -> Pointer cast (tensor struct to raw pointer)
+                // The array literal lowers to a tensor struct { ptr: i64, len: i64 }
+                // Casting to *u8 (width=64) should extract the ptr field, not convert the struct
+                let source_ty = v.get_type();
+                if let BasicTypeEnum::StructType(_) = source_ty {
+                    // Check if this is a tensor struct (ptr, len) and target is a pointer
+                    if *width == Some(64) || width.is_none() {
+                        let builder = self.value_builder.builder();
+                        // Extract the first field (ptr) from the tensor struct
+                        let ptr_val = builder
+                            .build_extract_value(v.into_struct_value(), 0, "tensor_ptr_cast")
+                            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                        // Convert the integer pointer back to a proper LLVM pointer type (i8*)
+                        let i8_type = self.value_builder.type_lowering().int_type(crate::codegen::abi::IntWidth::I8);
+                        let ptr_type = i8_type.ptr_type(AddressSpace::default());
+                        let ptr = builder
+                            .build_int_to_ptr(ptr_val.into_int_value(), ptr_type, "array_ptr_cast")
+                            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                        return Ok(ptr.into());
+                    }
+                }
 
                 // A FLOAT TARGET: `sitofp`/`uitofp`.
                 //
@@ -1673,9 +2012,10 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
         byte_ptr: inkwell::values::PointerValue<'ctx>,
         flat: IntValue<'ctx>,
     ) -> CodegenResult<BasicValueEnum<'ctx>> {
+        let i8_ty = self.value_builder.type_lowering().int_type(IntWidth::I8);
         let byte = self
             .value_builder
-            .build_load(byte_ptr, "i4_byte")?
+            .build_load(i8_ty.into(), byte_ptr, "i4_byte")?
             .into_int_value();
 
         // shift = (flat & 1) * 4 -- 0 for the low nibble, 4 for the high one.
@@ -1782,7 +2122,7 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
 
         let byte = self
             .value_builder
-            .build_load(byte_ptr, "i4s_byte")?
+            .build_load(i8_ty.into(), byte_ptr, "i4s_byte")?
             .into_int_value();
         let kept = self.value_builder.build_and(byte, clear, "i4s_kept")?;
         let merged = self.value_builder.build_or(kept, placed, "i4s_merged")?;
@@ -1983,6 +2323,10 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
                 // for; `ty` is read here only to name the expectation.
                 let _ = ty;
                 Ok(Some(self.call_f64_intrinsic(intrinsic, x, name)?))
+            }
+            // sys.net FFI functions - marshal Stream struct and tensor to FFI signature
+            "write" | "read" | "close" | "bind" | "accept" => {
+                return Ok(Some(self.build_sys_net_call_marshaled(name, args, &HashMap::new())?));
             }
             _ => Ok(None),
         }
@@ -2226,6 +2570,135 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
             .int_type(crate::codegen::abi::IntWidth::I64)
             .const_zero()
             .into()
+    }
+
+    /// Build a sys.net FFI call (write, read)
+    /// These are Naso prelude functions that must call FFI with C signatures.
+    /// The Naso signature is: write(stream: Stream, buf: [N] u8) -> Result<usize>
+    /// The FFI signature is: naso_write(fd: u64, buf: *u8, len: usize) -> usize
+    fn build_sys_net_call(
+        &mut self,
+        name: &str,
+        args: &[BasicValueEnum<'ctx>],
+        _quantities: &HashMap<String, Quantity>,
+    ) -> CodegenResult<BasicValueEnum<'ctx>> {
+        // args[0] = Stream (i64 fd), args[1] = [N] u8 tensor (ptr + len)
+        // For tensor, we get it from the tensor binding
+        // For now, handle the simple case where stream is a scalar i64 and buf is a tensor
+        let stream_val = args[0];
+        let buf_val = args[1];
+        
+        // Get the FFI function
+        let ffi_name = if name == "write" { "naso_write" } else { "naso_read" };
+        let func = self.module.get_function(ffi_name).ok_or_else(|| {
+            CodegenError::FunctionBuildError(format!(
+                "FFI function `{ffi_name}` not declared. Ensure extern block is in source."
+            ))
+        })?;
+        
+        // The stream_val is the fd (i64)
+        let fd = stream_val;
+        
+        // The buf_val is a tensor - we need to get ptr and len from tensor binding
+        // For now, assume it's already a tensor binding and we need to extract it
+        // This is complex because the tensor comes as a single BasicValueEnum
+        // but we need two args (ptr, len) for the FFI
+        
+        // Actually, the issue is that tensor args are handled in build_naso_call
+        // but we're not in that path. Let's check if buf_val is a tensor binding.
+        // For now, fall back to building a call with the args as-is and let LLVM verify
+        // We'll return an error for now to see the actual arg types
+        
+        Err(CodegenError::UnsupportedFeature(format!(
+            "sys.net.{name} call needs tensor marshaling - not yet implemented"
+        )))
+    }
+
+    /// Build a sys.net FFI call (write, read) with proper tensor marshaling
+    /// These are Naso prelude functions that must call FFI with C signatures.
+        /// The Naso signature is: write(stream: Stream, buf: [N] u8) -> Result<usize>
+        /// The FFI signature is: naso_write(fd: u64, buf: *u8, len: usize) -> usize
+        fn build_sys_net_call_marshaled(
+            &mut self,
+            name: &str,
+            args: &[BasicValueEnum<'ctx>],
+            _quantities: &HashMap<String, Quantity>,
+        ) -> CodegenResult<BasicValueEnum<'ctx>> {
+            // args[0] = Stream (struct { fd: i64 }), args[1] = [N] u8 tensor (struct { ptr, len })
+            let stream_val = args[0];
+            let buf_val = args[1];
+
+            // Get the FFI function
+            let ffi_name = if name == "write" {
+                "naso_write"
+            } else {
+                "naso_read"
+            };
+            let func = self.module.get_function(ffi_name).ok_or_else(|| {
+                CodegenError::FunctionBuildError(format!(
+                    "FFI function `{ffi_name}` not declared. Ensure extern block is in source."
+                ))
+            })?;
+
+            // The stream_val is a Stream struct { fd: i64 } - extract the fd
+            let builder = self.value_builder.builder();
+            let stream_type = stream_val.get_type();
+            let fd = match stream_type {
+                BasicTypeEnum::StructType(_) => {
+                    builder
+                        .build_extract_value(stream_val.into_struct_value(), 0, "stream_fd")
+                        .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                }
+                _ => stream_val, // fallback: assume it's already the fd
+            };
+
+            // The buffer value should be a struct { ptr: i64, len: i64 }
+            let buf_type = buf_val.get_type();
+
+            let ptr: BasicValueEnum<'ctx>;
+            let len: BasicValueEnum<'ctx>;
+
+            if let BasicTypeEnum::StructType(_) = buf_type {
+                // Assume struct { ptr: i64, len: i64 }
+                ptr = builder
+                    .build_extract_value(buf_val.into_struct_value(), 0, "tensor_ptr")
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                len = builder
+                    .build_extract_value(buf_val.into_struct_value(), 1, "tensor_len")
+                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+            } else {
+                // Fallback: treat as single pointer, len unknown
+                return Err(CodegenError::UnsupportedFeature(format!(
+                    "sys.net.{name}: buffer argument is not a tensor struct (got {buf_type:?})"
+                )));
+            }
+
+            // Build FFI call: naso_write(fd, ptr, len)
+            let arg_metadata = vec![
+                BasicMetadataValueEnum::from(fd),
+                // Convert ptr (i64) back to pointer for FFI call
+                BasicMetadataValueEnum::from(
+                    builder
+                        .build_int_to_ptr(
+                            ptr.into_int_value(),
+                            self.value_builder.type_lowering().ptr_type(self.value_builder.type_lowering().context().i8_type().into(), AddressSpace::from(0)),
+                            "tensor_ptr_ptr"
+                        )
+                        .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                ),
+                BasicMetadataValueEnum::from(len),
+            ];
+
+            let call = self
+                .value_builder
+                .builder()
+                .build_call(func, &arg_metadata, &format!("naso.call.{name}"))
+                .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+
+            Ok(call
+                .try_as_basic_value()
+                .basic()
+                .unwrap_or_else(|| self.void_placeholder()))
     }
 
     /// Bring a binary operation's two operands to one common type, or refuse naming why.
@@ -2605,35 +3078,93 @@ impl<'ctx, 'a> PirExprLowerer<'ctx, 'a> {
     }
 
     /// Float negation, and the integer arm below.
-    ///
-    /// `into_int_value` panics on a `double`, so `-v` on a float had to route here
-    /// first for the same reason binary multiplication does.
-    fn build_unary_op(
-        &mut self,
-        op: UnaryOp,
-        expr: BasicValueEnum<'ctx>,
-    ) -> CodegenResult<BasicValueEnum<'ctx>> {
-        if let BasicTypeEnum::FloatType(_) = expr.get_type() {
-            return match op {
-                UnaryOp::Neg => Ok(self
-                    .value_builder
-                    .builder()
-                    .build_float_neg(expr.into_float_value(), "fneg")
-                    .map_err(|e| CodegenError::InstructionError(e.to_string()))?
-                    .into()),
-                UnaryOp::Not => Err(CodegenError::UnsupportedFeature(
-                    "`!` (logical not) on a floating-point operand has no LLVM \
-                     spelling; the typechecker should have rejected it."
-                        .to_string(),
-                )),
-            };
-        }
-        let int_val = expr.into_int_value();
-        let result = match op {
-            UnaryOp::Neg => self.value_builder.builder().build_int_neg(int_val, "neg"),
-            UnaryOp::Not => self.value_builder.builder().build_not(int_val, "not"),
-        }
-        .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
-        Ok(result.into())
+    /// 
+            /// `into_int_value` panics on a `double`, so `-v` on a float had to route here
+            /// first for the same reason binary multiplication does.
+            fn build_unary_op(
+                &mut self,
+                op: UnaryOp,
+                expr: BasicValueEnum<'ctx>,
+            ) -> CodegenResult<BasicValueEnum<'ctx>> {
+                // Handle AddrOf on tensor structs (arrays) BEFORE trying to convert to int
+                if op == UnaryOp::AddrOf {
+                    if let BasicValueEnum::StructValue(struct_val) = expr {
+                        // Extract ptr field (first field) from tensor struct
+                        let builder = self.value_builder.builder();
+                        let ptr_val = builder
+                            .build_extract_value(struct_val, 0, "addr_of_array_ptr")
+                            .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                        return Ok(ptr_val.into());
+                    }
+                }
+                
+                if let BasicTypeEnum::FloatType(_) = expr.get_type() {
+                    return match op {
+                        UnaryOp::Neg => Ok(self
+                            .value_builder
+                            .builder()
+                            .build_float_neg(expr.into_float_value(), "fneg")
+                            .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                            .into()),
+                        UnaryOp::Not => Err(CodegenError::UnsupportedFeature(
+                            "`!` (logical not) on a floating-point operand has no LLVM \
+                             spelling; the typechecker should have rejected it."
+                                .to_string(),
+                        )),
+                        UnaryOp::Deref => Err(CodegenError::UnsupportedFeature(
+                            "`*` (deref) on a floating-point operand is not supported."
+                                .to_string(),
+                        )),
+                        UnaryOp::AddrOf => Err(CodegenError::UnsupportedFeature(
+                            "`&` (address-of) on a floating-point operand is not supported."
+                                .to_string(),
+                        )),
+                    };
+                }
+                let int_val = expr.into_int_value();
+                let result = match op {
+                    UnaryOp::Neg => self
+                        .value_builder
+                        .builder()
+                        .build_int_neg(int_val, "neg")
+                        .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                        .into(),
+                    UnaryOp::Not => self
+                        .value_builder
+                        .builder()
+                        .build_not(int_val, "not")
+                        .map_err(|e| CodegenError::InstructionError(e.to_string()))?
+                        .into(),
+                    UnaryOp::Deref => {
+                        // Deref: load from the pointer address
+                        let i8_ty = self.value_builder.type_lowering().int_type(IntWidth::I8);
+                        let ptr_type = self.value_builder.type_lowering().ptr_type(
+                            self.value_builder.type_lowering().context().i8_type().into(),
+                            AddressSpace::from(0),
+                        );
+                        let ptr = self.value_builder.builder().build_int_to_ptr(
+                            int_val,
+                            ptr_type,
+                            "deref.ptr",
+                        ).map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                        let loaded = self.value_builder.build_load(i8_ty.into(), ptr, "deref.load")?;
+                        loaded.into()
+                    }
+                    UnaryOp::AddrOf => {
+                        // Address-of: return the pointer value as an integer
+                        // This is a no-op for function pointers - they're already integers
+                        // But for arrays (tensor structs), we need to extract the ptr field
+                        if let BasicValueEnum::StructValue(struct_val) = expr {
+                            // Extract ptr field (first field) from tensor struct
+                            let builder = self.value_builder.builder();
+                            let ptr_val = builder
+                                .build_extract_value(struct_val, 0, "addr_of_array_ptr")
+                                .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+                            return Ok(ptr_val.into());
+                        }
+                        int_val.into()
+                    }
+                };
+                Ok(result)
     }
 }

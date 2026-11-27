@@ -8,6 +8,7 @@ pub mod codegen;
 pub mod ir;
 pub mod lexer;
 pub mod lowering;
+pub mod ml_guided;
 pub mod parser;
 pub mod runtime;
 pub mod typecheck;

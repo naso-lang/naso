@@ -213,6 +213,17 @@ fn pir_expr_to_string(expr: &PirExpr, _indent: usize) -> String {
                     .join(", ")
             )
         }
+        PirExpr::Array { items } => {
+            let inner: Vec<String> = items.iter().map(|a| pir_expr_to_string(a, 0)).collect();
+            format!("[{}]", inner.join(", "))
+        }
+        PirExpr::Struct { fields } => {
+            let inner: Vec<String> = fields.iter().map(|f| pir_expr_to_string(f, 0)).collect();
+            format!("{{{}}}", inner.join(", "))
+        }
+        PirExpr::Async(inner) => format!("async {}", pir_expr_to_string(inner, 0)),
+        PirExpr::Await(inner) => format!("await {}", pir_expr_to_string(inner, 0)),
+        PirExpr::StringLit(s) => format!("\"{}\"", s),
     }
 }
 
@@ -241,6 +252,8 @@ fn unary_op_to_str(op: UnaryOp) -> &'static str {
     match op {
         UnaryOp::Neg => "-",
         UnaryOp::Not => "!",
+        UnaryOp::Deref => "*",
+        UnaryOp::AddrOf => "&",
     }
 }
 

@@ -109,7 +109,6 @@ fn pir_expr_to_string(expr: &PirExpr, _indent: usize) -> String {
             width,
             signed,
             float_target,
-            pointer_target: _,
         } => match float_target {
             // A float target is printed as a float. Printing it as `i{width}` would be
             // a lie about the conversion the dump claims to be showing.
@@ -218,7 +217,10 @@ fn pir_expr_to_string(expr: &PirExpr, _indent: usize) -> String {
             let inner: Vec<String> = items.iter().map(|a| pir_expr_to_string(a, 0)).collect();
             format!("[{}]", inner.join(", "))
         }
-        PirExpr::Struct { name: _, fields } => {
+        PirExpr::ArrayRepeat { value, count } => {
+            format!("[{}; {}]", pir_expr_to_string(value, 0), pir_expr_to_string(count, 0))
+        }
+        PirExpr::Struct { fields } => {
             let inner: Vec<String> = fields.iter().map(|f| pir_expr_to_string(f, 0)).collect();
             format!("{{{}}}", inner.join(", "))
         }

@@ -42,7 +42,7 @@ impl LlvmAggregateType {
             LlvmAggregateType::Float(width) => Ok(lowering.float_type(*width).into()),
             LlvmAggregateType::Struct(fields) => {
                 let field_types: CodegenResult<Vec<_>> =
-                    fields.iter().map(|f| f.to_llvm_type(lowering)).collect();
+                    fields.iter().map(|f| f.ty.to_llvm_type(lowering)).collect();
                 let struct_type = lowering.context().struct_type(&field_types?, false);
                 Ok(struct_type.into())
             }
@@ -79,7 +79,7 @@ impl LlvmPointerType {
                 self.address_space
             ))
         })?;
-        Ok(lowering.context().ptr_type(addr_space).into())
+        Ok(lowering.ptr_type(_pointee_type, addr_space).into())
     }
 }
 

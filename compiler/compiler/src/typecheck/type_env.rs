@@ -576,6 +576,8 @@ impl TypeEnv {
         self.functions.insert(func.name.clone(), sig);
 
         // Also bind as callable variable for function calls
+        // Use parameter type quantities for the function type (what caller must provide).
+        // The binding quantity (p.quantity) is used for the function body.
         let param_tys: Vec<Type> = func.params.iter().map(|p| p.ty.clone()).collect();
         let ret_ty = func.ret_ty.clone().unwrap_or(Type::unit(func.span));
         let func_ty = Type::new(

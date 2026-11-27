@@ -52,7 +52,7 @@ impl<'ctx> AccessEmitter<'ctx> {
         let indices = self.compute_gep_indices(value_builder, access)?;
 
         // Build GEP
-        let gep = self.build_gep(value_builder, base, access, &indices)?;
+        let gep = self.build_gep(value_builder, &base, access, &indices)?;
 
         // Add alias.scope metadata for [1]-quantity variables
         self.add_alias_metadata(gep, access, quantities)?;
@@ -60,17 +60,17 @@ impl<'ctx> AccessEmitter<'ctx> {
         // Emit load or store based on access type
         match access.access_type {
             AccessType::Read => {
-                self.emit_load(value_builder, gep, access)?;
+                self.emit_load(value_builder, &base, access)?;
             }
             AccessType::Write => {
                 self.emit_store(value_builder, gep, access)?;
             }
             AccessType::ReadWrite => {
-                self.emit_load(value_builder, gep, access)?;
+                self.emit_load(value_builder, &base, access)?;
                 self.emit_store(value_builder, gep, access)?;
             }
             AccessType::Reduction => {
-                self.emit_reduction(value_builder, gep, access)?;
+                self.emit_reduction(value_builder, &base, gep, access)?;
             }
         }
 
@@ -295,7 +295,7 @@ impl<'ctx> AccessEmitter<'ctx> {
     fn build_gep(
         &self,
         value_builder: &mut LlvmValueBuilder<'ctx>,
-        base: BasePointer<'ctx>,
+        base: &BasePointer<'ctx>,
         access: &AccessRelation,
         indices: &[BasicValueEnum<'ctx>],
     ) -> CodegenResult<PointerValue<'ctx>> {
@@ -367,11 +367,10 @@ impl<'ctx> AccessEmitter<'ctx> {
     fn emit_load(
         &self,
         value_builder: &mut LlvmValueBuilder<'ctx>,
-        gep: PointerValue<'ctx>,
-        access: &AccessRelation,
+        base: &BasePointer<'ctx>,
+        _access: &AccessRelation,
     ) -> CodegenResult<BasicValueEnum<'ctx>> {
-        let name = access.array_name.as_deref().unwrap_or("load");
-        value_builder.build_load(gep, name)
+        value_builder.build_load(base.elem_type, base.ptr, "load")
     }
 
     /// Emit store instruction
@@ -394,11 +393,12 @@ impl<'ctx> AccessEmitter<'ctx> {
     fn emit_reduction(
         &self,
         value_builder: &mut LlvmValueBuilder<'ctx>,
+        base: &BasePointer<'ctx>,
         gep: PointerValue<'ctx>,
-        access: &AccessRelation,
+        _access: &AccessRelation,
     ) -> CodegenResult<()> {
         // Load current value, add new value, store back
-        let loaded = self.emit_load(value_builder, gep, access)?;
+        let loaded = self.emit_load(value_builder, base, _access)?;
         let int_type = value_builder
             .type_lowering()
             .int_type(crate::codegen::abi::IntWidth::I64);

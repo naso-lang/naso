@@ -51,6 +51,18 @@ pub enum CodegenError {
     #[error("Verification error: {0}")]
     VerificationError(String),
 
+    /// I/O errors
+    #[error("I/O error: {0}")]
+    IoError(String),
+
+    /// Network errors
+    #[error("Network error: {0}")]
+    NetworkError(String),
+
+    /// Serialization/deserialization errors
+    #[error("Serialization error: {0}")]
+    SerializationError(String),
+
     /// Internal compiler errors (should not happen)
     #[error("Internal error: {0}")]
     InternalError(String),
@@ -183,6 +195,9 @@ impl Diagnostic for CodegenError {
             CodegenError::CraneliftError(msg) => msg,
             CodegenError::EmissionError(msg) => msg,
             CodegenError::VerificationError(msg) => msg,
+            CodegenError::IoError(msg) => msg,
+            CodegenError::NetworkError(msg) => msg,
+            CodegenError::SerializationError(msg) => msg,
             CodegenError::InternalError(msg) => msg,
             CodegenError::UnsupportedFeature(msg) => msg,
         }
@@ -201,6 +216,9 @@ impl Diagnostic for CodegenError {
         match self {
             CodegenError::InternalError(_) => Severity::Fatal,
             CodegenError::VerificationError(_) => Severity::Error,
+            CodegenError::IoError(_) => Severity::Error,
+            CodegenError::NetworkError(_) => Severity::Error,
+            CodegenError::SerializationError(_) => Severity::Error,
             _ => Severity::Error,
         }
     }

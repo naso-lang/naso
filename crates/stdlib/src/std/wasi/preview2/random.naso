@@ -1,0 +1,70 @@
+//! WASI Preview 2: Random Interface
+//!
+//! Provides cryptographically secure random number generation.
+
+extern "C" {
+    fn wasi_random_get(buf: *mut u8, buf_len: usize) -> i32;
+    fn wasi_insecure_random_get(buf: *mut u8, buf_len: usize) -> i32;
+}
+
+pub struct Random;
+
+impl Random {
+    pub fn fill(buf: &mut [u8]) -> Result<(), std::io::Error> {
+        let result = unsafe { wasi_random_get(buf.as_mut_ptr(), buf.len()) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(())
+        }
+    }
+    
+    pub fn u64() -> Result<u64, std::io::Error> {
+        let mut buf = [0u8; 8];
+        Self::fill(&mut buf)?;
+        Ok(u64::from_le_bytes(buf))
+    }
+    
+    pub fn u32() -> Result<u32, std::io::Error> {
+        let mut buf = [0u8; 4];
+        Self::fill(&mut buf)?;
+        Ok(u32::from_le_bytes(buf))
+    }
+    
+    pub fn bytes(n: usize) -> Result<Vec<u8>, std::io::Error> {
+        let mut buf = vec![0u8; n];
+        Self::fill(&mut buf)?;
+        Ok(buf)
+    }
+}
+
+pub struct InsecureRandom;
+
+impl InsecureRandom {
+    pub fn fill(buf: &mut [u8]) -> Result<(), std::io::Error> {
+        let result = unsafe { wasi_insecure_random_get(buf.as_mut_ptr(), buf.len()) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(())
+        }
+    }
+    
+    pub fn u64() -> Result<u64, std::io::Error> {
+        let mut buf = [0u8; 8];
+        Self::fill(&mut buf)?;
+        Ok(u64::from_le_bytes(buf))
+    }
+    
+    pub fn u32() -> Result<u32, std::io::Error> {
+        let mut buf = [0u8; 4];
+        Self::fill(&mut buf)?;
+        Ok(u32::from_le_bytes(buf))
+    }
+    
+    pub fn bytes(n: usize) -> Result<Vec<u8>, std::io::Error> {
+        let mut buf = vec![0u8; n];
+        Self::fill(&mut buf)?;
+        Ok(buf)
+    }
+}

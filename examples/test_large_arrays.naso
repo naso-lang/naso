@@ -1,0 +1,13 @@
+// Test large arrays > 256 elements
+fn create_large_buffer() -> [u8; 512] {
+    [0; 512]
+}
+
+fn create_larger_buffer() -> [u8; 1024] {
+    [0; 1024]
+}
+
+fn main() -> () {
+    let buf1 = create_large_buffer();
+    let buf2 = create_larger_buffer();
+}

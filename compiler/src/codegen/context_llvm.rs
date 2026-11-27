@@ -56,14 +56,14 @@ impl CodegenContext {
         let llvm_context = LlvmContext::create();
         let target_triple_str = target.triple();
         let target_triple = TargetTriple::create(target_triple_str);
-        let target = Target::from_triple(&target_triple)
+        let target_ref = Target::from_triple(&target_triple)
             .map_err(|e| CodegenError::TargetError(format!("Failed to get target: {}", e)))?;
 
-        // Create target machine
+        // Create target machine with WASM features if applicable
         let cpu = "generic";
-        let features = "";
+        let features = target.wasm_features();
 
-        let target_machine = target
+        let target_machine = target_ref
             .create_target_machine(
                 &target_triple,
                 cpu,
@@ -179,7 +179,20 @@ impl CodegenContext {
 
     /// Check if target is WebAssembly
     pub fn is_wasm(&self) -> bool {
-        matches!(self.target_triple.architecture, Architecture::Wasm32)
+        matches!(
+            self.target_triple.architecture,
+            Architecture::Wasm32 | Architecture::Wasm64
+        )
+    }
+
+    /// Check if target is WebAssembly with GC support
+    pub fn is_wasm_gc(&self) -> bool {
+        self.target_triple.to_string().contains("gc")
+    }
+
+    /// Check if target is WASI
+    pub fn is_wasi(&self) -> bool {
+        self.target_triple.to_string().contains("wasi")
     }
 }
 

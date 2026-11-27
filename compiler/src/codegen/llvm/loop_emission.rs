@@ -145,7 +145,7 @@ impl<'ctx> LoopEmitter<'ctx> {
 
         // Load current induction variable value
         let iv_val = value_builder
-            .build_load(iv_alloca, "iv_val")?
+            .build_load(int_type.into(), iv_alloca, "iv_val")?
             .into_int_value();
 
         // Compare with upper bound.

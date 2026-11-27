@@ -1,0 +1,28 @@
+// Test trait parsing
+trait Iterator {
+    type Item;
+    fn next(inout self) -> u64;
+}
+
+struct MyIter {
+    data: [u64; 10],
+    index: u64,
+}
+
+impl Iterator for MyIter {
+    type Item = u64;
+    fn next(inout self) -> u64 {
+        if self.index < 10 {
+            let val = self.data[self.index];
+            self.index = self.index + 1;
+            val
+        } else {
+            0
+        }
+    }
+}
+
+fn main() -> () {
+    let mut iter = MyIter { data: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], index: 0 };
+    let _ = iter.next();
+}

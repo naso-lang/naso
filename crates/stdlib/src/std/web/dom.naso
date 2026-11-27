@@ -1,0 +1,853 @@
+//! DOM (Document Object Model) Bindings
+//!
+//! Zero-cost bindings to the browser DOM API.
+//! Direct WASM GC integration for managed objects.
+
+extern "C" {
+    // Document methods
+    fn document_create_element(tag: *const u8, tag_len: usize) -> u64;
+    fn document_create_text_node(data: *const u8, data_len: usize) -> u64;
+    fn document_get_element_by_id(id: *const u8, id_len: usize) -> u64;
+    fn document_query_selector(selectors: *const u8, selectors_len: usize) -> u64;
+    fn document_query_selector_all(selectors: *const u8, selectors_len: usize) -> u64;
+    fn document_get_body() -> u64;
+    fn document_get_head() -> u64;
+    fn document_get_title() -> u64; // Returns string pointer
+    fn document_set_title(title: *const u8, title_len: usize);
+    fn document_get_referrer() -> u64; // Returns string pointer
+    fn document_get_url() -> u64; // Returns string pointer
+    fn document_get_domain() -> u64; // Returns string pointer
+    fn document_get_cookie() -> u64; // Returns string pointer
+    fn document_set_cookie(cookie: *const u8, cookie_len: usize);
+    fn document_write(data: *const u8, data_len: usize);
+    fn document_writeln(data: *const u8, data_len: usize);
+    
+    // Element methods
+    fn element_get_tag_name(element: u64) -> u64; // Returns string pointer
+    fn element_get_id(element: u64) -> u64; // Returns string pointer
+    fn element_set_id(element: u64, id: *const u8, id_len: usize);
+    fn element_get_class_name(element: u64) -> u64; // Returns string pointer
+    fn element_set_class_name(element: u64, class: *const u8, class_len: usize);
+    fn element_get_attribute(element: u64, name: *const u8, name_len: usize) -> u64; // Returns string pointer
+    fn element_set_attribute(element: u64, name: *const u8, name_len: usize, value: *const u8, value_len: usize);
+    fn element_remove_attribute(element: u64, name: *const u8, name_len: usize);
+    fn element_has_attribute(element: u64, name: *const u8, name_len: usize) -> bool;
+    fn element_get_inner_html(element: u64) -> u64; // Returns string pointer
+    fn element_set_inner_html(element: u64, html: *const u8, html_len: usize);
+    fn element_get_text_content(element: u64) -> u64; // Returns string pointer
+    fn element_set_text_content(element: u64, text: *const u8, text_len: usize);
+    fn element_append_child(parent: u64, child: u64) -> u64;
+    fn element_remove_child(parent: u64, child: u64) -> u64;
+    fn element_replace_child(parent: u64, new_child: u64, old_child: u64) -> u64;
+    fn element_insert_before(parent: u64, new_child: u64, ref_child: u64) -> u64;
+    fn element_get_parent_node(element: u64) -> u64;
+    fn element_get_first_child(element: u64) -> u64;
+    fn element_get_last_child(element: u64) -> u64;
+    fn element_get_next_sibling(element: u64) -> u64;
+    fn element_get_previous_sibling(element: u64) -> u64;
+    fn element_get_child_nodes(element: u64) -> u64; // Returns NodeList
+    fn element_get_children(element: u64) -> u64; // Returns HTMLCollection
+    fn element_focus(element: u64);
+    fn element_blur(element: u64);
+    fn element_click(element: u64);
+    fn element_scroll_into_view(element: u64);
+    fn element_get_bounding_client_rect(element: u64) -> u64; // Returns DOMRect
+    
+    // Node methods
+    fn node_get_node_type(node: u64) -> i32;
+    fn node_get_node_name(node: u64) -> u64; // Returns string pointer
+    fn node_get_node_value(node: u64) -> u64; // Returns string pointer
+    fn node_set_node_value(node: u64, value: *const u8, value_len: usize);
+    fn node_get_parent_node(node: u64) -> u64;
+    fn node_get_child_nodes(node: u64) -> u64; // Returns NodeList
+    fn node_get_first_child(node: u64) -> u64;
+    fn node_get_last_child(node: u64) -> u64;
+    fn node_get_next_sibling(node: u64) -> u64;
+    fn node_get_previous_sibling(node: u64) -> u64;
+    fn node_contains(node: u64, other: u64) -> bool;
+    fn node_compare_document_position(node: u64, other: u64) -> i32;
+    fn node_is_equal_node(node: u64, other: u64) -> bool;
+    fn node_clone_node(node: u64, deep: bool) -> u64;
+    
+    // EventTarget methods
+    fn event_target_add_event_listener(target: u64, type_: *const u8, type_len: usize, listener: u64, options: u64);
+    fn event_target_remove_event_listener(target: u64, type_: *const u8, type_len: usize, listener: u64, options: u64);
+    fn event_target_dispatch_event(target: u64, event: u64) -> bool;
+    
+    // Window methods
+    fn window_get_document() -> u64;
+    fn window_get_location() -> u64; // Returns Location
+    fn window_get_navigator() -> u64; // Returns Navigator
+    fn window_get_history() -> u64; // Returns History
+    fn window_get_local_storage() -> u64; // Returns Storage
+    fn window_get_session_storage() -> u64; // Returns Storage
+    fn window_get_console() -> u64; // Returns Console
+    fn window_alert(message: *const u8, message_len: usize);
+    fn window_confirm(message: *const u8, message_len: usize) -> bool;
+    fn window_prompt(message: *const u8, message_len: usize, default: *const u8, default_len: usize) -> u64; // Returns string pointer
+    fn window_set_timeout(callback: u64, timeout: i32) -> i32;
+    fn window_clear_timeout(timeout_id: i32);
+    fn window_set_interval(callback: u64, timeout: i32) -> i32;
+    fn window_clear_interval(interval_id: i32);
+    fn window_request_animation_frame(callback: u64) -> i32;
+    fn window_cancel_animation_frame(request_id: i32);
+    fn window_get_inner_width() -> i32;
+    fn window_get_inner_height() -> i32;
+    fn window_get_outer_width() -> i32;
+    fn window_get_outer_height() -> i32;
+    fn window_get_screen_x() -> i32;
+    fn window_get_screen_y() -> i32;
+    fn window_get_scroll_x() -> f64;
+    fn window_get_scroll_y() -> f64;
+    fn window_scroll_to(x: f64, y: f64);
+    fn window_scroll_by(x: f64, y: f64);
+    fn window_open(url: *const u8, url_len: usize, target: *const u8, target_len: usize, features: *const u8, features_len: usize) -> u64;
+    fn window_close();
+    fn window_post_message(target: u64, message: u64, target_origin: *const u8, target_origin_len: usize);
+    
+    // String handling
+    fn string_get_length(str_ptr: u64) -> usize;
+    fn string_get_data(str_ptr: u64) -> *const u8;
+    fn string_new(data: *const u8, len: usize) -> u64;
+    fn string_drop(str_ptr: u64);
+    
+    // NodeList/HTMLCollection
+    fn node_list_get_length(list: u64) -> usize;
+    fn node_list_get_item(list: u64, index: usize) -> u64;
+    
+    // DOMRect
+    fn dom_rect_get_x(rect: u64) -> f64;
+    fn dom_rect_get_y(rect: u64) -> f64;
+    fn dom_rect_get_width(rect: u64) -> f64;
+    fn dom_rect_get_height(rect: u64) -> f64;
+    fn dom_rect_get_top(rect: u64) -> f64;
+    fn dom_rect_get_right(rect: u64) -> f64;
+    fn dom_rect_get_bottom(rect: u64) -> f64;
+    fn dom_rect_get_left(rect: u64) -> f64;
+}
+
+#[repr(C)]
+pub struct DomString {
+    ptr: u64,
+}
+
+impl DomString {
+    pub fn new(s: &str) -> Self {
+        unsafe {
+            let ptr = string_new(s.as_ptr(), s.len());
+            Self { ptr }
+        }
+    }
+    
+    pub fn from_ptr(ptr: u64) -> Self {
+        Self { ptr }
+    }
+    
+    pub fn as_str(&self) -> &str {
+        unsafe {
+            let len = string_get_length(self.ptr);
+            let data = string_get_data(self.ptr);
+            std::slice::from_raw_parts(data, len)
+        }
+    }
+    
+    pub fn to_string(&self) -> String {
+        self.as_str().to_string()
+    }
+}
+
+impl Drop for DomString {
+    fn drop(&mut self) {
+        unsafe { string_drop(self.ptr); }
+    }
+}
+
+impl Clone for DomString {
+    fn clone(&self) -> Self {
+        unsafe {
+            let len = string_get_length(self.ptr);
+            let data = string_get_data(self.ptr);
+            let ptr = string_new(data, len);
+            Self { ptr }
+        }
+    }
+}
+
+/// Node types
+pub mod node_type {
+    pub const ELEMENT_NODE: i32 = 1;
+    pub const ATTRIBUTE_NODE: i32 = 2;
+    pub const TEXT_NODE: i32 = 3;
+    pub const CDATA_SECTION_NODE: i32 = 4;
+    pub const ENTITY_REFERENCE_NODE: i32 = 5;
+    pub const ENTITY_NODE: i32 = 6;
+    pub const PROCESSING_INSTRUCTION_NODE: i32 = 7;
+    pub const COMMENT_NODE: i32 = 8;
+    pub const DOCUMENT_NODE: i32 = 9;
+    pub const DOCUMENT_TYPE_NODE: i32 = 10;
+    pub const DOCUMENT_FRAGMENT_NODE: i32 = 11;
+    pub const NOTATION_NODE: i32 = 12;
+}
+
+/// Document reference
+pub struct Document {
+    ptr: u64,
+}
+
+impl Document {
+    pub fn new(ptr: u64) -> Self {
+        Self { ptr }
+    }
+    
+    pub fn create_element(&self, tag: &str) -> Element {
+        let tag_str = DomString::new(tag);
+        let ptr = unsafe { document_create_element(tag_str.as_ptr(), tag_str.len()) };
+        Element::new(ptr)
+    }
+    
+    pub fn create_text_node(&self, data: &str) -> Node {
+        let data_str = DomString::new(data);
+        let ptr = unsafe { document_create_text_node(data_str.as_ptr(), data_str.len()) };
+        Node::new(ptr)
+    }
+    
+    pub fn get_element_by_id(&self, id: &str) -> Option<Element> {
+        let id_str = DomString::new(id);
+        let ptr = unsafe { document_get_element_by_id(id_str.as_ptr(), id_str.len()) };
+        if ptr == 0 { None } else { Some(Element::new(ptr)) }
+    }
+    
+    pub fn query_selector(&self, selectors: &str) -> Option<Element> {
+        let sel_str = DomString::new(selectors);
+        let ptr = unsafe { document_query_selector(sel_str.as_ptr(), sel_str.len()) };
+        if ptr == 0 { None } else { Some(Element::new(ptr)) }
+    }
+    
+    pub fn query_selector_all(&self, selectors: &str) -> NodeList {
+        let sel_str = DomString::new(selectors);
+        let ptr = unsafe { document_query_selector_all(sel_str.as_ptr(), sel_str.len()) };
+        NodeList::new(ptr)
+    }
+    
+    pub fn body(&self) -> Element {
+        let ptr = unsafe { document_get_body() };
+        Element::new(ptr)
+    }
+    
+    pub fn head(&self) -> Element {
+        let ptr = unsafe { document_get_head() };
+        Element::new(ptr)
+    }
+    
+    pub fn title(&self) -> String {
+        let ptr = unsafe { document_get_title() };
+        DomString::from_ptr(ptr).to_string()
+    }
+    
+    pub fn set_title(&self, title: &str) {
+        let title_str = DomString::new(title);
+        unsafe { document_set_title(title_str.as_ptr(), title_str.len()) }
+    }
+    
+    pub fn referrer(&self) -> String {
+        let ptr = unsafe { document_get_referrer() };
+        DomString::from_ptr(ptr).to_string()
+    }
+    
+    pub fn url(&self) -> String {
+        let ptr = unsafe { document_get_url() };
+        DomString::from_ptr(ptr).to_string()
+    }
+    
+    pub fn domain(&self) -> String {
+        let ptr = unsafe { document_get_domain() };
+        DomString::from_ptr(ptr).to_string()
+    }
+    
+    pub fn cookie(&self) -> String {
+        let ptr = unsafe { document_get_cookie() };
+        DomString::from_ptr(ptr).to_string()
+    }
+    
+    pub fn set_cookie(&self, cookie: &str) {
+        let cookie_str = DomString::new(cookie);
+        unsafe { document_set_cookie(cookie_str.as_ptr(), cookie_str.len()) }
+    }
+    
+    pub fn write(&self, data: &str) {
+        let data_str = DomString::new(data);
+        unsafe { document_write(data_str.as_ptr(), data_str.len()) }
+    }
+    
+    pub fn writeln(&self, data: &str) {
+        let data_str = DomString::new(data);
+        unsafe { document_writeln(data_str.as_ptr(), data_str.len()) }
+    }
+}
+
+/// Element reference
+pub struct Element {
+    ptr: u64,
+}
+
+impl Element {
+    pub fn new(ptr: u64) -> Self {
+        Self { ptr }
+    }
+    
+    pub fn as_node(&self) -> Node {
+        Node::new(self.ptr)
+    }
+    
+    pub fn tag_name(&self) -> String {
+        let ptr = unsafe { element_get_tag_name(self.ptr) };
+        DomString::from_ptr(ptr).to_string()
+    }
+    
+    pub fn id(&self) -> String {
+        let ptr = unsafe { element_get_id(self.ptr) };
+        DomString::from_ptr(ptr).to_string()
+    }
+    
+    pub fn set_id(&self, id: &str) {
+        let id_str = DomString::new(id);
+        unsafe { element_set_id(self.ptr, id_str.as_ptr(), id_str.len()) }
+    }
+    
+    pub fn class_name(&self) -> String {
+        let ptr = unsafe { element_get_class_name(self.ptr) };
+        DomString::from_ptr(ptr).to_string()
+    }
+    
+    pub fn set_class_name(&self, class: &str) {
+        let class_str = DomString::new(class);
+        unsafe { element_set_class_name(self.ptr, class_str.as_ptr(), class_str.len()) }
+    }
+    
+    pub fn get_attribute(&self, name: &str) -> Option<String> {
+        let name_str = DomString::new(name);
+        let ptr = unsafe { element_get_attribute(self.ptr, name_str.as_ptr(), name_str.len()) };
+        if ptr == 0 { None } else { Some(DomString::from_ptr(ptr).to_string()) }
+    }
+    
+    pub fn set_attribute(&self, name: &str, value: &str) {
+        let name_str = DomString::new(name);
+        let value_str = DomString::new(value);
+        unsafe { element_set_attribute(self.ptr, name_str.as_ptr(), name_str.len(), value_str.as_ptr(), value_str.len()) }
+    }
+    
+    pub fn remove_attribute(&self, name: &str) {
+        let name_str = DomString::new(name);
+        unsafe { element_remove_attribute(self.ptr, name_str.as_ptr(), name_str.len()) }
+    }
+    
+    pub fn has_attribute(&self, name: &str) -> bool {
+        let name_str = DomString::new(name);
+        unsafe { element_has_attribute(self.ptr, name_str.as_ptr(), name_str.len()) }
+    }
+    
+    pub fn inner_html(&self) -> String {
+        let ptr = unsafe { element_get_inner_html(self.ptr) };
+        DomString::from_ptr(ptr).to_string()
+    }
+    
+    pub fn set_inner_html(&self, html: &str) {
+        let html_str = DomString::new(html);
+        unsafe { element_set_inner_html(self.ptr, html_str.as_ptr(), html_str.len()) }
+    }
+    
+    pub fn text_content(&self) -> String {
+        let ptr = unsafe { element_get_text_content(self.ptr) };
+        DomString::from_ptr(ptr).to_string()
+    }
+    
+    pub fn set_text_content(&self, text: &str) {
+        let text_str = DomString::new(text);
+        unsafe { element_set_text_content(self.ptr, text_str.as_ptr(), text_str.len()) }
+    }
+    
+    pub fn append_child(&self, child: &Node) -> Node {
+        let ptr = unsafe { element_append_child(self.ptr, child.ptr) };
+        Node::new(ptr)
+    }
+    
+    pub fn remove_child(&self, child: &Node) -> Node {
+        let ptr = unsafe { element_remove_child(self.ptr, child.ptr) };
+        Node::new(ptr)
+    }
+    
+    pub fn replace_child(&self, new_child: &Node, old_child: &Node) -> Node {
+        let ptr = unsafe { element_replace_child(self.ptr, new_child.ptr, old_child.ptr) };
+        Node::new(ptr)
+    }
+    
+    pub fn insert_before(&self, new_child: &Node, ref_child: &Node) -> Node {
+        let ptr = unsafe { element_insert_before(self.ptr, new_child.ptr, ref_child.ptr) };
+        Node::new(ptr)
+    }
+    
+    pub fn parent_node(&self) -> Option<Node> {
+        let ptr = unsafe { element_get_parent_node(self.ptr) };
+        if ptr == 0 { None } else { Some(Node::new(ptr)) }
+    }
+    
+    pub fn first_child(&self) -> Option<Node> {
+        let ptr = unsafe { element_get_first_child(self.ptr) };
+        if ptr == 0 { None } else { Some(Node::new(ptr)) }
+    }
+    
+    pub fn last_child(&self) -> Option<Node> {
+        let ptr = unsafe { element_get_last_child(self.ptr) };
+        if ptr == 0 { None } else { Some(Node::new(ptr)) }
+    }
+    
+    pub fn next_sibling(&self) -> Option<Node> {
+        let ptr = unsafe { element_get_next_sibling(self.ptr) };
+        if ptr == 0 { None } else { Some(Node::new(ptr)) }
+    }
+    
+    pub fn previous_sibling(&self) -> Option<Node> {
+        let ptr = unsafe { element_get_previous_sibling(self.ptr) };
+        if ptr == 0 { None } else { Some(Node::new(ptr)) }
+    }
+    
+    pub fn child_nodes(&self) -> NodeList {
+        let ptr = unsafe { element_get_child_nodes(self.ptr) };
+        NodeList::new(ptr)
+    }
+    
+    pub fn children(&self) -> HTMLCollection {
+        let ptr = unsafe { element_get_children(self.ptr) };
+        HTMLCollection::new(ptr)
+    }
+    
+    pub fn focus(&self) {
+        unsafe { element_focus(self.ptr) }
+    }
+    
+    pub fn blur(&self) {
+        unsafe { element_blur(self.ptr) }
+    }
+    
+    pub fn click(&self) {
+        unsafe { element_click(self.ptr) }
+    }
+    
+    pub fn scroll_into_view(&self) {
+        unsafe { element_scroll_into_view(self.ptr) }
+    }
+    
+    pub fn bounding_client_rect(&self) -> DomRect {
+        let ptr = unsafe { element_get_bounding_client_rect(self.ptr) };
+        DomRect::new(ptr)
+    }
+}
+
+/// Node reference
+pub struct Node {
+    ptr: u64,
+}
+
+impl Node {
+    pub fn new(ptr: u64) -> Self {
+        Self { ptr }
+    }
+    
+    pub fn as_element(&self) -> Option<Element> {
+        if self.node_type() == node_type::ELEMENT_NODE {
+            Some(Element::new(self.ptr))
+        } else {
+            None
+        }
+    }
+    
+    pub fn node_type(&self) -> i32 {
+        unsafe { node_get_node_type(self.ptr) }
+    }
+    
+    pub fn node_name(&self) -> String {
+        let ptr = unsafe { node_get_node_name(self.ptr) };
+        DomString::from_ptr(ptr).to_string()
+    }
+    
+    pub fn node_value(&self) -> Option<String> {
+        let ptr = unsafe { node_get_node_value(self.ptr) };
+        if ptr == 0 { None } else { Some(DomString::from_ptr(ptr).to_string()) }
+    }
+    
+    pub fn set_node_value(&self, value: &str) {
+        let value_str = DomString::new(value);
+        unsafe { node_set_node_value(self.ptr, value_str.as_ptr(), value_str.len()) }
+    }
+    
+    pub fn parent_node(&self) -> Option<Node> {
+        let ptr = unsafe { node_get_parent_node(self.ptr) };
+        if ptr == 0 { None } else { Some(Node::new(ptr)) }
+    }
+    
+    pub fn child_nodes(&self) -> NodeList {
+        let ptr = unsafe { node_get_child_nodes(self.ptr) };
+        NodeList::new(ptr)
+    }
+    
+    pub fn first_child(&self) -> Option<Node> {
+        let ptr = unsafe { node_get_first_child(self.ptr) };
+        if ptr == 0 { None } else { Some(Node::new(ptr)) }
+    }
+    
+    pub fn last_child(&self) -> Option<Node> {
+        let ptr = unsafe { node_get_last_child(self.ptr) };
+        if ptr == 0 { None } else { Some(Node::new(ptr)) }
+    }
+    
+    pub fn next_sibling(&self) -> Option<Node> {
+        let ptr = unsafe { node_get_next_sibling(self.ptr) };
+        if ptr == 0 { None } else { Some(Node::new(ptr)) }
+    }
+    
+    pub fn previous_sibling(&self) -> Option<Node> {
+        let ptr = unsafe { node_get_previous_sibling(self.ptr) };
+        if ptr == 0 { None } else { Some(Node::new(ptr)) }
+    }
+    
+    pub fn contains(&self, other: &Node) -> bool {
+        unsafe { node_contains(self.ptr, other.ptr) }
+    }
+    
+    pub fn compare_document_position(&self, other: &Node) -> i32 {
+        unsafe { node_compare_document_position(self.ptr, other.ptr) }
+    }
+    
+    pub fn is_equal_node(&self, other: &Node) -> bool {
+        unsafe { node_is_equal_node(self.ptr, other.ptr) }
+    }
+    
+    pub fn clone_node(&self, deep: bool) -> Node {
+        let ptr = unsafe { node_clone_node(self.ptr, deep) };
+        Node::new(ptr)
+    }
+}
+
+/// NodeList reference
+pub struct NodeList {
+    ptr: u64,
+}
+
+impl NodeList {
+    pub fn new(ptr: u64) -> Self {
+        Self { ptr }
+    }
+    
+    pub fn len(&self) -> usize {
+        unsafe { node_list_get_length(self.ptr) }
+    }
+    
+    pub fn get(&self, index: usize) -> Option<Node> {
+        if index >= self.len() { return None; }
+        let ptr = unsafe { node_list_get_item(self.ptr, index) };
+        if ptr == 0 { None } else { Some(Node::new(ptr)) }
+    }
+    
+    pub fn iter(&self) -> NodeListIter {
+        NodeListIter { list: self, index: 0 }
+    }
+}
+
+pub struct NodeListIter<'a> {
+    list: &'a NodeList,
+    index: usize,
+}
+
+impl<'a> Iterator for NodeListIter<'a> {
+    type Item = Node;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.list.len() { return None; }
+        let item = self.list.get(self.index);
+        self.index += 1;
+        item
+    }
+}
+
+/// HTMLCollection reference
+pub struct HTMLCollection {
+    ptr: u64,
+}
+
+impl HTMLCollection {
+    pub fn new(ptr: u64) -> Self {
+        Self { ptr }
+    }
+    
+    pub fn len(&self) -> usize {
+        unsafe { node_list_get_length(self.ptr) }
+    }
+    
+    pub fn get(&self, index: usize) -> Option<Element> {
+        if index >= self.len() { return None; }
+        let ptr = unsafe { node_list_get_item(self.ptr, index) };
+        if ptr == 0 { None } else { Some(Element::new(ptr)) }
+    }
+}
+
+/// EventTarget reference
+pub struct EventTarget {
+    ptr: u64,
+}
+
+impl EventTarget {
+    pub fn new(ptr: u64) -> Self {
+        Self { ptr }
+    }
+    
+    pub fn add_event_listener(&self, type_: &str, listener: u64, options: u64) {
+        let type_str = DomString::new(type_);
+        unsafe { event_target_add_event_listener(self.ptr, type_str.as_ptr(), type_str.len(), listener, options) }
+    }
+    
+    pub fn remove_event_listener(&self, type_: &str, listener: u64, options: u64) {
+        let type_str = DomString::new(type_);
+        unsafe { event_target_remove_event_listener(self.ptr, type_str.as_ptr(), type_str.len(), listener, options) }
+    }
+    
+    pub fn dispatch_event(&self, event: u64) -> bool {
+        unsafe { event_target_dispatch_event(self.ptr, event) }
+    }
+}
+
+/// Window reference
+pub struct Window {
+    ptr: u64,
+}
+
+impl Window {
+    pub fn new(ptr: u64) -> Self {
+        Self { ptr }
+    }
+    
+    pub fn document(&self) -> Document {
+        let ptr = unsafe { window_get_document() };
+        Document::new(ptr)
+    }
+    
+    pub fn location(&self) -> Location {
+        let ptr = unsafe { window_get_location() };
+        Location::new(ptr)
+    }
+    
+    pub fn navigator(&self) -> Navigator {
+        let ptr = unsafe { window_get_navigator() };
+        Navigator::new(ptr)
+    }
+    
+    pub fn history(&self) -> History {
+        let ptr = unsafe { window_get_history() };
+        History::new(ptr)
+    }
+    
+    pub fn local_storage(&self) -> Storage {
+        let ptr = unsafe { window_get_local_storage() };
+        Storage::new(ptr)
+    }
+    
+    pub fn session_storage(&self) -> Storage {
+        let ptr = unsafe { window_get_session_storage() };
+        Storage::new(ptr)
+    }
+    
+    pub fn console(&self) -> Console {
+        let ptr = unsafe { window_get_console() };
+        Console::new(ptr)
+    }
+    
+    pub fn alert(&self, message: &str) {
+        let msg_str = DomString::new(message);
+        unsafe { window_alert(msg_str.as_ptr(), msg_str.len()) }
+    }
+    
+    pub fn confirm(&self, message: &str) -> bool {
+        let msg_str = DomString::new(message);
+        unsafe { window_confirm(msg_str.as_ptr(), msg_str.len()) }
+    }
+    
+    pub fn prompt(&self, message: &str, default: &str) -> String {
+        let msg_str = DomString::new(message);
+        let def_str = DomString::new(default);
+        let ptr = unsafe { window_prompt(msg_str.as_ptr(), msg_str.len(), def_str.as_ptr(), def_str.len()) };
+        DomString::from_ptr(ptr).to_string()
+    }
+    
+    pub fn set_timeout(&self, callback: u64, timeout: i32) -> i32 {
+        unsafe { window_set_timeout(callback, timeout) }
+    }
+    
+    pub fn clear_timeout(&self, timeout_id: i32) {
+        unsafe { window_clear_timeout(timeout_id) }
+    }
+    
+    pub fn set_interval(&self, callback: u64, timeout: i32) -> i32 {
+        unsafe { window_set_interval(callback, timeout) }
+    }
+    
+    pub fn clear_interval(&self, interval_id: i32) {
+        unsafe { window_clear_interval(interval_id) }
+    }
+    
+    pub fn request_animation_frame(&self, callback: u64) -> i32 {
+        unsafe { window_request_animation_frame(callback) }
+    }
+    
+    pub fn cancel_animation_frame(&self, request_id: i32) {
+        unsafe { window_cancel_animation_frame(request_id) }
+    }
+    
+    pub fn inner_width(&self) -> i32 {
+        unsafe { window_get_inner_width() }
+    }
+    
+    pub fn inner_height(&self) -> i32 {
+        unsafe { window_get_inner_height() }
+    }
+    
+    pub fn outer_width(&self) -> i32 {
+        unsafe { window_get_outer_width() }
+    }
+    
+    pub fn outer_height(&self) -> i32 {
+        unsafe { window_get_outer_height() }
+    }
+    
+    pub fn screen_x(&self) -> i32 {
+        unsafe { window_get_screen_x() }
+    }
+    
+    pub fn screen_y(&self) -> i32 {
+        unsafe { window_get_screen_y() }
+    }
+    
+    pub fn scroll_x(&self) -> f64 {
+        unsafe { window_get_scroll_x() }
+    }
+    
+    pub fn scroll_y(&self) -> f64 {
+        unsafe { window_get_scroll_y() }
+    }
+    
+    pub fn scroll_to(&self, x: f64, y: f64) {
+        unsafe { window_scroll_to(x, y) }
+    }
+    
+    pub fn scroll_by(&self, x: f64, y: f64) {
+        unsafe { window_scroll_by(x, y) }
+    }
+    
+    pub fn open(&self, url: &str, target: &str, features: &str) -> Window {
+        let url_str = DomString::new(url);
+        let target_str = DomString::new(target);
+        let features_str = DomString::new(features);
+        let ptr = unsafe { window_open(url_str.as_ptr(), url_str.len(), target_str.as_ptr(), target_str.len(), features_str.as_ptr(), features_str.len()) };
+        Window::new(ptr)
+    }
+    
+    pub fn close(&self) {
+        unsafe { window_close() }
+    }
+    
+    pub fn post_message(&self, target: &Window, message: &str, target_origin: &str) {
+        let msg_str = DomString::new(message);
+        let origin_str = DomString::new(target_origin);
+        unsafe { window_post_message(target.ptr, msg_str.ptr, origin_str.as_ptr(), origin_str.len()) }
+    }
+}
+
+/// Location reference
+pub struct Location {
+    ptr: u64,
+}
+
+impl Location {
+    pub fn new(ptr: u64) -> Self {
+        Self { ptr }
+    }
+}
+
+/// Navigator reference
+pub struct Navigator {
+    ptr: u64,
+}
+
+impl Navigator {
+    pub fn new(ptr: u64) -> Self {
+        Self { ptr }
+    }
+}
+
+/// History reference
+pub struct History {
+    ptr: u64,
+}
+
+impl History {
+    pub fn new(ptr: u64) -> Self {
+        Self { ptr }
+    }
+}
+
+/// DOMRect reference
+pub struct DomRect {
+    ptr: u64,
+}
+
+impl DomRect {
+    pub fn new(ptr: u64) -> Self {
+        Self { ptr }
+    }
+    
+    pub fn x(&self) -> f64 {
+        unsafe { dom_rect_get_x(self.ptr) }
+    }
+    
+    pub fn y(&self) -> f64 {
+        unsafe { dom_rect_get_y(self.ptr) }
+    }
+    
+    pub fn width(&self) -> f64 {
+        unsafe { dom_rect_get_width(self.ptr) }
+    }
+    
+    pub fn height(&self) -> f64 {
+        unsafe { dom_rect_get_height(self.ptr) }
+    }
+    
+    pub fn top(&self) -> f64 {
+        unsafe { dom_rect_get_top(self.ptr) }
+    }
+    
+    pub fn right(&self) -> f64 {
+        unsafe { dom_rect_get_right(self.ptr) }
+    }
+    
+    pub fn bottom(&self) -> f64 {
+        unsafe { dom_rect_get_bottom(self.ptr) }
+    }
+    
+    pub fn left(&self) -> f64 {
+        unsafe { dom_rect_get_left(self.ptr) }
+    }
+}
+
+/// Console reference
+pub struct Console {
+    ptr: u64,
+}
+
+impl Console {
+    pub fn new(ptr: u64) -> Self {
+        Self { ptr }
+    }
+    
+    pub fn log(&self, message: &str) {
+        let msg_str = DomString::new(message);
+        unsafe { window_alert(msg_str.as_ptr(), msg_str.len()) } // Reuse alert for now
+    }
+}

@@ -10,49 +10,8 @@
 //! like `QRegister[Cols]` stay unambiguous). `[*]` is lexed as a single
 //! dedicated token.
 
-use crate::ast::{Ident, IntTy, Quantity, Span, TypedInt};
 use logos::Logos;
 use std::fmt;
-
-/// Parse a typed integer literal like "72u8", "100u16", "200i32"
-pub fn parse_typed_int(s: &str) -> TypedInt {
-    // Check for type suffix
-    let mut suffix_start = s.len();
-    for (i, c) in s.char_indices().rev() {
-        if c == 'u' || c == 'U' || c == 'i' || c == 'I' {
-            suffix_start = i;
-            break;
-        } else if c == '_' || c.is_ascii_digit() {
-            continue;
-        } else {
-            break;
-        }
-    }
-    
-    let (num_part, suffix) = s.split_at(suffix_start);
-    let cleaned_num: String = num_part.chars().filter(|c| *c != '_').collect();
-    let value = cleaned_num.parse().unwrap_or(0);
-    
-    let ty = if !suffix.is_empty() {
-        match suffix.to_lowercase().as_str() {
-            "u8" => Some(IntTy::U8),
-            "u16" => Some(IntTy::U16),
-            "u32" => Some(IntTy::U32),
-            "u64" => Some(IntTy::U64),
-            "usize" => Some(IntTy::USize),
-            "i8" => Some(IntTy::I8),
-            "i16" => Some(IntTy::I16),
-            "i32" => Some(IntTy::I32),
-            "i64" => Some(IntTy::I64),
-            "isize" => Some(IntTy::ISize),
-            _ => None,
-        }
-    } else {
-        None
-    };
-    
-    TypedInt { value, ty }
-}
 
 /// A single lexical token produced by the [`super::Lexer`].
 #[derive(Debug, Clone, PartialEq)]
@@ -190,32 +149,17 @@ pub enum TokenKind {
     // naso-verify. Not reachable by codegen.
     #[regex("[pP][rR][oO][oO][fF]", priority = 3)]
     Proof,
-    /// `requires` introduces a PRECONDITION on a function: claims the caller must
-        // satisfy, which the prover may then assume when discharging the body's proof
-        // block. It is deliberately not sugar for an assertion -- a precondition is not
-        // something the function proves about itself, and conflating the two would let a
-        // function discharge its obligations by assuming them.
-        #[regex("[rR][eE][qQ][uU][iI][rR][eE][sS]", priority = 3)]
-        Requires,
-        // `trait` introduces a trait definition
-        #[regex("[tT][rR][aA][iI][tT]", priority = 3)]
-        Trait,
-        // `impl` introduces a trait implementation
-        #[regex("[iI][mM][pP][lL]", priority = 3)]
-        Impl,
-        // `where` introduces where clauses for trait bounds
-    #[regex("where", priority = 3)]
-    Where,
-    // `self` (lowercase) - the receiver in methods
-    #[regex("self", priority = 3)]
-    SelfLower,
-    // `Self` (capital S) - the implementing type in traits and impls
-    #[regex("Self", priority = 3)]
-    SelfKw,
+    // `requires` introduces a PRECONDITION on a function: claims the caller must
+    // satisfy, which the prover may then assume when discharging the body's proof
+    // block. It is deliberately not sugar for an assertion -- a precondition is not
+    // something the function proves about itself, and conflating the two would let a
+    // function discharge its obligations by assuming them.
+    #[regex("[rR][eE][qQ][uU][iI][rR][eE][sS]", priority = 3)]
+    Requires,
     // `as` introduces a numeric cast: `expr as i8`. Numeric types only --
     // the typechecker rejects casts to tensor, qubit or pointer-shaped types,
     // so this is not a general reinterpret-cast operator.
-    #[regex("as", priority = 3)]
+    #[regex("[aA][sS]", priority = 3)]
     As,
     #[regex("[iI]8", priority = 3)]
     Int8,
@@ -248,6 +192,8 @@ pub enum TokenKind {
     UInt64,
     #[regex("[qQ][uU][iI][nN][tT]8", priority = 3)]
     Quint8,
+    #[regex("[qQ][uU][iI][nN][tT]4", priority = 3)]
+    Quint4,
     #[regex("[uU][sS][iI][zZ][eE]", priority = 3)]
     USize,
     #[regex("[fF]32", priority = 3)]
@@ -311,13 +257,16 @@ pub enum TokenKind {
     #[regex("[tT][rR][uU][eE]", |lex| Some(lex.slice().eq_ignore_ascii_case("true")), priority = 3)]
     #[regex("[fF][aA][lL][sS][eE]", |lex| Some(lex.slice().eq_ignore_ascii_case("true")), priority = 3)]
     Bool(bool),
+    #[regex("[tT][rR][aA][iI][tT]", priority = 3)]
+    Trait,
+    #[regex("[iI][mM][pP][lL]", priority = 3)]
+    Impl,
     #[regex("[tT][eE][nN][sS][oO][rR]", priority = 3)]
     Tensor,
 
     // ===== Literals =====
-    // Typed integer literals: 72u8, 100u16, 200i32, etc.
-    #[regex(r"[0-9][0-9_]*([uUiI][0-9]+)?", |lex| parse_typed_int(lex.slice()))]
-    Int(TypedInt),
+    #[regex(r"[0-9][0-9_]*", |lex| parse_int(lex.slice()))]
+    Int(i64),
     #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*((e|E)[+-]?[0-9]+)?", |lex| parse_float(lex.slice()))]
     #[regex(r"\.[0-9][0-9_]*((e|E)[+-]?[0-9]+)?", |lex| parse_float(lex.slice()))]
     Float(f64),
@@ -454,11 +403,6 @@ impl TokenKind {
             TokenKind::Await => "'await'",
             TokenKind::Proof => "'proof'",
             TokenKind::Requires => "'requires'",
-            TokenKind::Trait => "'trait'",
-            TokenKind::Impl => "'impl'",
-            TokenKind::Where => "'where'",
-            TokenKind::SelfLower => "'self'",
-            TokenKind::SelfKw => "'Self'",
             TokenKind::As => "'as'",
             TokenKind::Mut => "'mut'",
             TokenKind::Int4 => "'i4'",
@@ -473,6 +417,7 @@ impl TokenKind {
             TokenKind::UInt32 => "'u32'",
             TokenKind::UInt64 => "'u64'",
             TokenKind::Quint8 => "'quint8'",
+            TokenKind::Quint4 => "'quint4'",
             TokenKind::USize => "'usize'",
             TokenKind::Float32 => "'f32'",
             TokenKind::Float64 => "'f64'",
@@ -542,6 +487,8 @@ impl TokenKind {
             TokenKind::Comment => "comment",
             TokenKind::IntKw => "'int'",
             TokenKind::BoolKw => "'bool'",
+            TokenKind::Trait => "'trait'",
+            TokenKind::Impl => "'impl'",
             TokenKind::Error => "<lex error>",
         }
     }
@@ -598,13 +545,7 @@ fn unescape(s: &str) -> String {
 impl fmt::Display for TokenKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TokenKind::Int(typed) => {
-                write!(f, "{}", typed.value)?;
-                if let Some(ty) = typed.ty {
-                    write!(f, "{}", ty)?;
-                }
-                Ok(())
-            }
+            TokenKind::Int(v) => write!(f, "{}", v),
             TokenKind::Float(v) => write!(f, "{}", v),
             TokenKind::Bool(v) => write!(f, "{}", v),
             TokenKind::Str(v) => write!(f, "\"{}\"", v),

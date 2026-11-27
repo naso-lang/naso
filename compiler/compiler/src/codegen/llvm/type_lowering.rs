@@ -30,7 +30,7 @@ pub struct LlvmTypeLowering<'ctx> {
 impl<'ctx> LlvmTypeLowering<'ctx> {
     /// Create a new type lowering context
     pub fn new(context: &'ctx Context) -> Self {
-        let qubit_type = context.ptr_type(AddressSpace::from(0)); // Generic address space for qubits
+        let qubit_type = Self::ptr_type_static(context, context.i8_type().into(), 0);
         let result_type = context.bool_type(); // i1
 
         Self {
@@ -44,6 +44,18 @@ impl<'ctx> LlvmTypeLowering<'ctx> {
     /// Get the LLVM context
     pub fn context(&self) -> &'ctx Context {
         self.context
+    }
+
+    /// Static ptr_type for use in new()
+    fn ptr_type_static(
+        context: &'ctx Context,
+        pointee: BasicTypeEnum<'ctx>,
+        address_space: u32,
+    ) -> PointerType<'ctx> {
+        let _ = pointee;
+        let addr_space = AddressSpace::try_from(address_space).unwrap_or(AddressSpace::default());
+        // With typed-pointers, use a type's ptr_type method
+        context.i8_type().ptr_type(addr_space)
     }
 
     /// Get the qubit type (opaque pointer)
@@ -122,7 +134,7 @@ impl<'ctx> LlvmTypeLowering<'ctx> {
             LlvmAggregateType::Struct(fields) => {
                 let field_types: CodegenResult<Vec<_>> = fields
                     .iter()
-                    .map(|f| self.lower_quantity_aware(f))
+                    .map(|f| self.lower_quantity_aware(&f.ty))
                     .collect();
                 let struct_type = self.context.struct_type(&field_types?, false);
                 Ok(struct_type.into())
@@ -150,9 +162,9 @@ impl<'ctx> LlvmTypeLowering<'ctx> {
     fn lower_pointer(&mut self, ptr: &LlvmPointerType) -> CodegenResult<BasicTypeEnum<'ctx>> {
         // Validate the pointee lowers cleanly even though opaque pointers
         // erase it in the resulting type.
-        let _pointee_type = self.lower_quantity_aware(&ptr.pointee)?;
+        let pointee_type = self.lower_quantity_aware(&ptr.pointee)?;
         let addr_space = self.address_space(ptr.address_space)?;
-        Ok(self.context.ptr_type(addr_space).into())
+        Ok(self.ptr_type(pointee_type, addr_space).into())
     }
 
     /// Convert a raw address space id into an inkwell `AddressSpace`.
@@ -173,19 +185,19 @@ impl<'ctx> LlvmTypeLowering<'ctx> {
     }
 
     /// Get pointer type for the given address space.
-    ///
     /// LLVM 15+ has opaque pointers, so the `pointee` argument does not
     /// affect the pointer type; it is retained for call-site readability and
     /// must still be a valid basic type. The address space is honoured.
     pub fn ptr_type(
         &self,
         pointee: BasicTypeEnum<'ctx>,
-        address_space: u32,
-    ) -> CodegenResult<PointerType<'ctx>> {
+        address_space: AddressSpace,
+    ) -> PointerType<'ctx> {
         // Keep the pointee meaningful: opaque pointers erase it in the IR, but
         // dropping it entirely would lose the caller's intent silently.
         let _ = pointee;
-        Ok(self.context.ptr_type(self.address_space(address_space)?))
+        // With typed-pointers, use a type's ptr_type method
+        self.context.i8_type().ptr_type(address_space)
     }
 
     /// Get function type

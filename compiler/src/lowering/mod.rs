@@ -8,14 +8,11 @@
 pub mod access_analysis;
 pub mod ast_to_pir;
 pub mod loop_extraction;
-pub mod polyhedral_scheduling;
 pub mod reversible_lowering;
 pub mod simd;
 pub mod uncomputation;
 
 use crate::ast::{Mutability, Program, Quantity};
-use crate::codegen::abi::{FloatWidth, IntWidth};
-use crate::ir::pir_types::ElemType;
 use crate::ir::validate::validate_pir;
 use crate::ir::{
     AccessRelations, AffineDomain, AffineMap, PirModule, PirStatement, QuantityMap, ScheduleNode,
@@ -83,6 +80,8 @@ pub struct LoweringContext {
     functions: Vec<crate::ir::pir_types::PirFunction>,
     /// External functions declared in extern blocks
     extern_functions: Vec<crate::ir::pir_types::ExternFunction>,
+    /// Type definitions collected from the AST for struct field name preservation
+    type_definitions: Vec<crate::ast::TypeDef>,
     /// The `StmtId` of the most recent `return e` this function lowered.
     ///
     /// `lower_stmt` turns `return e` into an ordinary statement, which is right for a
@@ -243,16 +242,7 @@ fn collect_bound_names_expr(expr: &crate::ast::Expr, out: &mut Vec<String>) {
         ExprKind::Let(l) => out.push(l.name.name.clone()),
         ExprKind::LetInOut(l) => out.push(l.name.name.clone()),
         ExprKind::LetConsume(l) => out.push(l.name.name.clone()),
-        ExprKind::Call(callee, args, const_args) => {
-            collect_bound_names_expr(callee, out);
-            for a in args {
-                collect_bound_names_expr(a, out);
-            }
-            for a in const_args {
-                collect_bound_names_expr(a, out);
-            }
-        }
-        ExprKind::MethodCall(callee, _, args) => {
+        ExprKind::Call(callee, args) | ExprKind::MethodCall(callee, _, args) => {
             collect_bound_names_expr(callee, out);
             for a in args {
                 collect_bound_names_expr(a, out);
@@ -262,9 +252,6 @@ fn collect_bound_names_expr(expr: &crate::ast::Expr, out: &mut Vec<String>) {
             for item in items {
                 collect_bound_names_expr(item, out);
             }
-        }
-        ExprKind::ArrayRepeat(value, _) => {
-            collect_bound_names_expr(value, out);
         }
         ExprKind::If(c, t, e) => {
             collect_bound_names_expr(c, out);
@@ -294,6 +281,7 @@ impl LoweringContext {
             function_params: Vec::new(),
             functions: Vec::new(),
             extern_functions: Vec::new(),
+            type_definitions: Vec::new(),
             pending_return_stmt: None,
         }
     }
@@ -343,6 +331,7 @@ impl LoweringContext {
         pir.function_params = std::mem::take(&mut self.function_params);
         pir.functions = std::mem::take(&mut self.functions);
         pir.extern_functions = std::mem::take(&mut self.extern_functions);
+        pir.type_definitions = std::mem::take(&mut self.type_definitions);
 
         // Validate the generated PIR
         validate_pir(&pir).map_err(|e| LoweringError::ValidationError(format!("{:?}", e)))?;
@@ -510,27 +499,6 @@ impl LoweringContext {
                 // String is represented as (ptr, len) pair in the ABI
                 // We pass it as a struct of two i64 values
                 ParamKind::Scalar(crate::ir::pir_types::ElemType::I64)
-            }
-            crate::ast::ty::TypeKind::Array(elem, size) => {
-                // Array parameters are passed by pointer (caller-allocated buffer)
-                let Some(elem_ty) = elem_kind(&*elem) else {
-                    return ParamKind::Unsupported(format!("array with unsupported element type"));
-                };
-                let shape = match size.as_ref() {
-                    Some(nat) => nat.to_u64().map(|n| vec![n]),
-                    None => None,
-                };
-                ParamKind::Tensor {
-                    elem: elem_ty,
-                    shape,
-                }
-            }
-            // User-defined structs (MiddlewareChain, Router, Response, Request, etc.)
-            // are passed as opaque pointers (caller-allocated, sret convention for params)
-            crate::ast::ty::TypeKind::Named(n, _)
-                if !matches!(n.name.as_str(), "QRegister" | "Qubits" | "Stream" | "Listener" | "Many" | "One") =>
-            {
-                ParamKind::Struct
             }
             // A quantity is not a type. `Many` and `One` parse as `Named` because
             // they are ordinary identifiers in type position, so `fn f(q: Many)`
@@ -825,6 +793,10 @@ impl LoweringContext {
             Item::Extern(extern_block) => {
                 self.lower_extern_block(extern_block)?;
             }
+            Item::TypeDef(type_def) => {
+                // Collect type definitions for codegen (struct field names, etc.)
+                self.type_definitions.push(type_def.clone());
+            }
             _ => {
                 // Skip other items for now
             }
@@ -916,30 +888,7 @@ impl LoweringContext {
         }
         match elem_kind(ty) {
             Some(elem) => FnReturn::Scalar(elem),
-            None => {
-                // Check if it's a tensor type
-                if matches!(ty.kind, crate::ast::ty::TypeKind::Tensor(_)) {
-                    // Tensor return type - would need shape info from type
-                    return FnReturn::Tensor { elem: ElemType::F64, shape: None };
-                }
-                // Check if it's a fixed-size array type
-                if let crate::ast::ty::TypeKind::Array(elem_ty, size) = &ty.kind {
-                    if let Some(elem) = elem_kind(elem_ty) {
-                        if let Some(size_expr) = size {
-                            if let Some(size_val) = size_expr.to_u64() {
-                                return FnReturn::Array { elem, size: size_val };
-                            }
-                        }
-                        return FnReturn::Unsupported(format!("{ty}"));
-                    }
-                    return FnReturn::Unsupported(format!("{ty}"));
-                }
-                // Check if it's a user-defined type (struct, enum, alias) - use Struct variant for sret
-                if matches!(ty.kind, crate::ast::ty::TypeKind::Named(_, _)) {
-                    return FnReturn::Struct;
-                }
-                FnReturn::Unsupported(format!("{ty}"))
-            }
+            None => FnReturn::Unsupported(format!("{ty}")),
         }
     }
 
@@ -1541,11 +1490,6 @@ impl LoweringContext {
                         crate::ast::ty::TypeKind::Float => elem_kind(ty),
                         _ => None,
                     },
-                    // A POINTER target carries the pointee element type for inttoptr.
-                    pointer_target: match ty.kind {
-                        crate::ast::ty::TypeKind::Pointer(ref pointee) => elem_kind(pointee),
-                        _ => None,
-                    },
                 })
             }
 
@@ -1566,12 +1510,8 @@ impl LoweringContext {
                     expr: Box::new(e),
                 })
             }
-            ExprKind::Call(func, args, const_args) => {
+            ExprKind::Call(func, args) => {
                 let args = args
-                    .iter()
-                    .map(|a| self.lower_expr(a))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let const_args = const_args
                     .iter()
                     .map(|a| self.lower_expr(a))
                     .collect::<Result<Vec<_>, _>>()?;
@@ -1635,27 +1575,13 @@ impl LoweringContext {
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(PirExpr::Array { items })
             }
-            ExprKind::ArrayRepeat(value, count) => {
-                let value_expr = self.lower_expr(value)?;
-                let count_expr = self.lower_expr(count)?;
-                // Lower ArrayRepeat to an Array with repeated elements
-                // We need to evaluate the count at compile time
-                let count_val = match &count_expr {
-                    PirExpr::IntLit(n) => *n as usize,
-                    _ => return Err(LoweringError::Unsupported(
-                        "ArrayRepeat count must be a compile-time constant".to_string()
-                    )),
-                };
-                let items = vec![value_expr; count_val];
-                Ok(PirExpr::Array { items })
-            }
             ExprKind::Struct(name, fields) => {
                 // Lower struct as a tuple of its fields
                 let items = fields
                     .iter()
                     .map(|f| self.lower_expr(&f.value))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(PirExpr::Struct { name: name.clone(), fields: items })
+                Ok(PirExpr::Struct { fields: items })
             }
             ExprKind::Let(let_binding) => {
                 let v = self.lower_expr(&let_binding.value)?;
@@ -2172,6 +2098,14 @@ impl LoweringContext {
                 let f = self.lower_expr(future)?;
                 Ok(crate::ir::PirExpr::Await(Box::new(f)))
             }
+            ExprKind::ArrayRepeat(value, count) => {
+                let v = self.lower_expr(value)?;
+                let c = self.lower_expr(count)?;
+                Ok(crate::ir::PirExpr::ArrayRepeat {
+                    value: Box::new(v),
+                    count: Box::new(c),
+                })
+            }
             _ => Err(LoweringError::Unsupported(format!("{:?}", expr.kind))),
         }
     }
@@ -2184,8 +2118,8 @@ impl LoweringContext {
         use crate::ir::PirExpr;
 
         match lit {
-            Literal::Int(v, _) => Ok(PirExpr::IntLit(*v)),
-            Literal::UInt(v, _) => Ok(PirExpr::IntLit(*v as i64)),
+            Literal::Int(v) => Ok(PirExpr::IntLit(*v)),
+            Literal::UInt(v) => Ok(PirExpr::IntLit(*v as i64)),
             Literal::Float(v) => Ok(PirExpr::FloatLit(v.to_string())),
             Literal::Bool(v) => Ok(PirExpr::BoolLit(*v)),
             Literal::String(s) => Ok(PirExpr::StringLit(s.clone())),
@@ -2231,7 +2165,7 @@ impl LoweringContext {
             ExprKind::Literal(crate::ast::Literal::Float(f)) => {
                 Ok(PirExpr::FloatLit(f.to_string()))
             }
-            ExprKind::Literal(crate::ast::Literal::Int(i, _)) => {
+            ExprKind::Literal(crate::ast::Literal::Int(i)) => {
                 Ok(PirExpr::FloatLit(format!("{i}.0")))
             }
             other => Err(LoweringError::Unsupported(format!(

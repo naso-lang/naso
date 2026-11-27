@@ -257,7 +257,7 @@ fn collect_called_names_expr<'a>(
     out: &mut Vec<&'a str>,
 ) {
     match &e.kind {
-        ExprKind::Call(callee, args, const_args) => {
+        ExprKind::Call(callee, args) => {
             if let ExprKind::Var(v) = &callee.kind
                 && let Some(target) = by_name.get(v.name.as_str())
             {
@@ -265,9 +265,6 @@ fn collect_called_names_expr<'a>(
             }
             collect_called_names_expr(callee, by_name, out);
             for a in args {
-                collect_called_names_expr(a, by_name, out);
-            }
-            for a in const_args {
                 collect_called_names_expr(a, by_name, out);
             }
         }
@@ -333,7 +330,7 @@ enum LoopBound {
 /// defaulting to zero) would silently change the iteration count.
 fn loop_bound(e: &Expr, what: &str, line: u32) -> CodegenResult<LoopBound> {
     match &e.kind {
-        ExprKind::Literal(Literal::Int(v, _)) => Ok(LoopBound::Const(*v)),
+        ExprKind::Literal(Literal::Int(v)) => Ok(LoopBound::Const(*v)),
         ExprKind::Var(v) => Ok(LoopBound::Symbol(sanitize(&v.name))),
         other => Err(CodegenError::UnsupportedFeature(format!(
             "`forall` {what} bound is {} at line {line}, which this backend cannot \
@@ -519,12 +516,9 @@ fn check_expr(
             Ok(())
         }
         ExprKind::Continue => Ok(()),
-        ExprKind::Call(callee, args, const_args) => {
+        ExprKind::Call(callee, args) => {
             check_expr(callee, known_function_names, signatures)?;
             for a in args {
-                check_expr(a, known_function_names, signatures)?;
-            }
-            for a in const_args {
                 check_expr(a, known_function_names, signatures)?;
             }
             let name = callee_name(callee);
@@ -765,7 +759,7 @@ fn expr_has_return(expr: &Expr) -> bool {
         ExprKind::Unary(_, i) | ExprKind::Ascribe(i, _) | ExprKind::Index(i, _) => {
             expr_has_return(i)
         }
-        ExprKind::Call(callee, args, const_args) => expr_has_return(callee) || args.iter().any(expr_has_return) || const_args.iter().any(expr_has_return),
+        ExprKind::Call(callee, args) => expr_has_return(callee) || args.iter().any(expr_has_return),
         ExprKind::MethodCall(recv, _, args) => {
             expr_has_return(recv) || args.iter().any(expr_has_return)
         }
@@ -972,7 +966,7 @@ fn emit_expr_inline(out: &mut String, expr: &Expr) {
         }
         ExprKind::Break(_) => out.push_str("break"),
         ExprKind::Continue => out.push_str("continue"),
-        ExprKind::Call(callee, args, const_args) => {
+        ExprKind::Call(callee, args) => {
             let callee_ident = callee_name(callee);
             // Own the sanitized string so nothing is leaked and no borrow of a
             // temporary outlives the push.
@@ -999,8 +993,8 @@ fn emit_expr_inline(out: &mut String, expr: &Expr) {
 
 pub(crate) fn emit_literal(lit: &Literal) -> String {
     match lit {
-        Literal::Int(i, _) => format!("{i}i"),
-        Literal::UInt(i, _) => format!("{i}u"),
+        Literal::Int(i) => format!("{i}i"),
+        Literal::UInt(i) => format!("{i}u"),
         Literal::Float(f) => {
             // WGSL needs an explicit fractional part or the literal is an
             // abstract float that may not convert.

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Type expression in the AST
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Type {
     pub kind: TypeKind,
     pub quantity: Quantity,
@@ -163,7 +163,7 @@ impl Type {
 }
 
 /// Core type kinds
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TypeKind {
     /// Unit type ()
     Unit,
@@ -201,6 +201,8 @@ pub enum TypeKind {
     Function(Vec<Type>, Box<Type>),
     /// Reference/projection type (for inout)
     Projection(Box<Type>),
+    /// Raw pointer type (for FFI)
+    Pointer(Box<Type>),
     /// Reversible computation type
     Reversible(Box<Type>),
     /// Dependent function type (Pi type)
@@ -222,7 +224,7 @@ pub enum TypeKind {
 }
 
 /// Type arguments for generic instantiation
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TypeArg {
     Type(Type),
     Nat(NatExpr),
@@ -250,7 +252,7 @@ impl fmt::Display for MetaVar {
 }
 
 /// Natural number expressions (for dependent types)
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NatExpr {
     /// A literal constant, carried as its value.
     ///
@@ -302,7 +304,16 @@ impl fmt::Display for Type {
         if self.quantity != Quantity::Many {
             write!(f, "{} ", self.quantity)?;
         }
-        write!(f, "{}", self.kind)
+        // Special handling for Nat to show the constant value
+        if matches!(self.kind, TypeKind::Nat) {
+            if let Some(n) = self.nat_value {
+                write!(f, "Nat<{}>", n)
+            } else {
+                write!(f, "Nat")
+            }
+        } else {
+            write!(f, "{}", self.kind)
+        }
     }
 }
 
@@ -387,6 +398,7 @@ impl fmt::Display for TypeKind {
             TypeKind::Universe(level) => write!(f, "Type{}", level),
             TypeKind::Var(v) => write!(f, "{}", v),
             TypeKind::Meta(m) => write!(f, "{}", m),
+            TypeKind::Pointer(inner) => write!(f, "*{}", inner),
             TypeKind::Error => write!(f, "<error>"),
         }
     }

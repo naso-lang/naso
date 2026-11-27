@@ -159,6 +159,8 @@ pub enum Item {
     Import(Import),
     /// Constant definition
     Const(ConstDef),
+    /// External function block (extern "C" { ... })
+    Extern(ExternBlock),
 }
 
 impl Item {
@@ -169,8 +171,38 @@ impl Item {
             Item::Module(m) => m.span,
             Item::Import(i) => i.span,
             Item::Const(c) => c.span,
+            Item::Extern(e) => e.span,
         }
     }
+}
+
+/// External function block: extern "C" { fn name(...); ... }
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExternBlock {
+    pub abi: String,
+    pub functions: Vec<ExternFn>,
+    pub span: Span,
+}
+
+/// External function declaration within extern block
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExternFn {
+    pub name: Ident,
+    pub params: Vec<ExternParam>,
+    pub ret_ty: Option<Type>,
+    pub link_name: Option<String>,
+    pub span: Span,
+    pub is_async: bool,
+}
+
+/// Parameter of an external function
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExternParam {
+    pub name: Ident,
+    pub ty: Type,
+    pub quantity: Quantity,
+    pub mutability: Mutability,
+    pub span: Span,
 }
 
 /// Function definition with quantitative parameters
@@ -184,6 +216,7 @@ pub struct Function {
     pub span: Span,
     pub attributes: Vec<Attribute>,
     pub is_reversible: bool,
+    pub is_async: bool,
     pub quantity: Quantity,
     /// Claims the CALLER must satisfy, written `requires { assert(..); .. }`.
     ///
@@ -196,14 +229,14 @@ pub struct Function {
 }
 
 /// Generic type parameter
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenericParam {
     pub name: Ident,
     pub kind: GenericKind,
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GenericKind {
     /// Type parameter
     Type,
@@ -242,7 +275,7 @@ impl Block {
 }
 
 /// Type definitions (struct, enum, type alias)
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypeDef {
     pub name: Ident,
     pub generics: Vec<GenericParam>,
@@ -251,7 +284,7 @@ pub struct TypeDef {
     pub attributes: Vec<Attribute>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TypeDefKind {
     /// struct Name { fields }
     Struct(Vec<Field>),
@@ -262,7 +295,7 @@ pub enum TypeDefKind {
 }
 
 /// Struct/enum field
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Field {
     pub name: Ident,
     pub ty: Type,
@@ -272,7 +305,7 @@ pub struct Field {
 }
 
 /// Enum variant
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Variant {
     pub name: Ident,
     pub fields: Vec<Field>,
@@ -314,14 +347,14 @@ pub struct ConstDef {
 }
 
 /// Attribute (e.g., #[inline], #[test])
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attribute {
     pub name: Ident,
     pub args: Vec<AttributeArg>,
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AttributeArg {
     Ident(Ident),
     Literal(Literal),
@@ -365,7 +398,7 @@ impl fmt::Display for Ident {
 }
 
 /// Literal values
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Literal {
     Int(i64),
     UInt(u64),
@@ -374,6 +407,23 @@ pub enum Literal {
     String(String),
     Char(char),
     Unit,
+}
+
+impl Eq for Literal {}
+
+impl PartialEq for Literal {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Literal::Int(a), Literal::Int(b)) => a == b,
+            (Literal::UInt(a), Literal::UInt(b)) => a == b,
+            (Literal::Float(a), Literal::Float(b)) => a.to_bits() == b.to_bits(),
+            (Literal::Bool(a), Literal::Bool(b)) => a == b,
+            (Literal::String(a), Literal::String(b)) => a == b,
+            (Literal::Char(a), Literal::Char(b)) => a == b,
+            (Literal::Unit, Literal::Unit) => true,
+            _ => false,
+        }
+    }
 }
 
 impl fmt::Display for Literal {

@@ -363,7 +363,7 @@ impl<'a> Parser<'a> {
                 }
             };
             match &expr.kind {
-                ExprKind::Call(callee, args, _) if is_assert_callee(callee) => {
+                ExprKind::Call(callee, args) if is_assert_callee(callee) => {
                     let Some(first) = args.first() else {
                         self.fail::<crate::lexer::Token>(
                             "`assert` requires one argument".to_string(),

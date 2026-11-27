@@ -17,25 +17,15 @@
 
 use std::collections::HashMap;
 use std::net::TcpListener;
-use std::io::Write;
 use std::sync::{Arc, Mutex, RwLock, OnceLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
-use socket2::{Socket, Domain, Type, Protocol, SockAddr};
+use std::io::Read;
+use socket2::{Domain, Protocol, Socket, Type};
 use crate::ResourceID;
-
-// Global counter to verify workers are running
-static WORKER_LOOP_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-// Global manager for multi-threaded accept loop
-static GLOBAL_MANAGER: OnceLock<Mutex<Option<WorkerThreadManager>>> = OnceLock::new();
-
-fn global_manager() -> &'static Mutex<Option<WorkerThreadManager>> {
-    GLOBAL_MANAGER.get_or_init(|| Mutex::new(None))
-}
 
 // ============================================================================
 // SHARDED FILE DESCRIPTOR TABLE
@@ -46,14 +36,15 @@ const SHARD_COUNT: usize = 8;  // Can be tuned based on core count
 
 /// Sharded file descriptor table
 pub struct ShardedFdTable {
-    pub shards: Vec<Mutex<FdTableShard>>,
+    shards: Vec<Mutex<FdTableShard>>,
     next_fd: AtomicUsize,
 }
 
 /// Individual shard of the FD table
 pub struct FdTableShard {
-    pub listeners: HashMap<u64, TcpListener>,
-    pub streams: HashMap<u64, std::net::TcpStream>,
+    listeners: HashMap<u64, TcpListener>,
+    streams: HashMap<u64, std::net::TcpStream>,
+    next_fd: u64,
 }
 
 impl ShardedFdTable {
@@ -68,45 +59,35 @@ impl ShardedFdTable {
         }
     }
     
-    /// Get shard index for a given fd (deterministic)
+    /// Get shard index for a given fd
     pub fn get_shard_index(&self, fd: u64) -> usize {
-        (fd as usize) % SHARD_COUNT
-    }
-    
-    /// Generate a new globally unique fd
-    pub fn next_fd(&self) -> u64 {
-        self.next_fd.fetch_add(1, Ordering::Relaxed) as u64
+        let mut hasher = DefaultHasher::new();
+        fd.hash(&mut hasher);
+        (hasher.finish() as usize) % SHARD_COUNT
     }
     
     /// Insert a listener and return its fd
     pub fn insert_listener(&self, listener: TcpListener) -> u64 {
-        // Generate fd FIRST, then determine shard from the fd
-        let fd = self.next_fd();
-        let shard_index = self.get_shard_index(fd);
+        let next_fd = self.next_fd.load(Ordering::Relaxed);
+        let shard_index = self.get_shard_index(next_fd as u64);
         let mut shard = self.shards[shard_index].lock().unwrap();
-        shard.listeners.insert(fd, listener);
+        let fd = shard.insert_listener(listener);
+        self.next_fd.fetch_add(1, Ordering::Relaxed);
         fd
     }
     
     /// Insert a stream and return its fd
     pub fn insert_stream(&self, stream: std::net::TcpStream) -> u64 {
-        // Generate fd FIRST, then determine shard from the fd
-        let fd = self.next_fd();
-        let shard_index = self.get_shard_index(fd);
+        let next_fd = self.next_fd.load(Ordering::Relaxed);
+        let shard_index = self.get_shard_index(next_fd as u64);
         let mut shard = self.shards[shard_index].lock().unwrap();
-        shard.streams.insert(fd, stream);
+        let fd = shard.insert_stream(stream);
+        self.next_fd.fetch_add(1, Ordering::Relaxed);
         fd
     }
     
-    /// Get a mutable reference to a stream (does NOT remove it - use remove_stream to remove)
+    /// Get a mutable reference to a stream
     pub fn get_stream(&self, fd: u64) -> Option<std::net::TcpStream> {
-        let shard_index = self.get_shard_index(fd);
-        let shard = self.shards[shard_index].lock().unwrap();
-        shard.streams.get(&fd).map(|s| s.try_clone().unwrap_or_else(|_| panic!("Failed to clone stream")))
-    }
-    
-    /// Remove and return a stream from the table
-    pub fn remove_stream(&self, fd: u64) -> Option<std::net::TcpStream> {
         let shard_index = self.get_shard_index(fd);
         let mut shard = self.shards[shard_index].lock().unwrap();
         shard.streams.remove(&fd)
@@ -118,64 +99,29 @@ impl ShardedFdTable {
         let shard = self.shards[shard_index].lock().unwrap();
         shard.listeners.get(&fd).map(|l| l.try_clone().unwrap_or_else(|_| panic!("Failed to clone listener")))
     }
-
-    /// Write to a stream (operates inside the shard's lock)
-    pub fn write_stream(&self, fd: u64, buf: &[u8]) -> Option<usize> {
-        let shard_index = self.get_shard_index(fd);
-        let mut shard = self.shards[shard_index].lock().unwrap();
-        // Use entry API to avoid HashMap lookup issues
-        match shard.streams.entry(fd) {
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                let stream = entry.get_mut();
-                use std::io::Write;
-                stream.write_all(buf).ok().map(|_| buf.len())
-            }
-            std::collections::hash_map::Entry::Vacant(_) => None,
-        }
-    }
-
-    /// Flush a stream (operates inside the shard's lock)
-    pub fn flush_stream(&self, fd: u64) -> Option<()> {
-        let shard_index = self.get_shard_index(fd);
-        let mut shard = self.shards[shard_index].lock().unwrap();
-        match shard.streams.entry(fd) {
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                let stream = entry.get_mut();
-                use std::io::Write;
-                stream.flush().ok()
-            }
-            std::collections::hash_map::Entry::Vacant(_) => None,
-        }
-    }
-
-    /// Read from a stream (operates inside the shard's lock)
-    pub fn read_stream(&self, fd: u64, buf: &mut [u8]) -> Option<usize> {
-        let shard_index = self.get_shard_index(fd);
-        let mut shard = self.shards[shard_index].lock().unwrap();
-        match shard.streams.entry(fd) {
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                let stream = entry.get_mut();
-                use std::io::Read;
-                stream.read(buf).ok()
-            }
-            std::collections::hash_map::Entry::Vacant(_) => None,
-        }
-    }
-
-    /// Close and remove a stream (operates inside the shard's lock)
-    pub fn close_stream(&self, fd: u64) -> Option<std::net::TcpStream> {
-        let shard_index = self.get_shard_index(fd);
-        let mut shard = self.shards[shard_index].lock().unwrap();
-        shard.streams.remove(&fd)
-    }
 }
 
 impl FdTableShard {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             listeners: HashMap::new(),
             streams: HashMap::new(),
+            next_fd: 1,
         }
+    }
+    
+    pub fn insert_listener(&mut self, listener: TcpListener) -> u64 {
+        let fd = self.next_fd;
+        self.next_fd += 1;
+        self.listeners.insert(fd, listener);
+        fd
+    }
+    
+    pub fn insert_stream(&mut self, stream: std::net::TcpStream) -> u64 {
+        let fd = self.next_fd;
+        self.next_fd += 1;
+        self.streams.insert(fd, stream);
+        fd
     }
 }
 
@@ -185,8 +131,7 @@ impl FdTableShard {
 
 static GLOBAL_SHARDED_FD_TABLE: OnceLock<ShardedFdTable> = OnceLock::new();
 
-/// Global sharded FD table accessor (public for cross-module use)
-pub fn global_sharded_fd_table() -> &'static ShardedFdTable {
+fn global_sharded_fd_table() -> &'static ShardedFdTable {
     GLOBAL_SHARDED_FD_TABLE.get_or_init(|| ShardedFdTable::new())
 }
 
@@ -219,7 +164,6 @@ impl AcceptWorker {
         let worker_id = self.worker_id;
         
         self.handle = Some(thread::spawn(move || {
-            eprintln!("THREAD SPAWNED: AcceptWorker[{}] thread started", worker_id);
             Self::worker_loop(worker_id, listener_fds, shutdown_flag);
         }));
     }
@@ -231,18 +175,7 @@ impl AcceptWorker {
         
         eprintln!("AcceptWorker[{}]: Started with {} listeners", worker_id, listener_fds.len());
         
-        let mut loop_count = 0;
-        
-        // Track consecutive "not found" to avoid spam
-        let mut not_found_counts: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
-        
         while !shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
-            loop_count += 1;
-            WORKER_LOOP_COUNTER.fetch_add(1, Ordering::Relaxed);
-            if loop_count % 1000 == 0 {
-                eprintln!("AcceptWorker[{}]: Loop iteration {}", worker_id, loop_count);
-            }
-            
             for (i, &listener_fd) in listener_fds.iter().enumerate() {
                 if shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
@@ -251,21 +184,12 @@ impl AcceptWorker {
                 // Try to accept from this listener
                 let mut table = global_sharded_fd_table();
                 let Some(listener) = table.get_listener(listener_fd) else {
-                    // Only log once per listener per worker
-                    let count = not_found_counts.entry(listener_fd).or_insert(0);
-                    *count += 1;
-                    if *count <= 3 {
-                        eprintln!("AcceptWorker[{}]: Listener {} not found (attempt {})", worker_id, listener_fd, count);
-                    }
+                    eprintln!("AcceptWorker[{}]: Listener {} not found", worker_id, listener_fd);
                     continue;
                 };
                 
-                // Reset not found count on success
-                not_found_counts.insert(listener_fd, 0);
-                
                 match listener.try_clone() {
                     Ok(listener_clone) => {
-                        eprintln!("AcceptWorker[{}]: Calling accept() on listener_fd={}", worker_id, listener_fd);
                         match listener_clone.accept() {
                             Ok((stream, _addr)) => {
                                 // Set stream to blocking mode for compatibility
@@ -284,10 +208,7 @@ impl AcceptWorker {
                                 eprintln!("AcceptWorker[{}]: Accepted new connection from listener {} -> stream {}", 
                                          worker_id, listener_fd, stream_fd);
                             }
-                            Err(e) => {
-                                if loop_count % 100 == 0 {
-                                    eprintln!("AcceptWorker[{}]: accept() returned: {:?}", worker_id, e);
-                                }
+                            Err(_) => {
                                 // No connection pending, continue
                                 std::thread::sleep(Duration::from_millis(1));
                             }
@@ -363,29 +284,16 @@ impl WorkerThreadManager {
 }
 
 // ============================================================================
-// GLOBAL LISTENER FD STORAGE FOR MULTI-THREADED ACCEPT
-// ============================================================================
-
-/// Global storage for multi-threaded listener fds (set by bind, read by start)
-static GLOBAL_LISTENER_FDS: OnceLock<Mutex<Vec<u64>>> = OnceLock::new();
-
-fn global_listener_fds() -> &'static Mutex<Vec<u64>> {
-    GLOBAL_LISTENER_FDS.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-// ============================================================================
 // MULTI-THREADED FFI FUNCTIONS
 // ============================================================================
 
 /// Multi-threaded bind function that creates multiple SO_REUSEPORT listeners
-/// Returns the number of listeners created (or 0 on error)
-/// All listener fds are stored globally for naso_start_multithreaded_accept to use
 #[unsafe(no_mangle)]
 pub extern "C" fn naso_tcp_bind_multithreaded(addr_ptr: *const u8, addr_len: usize, num_listeners: usize) -> u64 {
-    // eprintln!(">>> MULTI_THREADED naso_tcp_bind_multithreaded called: addr_len={}, num_listeners={}", addr_len, num_listeners);
+    eprintln!("naso_tcp_bind_multithreaded called: addr_len={}, num_listeners={}", addr_len, num_listeners);
     
     if addr_ptr.is_null() || addr_len == 0 || num_listeners == 0 {
-        // eprintln!("naso_tcp_bind_multithreaded: Invalid parameters");
+        eprintln!("naso_tcp_bind_multithreaded: Invalid parameters");
         return 0;
     }
     
@@ -393,112 +301,84 @@ pub extern "C" fn naso_tcp_bind_multithreaded(addr_ptr: *const u8, addr_len: usi
     let addr_str = match std::str::from_utf8(addr_bytes) {
         Ok(s) => s,
         Err(e) => {
-            // eprintln!("naso_tcp_bind_multithreaded: UTF8 error: {:?}", e);
+            eprintln!("naso_tcp_bind_multithreaded: UTF8 error: {:?}", e);
             return 0;
         }
     };
     
-    // Create multiple listeners with SO_REUSEPORT on the SAME port
     let mut listener_fds = Vec::new();
     
-    // Parse address ONCE outside the loop to ensure all listeners use the same port
-    let addr: std::net::SocketAddr = match addr_str.parse() {
-        Ok(a) => a,
-        Err(e) => {
-            // eprintln!("naso_tcp_bind_multithreaded: addr parse error: {:?}", e);
-            return 0;
-        }
-    };
-    let sock_addr: SockAddr = addr.into();
-    // eprintln!("naso_tcp_bind_multithreaded: Binding {} listeners to {} with SO_REUSEPORT", num_listeners, addr_str);
-    
+    // Create multiple listeners with SO_REUSEPORT
     for i in 0..num_listeners {
-        // Use socket2 directly to create SO_REUSEPORT sockets
-        let socket = match Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)) {
-            Ok(s) => s,
-            Err(e) => {
-                // eprintln!("naso_tcp_bind_multithreaded[{i}]: socket create error: {:?}", e);
-                continue;
+        // Each listener gets a slightly different port to enable load balancing
+        let port = if num_listeners == 1 {
+            addr_str.to_string()
+        } else {
+            // Parse address and increment port for each listener
+            let parts: Vec<&str> = addr_str.split(':').collect();
+            if parts.len() == 2 {
+                let base_port: u16 = parts[1].parse().unwrap_or(8080u16);
+                format!("{}:{}", parts[0], base_port + i as u16)
+            } else {
+                addr_str.to_string()
             }
         };
         
-        if let Err(e) = socket.set_reuse_port(true) {
-            // eprintln!("naso_tcp_bind_multithreaded[{i}]: set_reuse_port error: {:?}", e);
-            continue;
+        match TcpListener::bind(&port) {
+            Ok(listener) => {
+                // Enable SO_REUSEPORT for this listener using socket2
+                let socket = Socket::from(listener);
+                if let Err(e) = socket.set_reuse_port(true) {
+                    eprintln!("naso_tcp_bind_multithreaded: set_reuse_port error for port {}: {:?}", port, e);
+                    return 0;
+                }
+                let listener: TcpListener = socket.into();
+                
+                let fd = global_sharded_fd_table().insert_listener(listener);
+                listener_fds.push(fd);
+                eprintln!("naso_tcp_bind_multithreaded: Created listener {} with SO_REUSEPORT on port {}", fd, port);
+            }
+            Err(e) => {
+                eprintln!("naso_tcp_bind_multithreaded: Failed to bind to port {}: {:?}", port, e);
+                // Continue with remaining listeners even if some fail
+            }
         }
-        
-        // Also set SO_REUSEADDR for additional compatibility
-        if let Err(e) = socket.set_reuse_address(true) {
-            // eprintln!("naso_tcp_bind_multithreaded[{i}]: set_reuse_address error: {:?}", e);
-        }
-        
-        if let Err(e) = socket.bind(&sock_addr) {
-            // eprintln!("naso_tcp_bind_multithreaded[{i}]: bind error: {:?}", e);
-            continue;
-        }
-        
-        if let Err(e) = socket.listen(1024) {
-            // eprintln!("naso_tcp_bind_multithreaded[{i}]: listen error: {:?}", e);
-            continue;
-        }
-        
-        let listener: TcpListener = socket.into();
-        let fd = global_sharded_fd_table().insert_listener(listener);
-        listener_fds.push(fd);
-        // eprintln!("naso_tcp_bind_multithreaded[{i}]: Created listener fd={} with SO_REUSEPORT on {}", fd, addr_str);
     }
     
     if listener_fds.is_empty() {
-        // eprintln!("naso_tcp_bind_multithreaded: No listeners created successfully");
+        eprintln!("naso_tcp_bind_multithreaded: No listeners created successfully");
         return 0;
     }
     
-    // Store all listener fds globally for start function
-    {
-        let mut global = global_listener_fds().lock().unwrap();
-        *global = listener_fds.clone();
-    }
-    
-    // Return number of listeners created (for compatibility)
-    listener_fds.len() as u64
+    // Return the first listener fd as the main handle
+    // Additional listener fds can be tracked for worker distribution
+    listener_fds[0]
 }
 
 /// Start multi-threaded accept loop with worker threads
-/// Reads listener fds from global storage (set by naso_tcp_bind_multithreaded)
 #[unsafe(no_mangle)]
-pub extern "C" fn naso_start_multithreaded_accept(_listener_fds_ptr: *const u64, _listener_count: usize, num_workers: usize) -> u64 {
-    // eprintln!("naso_start_multithreaded_accept called: num_workers={}", num_workers);
+pub extern "C" fn naso_start_multithreaded_accept(listener_fds_ptr: *const u64, listener_count: usize, num_workers: usize) -> u64 {
+    eprintln!("naso_start_multithreaded_accept called: listener_count={}, num_workers={}", listener_count, num_workers);
     
-    if num_workers == 0 {
-        // eprintln!("naso_start_multithreaded_accept: Invalid parameters");
+    if listener_fds_ptr.is_null() || listener_count == 0 || num_workers == 0 {
+        eprintln!("naso_start_multithreaded_accept: Invalid parameters");
         return 0;
     }
     
-    // Get listener fds from global storage (set by naso_tcp_bind_multithreaded)
-    let listener_fds_vec = {
-        let global = global_listener_fds().lock().unwrap();
-        global.clone()
-    };
-    
-    if listener_fds_vec.is_empty() {
-        // eprintln!("naso_start_multithreaded_accept: No listener fds available (call naso_tcp_bind_multithreaded first)");
-        return 0;
-    }
+    let listener_fds = unsafe { std::slice::from_raw_parts(listener_fds_ptr, listener_count) };
+    let listener_fds_vec: Vec<u64> = listener_fds.to_vec();
     
     // Create worker thread manager
     let mut manager = WorkerThreadManager::new();
     manager.create_workers(num_workers as usize, &listener_fds_vec);
     
-    // Give workers time to start up
-    std::thread::sleep(std::time::Duration::from_millis(10));
-    
     // Store manager in a global static for cleanup
-    {
-        let mut global = global_manager().lock().unwrap();
-        *global = Some(manager);
+    static mut GLOBAL_MANAGER: Option<WorkerThreadManager> = None;
+    unsafe {
+        GLOBAL_MANAGER = Some(manager);
     }
     
-    // eprintln!("Started multi-threaded accept loop with {} workers and {} listeners", num_workers, listener_fds_vec.len());
+    eprintln!("Started multi-threaded accept loop with {} workers and {} listeners", num_workers, listener_count);
     1  // Success
 }
 
@@ -507,8 +387,9 @@ pub extern "C" fn naso_start_multithreaded_accept(_listener_fds_ptr: *const u64,
 pub extern "C" fn naso_stop_multithreaded_accept() {
     eprintln!("naso_stop_multithreaded_accept called");
     
-    let mut global = global_manager().lock().unwrap();
-    if let Some(mut manager) = global.take() {
+    static GLOBAL_MANAGER: OnceLock<Mutex<Option<WorkerThreadManager>>> = OnceLock::new();
+    let manager_lock = GLOBAL_MANAGER.get_or_init(|| Mutex::new(None));
+    if let Some(mut manager) = manager_lock.lock().unwrap().take() {
         manager.stop_all();
         eprintln!("Multi-threaded accept loop stopped");
     }
@@ -530,78 +411,6 @@ pub extern "C" fn naso_get_accept_stats() -> u64 {
     
     // Pack stats into return value (simplified for demo)
     ((total_listeners as u64) << 32) | (total_streams as u64)
-}
-
-/// Get next accepted connection from multi-threaded accept loop
-/// Returns stream_fd if available, 0 if none
-#[unsafe(no_mangle)]
-pub extern "C" fn naso_get_next_connection() -> u64 {
-    let table = global_sharded_fd_table();
-    
-    // Search all shards for available streams
-    for shard in &table.shards {
-        let mut shard_guard = shard.lock().unwrap();
-        if let Some((&fd, _)) = shard_guard.streams.iter().next() {
-            // Found a stream, remove it and return
-            if shard_guard.streams.remove(&fd).is_some() {
-                eprintln!("naso_get_next_connection: returning stream_fd={}", fd);
-                return fd;
-            }
-        }
-    }
-    
-    0 // No connections available
-}
-
-/// Async-aware get next connection - yields to async runtime if no connections
-/// Returns stream_fd if available, 0 if none (caller should yield)
-/// NOTE: Does NOT remove the stream from the table - legacy functions handle removal
-#[unsafe(no_mangle)]
-pub extern "C" fn naso_get_next_connection_async() -> u64 {
-    let table = global_sharded_fd_table();
-    
-    // Search all shards for available streams
-    for shard in &table.shards {
-        let shard_guard = shard.lock().unwrap();
-        if let Some((&fd, _)) = shard_guard.streams.iter().next() {
-            // Found a stream, return it (don't remove - legacy functions handle removal)
-            eprintln!("naso_get_next_connection_async: returning stream_fd={}", fd);
-            return fd;
-        }
-    }
-    
-    0 // No connections available
-}
-
-/// Check if there are pending connections without blocking
-#[unsafe(no_mangle)]
-pub extern "C" fn naso_has_pending_connections() -> u64 {
-    let table = global_sharded_fd_table();
-    
-    for shard in &table.shards {
-        let shard_guard = shard.lock().unwrap();
-        if !shard_guard.streams.is_empty() {
-            return 1;
-        }
-    }
-    
-    0
-}
-
-/// Get worker loop counter for debugging
-#[unsafe(no_mangle)]
-pub extern "C" fn naso_get_worker_loop_count() -> u64 {
-    WORKER_LOOP_COUNTER.load(Ordering::Relaxed) as u64
-}
-
-/// Register a callback for when new connections arrive (for async integration)
-#[unsafe(no_mangle)]
-pub extern "C" fn naso_set_connection_callback(callback: *const u8) -> u64 {
-    // Store callback for async notification
-    // In real implementation, would store in global and call when connections arrive
-    // For now, just acknowledge
-    eprintln!("naso_set_connection_callback: registered callback={:p}", callback);
-    1
 }
 
 // ============================================================================

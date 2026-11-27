@@ -1,0 +1,123 @@
+//! WASI Preview 3: Blob Interface
+//!
+//! Provides binary large object handling.
+
+extern "C" {
+    fn wasi_blob_new() -> u64;
+    fn wasi_blob_new_from_bytes(data: *const u8, len: usize) -> u64;
+    fn wasi_blob_size(blob: u64) -> u64;
+    fn wasi_blob_read(blob: u64, offset: u64, buf: *mut u8, len: usize) -> i32;
+    fn wasi_blob_write(blob: u64, offset: u64, data: *const u8, len: usize) -> i32;
+    fn wasi_blob_append(blob: u64, data: *const u8, len: usize) -> i32;
+    fn wasi_blob_slice(blob: u64, start: u64, end: u64) -> u64;
+    fn wasi_blob_reader_new(blob: u64) -> u64;
+    fn wasi_blob_writer_new(blob: u64) -> u64;
+    fn wasi_blob_reader_read(reader: u64, buf: *mut u8, len: usize) -> i32;
+    fn wasi_blob_writer_write(writer: u64, data: *const u8, len: usize) -> i32;
+    fn wasi_blob_writer_finish(writer: u64) -> u64;
+}
+
+pub struct Blob {
+    ptr: u64,
+}
+
+impl Blob {
+    pub fn new() -> Self {
+        Self { ptr: unsafe { wasi_blob_new() } }
+    }
+    
+    pub fn from_bytes(data: &[u8]) -> Self {
+        Self { ptr: unsafe { wasi_blob_new_from_bytes(data.as_ptr(), data.len()) } }
+    }
+    
+    pub fn size(&self) -> u64 {
+        unsafe { wasi_blob_size(self.ptr) }
+    }
+    
+    pub fn read(&self, offset: u64, buf: &mut [u8]) -> Result<usize, std::io::Error> {
+        let result = unsafe { wasi_blob_read(self.ptr, offset, buf.as_mut_ptr(), buf.len()) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(result as usize)
+        }
+    }
+    
+    pub fn write(&self, offset: u64, data: &[u8]) -> Result<usize, std::io::Error> {
+        let result = unsafe { wasi_blob_write(self.ptr, offset, data.as_ptr(), data.len()) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(result as usize)
+        }
+    }
+    
+    pub fn append(&self, data: &[u8]) -> Result<usize, std::io::Error> {
+        let result = unsafe { wasi_blob_append(self.ptr, data.as_ptr(), data.len()) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(result as usize)
+        }
+    }
+    
+    pub fn slice(&self, start: u64, end: u64) -> Blob {
+        let ptr = unsafe { wasi_blob_slice(self.ptr, start, end) };
+        Blob { ptr }
+    }
+    
+    pub fn reader(&self) -> BlobReader {
+        let ptr = unsafe { wasi_blob_reader_new(self.ptr) };
+        BlobReader { ptr }
+    }
+    
+    pub fn writer(&self) -> BlobWriter {
+        let ptr = unsafe { wasi_blob_writer_new(self.ptr) };
+        BlobWriter { ptr }
+    }
+}
+
+pub struct BlobReader {
+    ptr: u64,
+}
+
+impl BlobReader {
+    pub fn new(blob: &Blob) -> Self {
+        let ptr = unsafe { wasi_blob_reader_new(blob.ptr) };
+        Self { ptr }
+    }
+    
+    pub fn read(&self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
+        let result = unsafe { wasi_blob_reader_read(self.ptr, buf.as_mut_ptr(), buf.len()) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(result as usize)
+        }
+    }
+}
+
+pub struct BlobWriter {
+    ptr: u64,
+}
+
+impl BlobWriter {
+    pub fn new(blob: &Blob) -> Self {
+        let ptr = unsafe { wasi_blob_writer_new(blob.ptr) };
+        Self { ptr }
+    }
+    
+    pub fn write(&self, data: &[u8]) -> Result<usize, std::io::Error> {
+        let result = unsafe { wasi_blob_writer_write(self.ptr, data.as_ptr(), data.len()) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(result as usize)
+        }
+    }
+    
+    pub fn finish(self) -> Blob {
+        let ptr = unsafe { wasi_blob_writer_finish(self.ptr) };
+        Blob { ptr }
+    }
+}

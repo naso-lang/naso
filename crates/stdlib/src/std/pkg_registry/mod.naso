@@ -1,0 +1,696 @@
+// Package Registry Client for Naso
+// Provides publish, search, info, and dependency resolution against crates.naso-lang.org
+
+use std::http_client::{HttpClient, HttpClientConfig, Request, Response, Method};
+use std::serde::{Serialize, Deserialize, JsonValue};
+use std::async_io::{AsyncRead, AsyncWrite};
+use std::result::Result;
+use std::string::String;
+use std::vec::Vec;
+use std::option::Option;
+use std::fmt::Debug;
+
+// Registry configuration
+pub const DEFAULT_REGISTRY_URL: &str = "https://crates.naso-lang.org";
+pub const REGISTRY_API_VERSION: &str = "v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistryConfig {
+    pub base_url: String,
+    pub api_version: String,
+    pub token: Option<String>,
+    pub timeout_seconds: u64,
+}
+
+impl Default for RegistryConfig {
+    fn default() -> Self {
+        Self {
+            base_url: DEFAULT_REGISTRY_URL.to_string(),
+            api_version: REGISTRY_API_VERSION.to_string(),
+            token: None,
+            timeout_seconds: 30,
+        }
+    }
+}
+
+// Package metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Package {
+    pub name: String,
+    pub version: String,
+    pub description: Option<String>,
+    pub authors: Vec<String>,
+    pub license: Option<String>,
+    pub repository: Option<String>,
+    pub homepage: Option<String>,
+    pub documentation: Option<String>,
+    pub keywords: Vec<String>,
+    pub categories: Vec<String>,
+    pub readme: Option<String>,
+    pub dependencies: Vec<Dependency>,
+    pub dev_dependencies: Vec<Dependency>,
+    pub features: std::collections::HashMap<String, Vec<String>>,
+    pub target: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub downloads: u64,
+    pub verified: bool,
+    pub namespace: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Dependency {
+    pub name: String,
+    pub version_req: String,
+    pub features: Vec<String>,
+    pub optional: bool,
+    pub target: Option<String>,
+    pub registry: Option<String>,
+}
+
+// Search results
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResults {
+    pub packages: Vec<PackageSummary>,
+    pub total: u64,
+    pub page: u32,
+    pub per_page: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackageSummary {
+    pub name: String,
+    pub version: String,
+    pub description: Option<String>,
+    pub downloads: u64,
+    pub verified: bool,
+    pub namespace: Option<String>,
+    pub keywords: Vec<String>,
+}
+
+// Package version information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackageVersions {
+    pub versions: Vec<VersionInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionInfo {
+    pub version: String,
+    pub yanked: bool,
+    pub license: Option<String>,
+    pub dependencies: Vec<Dependency>,
+    pub features: std::collections::HashMap<String, Vec<String>>,
+    pub created_at: String,
+}
+
+// Publish response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublishResponse {
+    pub success: bool,
+    pub package: Option<Package>,
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+// Registry client
+pub struct RegistryClient {
+    config: RegistryConfig,
+    client: HttpClient,
+}
+
+impl RegistryClient {
+    pub fn new(config: RegistryConfig) -> Result<Self, String> {
+        let http_config = HttpClientConfig {
+            max_connections: 10,
+            idle_timeout: config.timeout_seconds,
+            tls_config: None,
+            ..Default::default()
+        };
+        let client = HttpClient::new(http_config)
+            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        Ok(Self { config, client })
+    }
+
+    pub fn with_token(mut self, token: String) -> Self {
+        self.config.token = Some(token);
+        self
+    }
+
+    fn auth_header(&self) -> Option<String> {
+        self.config.token.as_ref().map(|t| format!("Bearer {}", t))
+    }
+
+    fn base_url(&self) -> String {
+        format!("{}/api/{}", self.config.base_url, self.config.api_version)
+    }
+
+    // Search packages
+    pub async fn search(&self, query: &str, page: u32, per_page: u32) -> Result<SearchResults, String> {
+        let url = format!(
+            "{}/crates?q={}&page={}&per_page={}",
+            self.base_url(),
+            urlencoding::encode(query),
+            page,
+            per_page
+        );
+        
+        let mut request = Request::get(&url);
+        if let Some(auth) = self.auth_header() {
+            request = request.header("Authorization", &auth);
+        }
+        
+        let response = self.client.execute(request).await
+            .map_err(|e| format!("Search request failed: {}", e))?;
+        
+        if !response.status().is_success() {
+            return Err(format!("Search failed: {}", response.status()));
+        }
+        
+        let body = response.text().await
+            .map_err(|e| format!("Failed to read response: {}", e))?;
+        
+        std::serde::json::from_str(&body)
+            .map_err(|e| format!("Failed to parse search results: {}", e))
+    }
+
+    // Get package info
+    pub async fn get_package(&self, name: &str) -> Result<Package, String> {
+        let url = format!("{}/crates/{}", self.base_url(), name);
+        
+        let mut request = Request::get(&url);
+        if let Some(auth) = self.auth_header() {
+            request = request.header("Authorization", &auth);
+        }
+        
+        let response = self.client.execute(request).await
+            .map_err(|e| format!("Get package request failed: {}", e))?;
+        
+        if !response.status().is_success() {
+            return Err(format!("Get package failed: {}", response.status()));
+        }
+        
+        let body = response.text().await
+            .map_err(|e| format!("Failed to read response: {}", e))?;
+        
+        #[derive(Deserialize)]
+        struct PackageResponse {
+            crate: Package,
+        }
+        
+        let pkg_response: PackageResponse = std::serde::json::from_str(&body)
+            .map_err(|e| format!("Failed to parse package: {}", e))?;
+        
+        Ok(pkg_response.crate)
+    }
+
+    // Get package versions
+    pub async fn get_versions(&self, name: &str) -> Result<PackageVersions, String> {
+        let url = format!("{}/crates/{}/versions", self.base_url(), name);
+        
+        let mut request = Request::get(&url);
+        if let Some(auth) = self.auth_header() {
+            request = request.header("Authorization", &auth);
+        }
+        
+        let response = self.client.execute(request).await
+            .map_err(|e| format!("Get versions request failed: {}", e))?;
+        
+        if !response.status().is_success() {
+            return Err(format!("Get versions failed: {}", response.status()));
+        }
+        
+        let body = response.text().await
+            .map_err(|e| format!("Failed to read response: {}", e))?;
+        
+        std::serde::json::from_str(&body)
+            .map_err(|e| format!("Failed to parse versions: {}", e))
+    }
+
+    // Publish package
+    pub async fn publish(&self, package_path: &str) -> Result<PublishResponse, String> {
+        // Read package file
+        let package_data = std::fs::read(package_path)
+            .map_err(|e| format!("Failed to read package: {}", e))?;
+        
+        let url = format!("{}/crates/new", self.base_url());
+        
+        let mut request = Request::post(&url)
+            .header("Content-Type", "application/octet-stream");
+        
+        if let Some(auth) = self.auth_header() {
+            request = request.header("Authorization", &auth);
+        }
+        
+        request = request.body(package_data);
+        
+        let response = self.client.execute(request).await
+            .map_err(|e| format!("Publish request failed: {}", e))?;
+        
+        let body = response.text().await
+            .map_err(|e| format!("Failed to read response: {}", e))?;
+        
+        if !response.status().is_success() {
+            return Err(format!("Publish failed: {}", response.status()));
+        }
+        
+        std::serde::json::from_str(&body)
+            .map_err(|e| format!("Failed to parse publish response: {}", e))
+    }
+
+    // Yank version
+    pub async fn yank(&self, name: &str, version: &str) -> Result<bool, String> {
+        let url = format!("{}/crates/{}/{}/yank", self.base_url(), name, version);
+        
+        let mut request = Request::delete(&url);
+        if let Some(auth) = self.auth_header() {
+            request = request.header("Authorization", &auth);
+        }
+        
+        let response = self.client.execute(request).await
+            .map_err(|e| format!("Yank request failed: {}", e))?;
+        
+        Ok(response.status().is_success())
+    }
+
+    // Unyank version
+    pub async fn unyank(&self, name: &str, version: &str) -> Result<bool, String> {
+        let url = format!("{}/crates/{}/{}/unyank", self.base_url(), name, version);
+        
+        let mut request = Request::put(&url);
+        if let Some(auth) = self.auth_header() {
+            request = request.header("Authorization", &auth);
+        }
+        
+        let response = self.client.execute(request).await
+            .map_err(|e| format!("Unyank request failed: {}", e))?;
+        
+        Ok(response.status().is_success())
+    }
+
+    // Get crate owners
+    pub async fn get_owners(&self, name: &str) -> Result<Vec<String>, String> {
+        let url = format!("{}/crates/{}/owners", self.base_url(), name);
+        
+        let mut request = Request::get(&url);
+        if let Some(auth) = self.auth_header() {
+            request = request.header("Authorization", &auth);
+        }
+        
+        let response = self.client.execute(request).await
+            .map_err(|e| format!("Get owners request failed: {}", e))?;
+        
+        if !response.status().is_success() {
+            return Err(format!("Get owners failed: {}", response.status()));
+        }
+        
+        let body = response.text().await
+            .map_err(|e| format!("Failed to read response: {}", e))?;
+        
+        #[derive(Deserialize)]
+        struct OwnersResponse {
+            users: Vec<Owner>,
+        }
+        
+        #[derive(Deserialize)]
+        struct Owner {
+            login: String,
+        }
+        
+        let owners: OwnersResponse = std::serde::json::from_str(&body)
+            .map_err(|e| format!("Failed to parse owners: {}", e))?;
+        
+        Ok(owners.users.into_iter().map(|o| o.login).collect())
+    }
+
+    // Add owner
+    pub async fn add_owner(&self, name: &str, owner: &str) -> Result<bool, String> {
+        let url = format!("{}/crates/{}/owners", self.base_url(), name);
+        
+        let mut request = Request::put(&url)
+            .header("Content-Type", "application/json");
+        
+        if let Some(auth) = self.auth_header() {
+            request = request.header("Authorization", &auth);
+        }
+        
+        let body = std::serde::json::to_string(&serde_json::json!({
+            "login": owner
+        })).map_err(|e| format!("Failed to serialize request: {}", e))?;
+        
+        request = request.body(body.into_bytes());
+        
+        let response = self.client.execute(request).await
+            .map_err(|e| format!("Add owner request failed: {}", e))?;
+        
+        Ok(response.status().is_success())
+    }
+
+    // Remove owner
+    pub async fn remove_owner(&self, name: &str, owner: &str) -> Result<bool, String> {
+        let url = format!("{}/crates/{}/owners/{}", self.base_url(), name, owner);
+        
+        let mut request = Request::delete(&url);
+        if let Some(auth) = self.auth_header() {
+            request = request.header("Authorization", &auth);
+        }
+        
+        let response = self.client.execute(request).await
+            .map_err(|e| format!("Remove owner request failed: {}", e))?;
+        
+        Ok(response.status().is_success())
+    }
+}
+
+// URL encoding helper
+mod urlencoding {
+    pub fn encode(s: &str) -> String {
+        let mut result = String::new();
+        for c in s.chars() {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' {
+                result.push(c);
+            } else {
+                for byte in c.to_string().as_bytes() {
+                    result.push('%');
+                    result.push_str(&format!("{:02X}", byte));
+                }
+            }
+        }
+        result
+    }
+}
+
+// Registry index for dependency resolution
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistryIndex {
+    pub packages: Vec<IndexEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexEntry {
+    pub name: String,
+    pub vers: String,
+    pub deps: Vec<IndexDependency>,
+    pub cksum: String,
+    pub features: std::collections::HashMap<String, Vec<String>>,
+    pub yanked: bool,
+    pub links: Option<String>,
+    pub v: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexDependency {
+    pub name: String,
+    pub req: String,
+    pub features: Vec<String>,
+    pub optional: bool,
+    pub default_features: bool,
+    pub target: Option<String>,
+    pub kind: Option<String>,
+    pub registry: Option<String>,
+    pub package: Option<String>,
+}
+
+// Sparse index client for efficient dependency resolution
+pub struct SparseIndexClient {
+    config: RegistryConfig,
+    client: HttpClient,
+}
+
+impl SparseIndexClient {
+    pub fn new(config: RegistryConfig) -> Result<Self, String> {
+        let http_config = HttpClientConfig {
+            max_connections: 20,
+            idle_timeout: config.timeout_seconds,
+            tls_config: None,
+            ..Default::default()
+        };
+        let client = HttpClient::new(http_config)
+            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        Ok(Self { config, client })
+    }
+
+    // Fetch index entry for a package
+    pub async fn fetch_package_index(&self, name: &str) -> Result<Vec<IndexEntry>, String> {
+        // Convert package name to sparse index path
+        // e.g., "naso_http" -> "na/na/naso_http"
+        let path = self.package_to_index_path(name);
+        let url = format!("{}/index/{}", self.config.base_url, path);
+        
+        let mut request = Request::get(&url);
+        if let Some(auth) = self.auth_header() {
+            request = request.header("Authorization", &auth);
+        }
+        
+        let response = self.client.execute(request).await
+            .map_err(|e| format!("Fetch index failed: {}", e))?;
+        
+        if !response.status().is_success() {
+            return Err(format!("Fetch index failed: {}", response.status()));
+        }
+        
+        let body = response.text().await
+            .map_err(|e| format!("Failed to read response: {}", e))?;
+        
+        // Parse each line as JSON
+        let mut entries = Vec::new();
+        for line in body.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let entry: IndexEntry = std::serde::json::from_str(line)
+                .map_err(|e| format!("Failed to parse index entry: {}", e))?;
+            entries.push(entry);
+        }
+        
+        Ok(entries)
+    }
+
+    fn package_to_index_path(&self, name: &str) -> String {
+        if name.len() <= 2 {
+            format!("{}/{}", name, name)
+        } else if name.len() <= 3 {
+            format!("{}/{}/{}", &name[0..1], &name[1..2], name)
+        } else {
+            format!("{}/{}/{}/{}", &name[0..1], &name[1..2], &name[2..3], name)
+        }
+    }
+
+    fn auth_header(&self) -> Option<String> {
+        self.config.token.as_ref().map(|t| format!("Bearer {}", t))
+    }
+}
+
+// Package builder for creating publishable packages
+pub struct PackageBuilder {
+    name: String,
+    version: String,
+    description: Option<String>,
+    authors: Vec<String>,
+    license: Option<String>,
+    repository: Option<String>,
+    homepage: Option<String>,
+    documentation: Option<String>,
+    keywords: Vec<String>,
+    categories: Vec<String>,
+    readme: Option<String>,
+    dependencies: Vec<Dependency>,
+    dev_dependencies: Vec<Dependency>,
+    features: std::collections::HashMap<String, Vec<String>>,
+    target: Option<String>,
+    namespace: Option<String>,
+}
+
+impl PackageBuilder {
+    pub fn new(name: String, version: String) -> Self {
+        Self {
+            name,
+            version,
+            description: None,
+            authors: Vec::new(),
+            license: None,
+            repository: None,
+            homepage: None,
+            documentation: None,
+            keywords: Vec::new(),
+            categories: Vec::new(),
+            readme: None,
+            dependencies: Vec::new(),
+            dev_dependencies: Vec::new(),
+            features: std::collections::HashMap::new(),
+            target: None,
+            namespace: None,
+        }
+    }
+
+    pub fn description(mut self, desc: String) -> Self {
+        self.description = Some(desc);
+        self
+    }
+
+    pub fn authors(mut self, authors: Vec<String>) -> Self {
+        self.authors = authors;
+        self
+    }
+
+    pub fn license(mut self, license: String) -> Self {
+        self.license = Some(license);
+        self
+    }
+
+    pub fn repository(mut self, repo: String) -> Self {
+        self.repository = Some(repo);
+        self
+    }
+
+    pub fn keyword(mut self, keyword: String) -> Self {
+        self.keywords.push(keyword);
+        self
+    }
+
+    pub fn category(mut self, category: String) -> Self {
+        self.categories.push(category);
+        self
+    }
+
+    pub fn dependency(mut self, dep: Dependency) -> Self {
+        self.dependencies.push(dep);
+        self
+    }
+
+    pub fn dev_dependency(mut self, dep: Dependency) -> Self {
+        self.dev_dependencies.push(dep);
+        self
+    }
+
+    pub fn feature(mut self, name: String, deps: Vec<String>) -> Self {
+        self.features.insert(name, deps);
+        self
+    }
+
+    pub fn namespace(mut self, ns: String) -> Self {
+        self.namespace = Some(ns);
+        self
+    }
+
+    pub fn build(self) -> Package {
+        Package {
+            name: self.name,
+            version: self.version,
+            description: self.description,
+            authors: self.authors,
+            license: self.license,
+            repository: self.repository,
+            homepage: self.homepage,
+            documentation: self.documentation,
+            keywords: self.keywords,
+            categories: self.categories,
+            readme: self.readme,
+            dependencies: self.dependencies,
+            dev_dependencies: self.dev_dependencies,
+            features: self.features,
+            target: self.target,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            downloads: 0,
+            verified: false,
+            namespace: self.namespace,
+        }
+    }
+}
+
+// Package tarball creation for publishing
+pub fn create_package_tarball(
+    package_dir: &str,
+    output_path: &str,
+) -> Result<(), String> {
+    use std::fs;
+    use std::io::Write;
+    
+    // Create a simple tarball (simplified - in production use a proper tar crate)
+    let mut archive = Vec::new();
+    
+    // Add naso.toml
+    let manifest_path = format!("{}/naso.toml", package_dir);
+    let manifest_content = fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("Failed to read manifest: {}", e))?;
+    add_to_tarball(&mut archive, "naso.toml", manifest_content.as_bytes());
+    
+    // Add source files
+    let src_dir = format!("{}/src", package_dir);
+    if fs::metadata(&src_dir).is_ok() {
+        add_dir_to_tarball(&mut archive, &src_dir, "src")?;
+    }
+    
+    // Add README if exists
+    let readme_path = format!("{}/README.md", package_dir);
+    if fs::metadata(&readme_path).is_ok() {
+        let content = fs::read(&readme_path)
+            .map_err(|e| format!("Failed to read README: {}", e))?;
+        add_to_tarball(&mut archive, "README.md", &content);
+    }
+    
+    // Add LICENSE if exists
+    let license_path = format!("{}/LICENSE", package_dir);
+    if fs::metadata(&license_path).is_ok() {
+        let content = fs::read(&license_path)
+            .map_err(|e| format!("Failed to read LICENSE: {}", e))?;
+        add_to_tarball(&mut archive, "LICENSE", &content);
+    }
+    
+    // Write tarball
+    fs::write(output_path, archive)
+        .map_err(|e| format!("Failed to write tarball: {}", e))?;
+    
+    Ok(())
+}
+
+fn add_to_tarball(archive: &mut Vec<u8>, name: &str, data: &[u8]) {
+    // Simplified tar header (512 bytes)
+    let mut header = [0u8; 512];
+    let name_bytes = name.as_bytes();
+    header[..name_bytes.len().min(100)].copy_from_slice(&name_bytes[..name_bytes.len().min(100)]);
+    
+    // Size in octal
+    let size_str = format!("{:011o}", data.len());
+    header[124..136].copy_from_slice(size_str.as_bytes());
+    
+    // Type flag (regular file)
+    header[156] = b'0';
+    
+    // Magic
+    header[257..263].copy_from_slice(b"ustar\0");
+    
+    archive.extend_from_slice(&header);
+    archive.extend_from_slice(data);
+    
+    // Pad to 512 bytes
+    let padding = (512 - (data.len() % 512)) % 512;
+    archive.extend(vec![0u8; padding]);
+}
+
+fn add_dir_to_tarball(archive: &mut Vec<u8>, dir: &str, prefix: &str) -> Result<(), String> {
+    use std::fs;
+    use std::path::Path;
+    
+    for entry in fs::read_dir(dir)
+        .map_err(|e| format!("Failed to read dir {}: {}", dir, e))? {
+        let entry = entry.map_err(|e| format!("Dir entry error: {}", e))?;
+        let path = entry.path();
+        let name = path.file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("Invalid filename")?;
+        
+        let tar_name = format!("{}/{}", prefix, name);
+        
+        if path.is_file() {
+            let content = fs::read(&path)
+                .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+            add_to_tarball(archive, &tar_name, &content);
+        } else if path.is_dir() {
+            add_dir_to_tarball(archive, &path.to_string_lossy(), &tar_name)?;
+        }
+    }
+    
+    Ok(())
+}

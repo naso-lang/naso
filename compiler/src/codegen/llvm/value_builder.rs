@@ -26,7 +26,7 @@ pub struct LlvmValueBuilder<'ctx> {
     /// LLVM 17 uses opaque pointers, so a `PointerValue` no longer carries the
     /// type it points at. Loads and GEPs need that type explicitly, so we
     /// remember it for every pointer we mint here (allocas, GEPs, struct GEPs).
-    pub ptr_pointee_types: HashMap<PointerValue<'ctx>, BasicTypeEnum<'ctx>>,
+    ptr_pointee_types: HashMap<PointerValue<'ctx>, BasicTypeEnum<'ctx>>,
     /// Named variable allocations (name -> pointer, pointee type).
     ///
     /// This lives here, next to the builder that emits the loads and stores, so that
@@ -177,6 +177,11 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
         self.variables.get(name).copied()
     }
 
+    /// Get the pointee type for a pointer (for opaque pointer loads/GEPs)
+    pub fn ptr_pointee_type(&self, ptr: PointerValue<'ctx>) -> Option<BasicTypeEnum<'ctx>> {
+        self.ptr_pointee_types.get(&ptr).copied()
+    }
+
     /// Bind a caller-owned tensor buffer to `name`.
     ///
     /// The pointer IS the data. Nothing is allocated and nothing is zero-filled,
@@ -204,13 +209,6 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
     /// Bring a name out of scope (a non-statement-position `let` leaving its body).
     pub fn remove_variable(&mut self, name: &str) {
         self.variables.remove(name);
-    }
-
-    /// Bind a function argument that is already a pointer (e.g., struct parameter passed by pointer).
-    /// The pointer is recorded directly without creating an alloca, so the body reads it by name
-    /// and gets the original pointer value.
-    pub fn bind_pointer_argument(&mut self, name: &str, arg: PointerValue<'ctx>, pointee_ty: BasicTypeEnum<'ctx>) {
-        self.variables.insert(name.to_string(), (arg, pointee_ty));
     }
 
     /// Bind a function argument to `name`, so the body can read it by name.
@@ -401,15 +399,12 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
     /// Build a load instruction
     pub fn build_load(
         &mut self,
+        ty: BasicTypeEnum<'ctx>,
         ptr: PointerValue<'ctx>,
         name: &str,
     ) -> CodegenResult<BasicValueEnum<'ctx>> {
-        let pointee_type = self.ptr_pointee_types.get(&ptr).copied().unwrap_or_else(|| {
-            // Fallback: if we don't know the pointee type, use i8 (opaque pointer)
-            self.type_lowering.int_type(crate::codegen::abi::IntWidth::I8).into()
-        });
         self.builder
-            .build_load(pointee_type, ptr, name)
+            .build_load(ty, ptr, name)
             .map_err(|e| CodegenError::InstructionError(e.to_string()))
     }
 
@@ -480,14 +475,11 @@ impl<'ctx> LlvmValueBuilder<'ctx> {
         // For runtime values, we need to allocate and store each field
         let alloca = self.build_alloca(struct_ty.into(), "struct_tmp")?;
         for (i, field) in fields.iter().enumerate() {
-            let gep = self
-                .builder
-                .build_struct_gep(struct_ty, alloca, i as u32, "field_gep")
-                .map_err(|e| CodegenError::InstructionError(e.to_string()))?;
+            let gep = self.build_struct_gep(struct_ty, alloca, i as u32, "field_gep")?;
             self.ptr_pointee_types.insert(gep, struct_ty.into());
             self.build_store(gep, *field)?;
         }
-        self.build_load(alloca, "struct_val")
+        self.build_load(struct_ty.into(), alloca, "struct_val")
     }
 
     /// Extract a field from a struct value

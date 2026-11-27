@@ -6,267 +6,12 @@
 //!
 //! All functions return 0/ResourceID(0) on error (Naso checks via QTT)
 
-// Global allocator - use mimalloc when enabled for better performance
-#[cfg(feature = "mimalloc")]
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-
-// Object pool for reducing allocation overhead
-pub mod object_pool {
-    use std::sync::{Arc, Mutex};
-    use std::collections::VecDeque;
-    
-    /// Generic object pool with thread-safe access
-    pub struct ObjectPool<T> {
-        pool: Mutex<VecDeque<T>>,
-        factory: Box<dyn Fn() -> T + Send + Sync>,
-        max_size: usize,
-    }
-    
-    impl<T> ObjectPool<T> {
-        pub fn new<F>(factory: F, max_size: usize) -> Self 
-        where 
-            F: Fn() -> T + Send + Sync + 'static 
-        {
-            Self {
-                pool: Mutex::new(VecDeque::new()),
-                factory: Box::new(factory),
-                max_size,
-            }
-        }
-        
-        pub fn get(&self) -> T {
-            let mut pool = self.pool.lock().unwrap();
-            pool.pop_front().unwrap_or_else(|| (self.factory)())
-        }
-        
-        pub fn put(&self, obj: T) {
-            let mut pool = self.pool.lock().unwrap();
-            if pool.len() < self.max_size {
-                pool.push_back(obj);
-            }
-        }
-    }
-    
-    /// Pre-allocated buffer pool for I/O operations
-    pub struct BufferPool {
-        pool: Mutex<VecDeque<Vec<u8>>>,
-        buffer_size: usize,
-        max_buffers: usize,
-    }
-    
-    impl BufferPool {
-        pub fn new(buffer_size: usize, max_buffers: usize) -> Self {
-            Self {
-                pool: Mutex::new(VecDeque::new()),
-                buffer_size,
-                max_buffers,
-            }
-        }
-        
-        pub fn acquire(&self) -> Vec<u8> {
-            let mut pool = self.pool.lock().unwrap();
-            pool.pop_front().unwrap_or_else(|| vec![0u8; self.buffer_size])
-        }
-        
-        pub fn release(&self, mut buf: Vec<u8>) {
-            buf.clear();
-            let mut pool = self.pool.lock().unwrap();
-            if pool.len() < self.max_buffers {
-                pool.push_back(buf);
-            }
-        }
-    }
-}
-
-/// Cache-line aligned structures to prevent false sharing
-pub mod cache_aligned {
-    use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
-    
-    /// Cache-line aligned atomic counter (64 bytes = typical cache line)
-    #[repr(align(64))]
-    pub struct AlignedAtomicUsize {
-        value: AtomicUsize,
-        _padding: [u8; 56],
-    }
-    
-    impl AlignedAtomicUsize {
-        pub fn new(value: usize) -> Self {
-            Self {
-                value: AtomicUsize::new(value),
-                _padding: [0; 56],
-            }
-        }
-        
-        pub fn load(&self, order: Ordering) -> usize {
-            self.value.load(order)
-        }
-        
-        pub fn store(&self, value: usize, order: Ordering) {
-            self.value.store(value, order)
-        }
-        
-        pub fn fetch_add(&self, value: usize, order: Ordering) -> usize {
-            self.value.fetch_add(value, order)
-        }
-    }
-    
-    /// Cache-line aligned atomic u64
-    #[repr(align(64))]
-    pub struct AlignedAtomicU64 {
-        value: AtomicU64,
-        _padding: [u8; 56],
-    }
-    
-    impl AlignedAtomicU64 {
-        pub fn new(value: u64) -> Self {
-            Self {
-                value: AtomicU64::new(value),
-                _padding: [0; 56],
-            }
-        }
-        
-        pub fn load(&self, order: Ordering) -> u64 {
-            self.value.load(order)
-        }
-        
-        pub fn store(&self, value: u64, order: Ordering) {
-            self.value.store(value, order)
-        }
-        
-        pub fn fetch_add(&self, value: u64, order: Ordering) -> u64 {
-            self.value.fetch_add(value, order)
-        }
-    }
-}
-
-/// Vectorized response building for HTTP responses
-pub mod vectorized_response {
-    use std::arch::x86_64::*;
-    
-    /// Build HTTP response header using SIMD for common patterns
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "sse2")]
-    pub unsafe fn build_response_header_simd(
-        status_code: u16,
-        content_length: usize,
-        keep_alive: bool,
-        out_buf: &mut [u8],
-    ) -> usize {
-        // Use static strings to ensure consistent types
-        let status_str: &[u8] = match status_code {
-            200 => b"HTTP/1.1 200 OK\r\n",
-            404 => b"HTTP/1.1 404 Not Found\r\n",
-            500 => b"HTTP/1.1 500 Internal Server Error\r\n",
-            _ => b"HTTP/1.1 200 OK\r\n",
-        };
-        
-        let mut pos = 0;
-        
-        // Copy status line
-        out_buf[pos..pos + status_str.len()].copy_from_slice(status_str);
-        pos += status_str.len();
-        
-        // Content-Length header
-        let cl_header = b"Content-Length: ";
-        out_buf[pos..pos + cl_header.len()].copy_from_slice(cl_header);
-        pos += cl_header.len();
-        
-        // Convert content_length to string
-        let cl_str = content_length.to_string();
-        let cl_bytes = cl_str.as_bytes();
-        out_buf[pos..pos + cl_bytes.len()].copy_from_slice(cl_bytes);
-        pos += cl_bytes.len();
-        
-        out_buf[pos] = b'\r';
-        out_buf[pos + 1] = b'\n';
-        pos += 2;
-        
-        // Connection header
-        if keep_alive {
-            let conn_header = b"Connection: keep-alive\r\n";
-            out_buf[pos..pos + conn_header.len()].copy_from_slice(conn_header);
-            pos += conn_header.len();
-        } else {
-            let conn_header = b"Connection: close\r\n";
-            out_buf[pos..pos + conn_header.len()].copy_from_slice(conn_header);
-            pos += conn_header.len();
-        }
-        
-        // Content-Type header
-        let ct_header = b"Content-Type: text/plain\r\n";
-        out_buf[pos..pos + ct_header.len()].copy_from_slice(ct_header);
-        pos += ct_header.len();
-        
-        // Blank line
-        out_buf[pos] = b'\r';
-        out_buf[pos + 1] = b'\n';
-        pos += 2;
-        
-        pos
-    }
-    
-    /// Fallback non-SIMD implementation
-    #[cfg(not(target_arch = "x86_64"))]
-    pub fn build_response_header_simd(
-        status_code: u16,
-        content_length: usize,
-        keep_alive: bool,
-        out_buf: &mut [u8],
-    ) -> usize {
-        // Use static strings to ensure consistent types
-        let status_str: &[u8] = match status_code {
-            200 => b"HTTP/1.1 200 OK\r\n",
-            404 => b"HTTP/1.1 404 Not Found\r\n",
-            500 => b"HTTP/1.1 500 Internal Server Error\r\n",
-            _ => b"HTTP/1.1 200 OK\r\n",
-        };
-        
-        let mut pos = 0;
-        out_buf[pos..pos + status_str.len()].copy_from_slice(status_str);
-        pos += status_str.len();
-        
-        let cl_header = b"Content-Length: ";
-        out_buf[pos..pos + cl_header.len()].copy_from_slice(cl_header);
-        pos += cl_header.len();
-        
-        let cl_str = content_length.to_string();
-        let cl_bytes = cl_str.as_bytes();
-        out_buf[pos..pos + cl_bytes.len()].copy_from_slice(cl_bytes);
-        pos += cl_bytes.len();
-        
-        out_buf[pos] = b'\r';
-        out_buf[pos + 1] = b'\n';
-        pos += 2;
-        
-        if keep_alive {
-            let conn_header = b"Connection: keep-alive\r\n";
-            out_buf[pos..pos + conn_header.len()].copy_from_slice(conn_header);
-            pos += conn_header.len();
-        } else {
-            let conn_header = b"Connection: close\r\n";
-            out_buf[pos..pos + conn_header.len()].copy_from_slice(conn_header);
-            pos += conn_header.len();
-        }
-        
-        let ct_header = b"Content-Type: text/plain\r\n";
-        out_buf[pos..pos + ct_header.len()].copy_from_slice(ct_header);
-        pos += ct_header.len();
-        
-        out_buf[pos] = b'\r';
-        out_buf[pos + 1] = b'\n';
-        pos += 2;
-        
-        pos
-    }
-}
 
 mod io_uring_backend;
 pub use io_uring_backend::*;
@@ -277,11 +22,26 @@ pub use http_parser::*;
 mod multi_threaded_accept;
 pub use multi_threaded_accept::*;
 
-mod lockfree_deque;
-pub use lockfree_deque::*;
+/// Background thread handle for io_uring event loop
+static URING_BACKGROUND_THREAD: OnceLock<std::thread::JoinHandle<()>> = OnceLock::new();
 
-// Re-export async-runtime types
-pub use async_runtime::*;
+/// Start the io_uring background thread if not already running
+pub fn ensure_uring_background_thread() {
+    URING_BACKGROUND_THREAD.get_or_init(|| {
+        std::thread::spawn(|| {
+            let poller = uring_poller();
+            loop {
+                // Poll for completions with a small timeout to avoid busy-waiting
+                let mut poller_guard = poller.lock().unwrap();
+                let _ = poller_guard.poll_completions();
+                drop(poller_guard);
+                
+                // Small sleep to prevent 100% CPU when idle
+                std::thread::sleep(std::time::Duration::from_micros(100));
+            }
+        })
+    });
+}
 
 /// Returned to Naso as resource handle
 #[repr(C)]
@@ -380,8 +140,8 @@ impl FdTable {
         fd
     }
 
-    fn get_stream(&mut self, fd: u64) -> Option<&mut std::net::TcpStream> {
-        self.streams.get_mut(&fd)
+    fn get_stream(&mut self, fd: u64) -> Option<std::net::TcpStream> {
+        self.streams.remove(&fd)
     }
 }
 
@@ -392,21 +152,34 @@ fn fd_table() -> &'static Mutex<FdTable> {
 /// Bind to "addr:port" — returns ResourceID(0) on failure
 #[unsafe(no_mangle)]
 pub extern "C" fn naso_tcp_bind(addr_ptr: *const u8, addr_len: usize) -> ResourceID {
+    eprintln!("naso_tcp_bind called with addr_len={}", addr_len);
     if addr_ptr.is_null() || addr_len == 0 {
+        eprintln!("naso_tcp_bind: null ptr or zero len");
         return ResourceID(0);
     }
     let addr_bytes = unsafe { std::slice::from_raw_parts(addr_ptr, addr_len) };
+    eprintln!("naso_tcp_bind: addr_bytes={:?}", addr_bytes);
     let addr_str = match std::str::from_utf8(addr_bytes) {
-        Ok(s) => s,
-        Err(_) => return ResourceID(0)
+        Ok(s) => {
+            eprintln!("naso_tcp_bind: addr_str={}", s);
+            s
+        }
+        Err(e) => {
+            eprintln!("naso_tcp_bind: utf8 error: {:?}", e);
+            return ResourceID(0);
+        }
     };
     match TcpListener::bind(addr_str) {
         Ok(listener) => {
-            let table = global_sharded_fd_table();
+            let mut table = fd_table().lock().unwrap();
             let fd = table.insert_listener(listener);
+            eprintln!("naso_tcp_bind: success fd={}", fd);
             ResourceID(fd)
         }
-        Err(_) => ResourceID(0)
+        Err(e) => {
+            eprintln!("naso_tcp_bind: bind error: {:?}", e);
+            ResourceID(0)
+        }
     }
 }
 
@@ -483,24 +256,51 @@ pub extern "C" fn naso_tcp_bind_reuseport(addr_ptr: *const u8, addr_len: usize) 
 /// Returns 1 on success, 0 on failure.
 #[unsafe(no_mangle)]
 pub extern "C" fn naso_tcp_accept(listener_fd: u64, out: *mut u64) -> u64 {
+    static CALL_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let count = CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    eprintln!("naso_tcp_accept CALL #{}: listener_fd={}, out={:?}", count, listener_fd, out);
     if out.is_null() {
+        eprintln!("naso_tcp_accept: null out, returning 0");
         return 0;
     }
-    let table = global_sharded_fd_table();
-    let Some(listener) = table.get_listener(listener_fd) else {
+    let mut table = fd_table().lock().unwrap();
+    eprintln!("naso_tcp_accept CALL #{}: table.listeners.keys() = {:?}", count, table.listeners.keys().collect::<Vec<_>>());
+    eprintln!("naso_tcp_accept CALL #{}: table.streams.keys() = {:?}", count, table.streams.keys().collect::<Vec<_>>());
+    let Some(listener) = table.listeners.get(&listener_fd) else {
+        eprintln!("naso_tcp_accept CALL #{}: Listener {} not found in table", count, listener_fd);
+        eprintln!("naso_tcp_accept CALL #{}: Available listeners: {:?}", count, table.listeners.keys().collect::<Vec<_>>());
         return 0;
     };
-    match listener.accept() {
-        Ok((stream, _addr)) => {
-            // Set stream to blocking mode for synchronous FFI
-            let _ = stream.set_nonblocking(false);
-            let stream_fd = table.insert_stream(stream);
-            let out_slice = unsafe { std::slice::from_raw_parts_mut(out, 2) };
-            out_slice[0] = listener_fd;
-            out_slice[1] = stream_fd;
-            1
+    let listener_clone = listener.try_clone();
+    drop(table);
+    eprintln!("naso_tcp_accept CALL #{}: got listener clone, calling accept()", count);
+    match listener_clone {
+        Ok(listener_clone) => {
+            eprintln!("naso_tcp_accept CALL #{}: calling accept() on listener_fd={}", count, listener_fd);
+            match listener_clone.accept() {
+                Ok((stream, _addr)) => {
+                    eprintln!("naso_tcp_accept CALL #{}: accept() succeeded", count);
+                    // Set stream to blocking mode for synchronous FFI
+                    let _ = stream.set_nonblocking(false);
+                    let mut table = fd_table().lock().unwrap();
+                    let stream_fd = table.insert_stream(stream);
+                    eprintln!("naso_tcp_accept CALL #{}: inserted stream_fd={}", count, stream_fd);
+                    let out_slice = unsafe { std::slice::from_raw_parts_mut(out, 2) };
+                    out_slice[0] = listener_fd;
+                    out_slice[1] = stream_fd;
+                    eprintln!("naso_tcp_accept CALL #{}: wrote out[0]={}, out[1]={}", count, out_slice[0], out_slice[1]);
+                    1
+                }
+                Err(e) => {
+                    eprintln!("naso_tcp_accept CALL #{}: accept error: {:?}", count, e);
+                    0
+                }
+            }
         }
-        Err(_) => 0
+        Err(e) => {
+            eprintln!("naso_tcp_accept CALL #{}: clone error: {:?}", count, e);
+            0
+        }
     }
 }
 
@@ -508,97 +308,68 @@ pub extern "C" fn naso_tcp_accept(listener_fd: u64, out: *mut u64) -> u64 {
 /// Returns bytes read (0 = EOF or error).
 #[unsafe(no_mangle)]
 pub extern "C" fn naso_read(fd: u64, buf: *mut u8, max_len: usize) -> usize {
+    eprintln!(">>> naso_read ENTRY: fd={}, max_len={}", fd, max_len);
     if buf.is_null() || max_len == 0 {
+        eprintln!(">>> naso_read: null buf or zero max_len, returning 0");
         return 0;
     }
-    
-    // Try io_uring first for async I/O
-    if let Some(bytes) = naso_read_uring_sync(fd, buf, max_len) {
-        return bytes;
-    }
-    
-    // Fallback to synchronous implementation
-    let table = global_sharded_fd_table();
+    let mut table = fd_table().lock().unwrap();
+    let Some(mut stream) = table.get_stream(fd) else {
+        eprintln!(">>> naso_read: Stream {} not found in table, returning 0", fd);
+        eprintln!(">>> naso_read: Available streams: {:?}", table.streams.keys().collect::<Vec<_>>());
+        return 0;
+    };
     let buf_slice = unsafe { std::slice::from_raw_parts_mut(buf, max_len) };
-    match table.read_stream(fd, buf_slice) {
-        Some(n) => {
+    eprintln!(">>> naso_read: calling stream.read()");
+    match std::io::Read::read(&mut stream, buf_slice) {
+        Ok(n) => {
             memory_tracker().record_alloc(n);
+            eprintln!(">>> naso_read: read {} bytes from fd={}", n, fd);
             n
         }
-        None => 0
-    }
-}
-
-/// Internal: Read using io_uring synchronously (blocking wait)
-fn naso_read_uring_sync(fd: u64, buf: *mut u8, max_len: usize) -> Option<usize> {
-    use crate::io_uring_backend::uring_poller;
-    let mut poller_guard = uring_poller().lock().unwrap();
-    if let Some(ref mut poller) = *poller_guard {
-        // Submit read operation
-        let user_data = poller.submit_read(fd, buf, max_len, 0).ok()?;
-        // Submit and wait for completion
-        let submitted = poller.submit_batch().ok()?;
-        if submitted > 0 {
-            let completed = poller.wait_and_process(1).ok()?;
-            if completed > 0 {
-                // Check if our operation completed
-                if let Some(op) = poller.pending.get(&user_data) {
-                    if op.completed {
-                        return Some(if op.result >= 0 { op.result as usize } else { 0 });
-                    }
-                }
-            }
+        Err(e) => {
+            eprintln!(">>> naso_read: read error on fd={}: {:?}", fd, e);
+            0
         }
     }
-    None
 }
 
 /// Write exactly len bytes from buffer to stream fd.
 /// Returns bytes written (0 = error).
 #[unsafe(no_mangle)]
 pub extern "C" fn naso_write(fd: u64, buf: *const u8, len: usize) -> usize {
+    eprintln!(">>> naso_write ENTRY fd={}, len={}, buf={:p}", fd, len, buf);
     if buf.is_null() || len == 0 {
+        eprintln!(">>> naso_write: null buf or zero len, returning 0");
         return 0;
     }
-    
-    // Try io_uring first for async I/O
-    if let Some(bytes) = naso_write_uring_sync(fd, buf, len) {
-        return bytes;
-    }
-    
-    // Fallback to synchronous implementation
-    let table = global_sharded_fd_table();
+    let mut table = fd_table().lock().unwrap();
+    let Some(mut stream) = table.get_stream(fd) else {
+        eprintln!(">>> naso_write: Stream {} not found in table, returning 0", fd);
+        return 0;
+    };
     let buf_slice = unsafe { std::slice::from_raw_parts(buf, len) };
-    match table.write_stream(fd, buf_slice) {
-        Some(n) => {
-            // Flush the stream
-            let _ = table.flush_stream(fd);
-            memory_tracker().record_alloc(len);
-            n
-        }
-        None => 0
-    }
-}
-
-/// Internal: Write using io_uring synchronously (blocking wait)
-fn naso_write_uring_sync(fd: u64, buf: *const u8, len: usize) -> Option<usize> {
-    use crate::io_uring_backend::uring_poller;
-    let mut poller_guard = uring_poller().lock().unwrap();
-    if let Some(ref mut poller) = *poller_guard {
-        let user_data = poller.submit_write(fd, buf, len, 0).ok()?;
-        let submitted = poller.submit_batch().ok()?;
-        if submitted > 0 {
-            let completed = poller.wait_and_process(1).ok()?;
-            if completed > 0 {
-                if let Some(op) = poller.pending.get(&user_data) {
-                    if op.completed {
-                        return Some(if op.result >= 0 { op.result as usize } else { 0 });
-                    }
+    eprintln!(">>> naso_write: writing {} bytes: {:?}", len, buf_slice);
+    match std::io::Write::write_all(&mut stream, buf_slice) {
+        Ok(_) => {
+            eprintln!(">>> naso_write: write_all succeeded, flushing...");
+            match stream.flush() {
+                Ok(_) => {
+                    memory_tracker().record_alloc(len);
+                    eprintln!(">>> naso_write: wrote {} bytes to fd={}", len, fd);
+                    len
+                }
+                Err(e) => {
+                    eprintln!(">>> naso_write: flush error on fd={}: {:?}", fd, e);
+                    0
                 }
             }
         }
+        Err(e) => {
+            eprintln!(">>> naso_write: write error on fd={}: {:?}", fd, e);
+            0
+        }
     }
-    None
 }
 
 /// Get memory statistics for benchmarking
@@ -631,10 +402,18 @@ pub extern "C" fn naso_last_error(out_ptr: *mut u8, max_len: usize) -> usize {
 /// Returns 1 on success, 0 on failure
 #[unsafe(no_mangle)]
 pub extern "C" fn naso_close(fd: u64) -> u64 {
-    let table = global_sharded_fd_table();
-    match table.close_stream(fd) {
-        Some(_) => 1,
-        None => 0
+    eprintln!(">>> naso_close ENTRY: fd={}", fd);
+    let mut table = fd_table().lock().unwrap();
+    eprintln!(">>> naso_close: table.streams.keys() = {:?}", table.streams.keys().collect::<Vec<_>>());
+    eprintln!(">>> naso_close: table.listeners.keys() = {:?}", table.listeners.keys().collect::<Vec<_>>());
+    if let Some(stream) = table.streams.remove(&fd) {
+        // Don't shutdown - just let the stream be dropped naturally
+        // shutdown can close the connection before buffered data is sent
+        eprintln!(">>> naso_close: removed stream fd={}, remaining streams: {}", fd, table.streams.len());
+        1
+    } else {
+        eprintln!(">>> naso_close: fd={} not found in streams, existing streams: {:?}", fd, table.streams.keys().collect::<Vec<_>>());
+        0
     }
 }
 
@@ -733,7 +512,11 @@ fn generate_websocket_response(request: &str) -> String {
 
     // Build response
     format!(
-        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+        "HTTP/1.1 101 Switching Protocols\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {}\r\n\
+         \r\n",
         accept_key
     )
 }
@@ -755,18 +538,18 @@ pub extern "C" fn naso_websocket_send(
         return 0;
     }
 
-    let mut table = fd_table().lock().unwrap();
-    let Some(mut stream) = table.get_stream(stream_fd) else {
+    let stream = get_stream_mut(stream_fd);
+    if stream.is_none() {
         eprintln!(">>> naso_websocket_send: stream {} not found", stream_fd);
         return 0;
-    };
+    }
 
     // Encode and send WebSocket frame
     let frame = encode_websocket_frame(frame_type, mask, data_ptr, data_len);
     let frame_bytes = frame.as_bytes();
     
     // Write frame to stream
-    match stream.write_all(frame_bytes) {
+    match stream.unwrap().write_all(frame_bytes) {
         Ok(()) => {
             eprintln!(">>> naso_websocket_send: wrote {} bytes to stream {}", frame_bytes.len(), stream_fd);
             frame_bytes.len() as u64
@@ -796,15 +579,15 @@ pub extern "C" fn naso_websocket_recv(
         return 0;
     }
 
-    let mut table = fd_table().lock().unwrap();
-    let Some(mut stream) = table.get_stream(stream_fd) else {
+    let stream = get_stream_mut(stream_fd);
+    if stream.is_none() {
         eprintln!(">>> naso_websocket_recv: stream {} not found", stream_fd);
         return 0;
-    };
+    }
 
     // Read and parse WebSocket frame
     let mut buffer = [0u8; 4096];
-    match stream.read(&mut buffer) {
+    match stream.unwrap().read(&mut buffer) {
         Ok(bytes_read) => {
             if bytes_read == 0 {
                 eprintln!(">>> naso_websocket_recv: stream closed");
@@ -848,12 +631,12 @@ pub extern "C" fn naso_websocket_ping(
         let frame = encode_websocket_frame(0, 0, std::ptr::null(), 0);
         let frame_bytes = frame.as_bytes();
         
-        let mut table = fd_table().lock().unwrap();
-        let Some(mut stream) = table.get_stream(stream_fd) else {
+        let stream = get_stream_mut(stream_fd);
+        if stream.is_none() {
             return 0;
-        };
+        }
         
-        match stream.write_all(frame_bytes) {
+        match stream.unwrap().write_all(frame_bytes) {
             Ok(()) => frame_bytes.len() as u64,
             Err(e) => {
                 eprintln!(">>> naso_websocket_ping: write error: {:?}", e);
@@ -862,15 +645,15 @@ pub extern "C" fn naso_websocket_ping(
         }
     } else {
         // Ping with data payload
-        let mut table = fd_table().lock().unwrap();
-        let Some(mut stream) = table.get_stream(stream_fd) else {
+        let stream = get_stream_mut(stream_fd);
+        if stream.is_none() {
             return 0;
-        };
+        }
 
         let frame = encode_websocket_frame(0, 0, data_ptr, data_len);
         let frame_bytes = frame.as_bytes();
         
-        match stream.write_all(frame_bytes) {
+        match stream.unwrap().write_all(frame_bytes) {
             Ok(()) => frame_bytes.len() as u64,
             Err(e) => {
                 eprintln!(">>> naso_websocket_ping: write error: {:?}", e);
@@ -890,15 +673,15 @@ pub extern "C" fn naso_websocket_pong(
 ) -> u64 {
     eprintln!(">>> naso_websocket_pong called for stream_fd={}", stream_fd);
     
-    let mut table = fd_table().lock().unwrap();
-    let Some(mut stream) = table.get_stream(stream_fd) else {
+    let stream = get_stream_mut(stream_fd);
+    if stream.is_none() {
         return 0;
-    };
+    }
 
     let frame = encode_websocket_frame(0, 0, data_ptr, data_len);
     let frame_bytes = frame.as_bytes();
     
-    match stream.write_all(frame_bytes) {
+    match stream.unwrap().write_all(frame_bytes) {
         Ok(()) => frame_bytes.len() as u64,
         Err(e) => {
             eprintln!(">>> naso_websocket_pong: write error: {:?}", e);
@@ -917,10 +700,10 @@ pub extern "C" fn naso_websocket_close(
 ) -> u64 {
     eprintln!(">>> naso_websocket_close called for stream_fd={}, status={}", stream_fd, status_code);
     
-    let mut table = fd_table().lock().unwrap();
-    let Some(mut stream) = table.get_stream(stream_fd) else {
+    let stream = get_stream_mut(stream_fd);
+    if stream.is_none() {
         return 0;
-    };
+    }
 
     // Encode close frame
     let reason = if reason_ptr.is_null() {
@@ -933,6 +716,8 @@ pub extern "C" fn naso_websocket_close(
     let frame = encode_close_frame(status_code, reason);
     let frame_bytes = frame.as_bytes();
     
+    // Take the stream out of the Option to avoid double unwrap
+    let mut stream = stream.unwrap();
     match stream.write_all(frame_bytes) {
         Ok(()) => {
             // Close the stream after sending close frame
@@ -968,6 +753,12 @@ pub extern "C" fn naso_websocket_validate_frame(
             0
         }
     }
+}
+
+// Helper function to get mutable stream reference
+fn get_stream_mut(fd: u64) -> Option<std::net::TcpStream> {
+    let mut table = fd_table().lock().unwrap();
+    table.get_stream(fd)
 }
 
 // WebSocket frame encoding functions
@@ -1328,22 +1119,13 @@ pub extern "C" fn naso_spawn_future(future_ptr: *mut FutureHandle) -> u64 {
 // ============================================================================
 // YIELD / AWAIT FFI
 // ============================================================================
-// YIELD / POLL INTEGRATION
-// ============================================================================
 
 #[unsafe(no_mangle)]
 pub extern "C" fn naso_yield() -> u64 {
-    // Drive the unified async poll to process any pending I/O events
+    // Drive the async poll loop to process any pending I/O events
     // This allows the accept loop to yield control and handle multiple connections
-    // Polls both io_uring and mio-based async
-    naso_async_poll_all();
-    1
-}
-
-/// Simple sleep function to avoid stack overflow from naso_yield
-#[unsafe(no_mangle)]
-pub extern "C" fn naso_sleep_ms(ms: u64) -> u64 {
-    std::thread::sleep(std::time::Duration::from_millis(ms));
+    let mut poll_guard = async_poll().lock().unwrap();
+    let _ = poll_guard.poll_once(Some(Duration::from_millis(1)));
     1
 }
 
@@ -1944,193 +1726,8 @@ pub extern "C" fn naso_timer_sleep_async(duration_ms: u64,
 }
 
 // ============================================================================
-// ASYNC I/O INTEGRATION (io_uring + async runtime)
+// CONNECTION POOL FFI
 // ============================================================================
-// NOTE: io_uring requires Linux kernel 5.1+ and is NOT available in gVisor (4.19)
-// This implementation provides the framework but will fall back to mio on gVisor
-
-/// Async read with io_uring integration
-/// Returns future ID that can be polled for completion
-#[unsafe(no_mangle)]
-pub extern "C" fn naso_read_async_uring(fd: u64, buf_ptr: *mut u8, buf_len: usize) -> u64 {
-    if buf_ptr.is_null() {
-        return 0;
-    }
-    
-    // Try io_uring first, fall back to mio
-    use crate::io_uring_backend::uring_poller;
-    let mut poller_guard = uring_poller().lock().unwrap();
-    if let Some(ref mut poller) = *poller_guard {
-        match poller.submit_read(fd, buf_ptr, buf_len, 0) {
-            Ok(user_data) => user_data,
-            Err(_) => {
-                // Fall back to mio-based async
-                let mut poll = async_poll().lock().unwrap();
-                match poll.register_stream(fd, Interest::READABLE) {
-                    Ok(_) => 1,
-                    Err(_) => 0,
-                }
-            }
-        }
-    } else {
-        // io_uring not available, fall back to mio
-        let mut poll = async_poll().lock().unwrap();
-        match poll.register_stream(fd, Interest::READABLE) {
-            Ok(_) => 1,
-            Err(_) => 0,
-        }
-    }
-}
-
-/// Async write with io_uring integration
-#[unsafe(no_mangle)]
-pub extern "C" fn naso_write_async_uring(fd: u64, buf_ptr: *const u8, buf_len: usize) -> u64 {
-    if buf_ptr.is_null() {
-        return 0;
-    }
-    
-    // Try io_uring first
-    use crate::io_uring_backend::uring_poller;
-    let mut poller_guard = uring_poller().lock().unwrap();
-    if let Some(ref mut poller) = *poller_guard {
-        match poller.submit_write(fd, buf_ptr, buf_len, 0) {
-            Ok(user_data) => user_data,
-            Err(_) => {
-                // Fall back to mio-based async
-                let mut poll = async_poll().lock().unwrap();
-                match poll.register_stream(fd, Interest::WRITABLE) {
-                    Ok(_) => 1,
-                    Err(_) => 0,
-                }
-            }
-        }
-    } else {
-        // io_uring not available, fall back to mio
-        let mut poll = async_poll().lock().unwrap();
-        match poll.register_stream(fd, Interest::WRITABLE) {
-            Ok(_) => 1,
-            Err(_) => 0,
-        }
-    }
-}
-
-/// Check if io_uring async read has completed
-#[unsafe(no_mangle)]
-pub extern "C" fn naso_check_read_completion_uring(user_data: u64) -> u64 {
-    use crate::io_uring_backend::uring_poller;
-    let mut poller_guard = uring_poller().lock().unwrap();
-    if let Some(ref mut poller) = *poller_guard {
-        if let Some(op) = poller.pending.get(&user_data) {
-            if op.op_type == UringOp::Read && op.completed {
-                return 1;
-            }
-        }
-    }
-    0
-}
-
-/// Check if io_uring async write has completed
-#[unsafe(no_mangle)]
-pub extern "C" fn naso_check_write_completion_uring(user_data: u64) -> u64 {
-    use crate::io_uring_backend::uring_poller;
-    let mut poller_guard = uring_poller().lock().unwrap();
-    if let Some(ref mut poller) = *poller_guard {
-        if let Some(op) = poller.pending.get(&user_data) {
-            if op.op_type == UringOp::Write && op.completed {
-                return 1;
-            }
-        }
-    }
-    0
-}
-
-/// Submit all pending io_uring operations (batching)
-#[unsafe(no_mangle)]
-pub extern "C" fn naso_uring_submit_batch() -> u64 {
-    use crate::io_uring_backend::uring_poller;
-    let mut poller_guard = uring_poller().lock().unwrap();
-    if let Some(ref mut poller) = *poller_guard {
-        match poller.submit_batch() {
-            Ok(count) => count as u64,
-            Err(_) => 0,
-        }
-    } else {
-        0 // io_uring not available
-    }
-}
-
-/// Wait for io_uring completions
-#[unsafe(no_mangle)]
-pub extern "C" fn naso_uring_wait_completions(min_completions: u64) -> u64 {
-    use crate::io_uring_backend::uring_poller;
-    let mut poller_guard = uring_poller().lock().unwrap();
-    if let Some(ref mut poller) = *poller_guard {
-        match poller.wait_and_process(min_completions as u32) {
-            Ok(count) => count as u64,
-            Err(_) => 0,
-        }
-    } else {
-        0 // io_uring not available
-    }
-}
-
-/// Poll io_uring completions non-blocking (for runtime integration)
-#[unsafe(no_mangle)]
-pub extern "C" fn naso_uring_poll_async() -> u64 {
-    use crate::io_uring_backend::uring_poller;
-    let mut poller_guard = uring_poller().lock().unwrap();
-    if let Some(ref mut poller) = *poller_guard {
-        match poller.poll_completions() {
-            Ok(count) => count as u64,
-            Err(_) => 0,
-        }
-    } else {
-        0 // io_uring not available
-    }
-}
-
-/// Unified async poll - polls both multi-threaded accept and io_uring
-/// This should be called from naso_yield() or the async runtime
-#[unsafe(no_mangle)]
-pub extern "C" fn naso_async_poll_all() -> u64 {
-    let mut total: u64 = 0;
-    
-    // Poll io_uring completions
-    {
-        use crate::io_uring_backend::uring_poller;
-        let mut poller_guard = uring_poller().lock().unwrap();
-        if let Some(ref mut poller) = *poller_guard {
-            if let Ok(count) = poller.poll_completions() {
-                total += count as u64;
-            }
-        }
-    }
-    
-    // Poll mio-based async
-    {
-        let mut poll = async_poll().lock().unwrap();
-        let _ = poll.poll_once(Some(Duration::from_millis(0)));
-    }
-    
-    total
-}
-
-/// Initialize io_uring backend (call at startup)
-/// Returns 1 on success, 0 if io_uring not available (falls back to mio)
-#[unsafe(no_mangle)]
-pub extern "C" fn naso_uring_init() -> u64 {
-    match UringPoller::new(4096) {
-        Ok(poller) => {
-            let mut global = uring_poller().lock().unwrap();
-            *global = Some(poller);
-            1
-        }
-        Err(_) => {
-            // io_uring not available (e.g., gVisor kernel 4.19)
-            0 // Return 0 to indicate fallback to mio
-        }
-    }
-}
 
 /// Connection pool configuration
 #[repr(C)]
@@ -2454,83 +2051,5 @@ mod test_accept_get_client {
         let mut out = [1234u64, 5678u64];
         let result = naso_accept_get_client(out.as_ptr());
         assert_eq!(result, 5678);
-    }
-}
-
-/// Multi-run PGO profile merging support
-pub mod pgo_merge {
-    use std::fs;
-    use std::path::Path;
-    
-    /// Merge multiple profile data directories into one
-    pub fn merge_profiles(profile_dirs: &[&Path], output_path: &Path) -> Result<(), String> {
-        eprintln!("PGO merge: would merge {} profile dirs to {:?}", profile_dirs.len(), output_path);
-        Ok(())
-    }
-    
-    /// Run multiple benchmark iterations for better profile data
-    pub fn run_multi_benchmark(binary: &str, iterations: usize, duration_secs: usize) -> Result<(), String> {
-        for i in 0..iterations {
-            eprintln!("PGO iteration {}/{}: running benchmark for {}s", i + 1, iterations, duration_secs);
-        }
-        Ok(())
-    }
-}
-
-/// Async runtime integration for io_uring when available
-pub mod async_io {
-    use std::future::Future;
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
-    use std::sync::{Arc, Mutex};
-    
-    /// Async I/O operation types
-    #[derive(Debug, Clone, Copy)]
-    pub enum AsyncOp {
-        Read,
-        Write,
-        Accept,
-        Connect,
-    }
-    
-    /// Future for async I/O operations
-    pub struct AsyncIoFuture {
-        op_type: AsyncOp,
-        fd: u64,
-        buffer: Arc<Mutex<Vec<u8>>>,
-        completed: Arc<Mutex<bool>>,
-        result: Arc<Mutex<Option<Result<usize, std::io::Error>>>>,
-    }
-    
-    impl AsyncIoFuture {
-        pub fn new(op_type: AsyncOp, fd: u64, buffer: Vec<u8>) -> Self {
-            Self {
-                op_type,
-                fd,
-                buffer: Arc::new(Mutex::new(buffer)),
-                completed: Arc::new(Mutex::new(false)),
-                result: Arc::new(Mutex::new(None)),
-            }
-        }
-    }
-    
-    impl Future for AsyncIoFuture {
-        type Output = Result<usize, std::io::Error>;
-        
-        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            let completed = *self.completed.lock().unwrap();
-            if completed {
-                if let Some(result) = self.result.lock().unwrap().take() {
-                    return Poll::Ready(result);
-                }
-            }
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        }
-    }
-    
-    /// Submit async I/O operation (uses io_uring when available, falls back to mio)
-    pub fn submit_async_io(op: AsyncOp, fd: u64, buffer: Vec<u8>) -> AsyncIoFuture {
-        AsyncIoFuture::new(op, fd, buffer)
     }
 }

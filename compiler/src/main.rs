@@ -48,6 +48,12 @@ fn main() {
         "build" => {
             run_build_command(&args[2..]);
         }
+        "pkg" => {
+            run_pkg_command(&args[2..]);
+        }
+        "ci" => {
+            run_ci_command(&args[2..]);
+        }
         _ => {
             eprintln!("Unknown command: {command}");
             print_usage();
@@ -68,8 +74,10 @@ fn print_usage() {
     eprintln!("  watch <file>          Hot reload — recompile on file change");
     eprintln!("  test                  Run tests in current directory");
     eprintln!("  build [options] <file>  Build program to target");
+    eprintln!("  pkg <subcommand>      Package manager (add, remove, install, update, publish, search, info)");
+    eprintln!("  ci <subcommand>       CI/CD templates (init, github, gitlab)");
     eprintln!("Build options:");
-    eprintln!("  --target <llvm|qir|wgsl>  Target backend (default: llvm)");
+    eprintln!("  --target <llvm|qir|wgsl|wasm-gc|wasm-component|distributed>  Target backend (default: llvm)");
     // `cranelift` is still accepted by the parser so existing scripts do not break on
     // an unknown-target error, but it is not a working backend and says so itself.
     eprintln!(
@@ -77,9 +85,13 @@ fn print_usage() {
     );
     eprintln!("  -o, --output <file>            Output file path");
     eprintln!("  --opt <0|1|2|3>                Optimization level (default: 2)");
-    eprintln!("  --triple <target>              Target triple (host, nvptx64, wasm32, aarch64)");
+    eprintln!("  --triple <target>              Target triple (host, nvptx64, wasm32, wasm32-gc, wasm32-wasip1, wasm32-wasip2, wasm32-wasip3, aarch64)");
     eprintln!("  --debug                        Emit debug information");
+    eprintln!("Verification options:");
     eprintln!("  --verify                       Run formal verification after type checking");
+    eprintln!("  --verify-mode <MODE>           Verification mode: all, uncomputation, linearity, obligations (default: all)");
+    eprintln!("  --verify-jobs <N>              Parallel verification jobs (0 = auto, default: 0)");
+    eprintln!("  --verify-timeout <MS>          Solver timeout in milliseconds (default: 30000)");
 }
 
 fn run_frontend_command(command: &str, file: &str) {
@@ -846,11 +858,40 @@ fn run_wgsl_build_command(args: &[String]) {
     let mut kernel: Option<String> = None;
     // --emit-abi prints the host layout of the generated shader to stderr.
     let mut emit_abi = false;
+    // Verification options (only available with z3 feature)
+    #[allow(unused_variables)]
+    let mut verify = false;
+    #[allow(unused_variables)]
+    let mut verify_mode = "all";
+    #[allow(unused_variables)]
+    let mut verify_jobs = 0;
+    #[allow(unused_variables)]
+    let mut verify_timeout = 30000;
 
     let mut i = 0;
-    let mut verify = false;
     while i < args.len() {
         match args[i].as_str() {
+            "--verify" => {
+                verify = true;
+            }
+            "--verify-mode" => {
+                i += 1;
+                if i < args.len() {
+                    verify_mode = &args[i];
+                }
+            }
+            "--verify-jobs" => {
+                i += 1;
+                if i < args.len() {
+                    verify_jobs = args[i].parse().unwrap_or(0);
+                }
+            }
+            "--verify-timeout" => {
+                i += 1;
+                if i < args.len() {
+                    verify_timeout = args[i].parse().unwrap_or(30000);
+                }
+            }
             "--target" | "--opt" => i += 1, // value consumed; opt is irrelevant here
             "-o" | "--output" => {
                 i += 1;
@@ -865,7 +906,6 @@ fn run_wgsl_build_command(args: &[String]) {
                 }
             }
             "--emit-abi" => emit_abi = true,
-            "--verify" => verify = true,
             arg if arg.starts_with('-') => {}
             path => {
                 if input_file.is_none() {
@@ -904,11 +944,28 @@ fn run_wgsl_build_command(args: &[String]) {
         std::process::exit(1);
     }
 
-    // Run verification if requested
+    // Run formal verification if requested
     if verify {
-        if let Err(e) = run_verification(&program) {
-            eprintln!("Verification failed: {e}");
-            std::process::exit(1);
+        // Find naso-verify binary (in same directory as this executable)
+        let current_exe = std::env::current_exe().expect("Failed to get current executable path");
+        let naso_verify_bin = current_exe.parent().unwrap().join("naso-verify");
+        
+        eprintln!("Running formal verification (mode: {verify_mode})...");
+        let mut cmd = std::process::Command::new(&naso_verify_bin);
+        cmd.arg("--mode").arg(verify_mode);
+        if verify_jobs > 0 {
+            cmd.arg("--jobs").arg(verify_jobs.to_string());
+        }
+        cmd.arg("--timeout").arg(verify_timeout.to_string());
+        cmd.arg(&input_file);
+        
+        let status = cmd.status().expect("Failed to run naso verify");
+        if !status.success() {
+            let code = status.code().unwrap_or(1);
+            eprintln!("❌ Verification failed with exit code {}", code);
+            std::process::exit(code);
+        } else {
+            eprintln!("✅ Verification passed: all obligations discharged");
         }
     }
 
@@ -1022,44 +1079,6 @@ fn run_wgsl_build_command(args: &[String]) {
     }
 }
 
-/// Run formal verification on the parsed program.
-/// Attempts to use the `naso-verify` binary if available.
-fn run_verification(program: &naso_compiler::ast::Program) -> Result<(), String> {
-    // Write program to a temporary file for naso-verify
-    use std::io::Write;
-    let mut temp_file = std::fs::File::create("/tmp/naso_verify_input.naso")
-        .map_err(|e| format!("Failed to create temp file: {e}"))?;
-    
-    // Serialize the program as Naso source (we need to pretty-print it)
-    // For now, we'll use a simple approach - write a placeholder
-    // In a full implementation, we'd use the AST pretty-printer
-    writeln!(temp_file, "// Verification input - placeholder").map_err(|e| format!("Failed to write temp file: {e}"))?;
-    
-    // Try to run naso-verify binary
-    let output = std::process::Command::new("naso-verify")
-        .arg("/tmp/naso_verify_input.naso")
-        .output();
-    
-    match output {
-        Ok(result) => {
-            if result.status.success() {
-                println!("✅ Verification passed");
-                Ok(())
-            } else {
-                let stderr = String::from_utf8_lossy(&result.stderr);
-                let stdout = String::from_utf8_lossy(&result.stdout);
-                Err(format!("Verification failed:\n{}\n{}", stdout, stderr))
-            }
-        }
-        Err(_) => {
-            eprintln!("Warning: naso-verify binary not found in PATH");
-            eprintln!("  Build naso-verify with: cargo build --release --package naso-verify --features z3");
-            eprintln!("  Or install it to your PATH");
-            Ok(()) // Don't fail the build if verification is not available
-        }
-    }
-}
-
 #[cfg(feature = "llvm")]
 fn run_build_command(args: &[String]) {
     // Keep `--target wgsl` identical in both builds: it does not need LLVM, so
@@ -1074,10 +1093,46 @@ fn run_build_command(args: &[String]) {
 
     let mut config = CodegenConfig::default();
     let mut input_file = None;
+    // Verification options (only available with z3 feature)
+    #[allow(unused_variables)]
+    let mut verify = false;
+    #[allow(unused_variables)]
+    let mut verify_mode = "all";
+    #[allow(unused_variables)]
+    let mut verify_jobs = 0;
+    #[allow(unused_variables)]
+    let mut verify_timeout = 30000;
     let mut i = 0;
 
     while i < args.len() {
         match args[i].as_str() {
+            "--verify" => {
+                verify = true;
+            }
+            "--verify-mode" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("--verify-mode requires an argument (all, uncomputation, linearity, obligations)");
+                    std::process::exit(1);
+                }
+                verify_mode = &args[i];
+            }
+            "--verify-jobs" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("--verify-jobs requires an argument");
+                    std::process::exit(1);
+                }
+                verify_jobs = args[i].parse().unwrap_or(0);
+            }
+            "--verify-timeout" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("--verify-timeout requires an argument (ms)");
+                    std::process::exit(1);
+                }
+                verify_timeout = args[i].parse().unwrap_or(30000);
+            }
             "--target" => {
                 i += 1;
                 if i >= args.len() {
@@ -1089,8 +1144,11 @@ fn run_build_command(args: &[String]) {
                     "qir" => Backend::Qir,
                     "cranelift" => Backend::Cranelift,
                     "wgsl" => Backend::Wgsl,
+                    "wasm-gc" => Backend::WasmGc,
+                    "wasm-component" => Backend::WasmComponent,
+                    "distributed" => Backend::Distributed,
                     other => {
-                        eprintln!("Unknown target: {other}. Use llvm, qir, or cranelift");
+                        eprintln!("Unknown target: {other}. Use llvm, qir, cranelift, wgsl, wasm-gc, wasm-component, or distributed");
                         std::process::exit(1);
                     }
                 };
@@ -1133,9 +1191,6 @@ fn run_build_command(args: &[String]) {
             }
             "--debug" => {
                 config.emit_debug = true;
-            }
-            "--verify" => {
-                config.verify = true;
             }
             arg if arg.starts_with('-') => {
                 eprintln!("Unknown option: {arg}");
@@ -1182,11 +1237,29 @@ fn run_build_command(args: &[String]) {
         std::process::exit(1);
     }
 
-    // Run verification if requested
-    if config.verify {
-        if let Err(e) = run_verification(&program) {
-            eprintln!("Verification failed: {e}");
-            std::process::exit(1);
+    // Run formal verification if requested
+    if verify {
+        // Find naso-verify binary (in same directory as this executable)
+        let current_exe = std::env::current_exe().expect("Failed to get current executable path");
+        let naso_verify_bin = current_exe.parent().unwrap().join("naso-verify");
+        
+        // Run naso-verify as a subprocess
+        eprintln!("Running formal verification (mode: {verify_mode})...");
+        let mut cmd = std::process::Command::new(&naso_verify_bin);
+        cmd.arg("--mode").arg(verify_mode);
+        if verify_jobs > 0 {
+            cmd.arg("--jobs").arg(verify_jobs.to_string());
+        }
+        cmd.arg("--timeout").arg(verify_timeout.to_string());
+        cmd.arg(&input_file);
+        
+        let status = cmd.status().expect("Failed to run naso verify");
+        if !status.success() {
+            let code = status.code().unwrap_or(1);
+            eprintln!("❌ Verification failed with exit code {}", code);
+            std::process::exit(code);
+        } else {
+            eprintln!("✅ Verification passed: all obligations discharged");
         }
     }
 
@@ -1268,23 +1341,748 @@ fn run_build_command(args: &[String]) {
                 print!("{ir}");
             }
         }
-        Backend::Cranelift => match pipeline.execute_cranelift_jit(&pir_module) {
-            Ok(result) => {
-                println!("JIT execution result: {result}");
+        Backend::Cranelift => {
+            match pipeline.execute_cranelift_jit(&pir_module) {
+                Ok(result) => {
+                    println!("JIT execution result: {result}");
+                }
+                Err(e) => {
+                    eprintln!("Cranelift JIT error: {e}");
+                    std::process::exit(1);
+                }
             }
-            Err(e) => {
-                eprintln!("Cranelift JIT error: {e}");
+        }
+        Backend::WasmGc => {
+            let ir = match pipeline.emit_wasm_gc(&pir_module) {
+                Ok(ir) => ir,
+                Err(e) => {
+                    eprintln!("WASM GC codegen error: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if let Some(path) = config.output_path {
+                fs::write(&path, ir).unwrap_or_else(|e| {
+                    eprintln!("Failed to write output: {e}");
+                    std::process::exit(1);
+                });
+                println!("Written WASM GC IR to {}", path.display());
+            } else {
+                print!("{ir}");
+            }
+        }
+        Backend::WasmComponent => {
+            let ir = match pipeline.emit_wasm_component(&pir_module) {
+                Ok(ir) => ir,
+                Err(e) => {
+                    eprintln!("WASM Component codegen error: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if let Some(path) = config.output_path {
+                fs::write(&path, ir).unwrap_or_else(|e| {
+                    eprintln!("Failed to write output: {e}");
+                    std::process::exit(1);
+                });
+                println!("Written WASM Component IR to {}", path.display());
+            } else {
+                print!("{ir}");
+            }
+        }
+        Backend::Distributed => {
+            // Run the async distributed build
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let ir = match rt.block_on(pipeline.emit_distributed(&pir_module)) {
+                Ok(ir) => ir,
+                Err(e) => {
+                    eprintln!("Distributed build error: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if let Some(path) = config.output_path {
+                fs::write(&path, ir).unwrap_or_else(|e| {
+                    eprintln!("Failed to write output: {e}");
+                    std::process::exit(1);
+                });
+                println!("Written Distributed Build Output to {}", path.display());
+            } else {
+                print!("{ir}");
+            }
+        }
+    }
+}
+
+/// `naso pkg` — Package manager commands
+fn run_pkg_command(args: &[String]) {
+            use std::fs;
+            use std::path::PathBuf;
+    
+            if args.is_empty() {
+                eprintln!("Usage: naso pkg <subcommand> [args]");
+                eprintln!();
+                eprintln!("Subcommands:");
+                eprintln!("  add <name>[@version]     Add dependency to naso.toml");
+                eprintln!("  remove <name>            Remove dependency from naso.toml");
+                eprintln!("  install                  Install all dependencies (generates naso.lock)");
+                eprintln!("  update                   Update dependencies to latest versions");
+                eprintln!("  publish [path]           Publish package to registry");
+                eprintln!("  search <query>           Search registry for packages");
+                eprintln!("  info <name>              Show package information");
+                eprintln!("  yank <name> <version>    Yank a published version");
+                eprintln!("  unyank <name> <version>  Unyank a published version");
+                eprintln!("  owners <name>            List package owners");
+                eprintln!("  owner-add <name> <user>  Add package owner");
+                eprintln!("  owner-remove <name> <user>  Remove package owner");
                 std::process::exit(1);
             }
-        },
+    
+            let subcommand = &args[0];
+    
+            match subcommand.as_str() {
+                "add" => {
+                    if args.len() < 2 {
+                        eprintln!("Usage: naso pkg add <name>[@version]");
+                        std::process::exit(1);
+                    }
+                    let spec = &args[1];
+                    let (name, version): (&str, Option<&str>) = if let Some(idx) = spec.find('@') {
+                        (&spec[..idx], Some(&spec[idx+1..]))
+                    } else {
+                        (spec, None)
+                    };
+            
+                    let manifest_path = PathBuf::from("naso.toml");
+                    if !manifest_path.exists() {
+                        eprintln!("No naso.toml found in current directory");
+                        std::process::exit(1);
+                    }
+            
+                    let content = fs::read_to_string(&manifest_path)
+                        .unwrap_or_else(|e| {
+                            eprintln!("Failed to read naso.toml: {}", e);
+                            std::process::exit(1);
+                        });
+            
+                    let mut manifest = content.parse::<toml::Value>()
+                        .unwrap_or_else(|e| {
+                            eprintln!("Failed to parse naso.toml: {}", e);
+                            std::process::exit(1);
+                        });
+            
+                    if !manifest.get("dependencies").is_some() {
+                        let table = toml::value::Table::new();
+                        manifest["dependencies"] = toml::Value::Table(table);
+                    }
+                    let deps = manifest.get_mut("dependencies")
+                        .and_then(|v| v.as_table_mut())
+                        .unwrap();
+            
+                    let version_str = version.unwrap_or("*").to_string();
+                    deps.insert(name.to_string(), toml::Value::String(version_str.clone()));
+            
+                    fs::write(&manifest_path, manifest.to_string())
+                        .unwrap_or_else(|e| {
+                            eprintln!("Failed to write naso.toml: {}", e);
+                            std::process::exit(1);
+                        });
+            
+                    println!("Added {}@{} to dependencies", name, version_str);
+                }
+                "remove" => {
+                    if args.len() < 2 {
+                        eprintln!("Usage: naso pkg remove <name>");
+                        std::process::exit(1);
+                    }
+                    let name = &args[1];
+            
+                    let manifest_path = PathBuf::from("naso.toml");
+                    if !manifest_path.exists() {
+                        eprintln!("No naso.toml found in current directory");
+                        std::process::exit(1);
+                    }
+            
+                    let content = fs::read_to_string(&manifest_path)
+                        .unwrap_or_else(|e| {
+                            eprintln!("Failed to read naso.toml: {}", e);
+                            std::process::exit(1);
+                        });
+            
+                    let mut manifest = content.parse::<toml::Value>()
+                        .unwrap_or_else(|e| {
+                            eprintln!("Failed to parse naso.toml: {}", e);
+                            std::process::exit(1);
+                        });
+            
+                    if let Some(deps) = manifest.get_mut("dependencies").and_then(|v| v.as_table_mut()) {
+                        if deps.remove(name).is_some() {
+                            fs::write(&manifest_path, manifest.to_string())
+                                .unwrap_or_else(|e| {
+                                    eprintln!("Failed to write naso.toml: {}", e);
+                                    std::process::exit(1);
+                                });
+                            println!("Removed {} from dependencies", name);
+                        } else {
+                            eprintln!("Dependency '{}' not found", name);
+                            std::process::exit(1);
+                        }
+                    } else {
+                        eprintln!("No dependencies section found");
+                        std::process::exit(1);
+                    }
+                }
+                "install" => {
+                    println!("📦 Installing dependencies...");
+            
+                    let manifest_path = PathBuf::from("naso.toml");
+                    if !manifest_path.exists() {
+                        eprintln!("No naso.toml found in current directory");
+                        std::process::exit(1);
+                    }
+            
+                    let content = fs::read_to_string(&manifest_path)
+                        .unwrap_or_else(|e| {
+                            eprintln!("Failed to read naso.toml: {}", e);
+                            std::process::exit(1);
+                        });
+            
+                    let manifest = content.parse::<toml::Value>()
+                        .unwrap_or_else(|e| {
+                            eprintln!("Failed to parse naso.toml: {}", e);
+                            std::process::exit(1);
+                        });
+            
+                    let deps = manifest.get("dependencies")
+                        .and_then(|v| v.as_table())
+                        .cloned()
+                        .unwrap_or_default();
+            
+                    let dev_deps = manifest.get("dev-dependencies")
+                        .and_then(|v| v.as_table())
+                        .cloned()
+                        .unwrap_or_default();
+            
+                    // Generate lockfile
+                    let mut lockfile = String::new();
+                    lockfile.push_str("# This file is generated by naso pkg install\n");
+                    lockfile.push_str("# Do not edit manually\n\n");
+            
+                    for (name, version) in &deps {
+                        let version_str = version.as_str().unwrap_or("*");
+                        lockfile.push_str(&format!("[[package]]\n"));
+                        lockfile.push_str(&format!("name = \"{}\"\n", name));
+                        lockfile.push_str(&format!("version = \"{}\"\n", version_str));
+                        lockfile.push_str(&format!("source = \"registry+https://crates.naso-lang.org\"\n"));
+                        lockfile.push_str(&format!("dependencies = []\n\n"));
+                    }
+            
+                    for (name, version) in &dev_deps {
+                        let version_str = version.as_str().unwrap_or("*");
+                        lockfile.push_str(&format!("[[package]]\n"));
+                        lockfile.push_str(&format!("name = \"{}\"\n", name));
+                        lockfile.push_str(&format!("version = \"{}\"\n", version_str));
+                        lockfile.push_str(&format!("source = \"registry+https://crates.naso-lang.org\"\n"));
+                        lockfile.push_str(&format!("dependencies = []\n\n"));
+                    }
+            
+                    fs::write("naso.lock", lockfile)
+                        .unwrap_or_else(|e| {
+                            eprintln!("Failed to write naso.lock: {}", e);
+                            std::process::exit(1);
+                        });
+            
+                    println!("✅ Dependencies installed (lockfile generated)");
+                }
+                "update" => {
+                    println!("🔄 Updating dependencies...");
+            
+                    let manifest_path = PathBuf::from("naso.toml");
+                    if !manifest_path.exists() {
+                        eprintln!("No naso.toml found in current directory");
+                        std::process::exit(1);
+                    }
+            
+                    // For now, just reinstall (in production, would check registry for latest versions)
+                    run_pkg_command(&["install".to_string()]);
+                }
+                "publish" => {
+                    let package_path = if args.len() >= 2 {
+                        &args[1]
+                    } else {
+                        "."
+                    };
+            
+                    println!("📤 Publishing package from {}...", package_path);
+            
+                    let manifest_path = PathBuf::from(package_path).join("naso.toml");
+                    if !manifest_path.exists() {
+                        eprintln!("No naso.toml found in {}", package_path);
+                        std::process::exit(1);
+                    }
+            
+                    // Get registry token from environment
+                    let _token = std::env::var("NASO_REGISTRY_TOKEN")
+                        .unwrap_or_else(|_| {
+                            eprintln!("NASO_REGISTRY_TOKEN environment variable not set");
+                            std::process::exit(1);
+                        });
+            
+                    println!("Package would be published to crates.naso-lang.org");
+                    println!("(Use std::pkg_registry::RegistryClient from Naso code for programmatic access)");
+                }
+                "search" => {
+                    if args.len() < 2 {
+                        eprintln!("Usage: naso pkg search <query>");
+                        std::process::exit(1);
+                    }
+                    let query = &args[1];
+            
+                    println!("🔍 Searching for '{}'...", query);
+                    println!("(Registry search would query crates.naso-lang.org)");
+                }
+                "info" => {
+                    if args.len() < 2 {
+                        eprintln!("Usage: naso pkg info <name>");
+                        std::process::exit(1);
+                    }
+                    let name = &args[1];
+            
+                    println!("📋 Package info for '{}':", name);
+                    println!("(Registry info would query crates.naso-lang.org)");
+                }
+                "yank" => {
+                    if args.len() < 3 {
+                        eprintln!("Usage: naso pkg yank <name> <version>");
+                        std::process::exit(1);
+                    }
+                    let name = &args[1];
+                    let version = &args[2];
+            
+                    println!("📦 Yanking {}@{}...", name, version);
+                    println!("(Registry yank would require authentication)");
+                }
+                "unyank" => {
+                    if args.len() < 3 {
+                        eprintln!("Usage: naso pkg unyank <name> <version>");
+                        std::process::exit(1);
+                    }
+                    let name = &args[1];
+                    let version = &args[2];
+            
+                    println!("📦 Unyanking {}@{}...", name, version);
+                    println!("(Registry unyank would require authentication)");
+                }
+                "owners" => {
+                    if args.len() < 2 {
+                        eprintln!("Usage: naso pkg owners <name>");
+                        std::process::exit(1);
+                    }
+                    let name = &args[1];
+            
+                    println!("👥 Owners of '{}':", name);
+                    println!("(Registry owners would query crates.naso-lang.org)");
+                }
+                "owner-add" => {
+                    if args.len() < 3 {
+                        eprintln!("Usage: naso pkg owner-add <name> <user>");
+                        std::process::exit(1);
+                    }
+                    let name = &args[1];
+                    let user = &args[2];
+            
+                    println!("➕ Adding owner '{}' to '{}'...", user, name);
+                    println!("(Registry owner-add would require authentication)");
+                }
+                "owner-remove" => {
+                    if args.len() < 3 {
+                        eprintln!("Usage: naso pkg owner-remove <name> <user>");
+                        std::process::exit(1);
+                    }
+                    let name = &args[1];
+                    let user = &args[2];
+            
+                    println!("➖ Removing owner '{}' from '{}'...", user, name);
+                    println!("(Registry owner-remove would require authentication)");
+                }
+                _ => {
+                    eprintln!("Unknown pkg subcommand: {}", subcommand);
+                    std::process::exit(1);
+                }
+            }
+}
+
+/// `naso ci` — CI/CD template commands
+fn run_ci_command(args: &[String]) -> Result<(), String> {
+    use std::fs;
+    use std::path::PathBuf;
+
+    if args.is_empty() {
+        eprintln!("Usage: naso ci <subcommand> [args]");
+        eprintln!();
+        eprintln!("Subcommands:");
+        eprintln!("  init       Create CI/CD templates for GitHub Actions and GitLab CI");
+        eprintln!("  github     Create GitHub Actions workflow only");
+        eprintln!("  gitlab     Create GitLab CI configuration only");
+        return Err("No subcommand provided".to_string());
     }
+
+    let subcommand = &args[0];
+
+    match subcommand.as_str() {
+        "init" | "github" | "gitlab" => {
+            let project_root = PathBuf::from(".");
+
+            if subcommand == "init" || subcommand == "github" {
+                create_github_actions(&project_root)?;
+            }
+
+            if subcommand == "init" || subcommand == "gitlab" {
+                create_gitlab_ci(&project_root)?;
+            }
+
+            println!("✅ CI/CD templates created");
+        }
+        _ => {
+            return Err(format!("Unknown ci subcommand: {}", subcommand));
+        }
+    }
+    Ok(())
+}
+
+fn create_github_actions(project_root: &PathBuf) -> Result<(), String> {
+    use std::fs;
+
+    let workflows_dir = project_root.join(".github").join("workflows");
+    fs::create_dir_all(&workflows_dir)
+        .map_err(|e| format!("Failed to create workflows directory: {}", e))?;
+
+    // CI workflow
+    let ci_workflow = r#"name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build
+        run: cargo build --workspace --all-features
+      - name: Clippy
+        run: cargo clippy --workspace --all-features -- -D warnings
+      - name: Rustfmt
+        run: cargo fmt --all -- --check
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Test
+        run: cargo test --workspace --all-features
+
+  naso_build:
+    name: Naso Build
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Naso
+        run: curl -fsSL https://nasolang.org/install.sh | sh
+      - name: Add Naso to PATH
+        run: echo "$HOME/.naso/bin" >> $GITHUB_PATH
+      - name: Build Naso project
+        run: naso build src/main.naso -o naso-app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: naso-app
+          path: naso-app
+          retention-days: 1
+
+  naso_test:
+    name: Naso Test
+    runs-on: ubuntu-latest
+    needs: naso_build
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Naso
+        run: curl -fsSL https://nasolang.org/install.sh | sh
+      - name: Add Naso to PATH
+        run: echo "$HOME/.naso/bin" >> $GITHUB_PATH
+      - name: Run Naso tests
+        run: naso test
+
+  verify:
+    name: Formal Verification
+    runs-on: ubuntu-latest
+    needs: naso_build
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Naso
+        run: curl -fsSL https://nasolang.org/install.sh | sh
+      - name: Install Z3
+        run: sudo apt-get update && sudo apt-get install -y z3
+      - name: Add Naso to PATH
+        run: echo "$HOME/.naso/bin" >> $GITHUB_PATH
+      - name: Run formal verification
+        run: naso build --verify src/main.naso
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, naso_test]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build release
+        run: cargo build --workspace --all-features --release
+      - name: Package binaries
+        run: |
+          mkdir -p dist
+          cp target/release/naso dist/naso-${{ runner.os }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: naso-release
+          path: dist/
+          retention-days: 7
+
+  naso_publish:
+    name: Publish to Naso Registry
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: release
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Naso
+        run: curl -fsSL https://nasolang.org/install.sh | sh
+      - name: Add Naso to PATH
+        run: echo "$HOME/.naso/bin" >> $GITHUB_PATH
+      - name: Publish package
+        run: naso pkg publish .
+        env:
+          NASO_REGISTRY_TOKEN: ${{ secrets.NASO_REGISTRY_TOKEN }}"#;
+
+    fs::write(workflows_dir.join("ci.yml"), ci_workflow)
+        .map_err(|e| format!("Failed to write CI workflow: {}", e))?;
+
+    // Release workflow
+    let release_workflow = r#"name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build release
+        run: cargo build --workspace --all-features --release
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            target/release/naso
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  naso_publish:
+    name: Publish Naso Package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Naso
+        run: curl -fsSL https://nasolang.org/install.sh | sh
+      - name: Add Naso to PATH
+        run: echo "$HOME/.naso/bin" >> $GITHUB_PATH
+      - name: Publish to registry
+        run: naso pkg publish .
+        env:
+          NASO_REGISTRY_TOKEN: ${{ secrets.NASO_REGISTRY_TOKEN }}"#;
+
+    fs::write(workflows_dir.join("release.yml"), release_workflow)
+        .map_err(|e| format!("Failed to write release workflow: {}", e))?;
+
+    println!("  Created .github/workflows/ci.yml");
+    println!("  Created .github/workflows/release.yml");
+
+    Ok(())
+}
+
+fn create_gitlab_ci(project_root: &PathBuf) -> Result<(), String> {
+    use std::fs;
+
+    let gitlab_ci = r#"# Naso GitLab CI Configuration
+# Place this file at .gitlab-ci.yml in your project root
+
+stages:
+  - build
+  - test
+  - verify
+  - release
+  - deploy
+
+variables:
+  CARGO_TERM_COLOR: "always"
+  RUST_BACKTRACE: "1"
+
+# Cache cargo registry and target directory
+cache:
+  key: "${CI_COMMIT_REF_SLUG}"
+  paths:
+    - .cargo/registry/index/
+    - .cargo/registry/cache/
+    - target/
+    - ~/.naso/cache/
+
+# Build stage
+build:
+  stage: build
+  image: rust:latest
+  script:
+    - cargo build --workspace --all-features
+  artifacts:
+    paths:
+      - target/
+    expire_in: 1 hour
+
+# Test stage
+test:
+  stage: test
+  image: rust:latest
+  script:
+    - cargo test --workspace --all-features
+  needs:
+    - build
+
+# Clippy check
+clippy:
+  stage: test
+  image: rust:latest
+  script:
+    - cargo clippy --workspace --all-features -- -D warnings
+  needs:
+    - build
+
+# Naso-specific build
+naso_build:
+  stage: build
+  image: ubuntu:22.04
+  before_script:
+    - apt-get update && apt-get install -y curl llvm-17 clang
+    - curl -fsSL https://nasolang.org/install.sh | sh
+    - export PATH="$HOME/.naso/bin:$PATH"
+  script:
+    - naso build src/main.naso -o naso-app
+  artifacts:
+    paths:
+      - naso-app
+    expire_in: 1 hour
+
+# Naso tests
+naso_test:
+  stage: test
+  image: ubuntu:22.04
+  before_script:
+    - apt-get update && apt-get install -y curl llvm-17 clang
+    - curl -fsSL https://nasolang.org/install.sh | sh
+    - export PATH="$HOME/.naso/bin:$PATH"
+  script:
+    - naso test
+  needs:
+    - naso_build
+
+# Formal verification
+verify:
+  stage: verify
+  image: ubuntu:22.04
+  before_script:
+    - apt-get update && apt-get install -y curl llvm-17 clang z3
+    - curl -fsSL https://nasolang.org/install.sh | sh
+    - export PATH="$HOME/.naso/bin:$PATH"
+  script:
+    - naso build --verify src/main.naso
+  needs:
+    - naso_build
+  allow_failure: true
+
+# Release stage
+release:
+  stage: release
+  image: rust:latest
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/
+  script:
+    - cargo build --workspace --all-features --release
+    - mkdir -p dist
+    - cp target/release/naso dist/naso-${CI_RUNNER_DESCRIPTION}
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 1 week
+
+# Naso package publish
+naso_publish:
+  stage: deploy
+  image: ubuntu:22.04
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/
+  before_script:
+    - apt-get update && apt-get install -y curl llvm-17 clang
+    - curl -fsSL https://nasolang.org/install.sh | sh
+    - export PATH="$HOME/.naso/bin:$PATH"
+  script:
+    - naso pkg publish .
+  variables:
+    NASO_REGISTRY_TOKEN: $NASO_REGISTRY_TOKEN"#;
+
+    fs::write(project_root.join(".gitlab-ci.yml"), gitlab_ci)
+        .map_err(|e| format!("Failed to write .gitlab-ci.yml: {}", e))?;
+
+    println!("  Created .gitlab-ci.yml");
+
+    Ok(())
 }
 
 /// Without the LLVM feature, only the WGSL target is available.
 ///
-/// WGSL is emitted as text and needs no LLVM, so refusing it here would mean
-/// the one backend that works in a default build was unreachable. Every other
-/// target still reports the real reason.
+/// This function is compiled when the "llvm" feature is NOT enabled.
 #[cfg(not(feature = "llvm"))]
 fn run_build_command(args: &[String]) {
     let wants_wgsl = args

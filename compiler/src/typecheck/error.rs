@@ -195,53 +195,6 @@ pub enum TypeError {
 
     #[error("inference failed: {message}")]
     InferenceError { message: String, span: Span },
-
-    #[error("trait `{name}` not found")]
-    TraitNotFound { name: Ident, span: Span },
-
-    #[error("trait impl method `{method_name}` has wrong number of parameters: expected {expected}, found {found}")]
-    TraitImplMethodArityMismatch { method_name: Ident, expected: usize, found: usize, span: Span },
-
-    #[error("trait impl method `{method_name}` has wrong number of generic parameters: expected {expected}, found {found}")]
-    TraitImplGenericArityMismatch { method_name: Ident, expected: usize, found: usize, span: Span },
-
-    #[error("trait impl method `{method_name}` not declared in trait `{trait_name}`")]
-    TraitImplMethodNotInTrait { method_name: Ident, trait_name: Ident, span: Span },
-
-    #[error("trait impl missing required method `{method_name}` for trait `{trait_name}`")]
-    TraitImplMissingMethod { method_name: Ident, trait_name: Ident, span: Span },
-
-    #[error("trait impl associated type `{type_name}` has wrong number of generic parameters: expected {expected}, found {found}")]
-    TraitImplAssocTypeGenericArityMismatch { type_name: Ident, expected: usize, found: usize, span: Span },
-
-    #[error("trait impl associated type `{type_name}` not declared in trait `{trait_name}`")]
-    TraitImplAssocTypeNotInTrait { type_name: Ident, trait_name: Ident, span: Span },
-
-    #[error(
-        "orphan rule violation: trait `{trait_name}` is not local and type `{for_type}` is not local\n\
-         (at least one must be defined in the current crate)"
-    )]
-    OrphanRuleViolation {
-        trait_name: String,
-        for_type: String,
-        span: Span,
-    },
-
-    #[error(
-        "overlapping trait implementations for trait `{trait_name}`:\n  first at {impl1_span:?}\n  second at {impl2_span:?}"
-    )]
-    OverlappingImpls {
-        trait_name: String,
-        impl1_span: Span,
-        impl2_span: Span,
-    },
-
-    #[error("type `{ty}` does not satisfy trait bound `{trait_bound}`")]
-    TraitBoundNotSatisfied {
-        ty: Type,
-        trait_bound: TraitBound,
-        span: Span,
-    },
 }
 
 /// Result type for type checking operations

@@ -1,0 +1,120 @@
+//! WASI Preview 3: Logging Interface
+//!
+//! Provides structured logging.
+
+extern "C" {
+    fn wasi_log_write(level: u32, context: *const u8, context_len: usize, message: *const u8, message_len: usize) -> i32;
+    fn wasi_logger_new() -> u64;
+    fn wasi_logger_write(logger: u64, level: u32, context: *const u8, context_len: usize, message: *const u8, message_len: usize) -> i32;
+    fn wasi_logger_flush(logger: u64) -> i32;
+}
+
+#[repr(u32)]
+pub enum LogLevel {
+    Trace = 0,
+    Debug = 1,
+    Info = 2,
+    Warn = 3,
+    Error = 4,
+    Critical = 5,
+}
+
+#[repr(C)]
+pub struct LogRecord {
+    pub level: LogLevel,
+    pub context: String,
+    pub message: String,
+    pub timestamp: u64,
+    pub file: Option<String>,
+    pub line: Option<u32>,
+    pub module: Option<String>,
+}
+
+pub fn log(level: LogLevel, context: &str, message: &str) -> Result<(), std::io::Error> {
+    let ctx_str = crate::web::dom::DomString::new(context);
+    let msg_str = crate::web::dom::DomString::new(message);
+    let result = unsafe { wasi_log_write(level as u32, ctx_str.as_ptr(), ctx_str.len(), msg_str.as_ptr(), msg_str.len()) };
+    if result < 0 {
+        Err(std::io::Error::from_raw_os_error(-result))
+    } else {
+        Ok(())
+    }
+}
+
+pub fn trace(context: &str, message: &str) -> Result<(), std::io::Error> {
+    log(LogLevel::Trace, context, message)
+}
+
+pub fn debug(context: &str, message: &str) -> Result<(), std::io::Error> {
+    log(LogLevel::Debug, context, message)
+}
+
+pub fn info(context: &str, message: &str) -> Result<(), std::io::Error> {
+    log(LogLevel::Info, context, message)
+}
+
+pub fn warn(context: &str, message: &str) -> Result<(), std::io::Error> {
+    log(LogLevel::Warn, context, message)
+}
+
+pub fn error(context: &str, message: &str) -> Result<(), std::io::Error> {
+    log(LogLevel::Error, context, message)
+}
+
+pub fn critical(context: &str, message: &str) -> Result<(), std::io::Error> {
+    log(LogLevel::Critical, context, message)
+}
+
+pub struct Logger {
+    ptr: u64,
+}
+
+impl Logger {
+    pub fn new() -> Self {
+        Self { ptr: unsafe { wasi_logger_new() } }
+    }
+    
+    pub fn log(&self, level: LogLevel, context: &str, message: &str) -> Result<(), std::io::Error> {
+        let ctx_str = crate::web::dom::DomString::new(context);
+        let msg_str = crate::web::dom::DomString::new(message);
+        let result = unsafe { wasi_logger_write(self.ptr, level as u32, ctx_str.as_ptr(), ctx_str.len(), msg_str.as_ptr(), msg_str.len()) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(())
+        }
+    }
+    
+    pub fn trace(&self, context: &str, message: &str) -> Result<(), std::io::Error> {
+        self.log(LogLevel::Trace, context, message)
+    }
+    
+    pub fn debug(&self, context: &str, message: &str) -> Result<(), std::io::Error> {
+        self.log(LogLevel::Debug, context, message)
+    }
+    
+    pub fn info(&self, context: &str, message: &str) -> Result<(), std::io::Error> {
+        self.log(LogLevel::Info, context, message)
+    }
+    
+    pub fn warn(&self, context: &str, message: &str) -> Result<(), std::io::Error> {
+        self.log(LogLevel::Warn, context, message)
+    }
+    
+    pub fn error(&self, context: &str, message: &str) -> Result<(), std::io::Error> {
+        self.log(LogLevel::Error, context, message)
+    }
+    
+    pub fn critical(&self, context: &str, message: &str) -> Result<(), std::io::Error> {
+        self.log(LogLevel::Critical, context, message)
+    }
+    
+    pub fn flush(&self) -> Result<(), std::io::Error> {
+        let result = unsafe { wasi_logger_flush(self.ptr) };
+        if result < 0 {
+            Err(std::io::Error::from_raw_os_error(-result))
+        } else {
+            Ok(())
+        }
+    }
+}

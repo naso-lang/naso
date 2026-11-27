@@ -133,8 +133,17 @@ pub enum TokenKind {
     Mod,
     #[regex("[iI][mM][pP][oO][rR][tT]", priority = 3)]
     Import,
+    #[regex("[eE][xX][tT][eE][rR][nN]", priority = 3)]
+    Extern,
     #[regex("[cC][oO][nN][sS][tT]", priority = 3)]
     Const,
+    #[regex("[lL][oO][oO][pP]", priority = 3)]
+    Loop,
+    // async/await for async programming
+    #[regex("[aA][sS][yY][nN][cC]", priority = 3)]
+    Async,
+    #[regex("[aA][wW][aA][iI][tT]", priority = 3)]
+    Await,
     // `proof` introduces a proof block: obligations that the verifier must
     // discharge. Parsed and typechecked by the compiler, then consumed by
     // naso-verify. Not reachable by codegen.
@@ -291,6 +300,16 @@ pub enum TokenKind {
     FatArrow,
     #[token("..")]
     DotDot,
+    #[token("+=")]
+    PlusEq,
+    #[token("-=")]
+    MinusEq,
+    #[token("*=")]
+    StarEq,
+    #[token("/=")]
+    SlashEq,
+    #[token("%=")]
+    PercentEq,
     #[token("+")]
     Plus,
     #[token("-")]
@@ -315,8 +334,12 @@ pub enum TokenKind {
     Assign,
     #[token("@")]
     At,
+    #[token("#")]
+    Hash,
 
     // ===== Punctuation =====
+    #[token("::")]
+    ColonColon,
     #[token(":")]
     Colon,
     #[token(";")]
@@ -367,7 +390,11 @@ impl TokenKind {
             TokenKind::Type => "'type'",
             TokenKind::Mod => "'mod'",
             TokenKind::Import => "'import'",
+            TokenKind::Extern => "'extern'",
             TokenKind::Const => "'const'",
+            TokenKind::Loop => "'loop'",
+            TokenKind::Async => "'async'",
+            TokenKind::Await => "'await'",
             TokenKind::Proof => "'proof'",
             TokenKind::Requires => "'requires'",
             TokenKind::As => "'as'",
@@ -414,6 +441,11 @@ impl TokenKind {
             TokenKind::Star => "'*'",
             TokenKind::Slash => "'/'",
             TokenKind::Percent => "'%'",
+            TokenKind::PlusEq => "'+='",
+            TokenKind::MinusEq => "'-='",
+            TokenKind::StarEq => "'*='",
+            TokenKind::SlashEq => "'/='",
+            TokenKind::PercentEq => "'%='",
             TokenKind::Eq => "'=='",
             TokenKind::Ne => "'!='",
             TokenKind::Lt => "'<'",
@@ -441,7 +473,9 @@ impl TokenKind {
             TokenKind::RBracket => "']'",
             TokenKind::LBrace => "'{'",
             TokenKind::RBrace => "'}'",
+            TokenKind::ColonColon => "'::'",
             TokenKind::At => "'@'",
+            TokenKind::Hash => "'#'",
             TokenKind::Newline => "newline",
             TokenKind::Comment => "comment",
             TokenKind::IntKw => "'int'",

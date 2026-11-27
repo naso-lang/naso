@@ -12,7 +12,7 @@
 
 use crate::codegen::context::CodegenContext;
 use crate::codegen::error::{CodegenError, CodegenResult};
-use crate::codegen::llvm::module_builder::{EntryParam, ReturnSource, build_entry_signature};
+use crate::codegen::llvm::module_builder::{EntryParam, LLVMModuleBuilder, ReturnSource, build_entry_signature};
 use crate::codegen::llvm::value_builder::TensorBinding;
 use crate::codegen::llvm::{
     access_emission::AccessEmitter,
@@ -64,7 +64,6 @@ pub fn lower_schedule_tree<'ctx>(
     let abi = build_entry_signature(&mut LlvmTypeLowering::new(llvm_context), pir_module)?;
     lower_schedule_tree_into(
         ctx,
-        module,
         function,
         &mut value_builder,
         schedule,
@@ -72,6 +71,7 @@ pub fn lower_schedule_tree<'ctx>(
         quantities,
         access_relations,
         abi.as_slice(),
+        None,
         None,
         None,
         None,
@@ -102,7 +102,6 @@ pub fn lower_schedule_tree<'ctx>(
 #[allow(clippy::too_many_arguments)]
 pub fn lower_schedule_tree_into<'ctx>(
     ctx: &'ctx CodegenContext,
-    module: &inkwell::module::Module<'ctx>,
     function: FunctionValue<'ctx>,
     value_builder: &mut LlvmValueBuilder<'ctx>,
     schedule: &ScheduleTree,
@@ -113,14 +112,32 @@ pub fn lower_schedule_tree_into<'ctx>(
     return_value: Option<&PirExpr>,
     return_source: Option<ReturnSource>,
     callee_params: Option<&HashMap<String, Vec<ParamKind>>>,
+    mut module_builder: Option<&mut LLVMModuleBuilder<'ctx>>,
 ) -> CodegenResult<()> {
     let llvm_context = ctx.llvm_context();
-
-    // A schedule tree has no `let` step of its own, so a band body's only nameable
-    // storage is what already exists in the module. Bind the module's globals by name
-    // before lowering, so `counter = counter + 1` has somewhere to write. A name that
-    // is not a global stays unbound and an assignment to it is still refused.
-    value_builder.register_module_globals(module)?;
+    
+    // Extract module and use it for register_module_globals and abi_guard in a limited scope
+    // The borrow of module_builder ends at the end of this block
+    {
+        let module = {
+            let mb = module_builder.as_deref_mut().expect("module_builder must be provided when lowering with async");
+            mb.module_mut()
+        };
+        
+        // Register module globals
+        value_builder.register_module_globals(module)?;
+        
+        // Emit ABI guard
+        crate::codegen::llvm::abi_guard::emit_abi_guard(
+            value_builder.type_lowering(),
+            module,
+            function,
+            value_builder.builder(),
+            abi,
+        )?;
+    } // module_builder borrow ends here
+    
+    // module_builder is now available to move to ScheduleLowering
 
     // Create entry block
     let entry = llvm_context.append_basic_block(function, "entry");
@@ -236,15 +253,20 @@ pub fn lower_schedule_tree_into<'ctx>(
     // open and unterminated, so `ScheduleLowering` appends the body into it. A module
     // with no tensor parameter emits nothing here and the builder stays in `entry`, so
     // a scalar-only kernel's block structure is unchanged.
-    crate::codegen::llvm::abi_guard::emit_abi_guard(
-        llvm_context,
-        module,
-        function,
-        value_builder.builder(),
-        abi,
-    )?;
+    // abi_guard already called above with module from module_builder
 
-    // Create schedule lowering context
+    // Create schedule lowering context - extract module using a raw pointer approach
+    // to completely separate the borrow from the move
+    let module = {
+        let mb_ptr = module_builder
+            .as_deref_mut()
+            .expect("module_builder must be provided when lowering with async")
+            as *mut LLVMModuleBuilder<'ctx>;
+        // SAFETY: We're just reading the module field, no mutation
+        unsafe { (*mb_ptr).module() }
+    };
+    // borrow ends here
+    
     let mut lowering = ScheduleLowering::new(
         value_builder,
         module,
@@ -253,6 +275,7 @@ pub fn lower_schedule_tree_into<'ctx>(
         quantities,
         access_relations,
         callee_params,
+        module_builder,
     )?;
 
     // Lower the root schedule node
@@ -290,6 +313,10 @@ pub fn lower_schedule_tree_into<'ctx>(
     // arm and leave that caller to emit an unterminated function, the fallback stays
     // and says what it is. It is a compatibility path, NOT a claim that a Naso
     // function may return zero.
+    
+    // Use module from lowering context (already extracted)
+    let module = lowering.module;
+    
     let return_type = function.get_type().get_return_type();
     let returned = match (return_type, return_value) {
         (None, _) => None,
@@ -303,6 +330,8 @@ pub fn lower_schedule_tree_into<'ctx>(
                 // Empty: no loop is being lowered at the point this builder is created.
                 // The loop arms push and pop as they go.
                 loop_stack: Vec::new(),
+                module_builder: lowering.module_builder,
+                quantities: Some(quantities),
             };
             let value = lowerer.build_expr(expr, quantities)?;
             // A type mismatch here is REFUSED rather than converted: the return type
@@ -458,6 +487,8 @@ pub struct ScheduleLowering<'ctx, 'a> {
     /// can call any function in the module, not only a sibling. `None` for a
     /// hand-built module with no `functions`, where every callee is an `extern`.
     callee_params: Option<&'a HashMap<String, Vec<ParamKind>>>,
+    /// Module builder reference for async lowering (stored for async lowering, not for module access)
+    module_builder: Option<&'a mut LLVMModuleBuilder<'ctx>>,
 
     // Sub-emitters
     loop_emitter: LoopEmitter<'ctx>,
@@ -484,6 +515,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
         quantities: &'a QuantityMap,
         access_relations: &'a AccessRelations,
         callee_params: Option<&'a HashMap<String, Vec<ParamKind>>>,
+        module_builder: Option<&'a mut LLVMModuleBuilder<'ctx>>,
     ) -> CodegenResult<Self> {
         let loop_emitter = LoopEmitter::new(value_builder.type_lowering().context())?;
         let access_emitter = AccessEmitter::new(value_builder.type_lowering().context())?;
@@ -498,6 +530,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
             quantities,
             access_relations,
             callee_params,
+            module_builder,
             loop_emitter,
             access_emitter,
             optimizer,
@@ -621,6 +654,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
                 members,
                 child,
                 |lowering| {
+                    let module = self.module;
                     let mut inner = ScheduleLowering::new(
                         lowering.value_builder(),
                         module,
@@ -629,6 +663,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
                         quantities,
                         access_relations,
                         callee_params,
+                        self.module_builder.as_deref_mut(),
                     )?;
                     // Statements lowered from here ARE inside the loop nest this band
                     // emits, so their bodies carry the affine frame. Without this,
@@ -655,6 +690,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
                 members,
                 child,
                 |lowering| {
+                    let module = self.module;
                     let mut inner = ScheduleLowering::new(
                         lowering.value_builder(),
                         module,
@@ -663,6 +699,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
                         quantities,
                         access_relations,
                         callee_params,
+                        self.module_builder.as_deref_mut(),
                     )?;
                     // Statements lowered from here ARE inside the loop nest this band
                     // emits, so their bodies carry the affine frame. Without this,
@@ -876,7 +913,7 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
         // conversion this backend must not insert.
         match ty {
             inkwell::types::BasicTypeEnum::IntType(t) if t.get_bit_width() == 64 => {
-                Ok(self.value_builder.build_load(ptr, name)?.into_int_value())
+                Ok(self.value_builder.build_load(t.into(), ptr, name)?.into_int_value())
             }
             other => Err(CodegenError::UnsupportedFeature(format!(
                 "symbolic constant `{name}` is bound to {other:?}, but loop bounds are \
@@ -1072,6 +1109,8 @@ impl<'ctx, 'a> ScheduleLowering<'ctx, 'a> {
                 // it makes `break` say "outside a loop", which is the truth.
                 Vec::new()
             },
+            module_builder: self.module_builder.as_deref_mut(),
+            quantities: Some(self.quantities),
         };
         // The value is discarded because a statement body's result is not the point --
         // its SIDE EFFECTS are. Every arm of `build_expr` that has a side effect emits
@@ -1287,5 +1326,26 @@ mod tests {
             lowering.is_band_erased(&ScheduleNode::Empty),
             "a band with no statements must be erased rather than emit an empty loop"
         );
+    }
+}
+
+/// Implement ScheduleLoweringLike for our concrete type
+impl<'ctx, 'a> crate::codegen::llvm::loop_emission::ScheduleLoweringLike<'ctx> for ScheduleLowering<'ctx, 'a> {
+    fn value_builder(&mut self) -> &mut LlvmValueBuilder<'ctx> {
+        self.value_builder
+    }
+
+    fn module_builder(&mut self) -> Option<&mut LLVMModuleBuilder<'ctx>> {
+        self.module_builder.as_deref_mut()
+    }
+}
+
+impl<'ctx, 'a> crate::codegen::llvm::parallel::ScheduleLoweringLike<'ctx> for ScheduleLowering<'ctx, 'a> {
+    fn value_builder(&mut self) -> &mut LlvmValueBuilder<'ctx> {
+        self.value_builder
+    }
+
+    fn module_builder(&mut self) -> Option<&mut LLVMModuleBuilder<'ctx>> {
+        self.module_builder.as_deref_mut()
     }
 }

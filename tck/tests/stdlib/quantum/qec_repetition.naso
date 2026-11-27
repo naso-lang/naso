@@ -1,0 +1,14 @@
+// TEST: qec_repetition
+// CATEGORY: stdlib/quantum
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Repetition code
+
+edition 2024;
+
+use std::quantum::qec::{RepetitionCode, Decoder};
+
+fn main() {
+    let code = RepetitionCode::new(3);
+    let logical = code.encode(&[1]);
+}

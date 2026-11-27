@@ -1,0 +1,15 @@
+// TEST: subtyping_transitivity
+// CATEGORY: types/quantities
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Linear ≤ Affine ≤ Unrestricted transitivity
+
+edition 2024;
+
+fn take_unrestricted(x: i32) { }
+
+fn main() {
+    let x: [1] i32 = 42;
+    // Linear can go to unrestricted via affine? No - direct linear to unrestricted is not allowed
+    // This tests the hierarchy understanding
+}

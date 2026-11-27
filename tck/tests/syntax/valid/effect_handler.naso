@@ -1,0 +1,17 @@
+// TEST: effect_handler
+// CATEGORY: syntax
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Effect handler syntax
+
+edition 2024;
+
+effect MyEffect {
+    fn operation(x: i32) -> i32;
+}
+
+fn handle_effect() -> i32 {
+    handle perform MyEffect::operation(42) with {
+        operation(x) => x + 1
+    }
+}

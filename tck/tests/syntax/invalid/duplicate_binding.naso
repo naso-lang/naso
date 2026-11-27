@@ -1,0 +1,12 @@
+// TEST: duplicate_binding
+// CATEGORY: syntax
+// EXPECT: compile_error
+// EDITION: 2024
+// DESCRIPTION: Duplicate binding in same scope
+
+edition 2024;
+
+fn main() {
+    let x = 1;
+    let x = 2;  // Duplicate
+}

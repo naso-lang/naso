@@ -1,0 +1,13 @@
+// TEST: channel_communication
+// CATEGORY: semantics/concurrency
+// EXPECT: runtime_success
+// EDITION: 2024
+// DESCRIPTION: Message passing
+
+edition 2024;
+
+fn main() {
+    let (tx, rx) = channel();
+    spawn move || tx.send(42);
+    let value = rx.recv();  // 42
+}

@@ -1,0 +1,15 @@
+// TEST: unhandled_effect_error
+// CATEGORY: types/effects
+// EXPECT: compile_error
+// EDITION: 2024
+// DESCRIPTION: Unhandled effect is error
+
+edition 2024;
+
+effect Fail {
+    fn fail() -> !;
+}
+
+fn main() -> i32 {
+    perform Fail::fail()  // Unhandled - should error
+}

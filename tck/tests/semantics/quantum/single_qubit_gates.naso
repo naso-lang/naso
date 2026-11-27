@@ -1,0 +1,16 @@
+// TEST: single_qubit_gates
+// CATEGORY: semantics/quantum
+// EXPECT: runtime_success
+// EDITION: 2024
+// DESCRIPTION: X, Y, Z, H, S, T gates
+
+edition 2024;
+
+fn main() {
+    let q = qubit;
+    gate X(q);  // |1⟩
+    gate H(q);  // |+⟩
+    gate Z(q);  // |-⟩
+    gate S(q);  // phase
+    gate T(q);  // π/4 phase
+}

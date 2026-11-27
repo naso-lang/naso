@@ -1,0 +1,13 @@
+// TEST: closures
+// CATEGORY: semantics/basic
+// EXPECT: runtime_success
+// EDITION: 2024
+// DESCRIPTION: Closure capture and call
+
+edition 2024;
+
+fn main() {
+    let x = 10;
+    let add_x = |y| x + y;
+    let result = add_x(5);  // 15
+}

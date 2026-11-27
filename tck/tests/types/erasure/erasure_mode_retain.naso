@@ -1,0 +1,12 @@
+// TEST: erasure_mode_retain
+// CATEGORY: types/erasure
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Retain mode - proofs retained
+
+edition 2024;
+
+#[retain]
+fn proof_fn(p: Proof<True>) -> i32 {
+    42
+}

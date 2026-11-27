@@ -1,0 +1,11 @@
+// TEST: enhanced_dependent_types
+// CATEGORY: editions/2027
+// EXPECT: compile_success
+// EDITION: 2027
+// DESCRIPTION: Enhanced dependent types
+
+edition 2027;
+
+fn implicit_pi(n: Nat) -> Vec[i32, n] {
+    [0; n]  // Implicit Pi-type
+}

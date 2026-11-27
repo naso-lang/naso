@@ -1,0 +1,18 @@
+// TEST: circuit_execution
+// CATEGORY: semantics/quantum
+// EXPECT: runtime_success
+// EDITION: 2024
+// DESCRIPTION: Multi-gate circuits
+
+edition 2024;
+
+fn main() {
+    circuit {
+        let q1 = qubit;
+        let q2 = qubit;
+        gate H(q1);
+        gate CNOT(q1, q2);
+        gate H(q1);
+        measure q1, q2
+    }
+}

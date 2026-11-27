@@ -1,0 +1,12 @@
+// TEST: dependent_application
+// CATEGORY: types/dependent
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Dependent function application
+
+edition 2024;
+
+fn replicate[T](n: Nat, x: T) -> [T; n] {
+    // Application of dependent function
+    [x; n]
+}

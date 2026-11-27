@@ -1,0 +1,21 @@
+// TEST: handler_basic
+// CATEGORY: semantics/effects
+// EXPECT: runtime_success
+// EDITION: 2024
+// DESCRIPTION: Simple effect handling
+
+edition 2024;
+
+effect Greet {
+    fn hello() -> String;
+}
+
+fn greet() -> String effect {Greet} {
+    perform Greet::hello()
+}
+
+fn main() {
+    let result = handle greet() with {
+        hello() => "Hello, World!"
+    };
+}

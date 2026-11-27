@@ -1,0 +1,15 @@
+// TEST: postcondition_check
+// CATEGORY: verification/smt
+// EXPECT: verification_pass
+// EDITION: 2024
+// DESCRIPTION: Ensures clause verification
+
+edition 2024;
+
+fn double(x: i32) -> i32
+    verify {
+        ensures result == 2 * x;
+    }
+{
+    x * 2
+}

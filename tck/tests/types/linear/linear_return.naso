@@ -1,0 +1,18 @@
+// TEST: linear_return
+// CATEGORY: types/linear
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Linear return value
+
+edition 2024;
+
+fn make_linear() -> [1] i32 {
+    42
+}
+
+fn main() {
+    let x = make_linear();  // Linear return
+    use(x);
+}
+
+fn use(x: [1] i32) { }

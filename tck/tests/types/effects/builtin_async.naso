@@ -1,0 +1,15 @@
+// TEST: builtin_async
+// CATEGORY: types/effects
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Built-in Async effect
+
+edition 2024;
+
+async fn fetch() -> i32 {
+    42
+}
+
+fn main() {
+    let _ = fetch().await;
+}

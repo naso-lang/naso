@@ -1,0 +1,22 @@
+// TEST: handler_stacking
+// CATEGORY: semantics/effects
+// EXPECT: runtime_success
+// EDITION: 2024
+// DESCRIPTION: Multiple handlers
+
+edition 2024;
+
+effect A { fn op() -> i32; }
+effect B { fn op() -> i32; }
+
+fn both() -> i32 effect {A, B} {
+    perform A::op() + perform B::op()
+}
+
+fn main() {
+    handle handle both() with {
+        A::op() => 1
+    } with {
+        B::op() => 2
+    }
+}

@@ -1,0 +1,16 @@
+// TEST: variational_vqe
+// CATEGORY: stdlib/quantum
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: VQE algorithm
+
+edition 2024;
+
+use std::quantum::variational::{VQE, VQEConfig, Molecule};
+
+fn main() {
+    let h2 = Molecule::h2(0.74);
+    let config = VQEConfig::default();
+    let vqe = VQE::new(h2, config);
+    let energy = vqe.run();
+}

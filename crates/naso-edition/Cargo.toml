@@ -1,0 +1,20 @@
+[package]
+name = "naso-edition"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/naso-lang/naso"
+description = "Edition system for Naso language - manages 2024/2027/2030 editions"
+
+[dependencies]
+naso-compiler = { path = "../../compiler" }
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4.5", features = ["derive"] }
+colored = "2.0"
+walkdir = "2.0"
+
+[features]
+default = ["migration"]
+migration = []

@@ -1,0 +1,11 @@
+// TEST: invalid_quantity
+// CATEGORY: syntax
+// EXPECT: compile_error
+// EDITION: 2024
+// DESCRIPTION: Invalid quantity annotation
+
+edition 2024;
+
+fn main() {
+    let x: [2] i32 = 42;  // Invalid quantity
+}

@@ -1,0 +1,14 @@
+// TEST: dependent_types
+// CATEGORY: syntax
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Dependent type syntax (Pi/Sigma types)
+
+edition 2024;
+
+fn vector_append[T](v: Vector[T, n], x: T) -> Vector[T, n + 1] {
+    // dependent type example
+    v.push(x)
+}
+
+type Vector[T, n: Nat] = [T; n];

@@ -1,0 +1,21 @@
+// TEST: effect_handling
+// CATEGORY: types/effects
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Handler removes effects
+
+edition 2024;
+
+effect Fail {
+    fn fail() -> !;
+}
+
+fn may_fail() -> i32 effect {Fail} {
+    perform Fail::fail()
+}
+
+fn handled() -> i32 {
+    handle may_fail() with {
+        fail() => 0
+    }
+}

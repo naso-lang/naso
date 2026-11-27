@@ -1,0 +1,18 @@
+// TEST: mutex
+// CATEGORY: stdlib/core
+// EXPECT: runtime_success
+// EDITION: 2024
+// DESCRIPTION: Mutex API
+
+edition 2024;
+
+use std::mutex::Mutex;
+
+fn main() {
+    let m = Mutex::new(0);
+    {
+        let mut guard = m.lock();
+        *guard += 1;
+    }
+    assert_eq!(*m.lock(), 1);
+}

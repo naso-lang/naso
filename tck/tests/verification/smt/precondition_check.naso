@@ -1,0 +1,17 @@
+// TEST: precondition_check
+// CATEGORY: verification/smt
+// EXPECT: verification_pass
+// EDITION: 2024
+// DESCRIPTION: Requires clause verification
+
+edition 2024;
+
+fn add(x: i32, y: i32) -> i32
+    verify {
+        requires x >= 0;
+        requires y >= 0;
+        ensures result >= 0;
+    }
+{
+    x + y
+}

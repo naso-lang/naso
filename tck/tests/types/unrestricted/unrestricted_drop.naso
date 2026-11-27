@@ -1,0 +1,12 @@
+// TEST: unrestricted_drop
+// CATEGORY: types/unrestricted
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Unrestricted values implicitly dropped
+
+edition 2024;
+
+fn main() {
+    let x: i32 = 42;
+    // x dropped implicitly - OK
+}

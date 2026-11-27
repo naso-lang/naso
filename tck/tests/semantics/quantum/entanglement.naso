@@ -1,0 +1,15 @@
+// TEST: entanglement
+// CATEGORY: semantics/quantum
+// EXPECT: runtime_success
+// EDITION: 2024
+// DESCRIPTION: Bell state preparation
+
+edition 2024;
+
+fn main() {
+    let q1 = qubit;
+    let q2 = qubit;
+    gate H(q1);
+    gate CNOT(q1, q2);
+    // |Φ⁺⟩ = (|00⟩ + |11⟩)/√2
+}

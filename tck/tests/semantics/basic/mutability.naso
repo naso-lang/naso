@@ -1,0 +1,13 @@
+// TEST: mutability
+// CATEGORY: semantics/basic
+// EXPECT: runtime_success
+// EDITION: 2024
+// DESCRIPTION: Mutable bindings
+
+edition 2024;
+
+fn main() {
+    let mut x = 0;
+    x = 1;
+    x += 5;  // 6
+}

@@ -1,0 +1,16 @@
+// TEST: variational_qaoa
+// CATEGORY: stdlib/quantum
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: QAOA algorithm
+
+edition 2024;
+
+use std::quantum::variational::{QAOA, QAOAConfig, MaxCut};
+
+fn main() {
+    let graph = MaxCut::from_edges(&[(0,1), (1,2), (2,0)]);
+    let config = QAOAConfig::default();
+    let qaoa = QAOA::new(graph, config);
+    let cut = qaoa.run();
+}

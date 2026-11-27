@@ -1,0 +1,14 @@
+// TEST: builtin_try
+// CATEGORY: types/effects
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Built-in Try effect
+
+edition 2024;
+
+fn might_fail() -> i32 effect {Try<String>} {
+    if false {
+        throw "error"
+    }
+    42
+}

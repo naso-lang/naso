@@ -1,0 +1,15 @@
+// TEST: effect_inference
+// CATEGORY: types/effects
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Effect row inference
+
+edition 2024;
+
+fn async_fn() -> i32 {
+    async { 42 }.await
+}
+
+fn main() {
+    let result = async_fn();  // Effect {Async} inferred
+}

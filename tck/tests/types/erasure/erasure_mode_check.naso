@@ -1,0 +1,12 @@
+// TEST: erasure_mode_check
+// CATEGORY: types/erasure
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Check mode - proofs become runtime assertions
+
+edition 2024;
+
+#[check]
+fn proof_fn(p: Proof<True>) -> i32 {
+    42
+}

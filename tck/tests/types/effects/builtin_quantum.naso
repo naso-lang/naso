@@ -1,0 +1,13 @@
+// TEST: builtin_quantum
+// CATEGORY: types/effects
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Built-in Quantum effect
+
+edition 2024;
+
+fn quantum_ops() -> bool effect {Quantum} {
+    let q = qubit;
+    gate H(q);
+    measure q
+}

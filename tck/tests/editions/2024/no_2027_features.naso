@@ -1,0 +1,12 @@
+// TEST: no_2027_features
+// CATEGORY: editions/2024
+// EXPECT: compile_error
+// EDITION: 2024
+// DESCRIPTION: 2027 features rejected
+
+edition 2024;
+
+#[cfg(edition = "2027")]
+fn feature_2027() {}  // Should be disabled
+
+fn main() {}

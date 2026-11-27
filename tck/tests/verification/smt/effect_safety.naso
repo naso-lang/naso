@@ -1,0 +1,23 @@
+// TEST: effect_safety
+// CATEGORY: verification/smt
+// EXPECT: verification_pass
+// EDITION: 2024
+// DESCRIPTION: Effect handling proof
+
+edition 2024;
+
+effect E { fn op() -> i32; }
+
+fn with_effect() -> i32 effect {E} {
+    perform E::op()
+}
+
+fn handled() -> i32
+    verify {
+        // Proves no unhandled effects
+    }
+{
+    handle with_effect() with {
+        E::op() => 42
+    }
+}

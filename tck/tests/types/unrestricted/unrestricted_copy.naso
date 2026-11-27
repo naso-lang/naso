@@ -1,0 +1,14 @@
+// TEST: unrestricted_copy
+// CATEGORY: types/unrestricted
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Unrestricted values freely copied
+
+edition 2024;
+
+fn use_twice(x: i32, y: i32) { }
+
+fn main() {
+    let x: i32 = 42;
+    use_twice(x, x);  // Copy - OK
+}

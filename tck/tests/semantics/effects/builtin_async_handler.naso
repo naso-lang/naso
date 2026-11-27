@@ -1,0 +1,16 @@
+// TEST: builtin_async_handler
+// CATEGORY: semantics/effects
+// EXPECT: runtime_success
+// EDITION: 2024
+// DESCRIPTION: Async runtime handler
+
+edition 2024;
+
+async fn fetch() -> i32 {
+    42
+}
+
+fn main() {
+    // Async handled by runtime
+    let result = fetch().await;
+}

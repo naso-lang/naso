@@ -1,0 +1,14 @@
+// TEST: error_mitigation_zn
+// CATEGORY: semantics/quantum
+// EXPECT: runtime_success
+// EDITION: 2024
+// DESCRIPTION: Zero-noise extrapolation
+
+edition 2024;
+
+fn main() {
+    // ZNE with scaling factors
+    let result = zne(|| circuit {
+        // VQE circuit
+    }, [1.0, 1.5, 2.0, 3.0]);
+}

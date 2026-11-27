@@ -1,0 +1,19 @@
+// TEST: handler_polymorphic
+// CATEGORY: semantics/effects
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Generic handlers
+
+edition 2024;
+
+effect State[S] {
+    fn get() -> S;
+    fn set(s: S);
+}
+
+fn with_state[S](initial: S, f: fn() effect {State[S]}) -> S {
+    handle f() with {
+        State::get() => initial,
+        State::set(s) => s,
+    }
+}

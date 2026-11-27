@@ -1,0 +1,12 @@
+// TEST: erasure_mode_erase
+// CATEGORY: types/erasure
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Erase mode - proofs erased
+
+edition 2024;
+
+#[erase]
+fn proof_fn(p: Proof<True>) -> i32 {
+    42
+}

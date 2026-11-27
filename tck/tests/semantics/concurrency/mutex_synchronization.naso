@@ -1,0 +1,13 @@
+// TEST: mutex_synchronization
+// CATEGORY: semantics/concurrency
+// EXPECT: runtime_success
+// EDITION: 2024
+// DESCRIPTION: Mutual exclusion
+
+edition 2024;
+
+fn main() {
+    let m = Mutex::new(0);
+    let mut guard = m.lock();
+    *guard += 1;
+}

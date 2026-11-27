@@ -1,0 +1,15 @@
+// TEST: pi_type
+// CATEGORY: types/dependent
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Pi-type formation
+
+edition 2024;
+
+type Vec[T, n: Nat] = [T; n];
+
+fn make_vec[T](n: Nat, f: fn(Nat) -> T) -> Vec[T, n] {
+    // Pi-type: Π(n: Nat). Vec[T, n]
+    // Implementation would use dependent types
+    todo()
+}

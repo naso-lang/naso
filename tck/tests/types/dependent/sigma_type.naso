@@ -1,0 +1,13 @@
+// TEST: sigma_type
+// CATEGORY: types/dependent
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Sigma-type formation
+
+edition 2024;
+
+type Exists[T] = Σ(x: T). True;
+
+fn pack[T](x: T) -> Exists[T] {
+    (x, ())
+}

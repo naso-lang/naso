@@ -1,0 +1,12 @@
+// TEST: default_unrestricted
+// CATEGORY: types/unrestricted
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Default quantity is unrestricted
+
+edition 2024;
+
+fn main() {
+    let x = 42;  // No annotation = unrestricted
+    let y = x;   // Copy - OK
+}

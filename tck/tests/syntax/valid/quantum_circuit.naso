@@ -1,0 +1,20 @@
+// TEST: quantum_circuit
+// CATEGORY: syntax
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Quantum circuit declaration with gates
+
+edition 2024;
+
+quantum mod bell_state {
+    gate h(q: Qubit) -> Gate;
+    gate cnot(control: Qubit, target: Qubit) -> Gate;
+
+    circuit create_bell() -> Circuit {
+        let q1 = qubit;
+        let q2 = qubit;
+        h(q1);
+        cnot(q1, q2);
+        measure q1, q2
+    }
+}

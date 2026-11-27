@@ -1,0 +1,11 @@
+// TEST: unclosed_brace
+// CATEGORY: syntax
+// EXPECT: compile_error
+// EDITION: 2024
+// DESCRIPTION: Unclosed brace
+
+edition 2024;
+
+fn main() {
+    if true {
+        // Missing closing brace

@@ -1,0 +1,20 @@
+// TEST: hybrid_hpc
+// CATEGORY: stdlib/quantum
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Classical/quantum coupling
+
+edition 2024;
+
+use std::quantum::hybrid::{HybridWorkflow, CouplingStrategy};
+
+fn main() {
+    let workflow = HybridWorkflow::new(CouplingStrategy::Iterative);
+    workflow.run(|| {
+        // Classical pre-processing
+    }, || {
+        // Quantum circuit
+    }, || {
+        // Classical post-processing
+    });
+}

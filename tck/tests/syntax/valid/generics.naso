@@ -1,0 +1,15 @@
+// TEST: generics
+// CATEGORY: syntax
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Generic parameters and constraints
+
+edition 2024;
+
+trait Add {
+    fn add(self, other: Self) -> Self;
+}
+
+fn generic_add[T: Add](a: T, b: T) -> T {
+    a.add(b)
+}

@@ -1,0 +1,15 @@
+// TEST: linear_tuple
+// CATEGORY: types/linear
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Linear tuple components
+
+edition 2024;
+
+fn use_pair(p: ([1] i32, [1] i32)) { }
+
+fn main() {
+    let x: [1] i32 = 1;
+    let y: [1] i32 = 2;
+    use_pair((x, y));
+}

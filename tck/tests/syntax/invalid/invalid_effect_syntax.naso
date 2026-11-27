@@ -1,0 +1,11 @@
+// TEST: invalid_effect_syntax
+// CATEGORY: syntax
+// EXPECT: compile_error
+// EDITION: 2024
+// DESCRIPTION: Malformed effect declaration
+
+edition 2024;
+
+effect BadEffect {
+    fn operation  // Missing signature
+}

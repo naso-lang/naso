@@ -1,0 +1,14 @@
+// TEST: affine_not_copied
+// CATEGORY: types/affine
+// EXPECT: compile_error
+// EDITION: 2024
+// DESCRIPTION: Affine value cannot be copied
+
+edition 2024;
+
+fn use_twice(x: [?] i32, y: [?] i32) { }
+
+fn main() {
+    let x: [?] i32 = 42;
+    use_twice(x, x);  // Copy attempt - should error
+}

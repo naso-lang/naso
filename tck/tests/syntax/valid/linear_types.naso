@@ -1,0 +1,14 @@
+// TEST: linear_types
+// CATEGORY: syntax
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Linear type annotations
+
+edition 2024;
+
+fn consume_linear(x: [1] i32) {
+    // x must be used exactly once
+    use(x)
+}
+
+fn use(x: [1] i32) { }

@@ -1,0 +1,15 @@
+// TEST: async_await
+// CATEGORY: semantics/concurrency
+// EXPECT: runtime_success
+// EDITION: 2024
+// DESCRIPTION: Basic async/await
+
+edition 2024;
+
+async fn fetch() -> i32 {
+    42
+}
+
+fn main() {
+    let result = fetch().await;
+}

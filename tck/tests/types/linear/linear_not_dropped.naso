@@ -1,0 +1,12 @@
+// TEST: linear_not_dropped
+// CATEGORY: types/linear
+// EXPECT: compile_error
+// EDITION: 2024
+// DESCRIPTION: Linear value cannot be implicitly dropped
+
+edition 2024;
+
+fn main() {
+    let x: [1] i32 = 42;
+    // x dropped here - should error
+}

@@ -1,0 +1,13 @@
+// TEST: new_stdlib_modules
+// CATEGORY: editions/2027
+// EXPECT: compile_success
+// EDITION: 2027
+// DESCRIPTION: New stdlib modules
+
+edition 2027;
+
+use std::v2::new_module;
+
+fn main() {
+    new_module::new_function();
+}

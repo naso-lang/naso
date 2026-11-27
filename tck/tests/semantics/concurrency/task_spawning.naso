@@ -1,0 +1,15 @@
+// TEST: task_spawning
+// CATEGORY: semantics/concurrency
+// EXPECT: runtime_success
+// EDITION: 2024
+// DESCRIPTION: Task creation
+
+edition 2024;
+
+async fn background() {
+    // Do work
+}
+
+fn main() {
+    spawn background();
+}

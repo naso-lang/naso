@@ -1,0 +1,15 @@
+// TEST: relevance_inference
+// CATEGORY: types/dependent
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Relevance analysis
+
+edition 2024;
+
+fn with_proof(p: Proof<True>) -> i32 {
+    42  // Proof is irrelevant, erased
+}
+
+fn main() {
+    with_proof(());  // Proof argument erased
+}

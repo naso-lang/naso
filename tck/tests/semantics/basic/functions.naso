@@ -1,0 +1,15 @@
+// TEST: functions
+// CATEGORY: semantics/basic
+// EXPECT: runtime_success
+// EDITION: 2024
+// DESCRIPTION: Function calls, recursion
+
+edition 2024;
+
+fn factorial(n: u32) -> u32 {
+    if n <= 1 { 1 } else { n * factorial(n - 1) }
+}
+
+fn main() {
+    let result = factorial(5);  // 120
+}

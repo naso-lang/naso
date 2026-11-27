@@ -1,0 +1,16 @@
+// TEST: channel
+// CATEGORY: stdlib/core
+// EXPECT: runtime_success
+// EDITION: 2024
+// DESCRIPTION: Channel API
+
+edition 2024;
+
+use std::channel::channel;
+
+fn main() {
+    let (tx, rx) = channel::<i32>();
+    tx.send(42);
+    let val = rx.recv();
+    assert_eq!(val, 42);
+}

@@ -1,0 +1,15 @@
+// TEST: density_matrix
+// CATEGORY: semantics/quantum
+// EXPECT: runtime_success
+// EDITION: 2024
+// DESCRIPTION: Mixed state evolution
+
+edition 2024;
+
+fn main() {
+    // Mixed state with depolarizing noise
+    let q = qubit;
+    gate X(q);  // |1⟩
+    // Apply noise channel
+    // Result: mixed state
+}

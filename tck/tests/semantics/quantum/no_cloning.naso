@@ -1,0 +1,12 @@
+// TEST: no_cloning
+// CATEGORY: semantics/quantum
+// EXPECT: compile_error
+// EDITION: 2024
+// DESCRIPTION: Linear qubits prevent cloning
+
+edition 2024;
+
+fn main() {
+    let q = qubit;
+    let q2 = q;  // Copy attempt - should error (qubits are linear)
+}

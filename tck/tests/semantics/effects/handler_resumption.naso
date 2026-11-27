@@ -1,0 +1,27 @@
+// TEST: handler_resumption
+// CATEGORY: semantics/effects
+// EXPECT: runtime_success
+// EDITION: 2024
+// DESCRIPTION: Continuation resumption
+
+edition 2024;
+
+effect Yield {
+    fn yield_(value: i32) -> i32;
+}
+
+fn generator() -> i32 effect {Yield} {
+    let x = perform Yield::yield_(1);
+    let y = perform Yield::yield_(2);
+    x + y
+}
+
+fn main() {
+    let mut results = Vec::new();
+    handle generator() with {
+        yield_(v) => {
+            results.push(v);
+            v * 10  // Resume with v * 10
+        }
+    };
+}

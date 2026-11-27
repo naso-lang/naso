@@ -1,0 +1,13 @@
+// TEST: superposition
+// CATEGORY: semantics/quantum
+// EXPECT: runtime_success
+// EDITION: 2024
+// DESCRIPTION: H|0⟩ = |+⟩
+
+edition 2024;
+
+fn main() {
+    let q = qubit;  // |0⟩
+    gate H(q);      // (|0⟩ + |1⟩)/√2
+    // Measure gives 0 or 1 with equal probability
+}

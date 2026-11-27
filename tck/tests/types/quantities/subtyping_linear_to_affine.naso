@@ -1,0 +1,14 @@
+// TEST: subtyping_linear_to_affine
+// CATEGORY: types/quantities
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Linear ≤ Affine subtyping
+
+edition 2024;
+
+fn take_affine(x: [?] i32) { }
+
+fn main() {
+    let x: [1] i32 = 42;
+    take_affine(x);  // Linear → Affine - OK
+}

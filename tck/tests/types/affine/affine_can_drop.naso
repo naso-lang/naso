@@ -1,0 +1,12 @@
+// TEST: affine_can_drop
+// CATEGORY: types/affine
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Affine value can be dropped
+
+edition 2024;
+
+fn main() {
+    let x: [?] i32 = 42;
+    // x can be dropped implicitly - OK
+}

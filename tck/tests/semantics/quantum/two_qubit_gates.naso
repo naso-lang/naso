@@ -1,0 +1,15 @@
+// TEST: two_qubit_gates
+// CATEGORY: semantics/quantum
+// EXPECT: runtime_success
+// EDITION: 2024
+// DESCRIPTION: CNOT, CZ, SWAP
+
+edition 2024;
+
+fn main() {
+    let q1 = qubit;
+    let q2 = qubit;
+    gate CNOT(q1, q2);
+    gate CZ(q1, q2);
+    gate SWAP(q1, q2);
+}

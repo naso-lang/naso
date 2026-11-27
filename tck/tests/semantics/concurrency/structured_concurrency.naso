@@ -1,0 +1,16 @@
+// TEST: structured_concurrency
+// CATEGORY: semantics/concurrency
+// EXPECT: runtime_success
+// EDITION: 2024
+// DESCRIPTION: Task tree cancellation
+
+edition 2024;
+
+async fn child() {
+    loop {}
+}
+
+async fn parent() {
+    let task = spawn child();
+    // task cancelled when parent returns
+}

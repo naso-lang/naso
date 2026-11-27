@@ -1,0 +1,15 @@
+// TEST: quantum_unitarity
+// CATEGORY: verification/smt
+// EXPECT: verification_pass
+// EDITION: 2024
+// DESCRIPTION: Unitary gate proof
+
+edition 2024;
+
+fn hadamard(q: Qubit)
+    verify {
+        // Proves H is unitary: H†H = I
+    }
+{
+    gate H(q);
+}

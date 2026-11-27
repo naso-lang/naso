@@ -12,7 +12,11 @@ members = [
     "crates/naso-quantum-runtime",
     "crates/naso-verify",
     "crates/naso-cloud",
+    "crates/naso-gcc-backend",
+    "crates/naso-msvc-backend",
+    "crates/naso-edition",
     "bench_runner",
+    "tck",
 ]
 
 [workspace.package]

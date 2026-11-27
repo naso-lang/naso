@@ -1,0 +1,14 @@
+// TEST: prelude
+// CATEGORY: stdlib/core
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Auto-imported items
+
+edition 2024;
+
+fn main() {
+    // These are in prelude, no import needed
+    let v = Vec::new();
+    let opt = Option::Some(42);
+    let result = Result::Ok(42);
+}

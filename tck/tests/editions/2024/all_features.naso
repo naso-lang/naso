@@ -1,0 +1,23 @@
+// TEST: all_features
+// CATEGORY: editions/2024
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: All 2024 features work
+
+edition 2024;
+
+fn main() {
+    // QTT
+    let linear: [1] i32 = 42;
+    let affine: [?] i32 = 42;
+    let unrestricted: i32 = 42;
+    
+    // Effects
+    async fn async_fn() -> i32 { 42 }
+    
+    // Quantum
+    let q = qubit;
+    
+    // Verification
+    verify { requires true; ensures true; }
+}

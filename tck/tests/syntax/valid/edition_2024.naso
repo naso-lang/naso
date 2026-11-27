@@ -1,0 +1,11 @@
+// TEST: edition_2024
+// CATEGORY: syntax
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Edition 2024 declaration
+
+edition 2024;
+
+fn main() {
+    // All 2024 features available
+}

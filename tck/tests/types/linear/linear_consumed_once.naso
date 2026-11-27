@@ -1,0 +1,14 @@
+// TEST: linear_consumed_once
+// CATEGORY: types/linear
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Linear value used exactly once
+
+edition 2024;
+
+fn consume(x: [1] i32) { }
+
+fn main() {
+    let x: [1] i32 = 42;
+    consume(x);  // Consumed exactly once
+}

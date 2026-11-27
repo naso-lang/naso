@@ -1,0 +1,21 @@
+// TEST: linear_match
+// CATEGORY: types/linear
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Linear pattern matching
+
+edition 2024;
+
+enum LinearOpt[T] {
+    Some([1] T),
+    None,
+}
+
+fn handle(opt: LinearOpt[i32]) {
+    match opt {
+        Some(x) => use(x),
+        None => (),
+    }
+}
+
+fn use(x: [1] i32) { }

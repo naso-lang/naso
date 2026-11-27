@@ -1,0 +1,21 @@
+// TEST: pattern_matching
+// CATEGORY: syntax
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Complex pattern matching
+
+edition 2024;
+
+enum Option[T] {
+    Some(T),
+    None,
+}
+
+fn match_option(opt: Option[i32]) -> i32 {
+    match opt {
+        Some(x) if x > 0 => x,
+        Some(0) => 0,
+        Some(_) => -1,
+        None => -2,
+    }
+}

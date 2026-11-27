@@ -1,0 +1,20 @@
+[package]
+name = "naso-msvc-backend"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/naso-lang/naso"
+description = "MSVC backend for Naso compiler - enables Windows native compilation"
+
+[dependencies]
+naso-compiler = { path = "../../compiler" }
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+inkwell = { version = "0.11", features = ["llvm17-0"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["libloaderapi", "processthreadsapi", "memoryapi"], optional = true }
+
+[features]
+default = ["llvm-ir"]
+llvm-ir = ["inkwell"]

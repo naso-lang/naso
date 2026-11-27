@@ -1,0 +1,15 @@
+// TEST: effect_polymorphism
+// CATEGORY: types/effects
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Generic effects
+
+edition 2024;
+
+effect MyEffect {
+    fn op() -> i32;
+}
+
+fn with_effect[E](f: fn() -> i32 effect {E}) -> i32 effect {E} {
+    f()
+}

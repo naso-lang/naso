@@ -1,0 +1,13 @@
+// TEST: ai_compilation
+// CATEGORY: editions/2030
+// EXPECT: compile_success
+// EDITION: 2030
+// DESCRIPTION: AI-assisted compilation
+
+edition 2030;
+
+#[ai_optimize]
+fn optimized() -> i32 {
+    // AI-guided optimization
+    42
+}

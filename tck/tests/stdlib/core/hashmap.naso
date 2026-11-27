@@ -1,0 +1,17 @@
+// TEST: hashmap
+// CATEGORY: stdlib/core
+// EXPECT: runtime_success
+// EDITION: 2024
+// DESCRIPTION: Hash map operations
+
+edition 2024;
+
+use std::hashmap::HashMap;
+
+fn main() {
+    let mut map = HashMap::new();
+    map.insert("key", 42);
+    assert_eq!(map.get("key"), Some(42));
+    map.remove("key");
+    assert_eq!(map.get("key"), None);
+}

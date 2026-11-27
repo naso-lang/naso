@@ -1,0 +1,13 @@
+// TEST: advanced_quantum
+// CATEGORY: editions/2030
+// EXPECT: compile_success
+// EDITION: 2030
+// DESCRIPTION: Advanced quantum primitives
+
+edition 2030;
+
+use std::quantum::advanced::{LogicalQubit, FaultTolerant};
+
+fn main() {
+    let logical: LogicalQubit = FaultTolerant::encode(qubit);
+}

@@ -1,0 +1,17 @@
+// TEST: affine_optional_use
+// CATEGORY: types/affine
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Affine value used 0 or 1 times
+
+edition 2024;
+
+fn maybe_use(x: [?] i32) { }
+
+fn main() {
+    let x: [?] i32 = 42;
+    if true {
+        maybe_use(x);  // Used once - OK
+    }
+    // Or not used - also OK
+}

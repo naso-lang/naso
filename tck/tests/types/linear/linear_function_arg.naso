@@ -1,0 +1,14 @@
+// TEST: linear_function_arg
+// CATEGORY: types/linear
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Linear function parameter consumed
+
+edition 2024;
+
+fn take_linear(x: [1] i32) { }
+
+fn main() {
+    let x: [1] i32 = 42;
+    take_linear(x);  // Parameter consumed
+}

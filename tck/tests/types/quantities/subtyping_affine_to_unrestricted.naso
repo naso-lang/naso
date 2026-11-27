@@ -1,0 +1,14 @@
+// TEST: subtyping_affine_to_unrestricted
+// CATEGORY: types/quantities
+// EXPECT: compile_error
+// EDITION: 2024
+// DESCRIPTION: Affine ≤ Unrestricted (should fail - affine not ≤ unrestricted)
+
+edition 2024;
+
+fn take_unrestricted(x: i32) { }
+
+fn main() {
+    let x: [?] i32 = 42;
+    take_unrestricted(x);  // Affine → Unrestricted - should error
+}

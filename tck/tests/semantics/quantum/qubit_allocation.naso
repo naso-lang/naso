@@ -1,0 +1,12 @@
+// TEST: qubit_allocation
+// CATEGORY: semantics/quantum
+// EXPECT: runtime_success
+// EDITION: 2024
+// DESCRIPTION: Qubit allocation/initialization
+
+edition 2024;
+
+fn main() {
+    let q = qubit;  // Allocates |0⟩
+    // q is |0⟩
+}

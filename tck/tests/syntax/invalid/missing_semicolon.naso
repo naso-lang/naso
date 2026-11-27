@@ -1,0 +1,11 @@
+// TEST: missing_semicolon
+// CATEGORY: syntax
+// EXPECT: compile_error
+// EDITION: 2024
+// DESCRIPTION: Missing semicolon should error
+
+edition 2024;
+
+fn main() {
+    let x = 42  // Missing semicolon
+}

@@ -1,0 +1,16 @@
+// TEST: primitives
+// CATEGORY: stdlib/quantum
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Qubit, Gate, Circuit types
+
+edition 2024;
+
+use std::quantum::{Qubit, Gate, Circuit, measure};
+
+fn main() {
+    let q: Qubit = qubit;
+    let g: Gate = Gate::H;
+    let c: Circuit = circuit { gate H(q) };
+    let result: bool = measure q;
+}

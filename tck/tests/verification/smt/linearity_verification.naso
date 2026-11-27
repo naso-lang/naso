@@ -1,0 +1,15 @@
+// TEST: linearity_verification
+// CATEGORY: verification/smt
+// EXPECT: verification_pass
+// EDITION: 2024
+// DESCRIPTION: Resource usage proof
+
+edition 2024;
+
+fn use_linear(x: [1] i32) -> [1] i32
+    verify {
+        // Proves x consumed exactly once
+    }
+{
+    x
+}

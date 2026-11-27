@@ -1,0 +1,16 @@
+// TEST: builtin_try_handler
+// CATEGORY: semantics/effects
+// EXPECT: runtime_success
+// EDITION: 2024
+// DESCRIPTION: Error handling with Try effect
+
+edition 2024;
+
+fn might_fail() -> i32 effect {Try<String>} {
+    if false { throw "error" }
+    42
+}
+
+fn main() {
+    let result = try might_fail() catch e => 0;
+}

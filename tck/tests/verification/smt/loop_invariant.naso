@@ -1,0 +1,27 @@
+// TEST: loop_invariant
+// CATEGORY: verification/smt
+// EXPECT: verification_pass
+// EDITION: 2024
+// DESCRIPTION: Loop invariant checking
+
+edition 2024;
+
+fn sum_to(n: i32) -> i32
+    verify {
+        requires n >= 0;
+        ensures result == n * (n + 1) / 2;
+    }
+{
+    let mut sum = 0;
+    let mut i = 1;
+    while i <= n
+        verify {
+            invariant sum == i * (i - 1) / 2;
+            invariant i <= n + 1;
+        }
+    {
+        sum += i;
+        i += 1;
+    }
+    sum
+}

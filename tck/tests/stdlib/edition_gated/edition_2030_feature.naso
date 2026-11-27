@@ -1,0 +1,11 @@
+// TEST: edition_2030_feature
+// CATEGORY: stdlib/edition_gated
+// EXPECT: compile_error
+// EDITION: 2024
+// DESCRIPTION: 2030-only feature rejected in 2024
+
+edition 2024;
+
+use std::edition::v2030::ai_feature;  // Should fail
+
+fn main() {}

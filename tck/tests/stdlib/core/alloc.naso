@@ -1,0 +1,15 @@
+// TEST: alloc
+// CATEGORY: stdlib/core
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Allocation API
+
+edition 2024;
+
+use std::alloc::{alloc, dealloc, Layout};
+
+fn main() {
+    let layout = Layout::new::<i32>();
+    let ptr = unsafe { alloc(layout) };
+    unsafe { dealloc(ptr, layout) };
+}

@@ -1,0 +1,15 @@
+// TEST: basic_function
+// CATEGORY: syntax
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Basic function declaration and call
+
+edition 2024;
+
+fn add(x: i32, y: i32) -> i32 {
+    x + y
+}
+
+fn main() {
+    let result = add(2, 3);
+}

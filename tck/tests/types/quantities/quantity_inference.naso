@@ -1,0 +1,19 @@
+// TEST: quantity_inference
+// CATEGORY: types/quantities
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Quantity inference
+
+edition 2024;
+
+fn identity[T](x: T) -> T { x }
+
+fn main() {
+    let linear: [1] i32 = 42;
+    let affine: [?] i32 = 42;
+    let unrestricted: i32 = 42;
+
+    let _ = identity(linear);   // Infers [1] T
+    let _ = identity(affine);   // Infers [?] T
+    let _ = identity(unrestricted); // Infers [ω] T
+}

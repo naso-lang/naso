@@ -1,0 +1,14 @@
+// TEST: linear_not_copied
+// CATEGORY: types/linear
+// EXPECT: compile_error
+// EDITION: 2024
+// DESCRIPTION: Linear value cannot be copied
+
+edition 2024;
+
+fn use_twice(x: [1] i32, y: [1] i32) { }
+
+fn main() {
+    let x: [1] i32 = 42;
+    use_twice(x, x);  // Copy attempt - should error
+}

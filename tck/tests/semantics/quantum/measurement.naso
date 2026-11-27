@@ -1,0 +1,13 @@
+// TEST: measurement
+// CATEGORY: semantics/quantum
+// EXPECT: runtime_success
+// EDITION: 2024
+// DESCRIPTION: Computational basis measurement
+
+edition 2024;
+
+fn main() {
+    let q = qubit;
+    gate H(q);  // |+⟩
+    let result = measure q;  // 0 or 1 with 50% probability
+}

@@ -1,0 +1,14 @@
+// TEST: qec_steane
+// CATEGORY: stdlib/quantum
+// EXPECT: compile_success
+// EDITION: 2024
+// DESCRIPTION: Steane code
+
+edition 2024;
+
+use std::quantum::qec::{SteaneCode, Decoder};
+
+fn main() {
+    let code = SteaneCode::new();
+    let logical = code.encode(&[0, 1]);
+}
